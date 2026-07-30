@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_DATA}\"/bin/draft-hook-claude"
+          }
+        ]
+      }
+    ]
+  }
+}

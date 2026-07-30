@@ -1,0 +1,19 @@
+{
+  "name": "draft",
+  "version": "0.1.0",
+  "description": "Maintain long-running, branching design drafts as self-contained Markdown.",
+  "author": {"name": "CLD"},
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Draft",
+    "shortDescription": "Maintain long-running design drafts",
+    "longDescription": "Structure long-running, branching design discussions as self-contained Markdown drafts.",
+    "developerName": "CLD",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": [
+      "Use Draft to structure this long-running design discussion.",
+      "Check the current Draft for structural errors."
+    ]
+  }
+}
