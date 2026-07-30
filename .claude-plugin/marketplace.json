@@ -1,5 +1,5 @@
 {
-  "name": "draft",
+  "name": "cld-plugins",
   "owner": {"name": "CLD"},
   "plugins": [
     {"name": "draft", "source": "./plugins/draft"}

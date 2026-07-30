@@ -17,10 +17,10 @@ def load_json(path: Path) -> dict[str, Any]:
 def test_marketplaces_publish_draft() -> None:
     codex = load_json(REPO_ROOT / ".agents/plugins/marketplace.json")
     claude = load_json(REPO_ROOT / ".claude-plugin/marketplace.json")
-    assert codex["name"] == "draft"
+    assert codex["name"] == "cld-plugins"
     assert codex["plugins"][0]["name"] == "draft"
     assert codex["plugins"][0]["source"]["path"] == "./plugins/draft"
-    assert claude["name"] == "draft"
+    assert claude["name"] == "cld-plugins"
     assert claude["owner"] == {"name": "CLD"}
     assert claude["plugins"] == [{"name": "draft", "source": "./plugins/draft"}]
 

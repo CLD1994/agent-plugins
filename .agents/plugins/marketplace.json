@@ -1,7 +1,7 @@
 {
-  "name": "draft",
+  "name": "cld-plugins",
   "interface": {
-    "displayName": "Draft"
+    "displayName": "CLD Plugins"
   },
   "plugins": [
     {
