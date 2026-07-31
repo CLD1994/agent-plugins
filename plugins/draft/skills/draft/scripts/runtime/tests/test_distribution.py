@@ -39,5 +39,22 @@ def test_plugin_manifests_match_the_install_artifact() -> None:
     assert codex["name"] == claude["name"] == PLUGIN_ROOT.name == "draft"
     assert codex["version"] == claude["version"] == "0.1.0"
     assert codex["skills"] == claude["skills"] == "./skills/"
-    assert "hooks" not in codex
+
+
+def test_both_manifests_declare_their_session_start_hook() -> None:
+    codex = load_json(PLUGIN_ROOT / ".codex-plugin/plugin.json")
+    claude = load_json(PLUGIN_ROOT / ".claude-plugin/plugin.json")
+    assert codex["hooks"] == "./hooks/codex-hooks.json"
     assert claude["hooks"] == "./hooks/claude-hooks.json"
+
+
+def test_hook_commands_use_the_stable_skill_entry() -> None:
+    codex = load_json(PLUGIN_ROOT / "hooks/codex-hooks.json")
+    claude = load_json(PLUGIN_ROOT / "hooks/claude-hooks.json")
+    codex_command = codex["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    claude_command = claude["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    assert "${PLUGIN_ROOT}/skills/draft/scripts/draft" in codex_command
+    assert "${CLAUDE_PLUGIN_ROOT}/skills/draft/scripts/draft" in claude_command
+    assert "PLUGIN_DATA" not in codex_command
+    assert "CLAUDE_PLUGIN_DATA" not in claude_command
+    assert "/bin/draft" not in codex_command + claude_command

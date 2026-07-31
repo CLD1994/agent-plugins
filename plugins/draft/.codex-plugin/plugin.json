@@ -4,6 +4,7 @@
   "description": "Maintain long-running, branching design drafts as self-contained Markdown.",
   "author": {"name": "CLD"},
   "skills": "./skills/",
+  "hooks": "./hooks/codex-hooks.json",
   "interface": {
     "displayName": "Draft",
     "shortDescription": "Maintain long-running design drafts",

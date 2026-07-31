@@ -275,3 +275,28 @@ def test_main_reports_missing_uv(
     monkeypatch.setattr("draft.entry.run_command", missing_uv)
     assert main(internal_argv(layout, "setup")) == 4
     assert "runtime.uv_unavailable" in capsys.readouterr().err
+
+
+def test_session_start_rejects_unknown_host(
+    tmp_path: Path,
+    runtime_env: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    layout = make_layout(tmp_path)
+    assert main(internal_argv(layout, "_session-start", "other")) == 4
+    assert "entry.invalid_arguments" in capsys.readouterr().err
+
+
+def test_session_start_requires_host_variables(
+    tmp_path: Path,
+    runtime_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    layout = make_layout(tmp_path)
+    for variable in ("PLUGIN_ROOT", "PLUGIN_DATA", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA"):
+        monkeypatch.delenv(variable, raising=False)
+    assert main(internal_argv(layout, "_session-start", "codex")) == 4
+    assert "hook.environment_missing" in capsys.readouterr().err
+    assert main(internal_argv(layout, "_session-start", "claude")) == 4
+    assert "hook.environment_missing" in capsys.readouterr().err
