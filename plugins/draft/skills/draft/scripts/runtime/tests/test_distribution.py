@@ -16,6 +16,17 @@ def test_runtime_belongs_to_the_skill() -> None:
     assert not (PLUGIN_ROOT / "runtime").exists()
 
 
+def test_skill_is_a_self_contained_runtime_unit() -> None:
+    scripts = SKILL_ROOT / "scripts"
+    assert (scripts / "draft").is_file()
+    assert (scripts / "draft.ps1").is_file()
+    assert (scripts / "runtime/pyproject.toml").is_file()
+    assert (scripts / "runtime/uv.lock").is_file()
+    assert (scripts / "runtime/src/draft/__main__.py").is_file()
+    assert not (PLUGIN_ROOT / "runtime").exists()
+    assert not (PLUGIN_ROOT / "bootstrap").exists()
+
+
 def load_json(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     assert isinstance(value, dict)

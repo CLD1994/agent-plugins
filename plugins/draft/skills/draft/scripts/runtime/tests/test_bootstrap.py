@@ -149,6 +149,81 @@ def test_missing_uv_reports_runtime_uv_unavailable(tmp_path: Path) -> None:
     assert "runtime.uv_unavailable" in result.stderr
 
 
+def test_copied_skill_runs_standalone_with_isolated_runtime_dir(tmp_path: Path) -> None:
+    artifact = copy_skill(tmp_path)
+    case_dir = artifact.parent
+    fake_bin = case_dir / "bin"
+    fake_bin.mkdir()
+    _write_fake_uv(fake_bin)
+    xdg = case_dir / "xdg"
+    xdg.mkdir()
+    xdg.chmod(0o700)
+    uv_log = case_dir / "uv.log"
+    py_log = case_dir / "py.log"
+    env = os.environ.copy()
+    for name in (
+        "PLUGIN_ROOT",
+        "PLUGIN_DATA",
+        "CLAUDE_PLUGIN_ROOT",
+        "CLAUDE_PLUGIN_DATA",
+        "DRAFT_DATA",
+        "DRAFT_SKILL_PATH",
+    ):
+        env.pop(name, None)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["XDG_RUNTIME_DIR"] = str(xdg)
+    env["UV_LOG"] = str(uv_log)
+    env["PY_LOG"] = str(py_log)
+
+    def run(*args: str) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            ["/bin/sh", str(artifact / "scripts/draft"), *args],
+            cwd=case_dir,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"{args}: {result.stderr}{result.stdout}"
+        return result
+
+    root = case_dir / "draft-root"
+    run("setup")
+    run("init", str(root))
+    index = root / "index.md"
+    index.write_text(
+        index.read_text(encoding="utf-8") + "- [A](pages/a.md)\n", encoding="utf-8"
+    )
+    (root / "pages" / "a.md").write_text(
+        "# A\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n",
+        encoding="utf-8",
+    )
+    run("check", str(root))
+    run("move", str(root), "pages/a.md", "pages/b.md")
+    run("check", str(root))
+
+    assert not (root / "pages" / "a.md").exists()
+    assert (root / "pages" / "b.md").is_file()
+
+    pythons = list(case_dir.rglob("bin/python"))
+    assert pythons, "expected a synced environment python"
+    assert all(xdg in path.parents for path in pythons)
+    envs = xdg / "draft" / "envs"
+    assert envs.is_dir()
+    assert [path.parent.parent.parent for path in pythons] == [envs] * len(pythons)
+
+    internal = [path for path in case_dir.rglob(".draft")]
+    assert internal and all(root in path.parents for path in internal)
+    managed = [
+        path
+        for path in case_dir.rglob("*.md")
+        if artifact not in path.parents and ".draft" not in path.parts
+    ]
+    assert managed and all(root in path.parents for path in managed)
+
+    _assert_no_forbidden_references(uv_log, py_log)
+
+
 def test_wrappers_do_not_reference_host_data_or_legacy_layout() -> None:
     for name in ("draft", "draft.ps1"):
         text = (SKILL_ROOT / "scripts" / name).read_text(encoding="utf-8")

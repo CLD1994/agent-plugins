@@ -83,8 +83,8 @@ draft collapse ROOT HUB
 draft trash ROOT PAGE
 draft restore ROOT OPERATION_ID
 draft recover ROOT
-draft bind ROOT --platform claude|codex --session SESSION_ID [--last-page-hint PAGE]
-draft unbind --platform claude|codex --session SESSION_ID
+draft bind ROOT --session SESSION_ID [--last-page-hint PAGE]
+draft unbind --session SESSION_ID
 ```
 
 - `ROOT` 永远显式给出；`SOURCE`、`TARGET`、`PAGE`、`CHILD`、`HUB` 是草稿根内规范相对页面路径（如 `pages/a.md`、`pages/hub/index.md`），不接受目录别名。

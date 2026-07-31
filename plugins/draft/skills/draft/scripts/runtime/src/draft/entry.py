@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from draft.errors import DraftError
-from draft.plugin_context import PluginContext, load, per_user_runtime_dir, publish
+from draft.plugin_context import PluginContext, load, per_user_runtime_dir, publish, reset
 
 _EXIT_RUNTIME = 4
 
@@ -315,6 +315,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         layout, user_args = _parse_layout(arguments)
         if user_args[:1] == ["_session-start"]:
             return _session_start(layout, user_args, os.environ)
+        if user_args == ["plugin-context", "reset"]:
+            # 唯一允许在普通 plugin context 解析失败前分派的用户维护动作
+            reset(layout.entry_path)
+            return 0
         context = load(layout.entry_path)
         target = environment_path(layout, context)
         sync_environment(layout, target, os.environ)

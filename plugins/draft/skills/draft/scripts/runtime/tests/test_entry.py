@@ -277,6 +277,26 @@ def test_main_reports_missing_uv(
     assert "runtime.uv_unavailable" in capsys.readouterr().err
 
 
+def test_plugin_context_reset_runs_before_context_resolution(
+    tmp_path: Path,
+    runtime_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layout = make_layout(tmp_path)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    publish(layout.entry_path, data_dir)
+    other = tmp_path / "other"
+    other.mkdir()
+    with pytest.raises(DraftError, match="plugin.context_conflict"):
+        publish(layout.entry_path, other)
+    runner = FakeRunner()
+    monkeypatch.setattr("draft.entry.run_command", runner)
+    assert main(internal_argv(layout, "plugin-context", "reset")) == 0
+    assert runner.calls == []
+    assert main(internal_argv(layout, "check", "x")) == 0
+
+
 def test_session_start_rejects_unknown_host(
     tmp_path: Path,
     runtime_env: Path,
