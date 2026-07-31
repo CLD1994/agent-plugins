@@ -13,9 +13,7 @@ from draft.models import Binding
 from draft.operations import durable_write
 from draft.paths import resolve_draft_root
 
-_PAYLOAD_KEYS = frozenset(
-    {"session_id", "root", "last_page_hint", "skill_name", "skill_digest"}
-)
+_PAYLOAD_KEYS = {"session_id", "root", "last_page_hint", "skill_name", "skill_digest"}
 
 
 def required_skill_path(raw: str | None) -> Path:
