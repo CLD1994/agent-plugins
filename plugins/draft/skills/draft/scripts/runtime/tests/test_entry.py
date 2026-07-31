@@ -130,8 +130,13 @@ def test_sync_environment_invokes_uv_with_exact_arguments(tmp_path: Path) -> Non
     assert len(runner.calls) == 1
     call = runner.calls[0]
     assert call.args == [
-        "uv", "sync", "--project", str(layout.project_path),
-        "--locked", "--no-install-project", "--no-dev",
+        "uv",
+        "sync",
+        "--project",
+        str(layout.project_path),
+        "--locked",
+        "--no-install-project",
+        "--no-dev",
     ]
     assert call.env["UV_PROJECT_ENVIRONMENT"] == str(target)
     assert call.env["PATH"] == "/usr/bin"
@@ -252,10 +257,14 @@ def test_main_reports_invalid_layout(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     argv = [
-        "--entry-path", str(tmp_path / "missing-entry"),
-        "--skill-path", str(tmp_path / "missing-skill"),
-        "--runtime-path", str(tmp_path / "missing-runtime"),
-        "--", "setup",
+        "--entry-path",
+        str(tmp_path / "missing-entry"),
+        "--skill-path",
+        str(tmp_path / "missing-skill"),
+        "--runtime-path",
+        str(tmp_path / "missing-runtime"),
+        "--",
+        "setup",
     ]
     assert main(argv) == 4
     assert "entry.layout_invalid" in capsys.readouterr().err

@@ -96,8 +96,13 @@ def sync_environment(
     try:
         code = runner(
             [
-                "uv", "sync", "--project", str(layout.project_path),
-                "--locked", "--no-install-project", "--no-dev",
+                "uv",
+                "sync",
+                "--project",
+                str(layout.project_path),
+                "--locked",
+                "--no-install-project",
+                "--no-dev",
             ],
             env,
         )
@@ -278,9 +283,7 @@ def _session_start(
     key = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
     if not _binding_present(data_dir / "bindings" / f"{key}.json"):
         print(session_hook.render_session_fact(session_id))
-        session_hook.log_hook(
-            data_dir, host, branch="session_fact", source=source, warmed=warmed
-        )
+        session_hook.log_hook(data_dir, host, branch="session_fact", source=source, warmed=warmed)
         return 0
     try:
         if not warmed:

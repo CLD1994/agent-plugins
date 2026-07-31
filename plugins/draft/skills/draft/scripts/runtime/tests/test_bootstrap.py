@@ -191,9 +191,7 @@ def test_copied_skill_runs_standalone_with_isolated_runtime_dir(tmp_path: Path) 
     run("setup")
     run("init", str(root))
     index = root / "index.md"
-    index.write_text(
-        index.read_text(encoding="utf-8") + "- [A](pages/a.md)\n", encoding="utf-8"
-    )
+    index.write_text(index.read_text(encoding="utf-8") + "- [A](pages/a.md)\n", encoding="utf-8")
     (root / "pages" / "a.md").write_text(
         "# A\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n",
         encoding="utf-8",

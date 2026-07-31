@@ -178,9 +178,7 @@ def hook_log(setup: Setup) -> list[dict[str, object]]:
     if not path.exists():
         return []
     return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
     ]
 
 
@@ -550,9 +548,7 @@ def test_warmup_syncs_persistent_environment_even_without_binding(
     standalone = setup.runtime_dir / "draft" / "envs" / key
     standalone.mkdir(parents=True)
     runner = HookRunner()
-    code, output, _ = run_hook(
-        setup, host, session_stdin("fresh"), monkeypatch, capsys, runner
-    )
+    code, output, _ = run_hook(setup, host, session_stdin("fresh"), monkeypatch, capsys, runner)
 
     assert code == 0
     assert output == session_hook.render_session_fact("fresh") + "\n"
@@ -579,9 +575,7 @@ def test_unsafe_standalone_environment_is_not_a_warmup_signal(
     elsewhere.mkdir()
     standalone.symlink_to(elsewhere)
     runner = HookRunner()
-    code, output, _ = run_hook(
-        setup, host, session_stdin("fresh"), monkeypatch, capsys, runner
-    )
+    code, output, _ = run_hook(setup, host, session_stdin("fresh"), monkeypatch, capsys, runner)
 
     assert code == 0
     assert output == session_hook.render_session_fact("fresh") + "\n"

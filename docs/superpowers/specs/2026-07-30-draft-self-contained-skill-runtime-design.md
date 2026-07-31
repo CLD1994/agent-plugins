@@ -2,7 +2,7 @@
 
 ## 状态与优先级
 
-状态：已完成用户评审并同步进 `docs/design.md`，尚未实施。后续实现以本规格、主设计和 `docs/superpowers/plans/2026-07-31-draft-self-contained-skill-runtime.md` 为依据。
+状态：已完成用户评审并同步进 `docs/design.md`，已实现并验证。实现依据本规格、主设计和 `docs/superpowers/plans/2026-07-31-draft-self-contained-skill-runtime.md`。
 
 本规格定义 Draft 下一阶段的运行时归属、唯一执行入口、插件上下文桥接、Python/uv 环境和会话绑定协议。
 
