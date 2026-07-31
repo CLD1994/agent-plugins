@@ -6,7 +6,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[2]
+RUNTIME_ROOT = Path(__file__).resolve().parents[1]
+SKILL_ROOT = RUNTIME_ROOT.parents[1]
+PLUGIN_ROOT = SKILL_ROOT.parents[1]
 
 
 def _write_fake_uv(bin_dir: Path) -> None:

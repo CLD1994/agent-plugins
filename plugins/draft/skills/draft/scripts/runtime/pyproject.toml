@@ -10,7 +10,6 @@ dependencies = [
 
 [project.scripts]
 draft = "draft.cli:main"
-draft-hook-claude = "draft.claude_hook:main"
 
 [dependency-groups]
 dev = [

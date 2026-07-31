@@ -11,10 +11,7 @@ def test_runtime_uses_draft_identity() -> None:
     assert importlib.util.find_spec("draft") is not None
     config = tomllib.loads((RUNTIME_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert config["project"]["name"] == "draft-runtime"
-    assert config["project"]["scripts"] == {
-        "draft": "draft.cli:main",
-        "draft-hook-claude": "draft.claude_hook:main",
-    }
+    assert config["project"]["scripts"] == {"draft": "draft.cli:main"}
 
 
 def test_root_domain_exports_use_draft() -> None:

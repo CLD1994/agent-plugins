@@ -4,8 +4,16 @@ import json
 from pathlib import Path
 from typing import Any, cast
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[2]
-REPO_ROOT = Path(__file__).resolve().parents[4]
+RUNTIME_ROOT = Path(__file__).resolve().parents[1]
+SKILL_ROOT = RUNTIME_ROOT.parents[1]
+PLUGIN_ROOT = SKILL_ROOT.parents[1]
+REPO_ROOT = PLUGIN_ROOT.parents[1]
+
+
+def test_runtime_belongs_to_the_skill() -> None:
+    assert RUNTIME_ROOT == SKILL_ROOT / "scripts/runtime"
+    assert (SKILL_ROOT / "SKILL.md").is_file()
+    assert not (PLUGIN_ROOT / "runtime").exists()
 
 
 def load_json(path: Path) -> dict[str, Any]:
