@@ -102,7 +102,7 @@ def test_unknown_bridge_field_is_invalid(tmp_path: Path) -> None:
     publish(entry, data_dir, runtime_dir)
     path = bridge_paths(entry, runtime_dir).json
     path.write_text(
-        json.dumps({"schema_version": 1, "data_dir": str(data_dir), "platform": "codex"}),
+        json.dumps({"schema_version": 1, "data_dir": str(data_dir), "runtime_version": "1"}),
         encoding="utf-8",
     )
     with pytest.raises(DraftError, match="plugin.context_invalid"):

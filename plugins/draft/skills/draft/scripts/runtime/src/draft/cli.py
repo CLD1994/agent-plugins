@@ -76,12 +76,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     bind_cmd = subparsers.add_parser("bind", parents=[shared])
     bind_cmd.add_argument("root", metavar="ROOT")
-    bind_cmd.add_argument("--platform", required=True, choices=["claude", "codex"])
     bind_cmd.add_argument("--session", required=True, metavar="SESSION_ID")
     bind_cmd.add_argument("--last-page-hint", metavar="PAGE")
 
     unbind_cmd = subparsers.add_parser("unbind", parents=[shared])
-    unbind_cmd.add_argument("--platform", required=True, choices=["claude", "codex"])
     unbind_cmd.add_argument("--session", required=True, metavar="SESSION_ID")
 
     return parser
@@ -297,11 +295,9 @@ def _dispatch(args: argparse.Namespace) -> tuple[dict[str, object], str, int]:
         from draft.models import Binding
 
         data_value = os.environ.get("DRAFT_DATA")
-        if not data_value:
-            raise DraftError("binding.data_dir_unavailable")
+        if data_value is None:
+            raise DraftError("binding.plugin_context_unavailable")
         session = cast(str, args.session)
-        if not session:
-            raise DraftError("binding.session_unavailable")
         root = Path(cast(str, args.root))
         hint_value = cast("str | None", args.last_page_hint)
         hint = _page_operand(root, hint_value) if hint_value else None
@@ -310,7 +306,6 @@ def _dispatch(args: argparse.Namespace) -> tuple[dict[str, object], str, int]:
         binding = bindings.bind(
             Path(data_value),
             Binding(
-                platform=cast(str, args.platform),
                 session_id=session,
                 root=root,
                 last_page_hint=hint,
@@ -321,10 +316,9 @@ def _dispatch(args: argparse.Namespace) -> tuple[dict[str, object], str, int]:
         return (
             {
                 "result_type": "bind",
-                "platform": binding.platform,
                 "root": str(binding.root),
             },
-            f"已绑定 {binding.platform} 会话到 {binding.root}",
+            f"已绑定会话到 {binding.root}",
             0,
         )
     if command == "unbind":
@@ -333,12 +327,10 @@ def _dispatch(args: argparse.Namespace) -> tuple[dict[str, object], str, int]:
         from draft import bindings
 
         data_value = os.environ.get("DRAFT_DATA")
-        if not data_value:
-            raise DraftError("binding.data_dir_unavailable")
+        if data_value is None:
+            raise DraftError("binding.plugin_context_unavailable")
         session = cast(str, args.session)
-        if not session:
-            raise DraftError("binding.session_unavailable")
-        removed = bindings.unbind(Path(data_value), cast(str, args.platform), session)
+        removed = bindings.unbind(Path(data_value), session)
         return (
             {
                 "result_type": "unbind",
@@ -387,7 +379,11 @@ def _structure_preflight_human(report: LifecycleAdvanceReport) -> str:
 def _exit_for_error(error: DraftError) -> int:
     if error.code.startswith("operation.") or error.code == "adopt.recovery_required":
         return _EXIT_OPERATION
-    if error.code in ("binding.data_dir_unavailable", "binding.session_unavailable"):
+    if error.code in (
+        "binding.plugin_context_unavailable",
+        "binding.data_dir_unavailable",
+        "binding.skill_unavailable",
+    ):
         return _EXIT_RUNTIME
     return _EXIT_DOMAIN
 

@@ -29,7 +29,6 @@ def bound_data_dir(tmp_path: Path, skill_file: Path) -> Path:
     bind(
         data_dir,
         Binding(
-            platform="claude",
             session_id="abc123",
             root=root,
             last_page_hint=None,
@@ -182,7 +181,6 @@ def test_stale_page_hint_is_omitted(
     bind(
         bound_data_dir,
         Binding(
-            platform="claude",
             session_id="abc123",
             root=root,
             last_page_hint=Path("pages/a.md"),

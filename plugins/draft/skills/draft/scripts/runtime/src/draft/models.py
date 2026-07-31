@@ -170,7 +170,6 @@ class TrashResult:
 
 @dataclass(frozen=True)
 class Binding:
-    platform: str
     session_id: str
     root: Path
     last_page_hint: Path | None

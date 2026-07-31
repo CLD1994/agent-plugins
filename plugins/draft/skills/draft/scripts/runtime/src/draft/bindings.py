@@ -13,7 +13,9 @@ from draft.models import Binding
 from draft.operations import durable_write
 from draft.paths import resolve_draft_root
 
-PLATFORMS = frozenset({"claude", "codex"})
+_PAYLOAD_KEYS = frozenset(
+    {"session_id", "root", "last_page_hint", "skill_name", "skill_digest"}
+)
 
 
 def required_skill_path(raw: str | None) -> Path:
@@ -41,14 +43,16 @@ def _require_data_dir(data_dir: Path) -> Path:
     return data_dir
 
 
-def binding_path(data_dir: Path, platform: str, session_id: str) -> Path:
-    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
-    return data_dir / "bindings" / platform / f"{digest}.json"
+def binding_key(session_id: str) -> str:
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+
+
+def binding_path(data_dir: Path, session_id: str) -> Path:
+    return data_dir / "bindings" / f"{binding_key(session_id)}.json"
 
 
 def _binding_json(binding: Binding) -> bytes:
     payload = {
-        "platform": binding.platform,
         "session_id": binding.session_id,
         "root": str(binding.root),
         "last_page_hint": (
@@ -60,28 +64,29 @@ def _binding_json(binding: Binding) -> bytes:
     return (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
 
 
-def _parse_binding(raw: object, path: Path) -> Binding:
+def _parse_binding(raw: object, path: Path, session_id: str) -> Binding:
     if not isinstance(raw, dict):
         raise DraftError("binding.invalid", path)
     data = cast("dict[str, object]", raw)
-    platform = data.get("platform")
-    session_id = data.get("session_id")
-    root = data.get("root")
-    hint = data.get("last_page_hint")
-    skill_name = data.get("skill_name")
-    digest = data.get("skill_digest")
+    if set(data) != _PAYLOAD_KEYS:
+        raise DraftError("binding.invalid", path)
+    payload_session = data["session_id"]
+    root = data["root"]
+    hint = data["last_page_hint"]
+    skill_name = data["skill_name"]
+    digest = data["skill_digest"]
     if (
-        not isinstance(platform, str)
-        or not isinstance(session_id, str)
+        not isinstance(payload_session, str)
         or not isinstance(root, str)
         or not (hint is None or isinstance(hint, str))
         or not isinstance(skill_name, str)
         or not isinstance(digest, str)
     ):
         raise DraftError("binding.invalid", path)
+    if payload_session != session_id:
+        raise DraftError("binding.session_mismatch", path)
     return Binding(
-        platform=platform,
-        session_id=session_id,
+        session_id=payload_session,
         root=Path(root),
         last_page_hint=None if hint is None else Path(hint),
         skill_name=skill_name,
@@ -90,8 +95,6 @@ def _parse_binding(raw: object, path: Path) -> Binding:
 
 
 def bind(data_dir: Path, binding: Binding) -> Binding:
-    if binding.platform not in PLATFORMS:
-        raise DraftError("binding.invalid_platform", Path(binding.platform))
     _require_data_dir(data_dir)
     root = resolve_draft_root(binding.root)
     report = check_draft(root)
@@ -103,33 +106,38 @@ def bind(data_dir: Path, binding: Binding) -> Binding:
         if binding.last_page_hint not in graph.pages:
             raise DraftError("binding.invalid_hint", binding.last_page_hint)
     canonical = Binding(
-        platform=binding.platform,
         session_id=binding.session_id,
         root=root,
         last_page_hint=binding.last_page_hint,
         skill_name=binding.skill_name,
         skill_digest=binding.skill_digest,
     )
-    target = binding_path(data_dir, binding.platform, binding.session_id)
+    target = binding_path(data_dir, binding.session_id)
     target.parent.mkdir(parents=True, exist_ok=True)
     durable_write(target, _binding_json(canonical))
     return canonical
 
 
-def load_binding(data_dir: Path, platform: str, session_id: str) -> Binding | None:
-    path = binding_path(data_dir, platform, session_id)
-    if not path.is_file():
+def load_binding(data_dir: Path, session_id: str) -> Binding | None:
+    path = binding_path(data_dir, session_id)
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise DraftError("binding.invalid", path) from exc
+    if not stat.S_ISREG(mode):
+        raise DraftError("binding.invalid", path)
     try:
         decoded = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise DraftError("binding.invalid", path) from exc
-    return _parse_binding(decoded, path)
+    return _parse_binding(decoded, path, session_id)
 
 
-def unbind(data_dir: Path, platform: str, session_id: str) -> bool:
+def unbind(data_dir: Path, session_id: str) -> bool:
     _require_data_dir(data_dir)
-    path = binding_path(data_dir, platform, session_id)
+    path = binding_path(data_dir, session_id)
     if not path.exists():
         return False
     path.unlink()

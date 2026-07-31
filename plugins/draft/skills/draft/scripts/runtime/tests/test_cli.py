@@ -523,20 +523,44 @@ def test_bind_and_unbind_round_trip(
     monkeypatch.setenv("DRAFT_SKILL_PATH", str(skill))
     capsys.readouterr()
 
-    code, payload = run_json(
-        ["bind", str(root), "--platform", "claude", "--session", "abc123", "--json"], capsys
-    )
+    code, payload = run_json(["bind", str(root), "--session", "abc123", "--json"], capsys)
     assert code == 0
     assert payload["ok"] is True
-    binding_file = data_dir / "bindings" / "claude"
-    assert len(list(binding_file.iterdir())) == 1
+    assert payload["result_type"] == "bind"
+    assert payload["root"] == str(root.resolve())
+    assert "platform" not in payload
+    binding_dir = data_dir / "bindings"
+    assert len(list(binding_dir.iterdir())) == 1
 
-    code, payload = run_json(
-        ["unbind", "--platform", "claude", "--session", "abc123", "--json"], capsys
-    )
+    code, payload = run_json(["unbind", "--session", "abc123", "--json"], capsys)
     assert code == 0
     assert payload["removed"] is True
-    assert list(binding_file.iterdir()) == []
+    assert list(binding_dir.iterdir()) == []
+
+
+def test_bind_accepts_opaque_session_strings(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "topic"
+    build_draft(root)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    skill = tmp_path / "SKILL.md"
+    skill.write_text("stub skill", encoding="utf-8")
+    monkeypatch.setenv("DRAFT_DATA", str(data_dir))
+    monkeypatch.setenv("DRAFT_SKILL_PATH", str(skill))
+    capsys.readouterr()
+
+    for session in ("", "..", "会话/①"):
+        code, payload = run_json(["bind", str(root), "--session", session, "--json"], capsys)
+        assert code == 0
+        assert payload["ok"] is True
+    binding_dir = data_dir / "bindings"
+    files = list(binding_dir.iterdir())
+    assert len(files) == 3
+    assert all(path.parent == binding_dir for path in files)
 
 
 def test_bind_uses_skill_from_unrelated_location(
@@ -556,14 +580,12 @@ def test_bind_uses_skill_from_unrelated_location(
     monkeypatch.setenv("DRAFT_SKILL_PATH", str(skill))
     capsys.readouterr()
 
-    code, payload = run_json(
-        ["bind", str(root), "--platform", "codex", "--session", "layout", "--json"], capsys
-    )
+    code, payload = run_json(["bind", str(root), "--session", "layout", "--json"], capsys)
     assert code == 0
     assert payload["ok"] is True
 
 
-def test_bind_requires_data_env(
+def test_bind_requires_plugin_context(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -573,13 +595,11 @@ def test_bind_requires_data_env(
     monkeypatch.delenv("DRAFT_DATA", raising=False)
     capsys.readouterr()
 
-    code, payload = run_json(
-        ["bind", str(root), "--platform", "claude", "--session", "abc123", "--json"], capsys
-    )
+    code, payload = run_json(["bind", str(root), "--session", "abc123", "--json"], capsys)
     assert code == 4
     error = payload["error"]
     assert isinstance(error, dict)
-    assert error["code"] == "binding.data_dir_unavailable"
+    assert error["code"] == "binding.plugin_context_unavailable"
 
 
 def test_bind_hook_help_exits_zero() -> None:

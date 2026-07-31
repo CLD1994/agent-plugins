@@ -106,7 +106,7 @@ def _run(data_dir: Path) -> str | None:
     if not isinstance(source, str) or source not in _SOURCES:
         _log(data_dir, "source_unknown", source=str(source))
         return None
-    binding = bindings.load_binding(data_dir, "claude", session_id)
+    binding = bindings.load_binding(data_dir, session_id)
     if binding is None:
         return None
     if not binding.root.is_dir():
