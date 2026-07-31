@@ -1,5 +1,7 @@
 # Draft 插件清单、完整改名与路径契约设计
 
+> **状态提示（2026-07-31）：** 本规格关于运行时归属（插件根级 `plugins/draft/runtime/`）、生成式启动器和平台绑定维度的结论已被[自包含技能运行时与插件增强桥接设计](2026-07-30-draft-self-contained-skill-runtime-design.md)取代；两者冲突时以后者为准。本规格关于插件身份、marketplace、文件格式和不向后兼容的结论仍然有效。
+
 ## 目标
 
 把已经完成孵化并重组为安装产物的项目统一命名为 `draft`，补齐 Codex 与 Claude Code 的插件清单和 marketplace 清单，并修复迁移后依赖固定目录层级的路径解析。

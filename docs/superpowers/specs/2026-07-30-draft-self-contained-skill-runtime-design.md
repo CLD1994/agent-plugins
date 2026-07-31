@@ -4,6 +4,8 @@
 
 状态：已完成用户评审并同步进 `docs/design.md`，已实现并验证。实现依据本规格、主设计和 `docs/superpowers/plans/2026-07-31-draft-self-contained-skill-runtime.md`。
 
+宿主机复验仍待执行：Codex 校验器、pwsh 包装脚本执行、真实宿主钩子信任与端到端、沙箱 `data_dir` 写权限、宿主官方文档复核。
+
 本规格定义 Draft 下一阶段的运行时归属、唯一执行入口、插件上下文桥接、Python/uv 环境和会话绑定协议。
 
 术语约定：Agent（智能体）是宿主执行技能指令的主体；skill（技能）是宿主扩展单元，路径和 frontmatter 中保留该协议字面量；runtime（运行时）特指技能携带的确定性 Python 程序；plugin context（插件上下文）是数据目录定位协议；bridge（桥接定位器）是该协议在临时文件系统中的载体；binding（会话绑定）是会话到活动 Draft 的持久记录。后文代码标识和宿主协议名保持原文。

@@ -56,9 +56,13 @@ def per_user_runtime_dir(environ: Mapping[str, str] | None = None) -> Path:
         ):
             return candidate
     base = Path(tempfile.gettempdir()) / f"draft-runtime-{os.getuid()}"
-    with suppress(FileExistsError):
+    try:
         os.mkdir(base, 0o700)
         os.chmod(base, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise DraftError("plugin.context_invalid", base) from exc
     try:
         status = base.lstat()
     except OSError as exc:

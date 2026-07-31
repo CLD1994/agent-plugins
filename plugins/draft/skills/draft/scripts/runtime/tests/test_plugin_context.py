@@ -384,6 +384,21 @@ def test_per_user_runtime_dir_rejects_insecure_existing_fallback(
         per_user_runtime_dir({})
 
 
+def test_per_user_runtime_dir_surfaces_mkdir_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    temp = tmp_path / "tmp"
+    temp.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp))
+
+    def denied(path: object, mode: int = 0o777) -> None:
+        raise PermissionError("read-only filesystem")
+
+    monkeypatch.setattr(os, "mkdir", denied)
+    with pytest.raises(DraftError, match="plugin.context_invalid"):
+        per_user_runtime_dir({})
+
+
 # 步骤 7：并发发布串行化
 
 

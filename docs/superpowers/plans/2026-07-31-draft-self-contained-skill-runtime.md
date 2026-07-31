@@ -59,7 +59,7 @@
 - 输入：当前 `draft.cli:main`、Python 包身份 `draft`、运行时版本 `0.1.0` 以及所有既有领域测试。
 - 输出：`python -m draft [ARGS...]`，以及所有路径都相对于已安装技能的运行时子树。
 
-- [ ] **步骤 1：为目标归属边界增加失败测试**
+- [x] **步骤 1：为目标归属边界增加失败测试**
 
 移动文件前，更新 `test_distribution.py`，使其不依赖仓库特定绝对路径即可推导各层根目录：
 
@@ -82,7 +82,7 @@ def test_runtime_belongs_to_the_skill() -> None:
 assert config["project"]["scripts"] == {"draft": "draft.cli:main"}
 ```
 
-- [ ] **步骤 2：运行归属测试并确认处于红灯状态**
+- [x] **步骤 2：运行归属测试并确认处于红灯状态**
 
 运行：
 
@@ -94,7 +94,7 @@ uv run --isolated --project plugins/draft/runtime pytest -q \
 
 预期：测试失败，因为运行时仍位于插件根，`scripts/runtime/` 尚不存在，并且插件根的 `bootstrap/` 仍然存在。
 
-- [ ] **步骤 3：移动运行时，不改变领域模块**
+- [x] **步骤 3：移动运行时，不改变领域模块**
 
 创建 `plugins/draft/skills/draft/scripts/`，把完整的已跟踪运行时子树移入其中；不得复制缓存或创建第二份运行时。`pyproject.toml`、`uv.lock`、`src/draft/` 和 `tests/` 必须整体保留。
 
@@ -107,7 +107,7 @@ draft = "draft.cli:main"
 
 删除 `draft-hook-claude`；任务 5 将用稳定的内部钩子分派替代这个宿主专用控制台脚本。
 
-- [ ] **步骤 4：增加模块执行入口**
+- [x] **步骤 4：增加模块执行入口**
 
 新建 `src/draft/__main__.py`：
 
@@ -121,7 +121,7 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-- [ ] **步骤 5：运行迁移后的运行时测试并确认处于绿灯状态**
+- [x] **步骤 5：运行迁移后的运行时测试并确认处于绿灯状态**
 
 运行：
 
@@ -135,7 +135,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime \
 
 预期：定向测试通过，模块命令输出 `0.1.0`。
 
-- [ ] **步骤 6：评审移动边界**
+- [x] **步骤 6：评审移动边界**
 
 运行：
 
@@ -169,7 +169,7 @@ git status --short
   - `load(entry_path: Path, runtime_dir: Path | None = None) -> PluginContext | None`
   - `reset(entry_path: Path, runtime_dir: Path | None = None) -> None`
 
-- [ ] **步骤 1：编写安装键、路径和模式的失败测试**
+- [x] **步骤 1：编写安装键、路径和模式的失败测试**
 
 新建 `test_plugin_context.py`，并在测试中独立计算预期值：
 
@@ -203,7 +203,7 @@ def test_unknown_bridge_field_is_invalid(tmp_path: Path) -> None:
 
 还要覆盖以下状态：桥接定位器不存在时返回 `None`、未知模式版本、相对 `data_dir`、目标不存在或不是目录、JSON 损坏，以及 JSON 顶层值不是对象。
 
-- [ ] **步骤 2：编写文件状态和冲突的失败测试**
+- [x] **步骤 2：编写文件状态和冲突的失败测试**
 
 为下列互不相同的状态增加测试：
 
@@ -236,7 +236,7 @@ def test_reset_removes_only_json_and_conflict(tmp_path: Path) -> None:
 
 对桥接 JSON、冲突哨兵、锁文件和父目录分别参数化以下状态：符号链接、目录占据文件位置、POSIX 下所有者错误，以及组用户或其他用户可写。每种不安全状态都必须报告 `plugin.context_invalid`，且不得跟随或替换该文件系统对象。
 
-- [ ] **步骤 3：运行桥接测试并确认处于红灯状态**
+- [x] **步骤 3：运行桥接测试并确认处于红灯状态**
 
 运行：
 
@@ -247,7 +247,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime \
 
 预期：测试失败，因为 `draft.plugin_context` 尚不存在。
 
-- [ ] **步骤 4：实现运行目录选择和不可变公开记录**
+- [x] **步骤 4：实现运行目录选择和不可变公开记录**
 
 `plugin_context.py` 初始只导入标准库，并定义下列准确记录：
 
@@ -293,7 +293,7 @@ def installation_key(entry_path: Path) -> str:
 - 在 Windows 上，使用 `tempfile.gettempdir()` 返回的当前用户临时目录；
 - 绝不把当前工作目录或仓库路径用作回退位置。
 
-- [ ] **步骤 5：实现单一操作系统锁和严格状态解析**
+- [x] **步骤 5：实现单一操作系统锁和严格状态解析**
 
 实现一个私有上下文管理器：不跟随符号链接地打开准确的 `.lock` 文件，然后在 POSIX 上调用 `fcntl.flock(..., LOCK_EX)`，在 Windows 上调用 `msvcrt.locking(..., LK_LOCK, 1)`。释放锁后保留锁文件；文件存在永远不等于锁正被持有。
 
@@ -311,13 +311,13 @@ if not isinstance(payload["data_dir"], str):
 
 严格解析 `data_dir`，并要求它是绝对、真实且可写的目录。发布时，先规范化宿主路径，再与既有桥接定位器比较。
 
-- [ ] **步骤 6：实现原子发布、冲突和 reset**
+- [x] **步骤 6：实现原子发布、冲突和 reset**
 
 发布必须在桥接目录中写入模式为 `0600` 的临时文件，刷新缓冲区并调用 `os.fsync()`，再通过 `os.replace()` 替换 JSON；操作系统支持时还要同步父目录。如果既有合法桥接定位器指向另一个规范 `data_dir`，则以排他创建方式写入空冲突哨兵，保留原 JSON，并报告 `plugin.context_conflict`。
 
 reset 必须取得同一把锁，先验证文件类型和所有权，再只删除当前安装实例的 JSON 和冲突哨兵。它不接受数据目录参数，且永不删除锁文件或桥接父目录。
 
-- [ ] **步骤 7：证明并发发布会被串行化**
+- [x] **步骤 7：证明并发发布会被串行化**
 
 增加一个多进程测试，在同一屏障处同时释放两个工作进程：
 
@@ -359,7 +359,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime \
   - `main(argv: Sequence[str] | None = None) -> int`
   - 公开命令 `scripts/draft setup` 和 `scripts/draft [draft CLI args]`。
 
-- [ ] **步骤 1：编写环境键和模式选择的失败测试**
+- [x] **步骤 1：编写环境键和模式选择的失败测试**
 
 新建 `test_entry.py`：
 
@@ -386,7 +386,7 @@ def test_environment_path_switches_only_on_valid_context(tmp_path: Path) -> None
 
 增加变更测试，证明任一清单发生字节变化都会产生不同的环境键，而只改变源码不会改变环境键。
 
-- [ ] **步骤 2：编写同步和失败停止的失败测试**
+- [x] **步骤 2：编写同步和失败停止的失败测试**
 
 向 `sync_environment()` 注入子进程执行器，并断言准确的调用参数和环境：
 
@@ -409,7 +409,7 @@ assert call.env["UV_PROJECT_ENVIRONMENT"] == str(target)
 - 普通命令执行同样的同步和自检，再运行 `<target interpreter> -m draft ...`，并返回该进程的准确退出码；
 - 独立模式移除 `DRAFT_DATA`，插件增强模式设置它，两种模式都设置准确的 `DRAFT_SKILL_PATH`。
 
-- [ ] **步骤 3：运行入口测试并确认处于红灯状态**
+- [x] **步骤 3：运行入口测试并确认处于红灯状态**
 
 运行：
 
@@ -420,7 +420,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime \
 
 预期：测试失败，因为 `draft.entry` 尚不存在。
 
-- [ ] **步骤 4：实现仅依赖标准库的入口边界**
+- [x] **步骤 4：实现仅依赖标准库的入口边界**
 
 模块级导入只能包含标准库、`draft.errors` 和 `draft.plugin_context`。使用包装脚本传入的准确布局，不得通过 `__file__.parents` 发现 `SKILL.md`：
 
@@ -441,7 +441,7 @@ def environment_key(layout: RuntimeLayout) -> str:
 
 在用户命令之前解析包装脚本提供的三个准确内部路径参数（`--entry-path`、`--skill-path`、`--runtime-path`）。严格解析每个路径，要求 `entry_path` 和 `skill_path` 是普通文件、运行时和源码路径是真实目录，然后构造 `RuntimeLayout`。
 
-- [ ] **步骤 5：实现同步、解释器选择、自检和执行**
+- [x] **步骤 5：实现同步、解释器选择、自检和执行**
 
 不依赖虚拟环境 shebang，直接选择环境解释器：
 
@@ -461,7 +461,7 @@ def environment_python(target: Path) -> Path:
 
 不得创建或检查环境元数据文件。由 uv 串行化并发同步。uv 缺失时报告 `runtime.uv_unavailable`；同步或自检失败时保留子进程退出码和简洁诊断。
 
-- [ ] **步骤 6：编写 POSIX 稳定包装脚本**
+- [x] **步骤 6：编写 POSIX 稳定包装脚本**
 
 新建可执行文件 `scripts/draft`：
 
@@ -485,7 +485,7 @@ PYTHONPATH="$RUNTIME/src" exec uv run --no-project --python 3.14 python -m draft
 
 包装脚本不得读取 `PLUGIN_DATA`、`CLAUDE_PLUGIN_DATA` 或宿主缓存路径。
 
-- [ ] **步骤 7：编写 PowerShell 稳定包装脚本**
+- [x] **步骤 7：编写 PowerShell 稳定包装脚本**
 
 新建 `scripts/draft.ps1`，使用相同的准确路径参数和退出行为：
 
@@ -512,7 +512,7 @@ try {
 
 只根据真实 PowerShell 解析测试的需要调整引号；不得在 Agent 可见语法中引入 `platform` 或数据目录参数。
 
-- [ ] **步骤 8：用包装脚本行为测试替换 bootstrap 测试**
+- [x] **步骤 8：用包装脚本行为测试替换 bootstrap 测试**
 
 重写 `test_bootstrap.py`：只复制 `skills/draft/`，把伪造的 `uv` 放在 `PATH` 首位，并验证两个包装脚本使用的资源路径都位于复制出的技能内。伪 uv 必须记录调用，并创建测试所需的目标环境解释器；任何对插件根 `runtime/`、`bootstrap/`、`data/bin`、`installed-runtime-manifest` 或 `setup-status.json` 的引用都必须使测试失败。
 
@@ -533,7 +533,7 @@ pwsh -NoProfile -File plugins/draft/skills/draft/scripts/draft.ps1 --version
 
 预期：全部测试通过，包装脚本返回模拟的 Draft 退出码，并且没有生成式启动器或元数据文件。
 
-- [ ] **步骤 9：删除已被替代的 bootstrap 子树**
+- [x] **步骤 9：删除已被替代的 bootstrap 子树**
 
 包装脚本测试通过后，删除 `plugins/draft/bootstrap/setup.sh`、`setup.ps1` 和空目录。重新运行任务 1 的分发测试，证明只存在一种入口架构。
 
@@ -561,7 +561,7 @@ pwsh -NoProfile -File plugins/draft/skills/draft/scripts/draft.ps1 --version
   - `unbind(data_dir: Path, session_id: str) -> bool`
   - CLI 命令 `bind ROOT --session SESSION_ID` 和 `unbind --session SESSION_ID`。
 
-- [ ] **步骤 1：按目标契约重写绑定测试，并确认处于红灯状态**
+- [x] **步骤 1：按目标契约重写绑定测试，并确认处于红灯状态**
 
 用下列内容替换 `platform` fixture（夹具）和断言：
 
@@ -585,7 +585,7 @@ def test_binding_path_hashes_opaque_session_id(data_dir: Path) -> None:
 
 显式增加 `""`、`/`、`\\`、`..`、空白和非 ASCII 字符串用例。这些测试断言哈希和路径包含关系，而不是断言拒绝输入。
 
-- [ ] **步骤 2：增加载荷错配和不安全文件测试**
+- [x] **步骤 2：增加载荷错配和不安全文件测试**
 
 在正确的哈希路径创建文件，但写入另一个会话标识：
 
@@ -602,7 +602,7 @@ def test_load_rejects_session_payload_mismatch(data_dir: Path, draft: Path) -> N
 
 还必须验证以下状态都会失败且不返回草稿根：绑定文件是符号链接或目录、JSON 损坏、缺少字段、额外包含 `platform` 字段，以及字段类型错误。只有文件不存在时返回 `None`。
 
-- [ ] **步骤 3：运行绑定和 CLI 测试并确认处于红灯状态**
+- [x] **步骤 3：运行绑定和 CLI 测试并确认处于红灯状态**
 
 运行：
 
@@ -614,7 +614,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
 
 预期：失败结果暴露当前仍存在的 `Binding.platform`、`PLATFORMS`、`--platform` 和 `bindings/<platform>/` 契约。
 
-- [ ] **步骤 4：实现不含 `platform` 的模型和存储**
+- [x] **步骤 4：实现不含 `platform` 的模型和存储**
 
 把 dataclass（数据类）改为：
 
@@ -642,19 +642,21 @@ payload = {
 
 读取时要求键集合严格等于这五项，解析字段类型，并在暴露载荷中任何路径之前，把解析出的 `session_id` 与请求字符串进行精确比较。错配时报告 `binding.session_mismatch`；结构损坏时使用 `binding.invalid`。
 
-- [ ] **步骤 5：更新 CLI 边界**
+- [x] **步骤 5：更新 CLI 边界**
 
-从两个解析器中删除 `--platform`。argparse 已提供 Python `str` 后，不得拒绝空字符串。插件上下文缺失时改用已批准的错误：
+从两个解析器中删除 `--platform`。argparse 已提供 Python `str` 后，不得拒绝空字符串。CLI 只区分 `DRAFT_DATA` 缺失（`None`）与其他取值，不得用 `if not data_value` 合并两种判定：
 
-```python
-data_value = os.environ.get("DRAFT_DATA")
-if data_value is None:
-    raise DraftError("binding.plugin_context_unavailable")
-```
+| `DRAFT_DATA` 状态 | 结果 |
+| --- | --- |
+| 环境变量缺失 | `binding.plugin_context_unavailable`（CLI 保留 `None` 判定） |
+| 空字符串、纯空白、相对路径或其他无效取值 | `binding.data_dir_unavailable` |
+| 绝对、规范化、真实存在的可写目录 | 继续执行 |
+
+`None` 之外的取值一律传入共享绑定存储边界校验；`bindings.py` 在构造任何绑定路径之前，对 `bind()`、`load_binding()` 和 `unbind()` 统一执行 `_require_data_dir()`：要求 `Path.is_absolute()`、`resolve(strict=True)` 不自逃逸、`lstat` 确认为真实目录（拒绝符号链接，与绑定文件校验一致）且可写，违反时抛出 `binding.data_dir_unavailable`。
 
 `bind` 输出只包含 `result_type`、规范草稿根和成功状态，不回显 `platform`。更新 `_exit_for_error()`，使插件上下文和部署错误使用运行时退出码 `4`。
 
-- [ ] **步骤 6：运行定向测试确认绿灯，并扫描契约残留**
+- [x] **步骤 6：运行定向测试确认绿灯，并扫描契约残留**
 
 运行：
 
@@ -699,7 +701,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
   - 两个宿主都接受的简短标准输出上下文；
   - 持久化的 `data_dir/logs/hook.jsonl` 诊断。
 
-- [ ] **步骤 1：重新打开宿主官方文档并记录核对事实**
+- [x] **步骤 1：重新打开宿主官方文档并记录核对事实**
 
 编码前立即核对：
 
@@ -711,7 +713,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
 
 如果任一项发生变化，必须先更新 `docs/design.md` 和运行时规格，再修改代码。
 
-- [ ] **步骤 2：编写插件清单失败测试**
+- [x] **步骤 2：编写插件清单失败测试**
 
 更新 `test_distribution.py`：
 
@@ -735,7 +737,7 @@ def test_hook_commands_use_the_stable_skill_entry() -> None:
     assert "/bin/draft" not in codex_command + claude_command
 ```
 
-- [ ] **步骤 3：编写 `SessionStart` 状态失败测试**
+- [x] **步骤 3：编写 `SessionStart` 状态失败测试**
 
 用宿主参数化测试替换仅覆盖 Claude Code 的 fixture，并覆盖：
 
@@ -751,7 +753,7 @@ def test_hook_commands_use_the_stable_skill_entry() -> None:
 - 在状态完全相同时重复调用，产生完全相同的模型可见输出；
 - 损坏绑定、载荷错配、桥接冲突、环境失败和不安全路径保持可区分。
 
-- [ ] **步骤 4：运行钩子测试并确认处于红灯状态**
+- [x] **步骤 4：运行钩子测试并确认处于红灯状态**
 
 运行：
 
@@ -764,7 +766,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
 
 预期：测试失败，因为宿主无关模块、Codex 钩子和稳定内部分派尚不存在。
 
-- [ ] **步骤 5：实现宿主无关的绑定上下文渲染器**
+- [x] **步骤 5：实现宿主无关的绑定上下文渲染器**
 
 新建 `session_hook.py`，使用标准库解析和当前绑定 API。模型可见函数必须保持确定性：
 
@@ -788,7 +790,7 @@ def render_rebind(binding: Binding, source: str, hint: Path | None) -> str:
 
 继续使用仓库既有的简洁中文措辞。测试必须断言字段和旧数据不存在，而不是对完整自然语言文本建立快照。
 
-- [ ] **步骤 6：扩展入口，增加宿主专用环境选择**
+- [x] **步骤 6：扩展入口，增加宿主专用环境选择**
 
 在普通桥接消费逻辑之前，只识别内部命令 `_session-start HOST`。准确变量映射如下：
 
@@ -814,7 +816,7 @@ HOST_ENV = {
 
 引导路径必须在两个目标环境都不存在时工作。它可以使用包装脚本的 `uv run --no-project --python 3.14` 解释器，但在环境同步之前不得导入 `markdown-it-py`、`Send2Trash` 或其他第三方包。
 
-- [ ] **步骤 7：编写两个钩子文件及其清单引用**
+- [x] **步骤 7：编写两个钩子文件及其清单引用**
 
 新建 `hooks/codex-hooks.json`：
 
@@ -838,7 +840,7 @@ HOST_ENV = {
 
 使用相同的稳定路径和 `_session-start claude` 重写 `hooks/claude-hooks.json`，并在 `matcher` 中包含 `fork`。如果步骤 1 的强制文档复核表明 `fork` 或其他公开字段已经变化，先停止实施并修订规范性文档，再修改适配器。每份插件清单只指向自己的钩子文件。
 
-- [ ] **步骤 8：删除旧的 Claude 专用运行时入口，并运行测试确认绿灯**
+- [x] **步骤 8：删除旧的 Claude 专用运行时入口，并运行测试确认绿灯**
 
 删除 `src/draft/claude_hook.py`，清除仍然存在的控制台脚本元数据，并确保没有测试继续导入它。
 
@@ -871,7 +873,7 @@ python3 -m json.tool plugins/draft/hooks/claude-hooks.json >/dev/null
 - 输入：任务 1 至任务 5 产出的最终入口命令、桥接模式、绑定 CLI、宿主钩子行为和环境错误码。
 - 输出：绝不要求动态启动器或插件数据变量的 Agent 指令，以及能够独立执行复制后技能的安装产物测试。
 
-- [ ] **步骤 1：记录当前文档扫描的失败基线**
+- [x] **步骤 1：记录当前文档扫描的失败基线**
 
 运行：
 
@@ -882,7 +884,7 @@ rg -n 'bootstrap/setup|data.*/bin/draft|DRAFT_DATA|CLAUDE_CODE_SESSION_ID|--plat
 
 预期：旧 setup 参考文档和绑定示例仍包含已废止接口，因此扫描产生匹配。
 
-- [ ] **步骤 2：把 `SKILL.md` 更新为唯一入口**
+- [x] **步骤 2：把 `SKILL.md` 更新为唯一入口**
 
 第一条命令指令必须建立唯一规则：
 
@@ -903,7 +905,7 @@ scripts/draft unbind --session SESSION_ID
 
 说明 `setup` 只是可选预热，普通命令会执行相同的环境检查；独立模式下 `bind`/`unbind` 会失败，但核心命令仍然可用。
 
-- [ ] **步骤 3：围绕行为而非宿主路径重写 `platform-setup.md`**
+- [x] **步骤 3：围绕行为而非宿主路径重写 `platform-setup.md`**
 
 参考文档必须覆盖：
 
@@ -918,7 +920,7 @@ scripts/draft unbind --session SESSION_ID
 
 不得指示 Agent 读取或导出宿主数据变量。不得记录生成式 `bin/` 启动器、运行时清单、setup 状态、环境 JSON 或带 `platform` 层级的绑定目录。
 
-- [ ] **步骤 4：加强分发测试**
+- [x] **步骤 4：加强分发测试**
 
 要求已安装插件和独立复制的技能准确包含执行所需的运行时资源：
 
@@ -936,7 +938,7 @@ def test_skill_is_a_self_contained_runtime_unit() -> None:
 
 增加复制技能的子进程测试：移除所有插件宿主变量，使用隔离的运行目录，然后通过复制后的 `scripts/draft` 运行 `setup`、`init`、`check` 和 `move`。断言创建的全部环境状态都位于注入的测试运行目录内，全部受管理内容都位于选定的 Draft 草稿根内。
 
-- [ ] **步骤 5：运行技能和分发检查并确认处于绿灯状态**
+- [x] **步骤 5：运行技能和分发检查并确认处于绿灯状态**
 
 运行：
 
@@ -967,7 +969,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
 - 输入：任务 1 至任务 6 的全部产物。
 - 输出：目标目录树、运行时契约、两个宿主和独立复制技能的新鲜证据；不创建 Git 提交。
 
-- [ ] **步骤 1：运行完整 Python 质量门禁**
+- [x] **步骤 1：运行完整 Python 质量门禁**
 
 运行：
 
@@ -980,7 +982,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime ruff form
 
 预期：测试失败、类型错误、lint 错误和格式差异均为零。
 
-- [ ] **步骤 2：校验插件、技能、JSON 和包装脚本**
+- [x] **步骤 2：校验插件、技能、JSON 和包装脚本**
 
 运行：
 
@@ -999,7 +1001,7 @@ sh -n plugins/draft/skills/draft/scripts/draft
 
 如果存在 `pwsh`，在临时复制的技能中解析并执行 PowerShell 包装脚本。如果不存在，明确记录运行时的 PowerShell 烟雾测试仍是环境假设；静态评审不能等同于实际执行。
 
-- [ ] **步骤 3：证明被禁止的架构产物不存在**
+- [x] **步骤 3：证明被禁止的架构产物不存在**
 
 运行：
 
@@ -1019,7 +1021,7 @@ test ! -e plugins/draft/bootstrap
 
 预期：所有命令退出码均为 `0`，且不产生任何禁止项匹配。
 
-- [ ] **步骤 4：运行独立复制技能的烟雾测试**
+- [x] **步骤 4：运行独立复制技能的烟雾测试**
 
 使用全新目录，并清除插件变量：
 
@@ -1041,7 +1043,7 @@ env -u PLUGIN_DATA -u CLAUDE_PLUGIN_DATA -u PLUGIN_ROOT -u CLAUDE_PLUGIN_ROOT \
 
 预期：所有命令成功；环境只存在于 `runtime/draft/envs/<environment_key>/` 下；不创建桥接定位器、会话绑定、生成式启动器或临时根目录之外的状态。
 
-- [ ] **步骤 5：为两个宿主适配器运行复制插件的 `SessionStart` 烟雾测试**
+- [x] **步骤 5：为两个宿主适配器运行复制插件的 `SessionStart` 烟雾测试**
 
 复制 `plugins/draft/`，分别提供临时 Codex 和 Claude Code 数据目录，并用真实的 `SessionStart` JSON 对象调用各自钩子命令。验证：
 
@@ -1051,11 +1053,11 @@ env -u PLUGIN_DATA -u CLAUDE_PLUGIN_DATA -u PLUGIN_ROOT -u CLAUDE_PLUGIN_ROOT \
 4. 改变技能字节后，钩子拒绝旧重新绑定上下文，直到 `bind` 显式覆盖记录；
 5. 同一复制入口收到两个不同数据目录时形成粘滞冲突，并要求 reset。
 
-- [ ] **步骤 6：仅在验证完成后更新文档状态**
+- [x] **步骤 6：仅在验证完成后更新文档状态**
 
 步骤 1 至步骤 5 全部通过后，才把 `docs/design.md` 的状态从“待按实现计划落地”改为“已实现并验证”，并把运行时规格状态改为已实现。任何强制门禁仍为红灯或尚未执行时，都不得更新状态。
 
-- [ ] **步骤 7：执行最终差异和需求审计**
+- [x] **步骤 7：执行最终差异和需求审计**
 
 运行：
 

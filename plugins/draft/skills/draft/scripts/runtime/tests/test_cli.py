@@ -602,6 +602,101 @@ def test_bind_requires_plugin_context(
     assert error["code"] == "binding.plugin_context_unavailable"
 
 
+def _bind_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    root = tmp_path / "topic"
+    build_draft(root)
+    skill = tmp_path / "SKILL.md"
+    skill.write_text("stub skill", encoding="utf-8")
+    workspace = (tmp_path / "workspace").resolve()
+    (workspace / "relative-data").mkdir(parents=True)
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("DRAFT_SKILL_PATH", str(skill))
+    return root, workspace
+
+
+@pytest.mark.parametrize("value", ["", "   ", ".", "relative-data"])
+def test_bind_rejects_invalid_data_dir_without_touching_cwd(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    root, workspace = _bind_workspace(tmp_path, monkeypatch)
+    monkeypatch.setenv("DRAFT_DATA", value)
+    capsys.readouterr()
+
+    code, payload = run_json(["bind", str(root), "--session", "abc123", "--json"], capsys)
+
+    assert code == 4
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "binding.data_dir_unavailable"
+    assert not (workspace / "bindings").exists()
+    assert list((workspace / "relative-data").iterdir()) == []
+
+
+def test_bind_rejects_symlink_data_dir(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, workspace = _bind_workspace(tmp_path, monkeypatch)
+    real = (tmp_path / "real-data").resolve()
+    real.mkdir()
+    link = workspace / "linked-data"
+    link.symlink_to(real)
+    monkeypatch.setenv("DRAFT_DATA", str(link))
+    capsys.readouterr()
+
+    code, payload = run_json(["bind", str(root), "--session", "abc123", "--json"], capsys)
+
+    assert code == 4
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "binding.data_dir_unavailable"
+    assert list(real.iterdir()) == []
+
+
+def test_unbind_rejects_invalid_data_dir_without_removing_cwd_bindings(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, workspace = _bind_workspace(tmp_path, monkeypatch)
+    foreign = workspace / "relative-data" / "bindings" / "keep.json"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("DRAFT_DATA", "relative-data")
+    capsys.readouterr()
+
+    code, payload = run_json(["unbind", "--session", "abc123", "--json"], capsys)
+
+    assert code == 4
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "binding.data_dir_unavailable"
+    assert foreign.is_file()
+
+
+def test_bind_accepts_canonical_absolute_data_dir(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, workspace = _bind_workspace(tmp_path, monkeypatch)
+    data_dir = (tmp_path / "data").resolve()
+    data_dir.mkdir()
+    monkeypatch.setenv("DRAFT_DATA", str(data_dir))
+    capsys.readouterr()
+
+    code, payload = run_json(["bind", str(root), "--session", "abc123", "--json"], capsys)
+
+    assert code == 0
+    assert payload["ok"] is True
+    assert len(list((data_dir / "bindings").iterdir())) == 1
+    assert not (workspace / "bindings").exists()
+
+
 def test_bind_hook_help_exits_zero() -> None:
     for args in (["bind", "--help"], ["unbind", "--help"]):
         with pytest.raises(SystemExit) as captured:

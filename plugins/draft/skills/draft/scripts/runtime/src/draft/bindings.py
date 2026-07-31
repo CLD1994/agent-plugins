@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 from pathlib import Path
 from typing import cast
@@ -36,7 +37,19 @@ def skill_digest(skill_path: Path) -> str:
 
 
 def _require_data_dir(data_dir: Path) -> Path:
-    if not data_dir.is_dir():
+    """只接受绝对、规范化、真实存在且可写的目录；lstat 拒绝符号链接，与绑定文件校验一致。"""
+    if not data_dir.is_absolute():
+        raise DraftError("binding.data_dir_unavailable", data_dir)
+    try:
+        status = data_dir.lstat()
+        canonical = data_dir.resolve(strict=True)
+    except OSError as exc:
+        raise DraftError("binding.data_dir_unavailable", data_dir) from exc
+    if (
+        canonical != data_dir
+        or not stat.S_ISDIR(status.st_mode)
+        or not os.access(data_dir, os.W_OK)
+    ):
         raise DraftError("binding.data_dir_unavailable", data_dir)
     return data_dir
 
@@ -117,6 +130,7 @@ def bind(data_dir: Path, binding: Binding) -> Binding:
 
 
 def load_binding(data_dir: Path, session_id: str) -> Binding | None:
+    _require_data_dir(data_dir)
     path = binding_path(data_dir, session_id)
     try:
         mode = path.lstat().st_mode

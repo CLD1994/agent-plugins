@@ -144,6 +144,34 @@ def test_missing_data_dir_never_falls_back(tmp_path: Path, draft: Path) -> None:
     assert not missing.exists()
 
 
+def test_data_dir_boundary_rejects_non_canonical_dirs(
+    tmp_path: Path, draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = (tmp_path / "data").resolve()
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    monkeypatch.chdir(tmp_path)
+    invalid = [Path("."), Path("data"), link, tmp_path / "missing", draft / "index.md"]
+    for candidate in invalid:
+        with pytest.raises(DraftError, match="binding.data_dir_unavailable"):
+            bind(candidate, make_binding(draft))
+        with pytest.raises(DraftError, match="binding.data_dir_unavailable"):
+            load_binding(candidate, "abc123")
+        with pytest.raises(DraftError, match="binding.data_dir_unavailable"):
+            unbind(candidate, "abc123")
+    assert not (tmp_path / "bindings").exists()
+    assert list(real.iterdir()) == []
+
+
+def test_data_dir_boundary_accepts_canonical_absolute_dir(tmp_path: Path, draft: Path) -> None:
+    data_dir = (tmp_path / "data").resolve()
+    data_dir.mkdir()
+    bind(data_dir, make_binding(draft))
+    assert load_binding(data_dir, "abc123") is not None
+    assert unbind(data_dir, "abc123") is True
+
+
 def test_load_returns_none_only_when_file_missing(data_dir: Path) -> None:
     assert load_binding(data_dir, "abc123") is None
 
