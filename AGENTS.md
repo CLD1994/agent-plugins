@@ -21,6 +21,11 @@
 
 - 如果项目发生了改变从而使 根目录的 AGENTS.md 或 作用域内的 AGENTS.md 收到影响, 则必须更新它们.
 
+## Environment
+
+- 通过环境变量 `DEVCONTAINER=true` 判断当前为容器开发环境。容器环境通常预装 uv（Python）和 pnpm（Node）作为依赖管理工具，应优先使用。
+- 执行 Python 脚本时，优先使用 uv 创建的非项目级虚拟环境，而非系统 Python。该环境通常已创建于 `~/.venv`。
+
 ## Implementation Discipline
 
 - 写具体的代码实现之前，先把需求重述为可验证的行为契约：输入、输出、不变量、允许的状态转换和失败语义。无法明确契约时，先澄清，不凭实现便利自行选择语义。
