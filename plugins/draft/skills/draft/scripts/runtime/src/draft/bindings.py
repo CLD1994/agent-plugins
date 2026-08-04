@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import stat
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import cast
 
 from draft.checker import check_draft
@@ -15,6 +15,21 @@ from draft.operations import durable_write
 from draft.paths import resolve_draft_root
 
 _PAYLOAD_KEYS = {"session_id", "root", "last_page_hint", "skill_name", "skill_digest"}
+
+SKILL_NAME = "draft"
+
+
+def _managed_hint(raw: str) -> PurePosixPath:
+    """只接受草稿内的相对受管理路径：非空、两平台语义下都非绝对、不含 ..。"""
+    hint = PurePosixPath(raw)
+    if (
+        not raw.strip()
+        or hint.is_absolute()
+        or PureWindowsPath(raw).is_absolute()
+        or ".." in hint.parts
+    ):
+        raise DraftError("binding.invalid_hint", Path(raw))
+    return hint
 
 
 def required_skill_path(raw: str | None) -> Path:
@@ -96,10 +111,12 @@ def _parse_binding(raw: object, path: Path, session_id: str) -> Binding:
         raise DraftError("binding.invalid", path)
     if payload_session != session_id:
         raise DraftError("binding.session_mismatch", path)
+    if skill_name != SKILL_NAME:
+        raise DraftError("binding.invalid", path)
     return Binding(
         session_id=payload_session,
         root=Path(root),
-        last_page_hint=None if hint is None else Path(hint),
+        last_page_hint=None if hint is None else Path(_managed_hint(hint)),
         skill_name=skill_name,
         skill_digest=digest,
     )

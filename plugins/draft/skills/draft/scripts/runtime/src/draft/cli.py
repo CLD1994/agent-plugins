@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
@@ -309,7 +310,7 @@ def _dispatch(args: argparse.Namespace) -> tuple[dict[str, object], str, int]:
                 session_id=session,
                 root=root,
                 last_page_hint=hint,
-                skill_name="draft",
+                skill_name=bindings.SKILL_NAME,
                 skill_digest=digest,
             ),
         )
@@ -389,8 +390,13 @@ def _exit_for_error(error: DraftError) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["_session-start"]:
+        from draft import session_hook
+
+        return session_hook.main(arguments[1:])
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
     if getattr(args, "version", False):
         print(__version__)
         return 0

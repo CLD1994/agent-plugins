@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/skills/draft/scripts/draft\" _session-start claude"
+            "command": "uv run \"${CLAUDE_PLUGIN_ROOT}/skills/draft/scripts/draft.py\" _session-start claude"
           }
         ]
       }

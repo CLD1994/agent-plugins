@@ -1,8 +1,8 @@
 # Draft 正式设计
 
-状态：第一版领域核心、Tavern 孵化、2026-07-21 增量整改与独立插件提取均已完成；自包含 skill 运行时与插件增强桥接已实现并验证。`draft` 是唯一活跃产品与协议身份。
+状态：第一版领域核心、Tavern 孵化、2026-07-21 增量整改与独立插件提取均已完成；自包含 skill 运行时与插件增强桥接基线已实现并验证。2026-08-04 全局评审确认的单文件 Python 启动入口、版本环境键和非可编辑 runtime 安装纠正设计已按 [`2026-08-04-draft-single-python-launcher.md`](superpowers/plans/2026-08-04-draft-single-python-launcher.md) 实施，容器内全部门禁通过。`draft` 是唯一活跃产品与协议身份。
 
-宿主机复验仍待执行：Codex 校验器、pwsh 包装脚本执行、真实宿主钩子信任与端到端、沙箱 `data_dir` 写权限、宿主官方文档复核。
+宿主机复验仍待执行：真实 Windows 上的单文件 Python 入口（P1 关闭验证）、Codex 校验器、两个宿主的钩子信任与端到端、沙箱 `data_dir` 写权限和宿主官方文档复核。在真实 Windows 复验完成前不得宣称 P1 已关闭。
 
 本文档定义 `draft`（讨论草稿）第一版的产品边界、文档协议、运行架构和交付方式。它由已经逐项确认的[结论汇总](discussion/2026-07-18-recursive-discussion-notebook-skill/conclusions.md)迁移而来，并根据真实试用、2026-07-20 的后续讨论和 2026-07-21 的对抗性复评修订。本文是当前规范性设计；结论汇总和来源草稿保存推导历史。两者冲突时以本文为准，并应把新的已确认结论同步回草稿，而不能让旧讨论记录覆盖修订设计。
 
@@ -30,7 +30,7 @@ Agent 判断讨论意味着什么；程序只处理能够从文件事实证明�
 - 检查器只报告客观结构问题，不用固定文案约束自然语言；
 - 同一 skill 和 Python 核心能够服务 Codex 与 Claude Code；
 - 安装环境与用户项目隔离，不共享跨平台虚拟环境；
-- 单独复制 `skills/draft/` 后仍能通过 `scripts/draft` 执行核心草稿命令；
+- 单独复制 `skills/draft/` 后仍能通过 `uv run scripts/draft.py` 执行核心草稿命令；
 - 插件钩子只通过两字段桥接定位宿主持久数据目录，Agent 不读取、推导或搜索宿主数据目录环境变量；
 - Python/uv 环境是可重建缓存；临时环境和插件持久环境只在各自目标位置创建，不搬迁目录；
 - 孵化完成后可以迁移到独立 Git 仓库，而不改变草稿格式或核心行为。
@@ -89,8 +89,7 @@ Agent 判断讨论意味着什么；程序只处理能够从文件事实证明�
 │               ├── SKILL.md
 │               ├── references/
 │               └── scripts/
-│                   ├── draft
-│                   ├── draft.ps1
+│                   ├── draft.py
 │                   └── runtime/
 │                       ├── pyproject.toml
 │                       ├── uv.lock
@@ -158,8 +157,8 @@ flowchart LR
     U["用户"] --> A["主 Agent"]
     S["Skill：语义维护规则"] --> A
     A -->|"普通内容编辑"| N["Markdown 草稿"]
-    A -->|"唯一入口"| E["scripts/draft"]
-    E -->|"当前 skill 源码"| C["draft CLI"]
+    A -->|"唯一入口"| E["scripts/draft.py"]
+    E -->|"版本环境（非可编辑安装）"| C["draft CLI"]
     C --> K["共同 Python 核心"]
     K --> N
     K --> J["操作日志与绑定状态"]
@@ -360,21 +359,21 @@ topic/
 
 ## 11. CLI 表面
 
-第一版领域 CLI 名称为 `draft`，但 Agent 始终通过当前 skill 的稳定入口调用它。最小命令集合为：
+第一版领域 CLI 名称为 `draft`，但 Agent 始终通过当前 skill 的稳定入口 `uv run <skill_root>/scripts/draft.py` 调用它。最小命令集合为：
 
 ```text
-scripts/draft setup
-scripts/draft init ROOT
-scripts/draft adopt ROOT
-scripts/draft check ROOT [--candidate]
-scripts/draft move ROOT SOURCE TARGET
-scripts/draft promote ROOT PAGE CHILD [CHILD ...]
-scripts/draft collapse ROOT HUB
-scripts/draft trash ROOT PAGE
-scripts/draft restore ROOT OPERATION_ID
-scripts/draft recover ROOT
-scripts/draft bind ROOT --session SESSION_ID [--last-page-hint PAGE]
-scripts/draft unbind --session SESSION_ID
+uv run <skill_root>/scripts/draft.py setup
+uv run <skill_root>/scripts/draft.py init ROOT
+uv run <skill_root>/scripts/draft.py adopt ROOT
+uv run <skill_root>/scripts/draft.py check ROOT [--candidate]
+uv run <skill_root>/scripts/draft.py move ROOT SOURCE TARGET
+uv run <skill_root>/scripts/draft.py promote ROOT PAGE CHILD [CHILD ...]
+uv run <skill_root>/scripts/draft.py collapse ROOT HUB
+uv run <skill_root>/scripts/draft.py trash ROOT PAGE
+uv run <skill_root>/scripts/draft.py restore ROOT OPERATION_ID
+uv run <skill_root>/scripts/draft.py recover ROOT
+uv run <skill_root>/scripts/draft.py bind ROOT --session SESSION_ID [--last-page-hint PAGE]
+uv run <skill_root>/scripts/draft.py unbind --session SESSION_ID
 ```
 
 共同规则：
@@ -410,7 +409,7 @@ scripts/draft unbind --session SESSION_ID
 
 普通 Agent 不选择宿主平台，也不读取、推导或搜索插件数据目录。Codex 与 Claude Code 只在各自 `SessionStart` 适配器内读取准确的宿主变量、发布 bridge，并把原始 `session_id` 交给共同绑定逻辑；`platform` 不进入 CLI 或领域模型。稳定入口在内部为 Python runtime 注入准确的 `DRAFT_SKILL_PATH`，且仅在插件增强模式注入准确的 `DRAFT_DATA`。对应路径缺失、不可写或来源不明确时明确失败，不回退到当前工作目录。普通结构命令不需要会话身份。
 
-`scripts/draft setup` 是稳定入口提供的可选幂等预热动作，不是其他命令的隐藏前置条件。入口负责检查 uv、同步当前模式的环境并执行自检；skill 不再依赖插件根的 `bootstrap/` 或数据目录内生成的启动器。
+`setup` 是稳定入口提供的可选幂等预热动作（映射为 `draft --version`），不是其他命令的隐藏前置条件。入口负责按锁文件同步当前模式的版本环境；skill 不再依赖插件根的 `bootstrap/` 或数据目录内生成的启动器。
 
 ## 12. 安全结构操作
 
@@ -521,7 +520,7 @@ trash
 
 `trash_purge_committed` 是永久清理的提交点。提交前发生任何失败或崩溃，页面内容必须仍位于受管理树或有效权威删除包之一；提交后，恢复器只能完成清理，不能恢复、重新投递或重新解释删除授权。`trash_handoff_pending` 缺少权威包属于状态损坏；`trash_purge_committed` 下权威包部分存在或已经缺失属于可继续的清理状态。`trash_handoff_succeeded` 和 `trash_purge_committed` 都必须在完成内部清理前持有匹配写锁。
 
-系统回收站适配优先使用经过目标平台和 Python 3.14 验证的成熟库，不自行重写三套桌面协议，也不提供跨平台找回接口。成功移交后的找回交给 Git、操作系统回收站或 Agent 的其他决策。
+系统回收站适配优先使用经过目标平台和当前支持 Python 版本验证的成熟库，不自行重写三套桌面协议，也不提供跨平台找回接口。成功移交后的找回交给 Git、操作系统回收站或 Agent 的其他决策。
 
 ### 13.5 惰性推进与时钟
 
@@ -582,7 +581,7 @@ trash
 插件钩子能从宿主获得准确的持久数据目录：Codex 使用 `PLUGIN_DATA`，Claude Code 使用 `CLAUDE_PLUGIN_DATA`。普通 Agent 工具进程不可依赖这些钩子环境变量，因此 `SessionStart` 向当前安装副本的临时运行目录发布最小 bridge（桥接定位器）。
 
 ```text
-installation_key = sha256(UTF-8(realpath(scripts/draft)))
+installation_key = sha256(UTF-8(realpath(scripts/draft.py)))
 bridge_path = <per-user-runtime-dir>/draft/bridges/<installation_key>.json
 conflict_path = <per-user-runtime-dir>/draft/bridges/<installation_key>.conflict
 bridge_lock_path = <per-user-runtime-dir>/draft/bridges/<installation_key>.lock
@@ -601,7 +600,9 @@ bridge_lock_path = <per-user-runtime-dir>/draft/bridges/<installation_key>.lock
 
 未知字段、未知版本、非绝对目录、损坏 JSON、不安全符号链接、非普通文件或所有权异常均报告 `plugin.context_invalid`，不降级为独立模式。bridge 不保存 `platform`、`runtime_version`、`entry_path`、`entry_digest`、`session_id` 或虚拟环境路径。
 
-发布和消费在同一 `bridge_lock_path` 上取得操作系统级排他锁，并使用同目录临时文件、刷新到磁盘和原子替换发布 JSON。同一 `installation_key` 收到不同 `data_dir` 时原子创建不含路径信息的冲突哨兵，报告 `plugin.context_conflict`，并使后续普通入口停止使用冲突前的旧 JSON。用户先停止重复加载，再执行 `scripts/draft plugin-context reset`；该维护动作在同一锁内删除本安装键的 JSON 和哨兵，不接受 `data_dir`。
+发布和消费在同一 `bridge_lock_path` 上取得操作系统级排他锁，并使用同目录临时文件、刷新到磁盘和原子替换发布 JSON。同一 `installation_key` 收到不同 `data_dir` 时原子创建不含路径信息的冲突哨兵，报告 `plugin.context_conflict`，并使后续普通入口停止使用冲突前的旧 JSON。用户先停止重复加载，再执行 `uv run <skill_root>/scripts/draft.py plugin-context reset`；该维护动作在同一锁内删除本安装键的 JSON 和哨兵，不接受 `data_dir`。
+
+bridge 的必要文件与锁操作（安装键解析、锁打开/状态检查/加锁/解锁/关闭、临时文件创建/写入/文件 fsync/原子替换、哨兵创建、reset 删除）发生 `OSError` 时，一律在知道具体操作对象与路径的函数现场转换为 `plugin.context_invalid`（退出 4），保留异常链，不泄漏原始 traceback，也不启动内层 uv；入口不设笼统的 `except OSError`。锁内主错误在途时，解锁/关闭等清理失败只向主错误附加诊断，绝不覆盖主错误；无主错误时清理失败本身必须明确失败。目录 fsync 明确规定为尽力而为（Windows 与部分文件系统不支持目录 fsync）；其余文件写入、文件 fsync、替换、删除和锁操作均为强制步骤。
 
 bridge 是数据目录定位器，不是租约。插件禁用或钩子未信任时不再发布或恢复绑定，但已存在且仍合法的 bridge 可继续被当前进程消费。若未来要求禁用后立即撤销，必须单独设计租约协议，不得向当前两字段 JSON 暗中添加语义。
 
@@ -644,23 +645,23 @@ SHA-256 只用来产生定长、路径安全的物理文件名。绑定 JSON 保
 Agent 始终使用：
 
 ```text
-scripts/draft bind ROOT --session SESSION_ID
-scripts/draft unbind --session SESSION_ID
+uv run <skill_root>/scripts/draft.py bind ROOT --session SESSION_ID
+uv run <skill_root>/scripts/draft.py unbind --session SESSION_ID
 ```
 
 `last_page_hint` 只是建立绑定时记录的导航提示，不是阅读游标。重新绑定时 Agent 先以根索引和当前对话为准；提示页存在且仍符合话题时才优先打开。
 
 ### 15.4 SessionStart
 
-Codex 与 Claude Code 的插件清单都声明实际存在的 `SessionStart` 钩子，并从插件根调用 `skills/draft/scripts/draft` 的内部 hook 入口。Codex 适配器只读取 `PLUGIN_ROOT`、`PLUGIN_DATA` 和 hook stdin；Claude 适配器只读取 `CLAUDE_PLUGIN_ROOT`、`CLAUDE_PLUGIN_DATA` 和 hook stdin。Codex 提供的 Claude 兼容别名不参与选择。当前公开边界见 [Codex Hooks](https://learn.chatgpt.com/docs/hooks) 和 [Claude Code Hooks](https://code.claude.com/docs/en/hooks)；实现适配层前必须再次复核官方字段和输出格式。
+Codex 与 Claude Code 的插件清单都声明实际存在的 `SessionStart` 钩子，并从插件根以同一命令形状直接调用 `uv run "<插件根变量>/skills/draft/scripts/draft.py" _session-start <host>`。Codex 适配器只读取 `PLUGIN_ROOT`、`PLUGIN_DATA` 和 hook stdin；Claude 适配器只读取 `CLAUDE_PLUGIN_ROOT`、`CLAUDE_PLUGIN_DATA` 和 hook stdin。Codex 提供的 Claude 兼容别名不参与选择。当前公开边界见 [Codex Hooks](https://learn.chatgpt.com/docs/hooks) 和 [Claude Code Hooks](https://code.claude.com/docs/en/hooks)；实现适配层前必须再次复核官方字段和输出格式。
 
 每次 `SessionStart`：
 
 1. 发布或验证两字段 bridge；
-2. 若当前 `environment_key` 的独立环境已经安全存在，只把它当作 setup 曾被尝试的预热信号，在持久目标位置按清单重新同步，不搬迁环境；
+2. 无条件按锁文件同步当前版本的持久环境，再解析 hook 载荷——无绑定、非法载荷也不例外；
 3. 从 stdin 取得宿主 `session_id`；字段缺失或不是字符串时报告 `binding.session_unavailable`，已成功发布的 bridge 保留；
 4. 无绑定时只注入当前 `session_id` 的短事实，不伪造活动草稿或动态启动命令；
-5. 有绑定时确保持久环境可用，校验会话 ID、草稿根、页面提示和 skill 摘要，再注入短重新绑定信封。
+5. 有绑定时校验会话 ID、草稿根、页面提示和 skill 摘要，再注入短重新绑定信封。
 
 信封只包含活动草稿根、可选页面提示、skill 名称与摘要、宿主提供的触发原因，以及要求 Agent 重新读取完整 skill 的指令。它不复制 skill、转录或草稿内容，也不创建维护任务。Codex 当前的启动来源为 `startup`、`resume`、`clear`、`compact`；Claude Code 还可提供 `fork`。触发原因只作为宿主事实显示，不改变绑定身份。
 
@@ -670,62 +671,57 @@ Codex 与 Claude Code 的插件清单都声明实际存在的 `SessionStart` 钩
 
 ### 16.1 入口契约
 
-Agent 只调用当前 skill 内的 `scripts/draft`（PowerShell 使用同职责的 `scripts/draft.ps1`），不根据运行模式切换命令，不调用 `data_dir/bin/` 生成物，也不自行拼装 uv 命令。入口负责：
+Agent 只通过 `uv run <skill_root>/scripts/draft.py` 调用当前 skill，Windows 与 POSIX 使用同一条命令；不根据运行模式切换命令，不调用 `data_dir/bin/` 生成物，也不自行拼装其他 uv 参数。`draft.py` 是只依赖标准库的部署边界，负责：
 
-1. 从自身位置取得同一 skill 内的准确 `SKILL.md`、runtime 项目、锁文件和源码路径；
+1. 从自身所在的 `scripts/` 位置推导同一 skill 内的准确 `SKILL.md`、runtime 项目和锁文件路径；
 2. 解析 plugin context 并显式选择独立或插件增强模式；
-3. 在准确目标位置同步虚拟环境并自检；
-4. 用环境解释器从当前 `scripts/runtime/src/` 执行 Draft，始终注入准确 `DRAFT_SKILL_PATH`，只在插件增强模式注入准确 `DRAFT_DATA`；
-5. 原样传播 Draft 命令的退出码。
+3. 选定 `{data_dir}/envs/<draft_version>` 目标并验证其安全性；
+4. 以内层 `uv run --project <scripts/runtime>` 按锁文件同步版本环境，runtime 与锁定依赖非可编辑安装；始终注入准确 `DRAFT_SKILL_PATH`，只在插件增强模式注入准确 `DRAFT_DATA`；
+5. 原样传播内层命令的退出码。
 
-Python 领域核心不扫描插件根、父目录、宿主缓存或默认数据目录。`scripts/draft setup` 是幂等的显式预热动作：它只确保当前模式选中的环境可用并完成自检，不创建绑定。其他子命令在执行前完成同一检查，因此 setup 不是隐藏的强制前置步骤。
+Python 领域核心不扫描插件根、父目录、宿主缓存或默认数据目录。`setup` 是幂等的显式预热动作（映射为 `draft --version`）：它只确保当前模式选中的版本环境可用，不创建绑定。其他子命令在执行前完成同一同步，因此 setup 不是隐藏的强制前置步骤。
 
 ### 16.2 Python 与环境身份
 
-运行核心使用 Python 3.14.x：`pyproject.toml` 固定主次版本，`uv.lock` 锁定依赖，补丁版本由 uv 选择当前合法的 3.14.x。不为没有真实需求的旧 Python 建立兼容矩阵。
+运行核心的 Python 兼容范围由 `pyproject.toml` 的 `requires-python` 声明，`uv.lock` 锁定依赖，具体解释器由 uv 按约束选择；`draft.py` 的 PEP 723 头让外层调用同样不依赖系统 Python。不为没有真实需求的旧 Python 建立兼容矩阵。
 
-环境身份只由 skill 携带的清单字节派生：
+环境身份只等于 runtime 的 `project.version`：
 
 ```text
-environment_key = sha256(
-  UTF-8("draft-environment-v1\0")
-  || sha256(bytes(pyproject.toml))
-  || sha256(bytes(uv.lock))
-)
+environment_key = project.version   # 来自 scripts/runtime/pyproject.toml
 ```
 
-两个内层摘要以固定 32 字节二进制值连接。Python 约束已经包含在 `pyproject.toml`，不再重复声明。`runtime_version` 和源码内容不进入环境键：虚拟环境只安装锁定的 Python 与第三方运行依赖，不安装 Draft 项目本身；当前 skill 始终执行自己携带的源码。
+同一版本共享环境，不同版本隔离；不增加源码、清单、入口或平台摘要。runtime 与锁定依赖以 `--no-editable` 安装进目标环境，绝不通过 `PYTHONPATH` 执行源码树。同版本重打包（内容变化但版本号不变）不受环境键保护：发布任何内容变化前必须由发布流程提升并统一 runtime 与两个插件清单的版本。
 
 ### 16.3 环境路径与同步
 
 ```text
-standalone:      <per-user-runtime-dir>/draft/envs/<environment_key>/
-plugin_enhanced: data_dir/envs/<environment_key>/
+standalone:      <per-user-runtime-dir>/draft/envs/<draft_version>/
+plugin_enhanced: data_dir/envs/<draft_version>/
 ```
 
-`<environment_key>/` 本身就是虚拟环境根，不增加 `venv/` 子目录、`environment.lock` 或 `environment.json`。临时环境丢失后按同一清单重建；从临时模式进入插件增强模式时，在持久目标重新同步，不移动、复制或重命名原环境。
+`<draft_version>/` 本身就是环境根，不增加 `venv/` 子目录、`environment.lock` 或 `environment.json`。临时环境丢失后按同一版本重建；从临时模式进入插件增强模式时，在持久目标重新同步，不移动、复制或重命名原环境。
 
 每次执行 Draft 前：
 
 1. 计算当前模式的准确环境路径；
 2. 目标不存在时允许 uv 创建；存在但不是当前用户可访问的普通目录，或是符号链接时，报告 `runtime.environment_invalid`；
-3. 设置准确 `UV_PROJECT_ENVIRONMENT`，执行等价的 `uv sync --project <scripts/runtime> --locked --no-install-project --no-dev`；
-4. 同步成功后，用该环境的解释器从当前 `scripts/runtime/src/` 执行 `draft --version` 自检；只有自检成功后才执行请求的命令。
+3. 设置准确 `UV_PROJECT_ENVIRONMENT`，执行 `uv run --project <scripts/runtime> --locked --exact --no-dev --no-editable --no-env-file draft <args>`，由 uv 按锁文件完成同步并运行命令。
 
-uv 自身使用目标虚拟环境文件锁并支持多进程并发同步，因此不增加 Draft 自有环境锁。目录存在、自有 JSON 或记录的 Python 版本都不能单独证明环境完整；每次的 uv 同步与当前源码自检才是执行证据。同步或自检失败时入口非零退出，不执行 Draft 命令；下次调用重新尝试同一流程。
+uv 自身使用目标虚拟环境文件锁并支持多进程并发同步，因此不增加 Draft 自有环境锁。目录存在或历史记录都不能单独证明环境完整；每次的内层 `uv run` 锁定同步才是执行证据。内层失败时退出码原样传播；下次调用重新尝试同一流程。
 
 插件持久数据布局为：
 
 ```text
 data_dir/
 ├── envs/
-│   └── <environment_key>/
+│   └── <draft_version>/
 ├── bindings/
 │   └── <binding_key>.json
 └── logs/
 ```
 
-第一版不主动清理旧 `environment_key`。插件从最后一个安装范围卸载时，宿主默认删除整个 `data_dir`；用户显式选择保留数据时保留。只有真实空间问题出现后才设计受保护的旧环境回收协议。
+第一版不主动清理旧版本环境。插件从最后一个安装范围卸载时，宿主默认删除整个 `data_dir`；用户显式选择保留数据时保留。只有真实空间问题出现后才设计受保护的旧环境回收协议。
 
 ## 17. 错误与并发边界
 
@@ -782,7 +778,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime ruff form
 - 当前、未知和非法 `format_version` 与 `journal_version`，以及候选检查与临时态复核都通过后 `adopt` 才发布最终 `draft.json`；
 - `platform` 从绑定 CLI、模型、JSON 和路径中完全删除，文件名为原始 `session_id` 的 SHA-256，payload 错配时拒绝返回 root；
 - bridge 不存在、合法、损坏、不安全、冲突和 reset 后状态，以及同一安装键的并发发布；
-- 临时与持久环境选择、清单键失效、uv 并发同步、同步/自检失败停止，以及临时环境绝不被搬迁；
+- 临时与持久环境选择、版本环境键隔离、uv 并发同步、内层失败退出码传播，以及临时环境绝不被搬迁；
 - Codex 和 Claude Code 的 `SessionStart` 清单、宿主变量选择、无绑定会话事实、已绑定信封、skill 摘要错配与重复调用幂等性；
 - 单独复制 `skills/draft/` 后的 setup、init、check 和一个结构操作；
 - CLI 人类输出和结构化结果的语义一致。
@@ -826,19 +822,20 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime ruff form
 独立仓库阶段已经补齐 Codex 与 Claude Code 的 marketplace 与插件基础清单；提取没有改变已经通过试用的草稿格式、CLI 或共同核心。自包含 skill 运行时与插件增强改造完成时还必须满足：
 
 - runtime 完整位于 `skills/draft/scripts/runtime/`，插件根不再存在 `runtime/` 或 `bootstrap/`；
-- Agent 在独立和插件增强模式都只使用 `scripts/draft`；
+- Agent 在独立和插件增强模式都只使用 `uv run <skill_root>/scripts/draft.py`，Windows 与 POSIX 同一命令；
 - bridge JSON 严格只有 `schema_version` 和 `data_dir`，不存在与损坏产生不同结果，竞争的数据目录稳定进入冲突哨兵状态；
-- 插件钩子首次运行可以发布 bridge 并在需要时于 `data_dir/envs/<environment_key>/` 重建环境，不依赖旧 setup 或数据目录启动器；
-- 清单不变时复用依赖环境并执行当前 skill 源码，清单改变时使用新环境键；不创建 `environment.lock` 或 `environment.json`；
+- 插件钩子首次运行可以发布 bridge 并在需要时于 `data_dir/envs/<draft_version>/` 重建环境，不依赖旧 setup 或数据目录启动器；
+- 环境键只等于 runtime 版本：同版本共享环境，不同版本隔离；runtime 非可编辑安装，不创建 `environment.lock` 或 `environment.json`；
 - 绑定不再包含 `platform`，会话标识按宿主原值哈希并在 payload 中精确复核；
-- Codex 与 Claude Code 的受信任 `SessionStart` 都能注入当前会话事实，有合法绑定时恢复活动草稿；
-- POSIX 与 PowerShell 入口、清单校验、完整 Python 门禁和复制后 skill 烟雾测试全部通过。
+- Codex 与 Claude Code 的受信任 `SessionStart` 都先同步版本环境再注入当前会话事实，有合法绑定时恢复活动草稿；
+- 单文件 Python 入口、清单校验、完整 Python 门禁和复制后 skill 烟雾测试全部通过。
 
 ## 20. 后续步骤
 
 初版实现、2026-07-21 增量整改和独立插件提取均已完成。当前演进依据与下一步：
 
 1. 插件清单、完整改名与路径契约由 `docs/superpowers/specs/2026-07-30-draft-plugin-manifests-and-path-contract-design.md` 定义；
-2. 自包含 skill 运行时、两字段 bridge、无平台绑定与双宿主 `SessionStart` 由 `docs/superpowers/specs/2026-07-30-draft-self-contained-skill-runtime-design.md` 定义，下一步按 `docs/superpowers/plans/2026-07-31-draft-self-contained-skill-runtime.md` 实施；
-3. `docs/discussion/` 保存历史推导资料，与本文冲突时以本文和当前规格为准；
-4. 租约撤销、旧环境回收、转录备份等未经验证的能力只在真实使用证明当前边界不足时重新评审。
+2. 自包含 skill 运行时、两字段 bridge、无平台绑定与双宿主 `SessionStart` 基线由 `docs/superpowers/specs/2026-07-30-draft-self-contained-skill-runtime-design.md` 定义，并已按 `docs/superpowers/plans/2026-07-31-draft-self-contained-skill-runtime.md` 实施；
+3. 单文件 Python 启动入口、版本环境键和非可编辑 runtime 安装由 `docs/superpowers/specs/2026-08-04-draft-single-python-launcher-design.md` 定义，已按 `docs/superpowers/plans/2026-08-04-draft-single-python-launcher.md` 实施且容器门禁全绿；真实 Windows 宿主复验（计划 Task 6 Step 6）完成前 P1 不关闭。前一项基线规格保留为已完成历史；
+4. `docs/discussion/` 保存历史推导资料，与本文冲突时以本文和当前规格为准；
+5. 租约撤销、旧环境回收、转录备份等未经验证的能力只在真实使用证明当前边界不足时重新评审。

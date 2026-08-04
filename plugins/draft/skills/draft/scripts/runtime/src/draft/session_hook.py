@@ -1,24 +1,26 @@
-"""宿主无关的 SessionStart 绑定查找、摘要验证、诊断和短上下文渲染。
+"""已安装 runtime 内的 SessionStart 处理：stdin 载荷解析、绑定查找、诊断和短上下文渲染。
 
-模块导入图只依赖标准库与 draft.errors/draft.models，稳定入口的引导解释器可以直接导入；
-draft.bindings 依赖第三方解析链，延迟到同步后的持久环境解释器中导入。
+launcher 已经发布 bridge、同步版本环境并注入 DRAFT_DATA / DRAFT_SKILL_PATH；
+本模块不再读取宿主 root/data 变量。
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import TextIO, cast
 
 from draft.errors import DraftError
 from draft.models import Binding
 
+MAX_STDIN = 64 * 1024
+
 
 def render_session_fact(session_id: str) -> str:
-    return f"Draft 宿主 session_id：{session_id}\n在 scripts/draft bind/unbind 中原样使用此值。"
+    return f"Draft 宿主 session_id：{session_id}\n在 Draft bind/unbind 命令中原样使用此值。"
 
 
 def render_rebind(binding: Binding, source: str, hint: Path | None) -> str:
@@ -59,8 +61,30 @@ def log_hook(data_dir: Path, host: str, **fields: object) -> None:
         pass
 
 
-def run_binding_branch(data_dir: Path, session_id: str, source: str, host: str) -> int:
-    from draft import bindings  # 第三方解析链只在同步后的环境解释器中可用
+def read_hook_payload(stream: TextIO) -> tuple[dict[str, object] | None, str]:
+    text = stream.read(MAX_STDIN + 1)
+    if len(text) > MAX_STDIN:
+        return None, "hook.stdin_oversized"
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return None, "hook.stdin_invalid"
+    if not isinstance(value, dict):
+        return None, "hook.stdin_not_object"
+    payload = cast("dict[str, object]", value)
+    if payload.get("hook_event_name") != "SessionStart":
+        return None, "hook.unexpected_event"
+    return payload, ""
+
+
+def run_binding_branch(
+    data_dir: Path,
+    session_id: str,
+    source: str,
+    host: str,
+    environ: Mapping[str, str],
+) -> int:
+    from draft import bindings
 
     try:
         binding = bindings.load_binding(data_dir, session_id)
@@ -74,7 +98,7 @@ def run_binding_branch(data_dir: Path, session_id: str, source: str, host: str) 
             )
             print(render_diagnostic("绑定根不存在；请重新选择草稿并重新 bind"))
             return 0
-        skill_path = bindings.required_skill_path(os.environ.get("DRAFT_SKILL_PATH"))
+        skill_path = bindings.required_skill_path(environ.get("DRAFT_SKILL_PATH"))
         if bindings.skill_digest(skill_path) != binding.skill_digest:
             log_hook(
                 data_dir, host, branch="diagnostic", source=source, error="binding.skill_mismatch"
@@ -100,19 +124,39 @@ def run_binding_branch(data_dir: Path, session_id: str, source: str, host: str) 
         return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m draft.session_hook")
-    parser.add_argument("--data-dir", required=True)
-    parser.add_argument("--session-id", required=True)
-    parser.add_argument("--source", required=True)
-    parser.add_argument("--host", required=True)
-    args = parser.parse_args(argv)
-    return run_binding_branch(
-        Path(cast(str, args.data_dir)),
-        cast(str, args.session_id),
-        cast(str, args.source),
-        cast(str, args.host),
-    )
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    stdin: TextIO | None = None,
+) -> int:
+    import sys
+
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    env = os.environ if environ is None else environ
+    stream = sys.stdin if stdin is None else stdin
+    if len(arguments) != 1:
+        print(render_diagnostic("entry.invalid_arguments；内部 hook 只接受一个 host 参数"))
+        return 0
+    host = arguments[0]
+    raw_data = env.get("DRAFT_DATA")
+    if not raw_data:
+        print(render_diagnostic("hook.environment_missing：DRAFT_DATA 未注入"))
+        return 0
+    data_dir = Path(raw_data)
+    payload, parse_error = read_hook_payload(stream)
+    if payload is None:
+        log_hook(data_dir, host, branch="ignored", error=parse_error)
+        return 0
+    raw_source = payload.get("source")
+    source = raw_source if isinstance(raw_source, str) else ""
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str):
+        log_hook(
+            data_dir, host, branch="ignored", source=source, error="binding.session_unavailable"
+        )
+        return 0
+    return run_binding_branch(data_dir, session_id, source, host, env)
 
 
 if __name__ == "__main__":

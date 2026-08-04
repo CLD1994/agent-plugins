@@ -1,4 +1,4 @@
-"""宿主参数化的 SessionStart 状态矩阵：两个宿主共用同一稳定入口与内部 _session-start 分派。"""
+"""宿主参数化的 SessionStart 状态矩阵：launcher 先发布 bridge，再无条件调用一次内层 uv。"""
 
 from __future__ import annotations
 
@@ -12,13 +12,14 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from test_launcher import load_launcher
 
 from draft import session_hook
 from draft.bindings import bind, binding_path, skill_digest
-from draft.entry import HOST_ENV, RuntimeLayout, environment_key, main
 from draft.lifecycle import initialize
 from draft.models import Binding
-from draft.plugin_context import bridge_paths, reset
+
+launcher = load_launcher()
 
 HOSTS = ("codex", "claude")
 
@@ -27,83 +28,79 @@ SOURCES = {
     "claude": ("startup", "resume", "clear", "compact", "fork"),
 }
 
+HOST_ENV = {
+    "codex": ("PLUGIN_ROOT", "PLUGIN_DATA"),
+    "claude": ("CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA"),
+}
+
+VERSION = "0.1.0"
+
 
 @dataclass
 class Setup:
     tmp_path: Path
-    layout: RuntimeLayout
+    entry: Path
+    skill_path: Path
     plugin_root: Path
     data_dir: Path
     runtime_dir: Path
+    version: str
 
 
 class HookRunner:
-    """替换子进程：记录 uv/自检调用，并把 session_hook 内部命令在当前进程内执行。"""
+    """替换内层 uv：记录调用，并把 `draft _session-start HOST` 在当前进程内执行。"""
 
-    def __init__(self, *, sync_code: int = 0, self_check_code: int = 0) -> None:
+    def __init__(self, *, fail_code: int | None = None) -> None:
         self.calls: list[tuple[list[str], dict[str, str]]] = []
-        self.sync_code = sync_code
-        self.self_check_code = self_check_code
+        self.fail_code = fail_code
 
     def __call__(self, arguments: Sequence[str], env: Mapping[str, str]) -> int:
         args = list(arguments)
         self.calls.append((args, dict(env)))
-        if args[:2] == ["uv", "sync"]:
-            return self.sync_code
-        if args[1:] == ["-m", "draft", "--version"]:
-            return self.self_check_code
-        if args[1:3] == ["-m", "draft.session_hook"]:
-            previous = os.environ.get("DRAFT_SKILL_PATH")
-            os.environ["DRAFT_SKILL_PATH"] = env["DRAFT_SKILL_PATH"]
-            try:
-                return session_hook.main(args[3:])
-            finally:
-                if previous is None:
-                    os.environ.pop("DRAFT_SKILL_PATH", None)
-                else:
-                    os.environ["DRAFT_SKILL_PATH"] = previous
-        raise AssertionError(f"unexpected command: {args}")
+        if self.fail_code is not None:
+            return self.fail_code
+        assert args[:3] == ["uv", "run", "--project"]
+        assert args[-3:-1] == ["draft", "_session-start"]
+        return session_hook.main([args[-1]], environ=env, stdin=sys.stdin)
 
 
-def make_plugin(tmp_path: Path) -> tuple[RuntimeLayout, Path]:
+def make_plugin(tmp_path: Path) -> tuple[Path, Path, Path]:
     plugin_root = tmp_path / "plugin"
     skill_dir = plugin_root / "skills" / "draft"
     runtime = skill_dir / "scripts" / "runtime"
-    source = runtime / "src"
-    source.mkdir(parents=True)
-    (runtime / "pyproject.toml").write_bytes(b"project")
-    (runtime / "uv.lock").write_bytes(b"lock")
-    entry_path = skill_dir / "scripts" / "draft"
-    entry_path.write_text("#!/bin/sh\n", encoding="utf-8")
+    runtime.mkdir(parents=True)
+    (runtime / "pyproject.toml").write_text(
+        f'[project]\nname = "draft-runtime"\nversion = "{VERSION}"\n'
+        'requires-python = ">=3.12,<3.15"\n',
+        encoding="utf-8",
+    )
+    (runtime / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    entry = skill_dir / "scripts" / "draft.py"
+    entry.write_text("# launcher\n", encoding="utf-8")
     skill_path = skill_dir / "SKILL.md"
     skill_path.write_text("测试 skill 内容\n", encoding="utf-8")
-    layout = RuntimeLayout(
-        entry_path=entry_path,
-        skill_path=skill_path,
-        project_path=runtime,
-        source_path=source,
-    )
-    return layout, plugin_root
+    return entry, skill_path, plugin_root
 
 
 @pytest.fixture
 def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Setup:
-    layout, plugin_root = make_plugin(tmp_path)
+    entry, skill_path, plugin_root = make_plugin(tmp_path)
     data_dir = tmp_path / "host-data"
     data_dir.mkdir()
     runtime_dir = tmp_path / "xdg"
     runtime_dir.mkdir()
     runtime_dir.chmod(0o700)
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
     for root_variable, data_variable in HOST_ENV.values():
         monkeypatch.delenv(root_variable, raising=False)
         monkeypatch.delenv(data_variable, raising=False)
     return Setup(
         tmp_path=tmp_path,
-        layout=layout,
+        entry=entry,
+        skill_path=skill_path,
         plugin_root=plugin_root,
         data_dir=data_dir,
         runtime_dir=runtime_dir,
+        version=VERSION,
     )
 
 
@@ -144,28 +141,22 @@ def run_hook(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     runner: HookRunner | None = None,
-) -> tuple[int, str, str]:
+) -> tuple[int, str, str, HookRunner]:
     monkeypatch.setattr(sys, "stdin", io.StringIO(stdin_text))
-    if runner is not None:
-        monkeypatch.setattr("draft.entry.run_command", runner)
-    argv = [
-        "--entry-path",
-        str(setup.layout.entry_path),
-        "--skill-path",
-        str(setup.layout.skill_path),
-        "--runtime-path",
-        str(setup.layout.project_path),
-        "--",
-        "_session-start",
-        host,
-    ]
-    code = main(argv)
+    active = HookRunner() if runner is None else runner
+    code = launcher.main(
+        ["_session-start", host],
+        entry_path=setup.entry,
+        environ=dict(os.environ),
+        runtime_dir=setup.runtime_dir,
+        runner=active,
+    )
     captured = capsys.readouterr()
-    return code, captured.out, captured.err
+    return code, captured.out, captured.err, active
 
 
 def bridge_record(setup: Setup) -> dict[str, object] | None:
-    path = bridge_paths(setup.layout.entry_path).json
+    path = launcher.bridge_paths(setup.entry, setup.runtime_dir).json
     if not path.exists():
         return None
     value = json.loads(path.read_text(encoding="utf-8"))
@@ -193,7 +184,7 @@ def bound(setup: Setup) -> Binding:
             root=root,
             last_page_hint=None,
             skill_name="draft",
-            skill_digest=skill_digest(setup.layout.skill_path),
+            skill_digest=skill_digest(setup.skill_path),
         ),
     )
 
@@ -219,6 +210,15 @@ def bound_with_hint(setup: Setup, bound: Binding) -> Binding:
     )
 
 
+def assert_single_inner_uv(setup: Setup, runner: HookRunner, host: str) -> None:
+    assert len(runner.calls) == 1
+    args, env = runner.calls[0]
+    assert args[:3] == ["uv", "run", "--project"]
+    assert args[-3:] == ["draft", "_session-start", host]
+    assert env["UV_PROJECT_ENVIRONMENT"] == str(setup.data_dir.resolve() / "envs" / setup.version)
+    assert env["DRAFT_DATA"] == str(setup.data_dir.resolve())
+
+
 @pytest.mark.parametrize("host", HOSTS)
 def test_bridge_is_published_before_session_fields_are_checked(
     setup: Setup,
@@ -227,7 +227,7 @@ def test_bridge_is_published_before_session_fields_are_checked(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     set_host_env(monkeypatch, setup, host)
-    code, output, _ = run_hook(setup, host, session_stdin(_MISSING), monkeypatch, capsys)
+    code, output, _, runner = run_hook(setup, host, session_stdin(_MISSING), monkeypatch, capsys)
 
     assert code == 0
     assert output == ""
@@ -235,6 +235,7 @@ def test_bridge_is_published_before_session_fields_are_checked(
     assert record == {"schema_version": 1, "data_dir": str(setup.data_dir.resolve())}
     assert hook_log(setup)[-1]["error"] == "binding.session_unavailable"
     assert not (setup.data_dir / "bindings").exists()
+    assert_single_inner_uv(setup, runner, host)
 
 
 @pytest.mark.parametrize("host", HOSTS)
@@ -246,13 +247,14 @@ def test_host_reads_only_its_own_variables(
 ) -> None:
     """兼容别名指向不存在的路径；成功即证明别名未参与选择。"""
     set_host_env(monkeypatch, setup, host)
-    code, output, _ = run_hook(setup, host, session_stdin("abc123"), monkeypatch, capsys)
+    code, output, _, runner = run_hook(setup, host, session_stdin("abc123"), monkeypatch, capsys)
 
     assert code == 0
     assert output == session_hook.render_session_fact("abc123") + "\n"
     record = bridge_record(setup)
     assert record is not None
     assert record["data_dir"] == str(setup.data_dir.resolve())
+    assert_single_inner_uv(setup, runner, host)
 
 
 @pytest.mark.parametrize("host", HOSTS)
@@ -265,7 +267,7 @@ def test_missing_or_non_string_session_id_reports_session_unavailable(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     set_host_env(monkeypatch, setup, host)
-    code, output, _ = run_hook(setup, host, session_stdin(bad_session), monkeypatch, capsys)
+    code, output, _, runner = run_hook(setup, host, session_stdin(bad_session), monkeypatch, capsys)
 
     assert code == 0
     assert output == ""
@@ -275,6 +277,7 @@ def test_missing_or_non_string_session_id_reports_session_unavailable(
     assert entry["error"] == "binding.session_unavailable"
     assert entry["host"] == host
     assert not (setup.data_dir / "bindings").exists()
+    assert_single_inner_uv(setup, runner, host)
 
 
 @pytest.mark.parametrize("host", HOSTS)
@@ -287,10 +290,11 @@ def test_every_string_is_accepted_as_session_identity(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     set_host_env(monkeypatch, setup, host)
-    code, output, _ = run_hook(setup, host, session_stdin(session), monkeypatch, capsys)
+    code, output, _, runner = run_hook(setup, host, session_stdin(session), monkeypatch, capsys)
 
     assert code == 0
     assert output == session_hook.render_session_fact(session) + "\n"
+    assert_single_inner_uv(setup, runner, host)
 
 
 @pytest.mark.parametrize("host", HOSTS)
@@ -301,9 +305,8 @@ def test_unbound_session_outputs_only_the_session_fact(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     set_host_env(monkeypatch, setup, host)
-    runner = HookRunner()
-    code, output, _ = run_hook(
-        setup, host, session_stdin("new-session"), monkeypatch, capsys, runner
+    code, output, _, runner = run_hook(
+        setup, host, session_stdin("new-session"), monkeypatch, capsys
     )
 
     assert code == 0
@@ -312,7 +315,7 @@ def test_unbound_session_outputs_only_the_session_fact(
     assert "/bin/" not in output
     assert "envs" not in output
     assert str(setup.data_dir) not in output
-    assert runner.calls == []
+    assert_single_inner_uv(setup, runner, host)
     assert hook_log(setup)[-1]["branch"] == "session_fact"
 
 
@@ -326,9 +329,8 @@ def test_bound_session_outputs_rebind_context(
 ) -> None:
     set_host_env(monkeypatch, setup, host)
     for source in SOURCES[host]:
-        runner = HookRunner()
-        code, output, _ = run_hook(
-            setup, host, session_stdin("abc123", source), monkeypatch, capsys, runner
+        code, output, _, runner = run_hook(
+            setup, host, session_stdin("abc123", source), monkeypatch, capsys
         )
 
         assert code == 0
@@ -336,27 +338,10 @@ def test_bound_session_outputs_rebind_context(
         assert "最后页面提示：pages/a.md" in output
         assert f"必须使用的 skill：draft（摘要 {bound_with_hint.skill_digest}）" in output
         assert f"宿主触发原因：{source}" in output
-        target = setup.data_dir.resolve() / "envs" / environment_key(setup.layout)
-        sync_args, sync_env = runner.calls[0]
-        assert sync_args[:2] == ["uv", "sync"]
-        assert sync_env["UV_PROJECT_ENVIRONMENT"] == str(target)
-        assert runner.calls[1][0][1:] == ["-m", "draft", "--version"]
-        hook_args, hook_env = runner.calls[2]
-        assert hook_args[1:] == [
-            "-m",
-            "draft.session_hook",
-            "--data-dir",
-            str(setup.data_dir.resolve()),
-            "--session-id",
-            "abc123",
-            "--source",
-            source,
-            "--host",
-            host,
-        ]
-        assert hook_env["DRAFT_DATA"] == str(setup.data_dir.resolve())
-        assert hook_env["DRAFT_SKILL_PATH"] == str(setup.layout.skill_path)
-        assert hook_env["PYTHONPATH"] == str(setup.layout.source_path)
+        assert_single_inner_uv(setup, runner, host)
+        _, hook_env = runner.calls[0]
+        assert hook_env["DRAFT_SKILL_PATH"] == str(setup.skill_path)
+        assert "PYTHONPATH" not in hook_env
         assert hook_log(setup)[-1]["branch"] == "rebind"
 
 
@@ -370,13 +355,14 @@ def test_stale_page_hint_is_omitted(
 ) -> None:
     set_host_env(monkeypatch, setup, host)
     (bound_with_hint.root / "pages/a.md").unlink()
-    code, output, _ = run_hook(
-        setup, host, session_stdin("abc123", "compact"), monkeypatch, capsys, HookRunner()
+    code, output, _, runner = run_hook(
+        setup, host, session_stdin("abc123", "compact"), monkeypatch, capsys
     )
 
     assert code == 0
     assert f"活动草稿根：{bound_with_hint.root}" in output
     assert "最后页面提示" not in output
+    assert_single_inner_uv(setup, runner, host)
 
 
 @pytest.mark.parametrize("host", HOSTS)
@@ -391,14 +377,15 @@ def test_missing_bound_root_outputs_diagnostic_without_exposing_root(
 
     set_host_env(monkeypatch, setup, host)
     shutil.rmtree(bound.root)
-    code, output, _ = run_hook(
-        setup, host, session_stdin("abc123", "compact"), monkeypatch, capsys, HookRunner()
+    code, output, _, runner = run_hook(
+        setup, host, session_stdin("abc123", "compact"), monkeypatch, capsys
     )
 
     assert code == 0
     assert "活动草稿根" not in output
     assert str(bound.root) not in output
     assert hook_log(setup)[-1]["error"] == "binding.root_missing"
+    assert_single_inner_uv(setup, runner, host)
 
 
 @pytest.mark.parametrize("host", HOSTS)
@@ -410,15 +397,16 @@ def test_skill_digest_mismatch_outputs_diagnostic_without_exposing_root(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     set_host_env(monkeypatch, setup, host)
-    setup.layout.skill_path.write_text("已被替换的 skill 内容\n", encoding="utf-8")
-    code, output, _ = run_hook(
-        setup, host, session_stdin("abc123", "compact"), monkeypatch, capsys, HookRunner()
+    setup.skill_path.write_text("已被替换的 skill 内容\n", encoding="utf-8")
+    code, output, _, runner = run_hook(
+        setup, host, session_stdin("abc123", "compact"), monkeypatch, capsys
     )
 
     assert code == 0
     assert "活动草稿根" not in output
     assert str(bound.root) not in output
     assert hook_log(setup)[-1]["error"] == "binding.skill_mismatch"
+    assert_single_inner_uv(setup, runner, host)
 
 
 @pytest.mark.parametrize("host", HOSTS)
@@ -431,15 +419,13 @@ def test_repeated_invocation_with_identical_state_is_byte_identical(
 ) -> None:
     set_host_env(monkeypatch, setup, host)
     stdin_text = session_stdin("abc123", "compact")
-    _, first, _ = run_hook(setup, host, stdin_text, monkeypatch, capsys, HookRunner())
-    _, second, _ = run_hook(setup, host, stdin_text, monkeypatch, capsys, HookRunner())
+    _, first, _, _ = run_hook(setup, host, stdin_text, monkeypatch, capsys)
+    _, second, _, _ = run_hook(setup, host, stdin_text, monkeypatch, capsys)
     assert first == second
 
-    _, third, _ = run_hook(
-        setup, host, session_stdin("unbound", "startup"), monkeypatch, capsys, HookRunner()
-    )
-    _, fourth, _ = run_hook(
-        setup, host, session_stdin("unbound", "startup"), monkeypatch, capsys, HookRunner()
+    _, third, _, _ = run_hook(setup, host, session_stdin("unbound", "startup"), monkeypatch, capsys)
+    _, fourth, _, _ = run_hook(
+        setup, host, session_stdin("unbound", "startup"), monkeypatch, capsys
     )
     assert third == fourth
 
@@ -456,8 +442,8 @@ def test_failure_kinds_remain_distinguishable(
     target = binding_path(setup.data_dir, "abc123")
 
     target.write_text("{损坏", encoding="utf-8")
-    code, output, _ = run_hook(
-        setup, host, session_stdin("abc123", "compact"), monkeypatch, capsys, HookRunner()
+    code, output, _, _ = run_hook(
+        setup, host, session_stdin("abc123", "compact"), monkeypatch, capsys
     )
     assert code == 0
     assert "binding.invalid" in output
@@ -476,8 +462,8 @@ def test_failure_kinds_remain_distinguishable(
         ),
         encoding="utf-8",
     )
-    code, output, _ = run_hook(
-        setup, host, session_stdin("abc123", "compact"), monkeypatch, capsys, HookRunner()
+    code, output, _, _ = run_hook(
+        setup, host, session_stdin("abc123", "compact"), monkeypatch, capsys
     )
     assert code == 0
     assert "binding.session_mismatch" in output
@@ -488,31 +474,31 @@ def test_failure_kinds_remain_distinguishable(
     other_data = setup.tmp_path / "other-data"
     other_data.mkdir()
     monkeypatch.setenv(data_variable, str(other_data))
-    code, _, stderr = run_hook(
-        setup, host, session_stdin("abc123", "compact"), monkeypatch, capsys, HookRunner()
+    code, _, stderr, runner = run_hook(
+        setup, host, session_stdin("abc123", "compact"), monkeypatch, capsys
     )
     assert code == 4
     assert "plugin.context_conflict" in stderr
+    assert runner.calls == []
 
-    reset(setup.layout.entry_path)
+    launcher.reset_context(setup.entry, setup.runtime_dir)
     monkeypatch.setenv(data_variable, str(setup.data_dir))
-    code, _, stderr = run_hook(
+    code, _, _, runner = run_hook(
         setup,
         host,
         session_stdin("abc123", "compact"),
         monkeypatch,
         capsys,
-        HookRunner(sync_code=7),
+        HookRunner(fail_code=7),
     )
     assert code == 7
-    assert "runtime.sync_failed" in stderr
+    assert len(runner.calls) == 1
     record = bridge_record(setup)
     assert record is not None
     assert record["data_dir"] == str(setup.data_dir.resolve())
 
     for code_text in ("binding.invalid", "binding.session_mismatch"):
         assert code_text != "plugin.context_conflict"
-        assert code_text != "runtime.sync_failed"
 
 
 @pytest.mark.parametrize("host", HOSTS)
@@ -528,57 +514,12 @@ def test_plugin_root_mismatch_stops_before_publish(
     set_host_env(monkeypatch, setup, host)
     monkeypatch.setenv(root_variable, str(wrong_root))
 
-    code, output, stderr = run_hook(setup, host, session_stdin(), monkeypatch, capsys)
+    code, output, stderr, runner = run_hook(setup, host, session_stdin(), monkeypatch, capsys)
 
     assert code == 4
     assert output == ""
     assert "hook.plugin_root_mismatch" in stderr
     assert bridge_record(setup) is None
-
-
-@pytest.mark.parametrize("host", HOSTS)
-def test_warmup_syncs_persistent_environment_even_without_binding(
-    setup: Setup,
-    host: str,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    set_host_env(monkeypatch, setup, host)
-    key = environment_key(setup.layout)
-    standalone = setup.runtime_dir / "draft" / "envs" / key
-    standalone.mkdir(parents=True)
-    runner = HookRunner()
-    code, output, _ = run_hook(setup, host, session_stdin("fresh"), monkeypatch, capsys, runner)
-
-    assert code == 0
-    assert output == session_hook.render_session_fact("fresh") + "\n"
-    assert len(runner.calls) == 1
-    sync_args, sync_env = runner.calls[0]
-    assert sync_args[:2] == ["uv", "sync"]
-    persistent = setup.data_dir.resolve() / "envs" / key
-    assert sync_env["UV_PROJECT_ENVIRONMENT"] == str(persistent)
-    assert hook_log(setup)[-1]["warmed"] is True
-
-
-@pytest.mark.parametrize("host", HOSTS)
-def test_unsafe_standalone_environment_is_not_a_warmup_signal(
-    setup: Setup,
-    host: str,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    set_host_env(monkeypatch, setup, host)
-    key = environment_key(setup.layout)
-    standalone = setup.runtime_dir / "draft" / "envs" / key
-    standalone.parent.mkdir(parents=True)
-    elsewhere = setup.tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    standalone.symlink_to(elsewhere)
-    runner = HookRunner()
-    code, output, _ = run_hook(setup, host, session_stdin("fresh"), monkeypatch, capsys, runner)
-
-    assert code == 0
-    assert output == session_hook.render_session_fact("fresh") + "\n"
     assert runner.calls == []
 
 
@@ -592,17 +533,18 @@ def test_wrong_event_and_invalid_stdin_are_silent_but_logged(
     set_host_env(monkeypatch, setup, host)
 
     wrong_event = json.dumps({"hook_event_name": "PreCompact", "session_id": "abc123"})
-    code, output, _ = run_hook(setup, host, wrong_event, monkeypatch, capsys)
+    code, output, _, runner = run_hook(setup, host, wrong_event, monkeypatch, capsys)
     assert code == 0
     assert output == ""
     assert hook_log(setup)[-1]["error"] == "hook.unexpected_event"
+    assert_single_inner_uv(setup, runner, host)
 
-    code, output, _ = run_hook(setup, host, "{not json", monkeypatch, capsys)
+    code, output, _, _ = run_hook(setup, host, "{not json", monkeypatch, capsys)
     assert code == 0
     assert output == ""
     assert hook_log(setup)[-1]["error"] == "hook.stdin_invalid"
 
-    code, output, _ = run_hook(setup, host, " " * (64 * 1024 + 1), monkeypatch, capsys)
+    code, output, _, _ = run_hook(setup, host, " " * (64 * 1024 + 1), monkeypatch, capsys)
     assert code == 0
     assert output == ""
     assert hook_log(setup)[-1]["error"] == "hook.stdin_oversized"

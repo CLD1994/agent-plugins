@@ -704,6 +704,36 @@ def test_bind_hook_help_exits_zero() -> None:
         assert captured.value.code == 0
 
 
+def test_public_help_hides_internal_session_start(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    assert "_session-start" not in capsys.readouterr().out
+
+
+def test_internal_session_start_dispatches_before_argparse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from collections.abc import Mapping, Sequence
+    from typing import TextIO
+
+    from draft import session_hook
+
+    seen: list[list[str]] = []
+
+    def fake_main(
+        argv: Sequence[str] | None = None,
+        *,
+        environ: Mapping[str, str] | None = None,
+        stdin: TextIO | None = None,
+    ) -> int:
+        seen.append(list(argv or []))
+        return 0
+
+    monkeypatch.setattr(session_hook, "main", fake_main)
+    assert main(["_session-start", "codex"]) == 0
+    assert seen == [["codex"]]
+
+
 def test_move_with_relative_root_from_cwd(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

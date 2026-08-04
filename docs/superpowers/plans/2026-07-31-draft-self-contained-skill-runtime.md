@@ -1,5 +1,11 @@
 # Draft 自包含 skill（技能）运行时实现计划
 
+> **历史状态：** 本计划已经执行完成，描述 2026-07-31 的实现基线。全局评审发现的
+> Windows 启动问题及后续确认的入口、环境键和 runtime 安装修正，不回写为本计划的已完成
+> 事项；目标设计见
+> `docs/superpowers/specs/2026-08-04-draft-single-python-launcher-design.md`，后续执行见
+> `docs/superpowers/plans/2026-08-04-draft-single-python-launcher.md`。
+
 > **面向执行计划的 Agent：** 必须使用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans`，逐项实施本计划。步骤使用复选框（`- [ ]`）跟踪状态。
 
 **目标：** 使 `plugins/draft/skills/draft/` 成为可独立执行的自包含技能，只向 Agent 暴露一个稳定的 `scripts/draft` 入口；Codex 与 Claude Code 钩子通过严格的两字段 bridge（桥接定位器）透明增强持久环境和会话绑定。

@@ -256,6 +256,30 @@ def test_load_rejects_wrong_field_types(
         load_binding(data_dir, "abc123")
 
 
+def test_load_rejects_foreign_skill_name(data_dir: Path, draft: Path) -> None:
+    bind(data_dir, make_binding(draft))
+    path = binding_path(data_dir, "abc123")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["skill_name"] = "other-skill"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(DraftError, match="binding.invalid"):
+        load_binding(data_dir, "abc123")
+
+
+@pytest.mark.parametrize(
+    "hint",
+    ["/etc/passwd", "../outside.md", "pages/../../outside.md", "C:\\temp\\x.md", "", "   "],
+)
+def test_load_rejects_unmanaged_hint(data_dir: Path, draft: Path, hint: str) -> None:
+    bind(data_dir, make_binding(draft))
+    path = binding_path(data_dir, "abc123")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["last_page_hint"] = hint
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(DraftError, match="binding.invalid_hint"):
+        load_binding(data_dir, "abc123")
+
+
 def test_skill_digest_reads_file_bytes(tmp_path: Path) -> None:
     skill = tmp_path / "SKILL.md"
     skill.write_text("content", encoding="utf-8")

@@ -18,13 +18,21 @@ def test_runtime_belongs_to_the_skill() -> None:
 
 def test_skill_is_a_self_contained_runtime_unit() -> None:
     scripts = SKILL_ROOT / "scripts"
-    assert (scripts / "draft").is_file()
-    assert (scripts / "draft.ps1").is_file()
+    assert (scripts / "draft.py").is_file()
     assert (scripts / "runtime/pyproject.toml").is_file()
     assert (scripts / "runtime/uv.lock").is_file()
     assert (scripts / "runtime/src/draft/__main__.py").is_file()
     assert not (PLUGIN_ROOT / "runtime").exists()
     assert not (PLUGIN_ROOT / "bootstrap").exists()
+
+
+def test_skill_has_one_python_launcher() -> None:
+    scripts = SKILL_ROOT / "scripts"
+    assert (scripts / "draft.py").is_file()
+    assert not (scripts / "draft").exists()
+    assert not (scripts / "draft.ps1").exists()
+    assert not (scripts / "runtime/src/draft/entry.py").exists()
+    assert not (scripts / "runtime/src/draft/plugin_context.py").exists()
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -45,10 +53,14 @@ def test_marketplaces_publish_draft() -> None:
 
 
 def test_plugin_manifests_match_the_install_artifact() -> None:
+    import tomllib
+
     codex = load_json(PLUGIN_ROOT / ".codex-plugin/plugin.json")
     claude = load_json(PLUGIN_ROOT / ".claude-plugin/plugin.json")
     assert codex["name"] == claude["name"] == PLUGIN_ROOT.name == "draft"
-    assert codex["version"] == claude["version"] == "0.1.0"
+    runtime = tomllib.loads((RUNTIME_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    runtime_version = runtime["project"]["version"]
+    assert codex["version"] == claude["version"] == runtime_version
     assert codex["skills"] == claude["skills"] == "./skills/"
 
 
@@ -59,13 +71,24 @@ def test_both_manifests_declare_their_session_start_hook() -> None:
     assert claude["hooks"] == "./hooks/claude-hooks.json"
 
 
-def test_hook_commands_use_the_stable_skill_entry() -> None:
+def hook_commands() -> tuple[str, str]:
     codex = load_json(PLUGIN_ROOT / "hooks/codex-hooks.json")
     claude = load_json(PLUGIN_ROOT / "hooks/claude-hooks.json")
     codex_command = codex["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     claude_command = claude["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-    assert "${PLUGIN_ROOT}/skills/draft/scripts/draft" in codex_command
-    assert "${CLAUDE_PLUGIN_ROOT}/skills/draft/scripts/draft" in claude_command
-    assert "PLUGIN_DATA" not in codex_command
-    assert "CLAUDE_PLUGIN_DATA" not in claude_command
-    assert "/bin/draft" not in codex_command + claude_command
+    return cast("str", codex_command), cast("str", claude_command)
+
+
+def test_hook_commands_run_the_same_python_launcher() -> None:
+    codex_command, claude_command = hook_commands()
+    assert codex_command == (
+        'uv run "${PLUGIN_ROOT}/skills/draft/scripts/draft.py" _session-start codex'
+    )
+    assert claude_command == (
+        'uv run "${CLAUDE_PLUGIN_ROOT}/skills/draft/scripts/draft.py" _session-start claude'
+    )
+    for command in (codex_command, claude_command):
+        assert "--python" not in command
+        assert "--project" not in command
+        assert "--no-project" not in command
+        assert ".ps1" not in command

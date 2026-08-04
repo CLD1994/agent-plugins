@@ -12,6 +12,14 @@ def test_runtime_uses_draft_identity() -> None:
     config = tomllib.loads((RUNTIME_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert config["project"]["name"] == "draft-runtime"
     assert config["project"]["scripts"] == {"draft": "draft.cli:main"}
+    assert config["tool"]["uv"]["package"] is True
+
+
+def test_version_comes_from_installed_metadata() -> None:
+    import draft
+
+    config = tomllib.loads((RUNTIME_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert draft.__version__ == config["project"]["version"]
 
 
 def test_root_domain_exports_use_draft() -> None:
