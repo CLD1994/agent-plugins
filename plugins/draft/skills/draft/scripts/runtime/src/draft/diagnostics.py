@@ -41,7 +41,8 @@ def _safe(value: str) -> str:
 def _location(issue: CheckIssue) -> tuple[LocationKind, str]:
     if issue.path is None:
         return LocationKind.ROOT, "<ROOT>"
-    path = issue.path.as_posix()
+    # Escape the path so a control character in it cannot break the line boundary.
+    path = _safe(issue.path.as_posix())
     # line <= 0 is not a legal one-based source line; never fabricate one.
     if issue.line is None or issue.line <= 0:
         return LocationKind.FILE, path
@@ -57,7 +58,9 @@ def _variant(arities: Mapping[str, int]) -> DetailValidator:
 
 
 def _cycle(details: tuple[str, ...]) -> bool:
-    return len(details) >= 3 and details[0] == details[-1]
+    # A closed cycle is the path with the first node repeated at the end; a
+    # self-loop is the shortest legal form (a, a), so require length >= 2.
+    return len(details) >= 2 and details[0] == details[-1]
 
 
 def _text(message: str) -> MessageRenderer:
@@ -292,7 +295,8 @@ def render_issue(issue: CheckIssue) -> str:
         if valid and spec is not None
         else _fallback(issue.details)
     )
-    return f"{location}: {_SEVERITY_NAMES[issue.severity]} {issue.code}：{message}"
+    # Escape the code too: every dynamic field must be single-line safe.
+    return f"{location}: {_SEVERITY_NAMES[issue.severity]} {_safe(issue.code)}：{message}"
 
 
 def issue_payload(issue: CheckIssue) -> dict[str, object]:

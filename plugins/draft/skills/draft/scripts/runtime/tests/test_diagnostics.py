@@ -713,3 +713,59 @@ def test_unclosed_cycle_details_fall_back_losslessly(issue: CheckIssue) -> None:
     rendered = render_issue(issue)
     assert "未登记诊断参数" in rendered
     assert rendered.endswith('：未登记诊断参数：["pages/a.md", "pages/b.md"]')
+
+
+SELF_LOOP_CASES = [
+    pytest.param(
+        CheckIssue(
+            "parent.cycle",
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            None,
+            ("pages/a.md", "pages/a.md"),
+        ),
+        "pages/a.md: 错误 parent.cycle：父主题形成环路：pages/a.md -> pages/a.md",
+        id="parent.cycle.self_loop",
+    ),
+    pytest.param(
+        CheckIssue(
+            "dependency.cycle",
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            None,
+            ("pages/a.md", "pages/a.md"),
+        ),
+        "pages/a.md: 错误 dependency.cycle：依赖形成环路：pages/a.md -> pages/a.md",
+        id="dependency.cycle.self_loop",
+    ),
+    pytest.param(
+        CheckIssue(
+            "replacement.cycle",
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            None,
+            ("pages/a.md", "pages/a.md"),
+        ),
+        "pages/a.md: 错误 replacement.cycle：取代形成环路：pages/a.md -> pages/a.md",
+        id="replacement.cycle.self_loop",
+    ),
+]
+
+
+@pytest.mark.parametrize(("issue", "expected"), SELF_LOOP_CASES)
+def test_render_issue_for_self_loop_cycles(issue: CheckIssue, expected: str) -> None:
+    assert render_issue(issue) == expected
+
+
+def test_path_with_control_character_stays_one_line() -> None:
+    issue = CheckIssue("link.missing", IssueSeverity.ERROR, Path("bad\nname.md"), 5, ("x", "x"))
+    rendered = render_issue(issue)
+    assert rendered.count("\n") == 0
+    assert "bad\\nname.md:5" in rendered
+
+
+def test_code_with_control_character_stays_one_line() -> None:
+    issue = CheckIssue("bad\ncode", IssueSeverity.ERROR, Path("a.md"), None, ("x",))
+    rendered = render_issue(issue)
+    assert rendered.count("\n") == 0
+    assert "bad\\ncode" in rendered

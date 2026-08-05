@@ -315,14 +315,21 @@ def _check_challenges(graph: DraftGraph) -> list[CheckIssue]:
     return issues
 
 
+def _resolved_target(source: Path, destination: str, root: Path) -> Path | None:
+    """Normalized target of a declaration, or None if it escapes the draft root."""
+    try:
+        target, _anchor = resolve_local_destination(source, destination, root)
+    except DraftError:
+        return None
+    return target
+
+
 def _check_outputs(graph: DraftGraph) -> list[CheckIssue]:
     issues: list[CheckIssue] = []
-    output_edges = _multi_edges(graph, RelationLabel.OUTPUT)
     for path, page in graph.pages.items():
         declared = [
             relation for relation in page.relations if relation.label is RelationLabel.OUTPUT
         ]
-        targets = output_edges.get(path, ())
         if path == CONCLUSIONS_PAGE:
             if declared:
                 issues.append(_error("output.forbidden", path, declared[0].link.line))
@@ -337,17 +344,24 @@ def _check_outputs(graph: DraftGraph) -> list[CheckIssue]:
             continue
         if len(declared) > 1:
             issues.append(_error("output.wrong_target", path, declared[1].link.line, "duplicate"))
-        if targets != (CONCLUSIONS_PAGE,):
-            line = declared[0].link.line
+        # 关联每条声明与其规范化目标，定位实际未指向 conclusions.md 的声明；
+        # 不能用 declared[0]，否则会把正确声明报成错误事实。
+        wrong_targets = [
+            relation
+            for relation in declared
+            if _resolved_target(path, relation.link.destination, graph.root) != CONCLUSIONS_PAGE
+        ]
+        for relation in wrong_targets:
             issues.append(
                 _error(
                     "output.wrong_target",
                     path,
-                    line,
+                    relation.link.line,
                     "not_conclusions",
-                    declared[0].link.destination,
+                    relation.link.destination,
                 )
             )
+        if wrong_targets:
             continue
         if path not in _body_links_to(graph, CONCLUSIONS_PAGE):
             issues.append(

@@ -123,7 +123,7 @@
 - Produces: `KNOWN_CHECK_CODES: frozenset[str]`、`render_issue(issue: CheckIssue) -> str`、`issue_payload(issue: CheckIssue) -> dict[str, object]`。
 - Later tasks must use the exact code and `details` schemas in the Diagnostic Contract Table.
 
-- [ ] **Step 1: 写错误码集合和普通渲染失败测试**
+- [x] **Step 1: 写错误码集合和普通渲染失败测试**
 
 ```python
 from pathlib import Path
@@ -164,7 +164,7 @@ def test_link_missing_is_a_complete_single_line() -> None:
     )
 ```
 
-- [ ] **Step 2: 写位置、复杂摘要和保真回退失败测试**
+- [x] **Step 2: 写位置、复杂摘要和保真回退失败测试**
 
 ```python
 def test_file_location_omits_a_fake_line() -> None:
@@ -189,7 +189,7 @@ def test_known_code_with_invalid_location_uses_the_same_fallback() -> None:
     assert "未登记诊断参数" in render_issue(issue)
 ```
 
-- [ ] **Step 3: 写 JSON 载荷失败测试**
+- [x] **Step 3: 写 JSON 载荷失败测试**
 
 ```python
 from draft.diagnostics import issue_payload
@@ -207,7 +207,7 @@ def test_issue_payload_adds_explicit_severity_and_keeps_raw_details() -> None:
     }
 ```
 
-- [ ] **Step 4: 运行新测试并确认因模块不存在而失败**
+- [x] **Step 4: 运行新测试并确认因模块不存在而失败**
 
 Run:
 
@@ -218,7 +218,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime \
 
 Expected: collection fails with `ModuleNotFoundError: No module named 'draft.diagnostics'`.
 
-- [ ] **Step 5: 实现位置、参数验证和安全单行辅助函数**
+- [x] **Step 5: 实现位置、参数验证和安全单行辅助函数**
 
 ```python
 from __future__ import annotations
@@ -274,7 +274,7 @@ def _cycle(details: tuple[str, ...]) -> bool:
 
 `_location` 还必须把 `line <= 0` 判为无效位置；不能把它渲染成合法来源位置。
 
-- [ ] **Step 6: 按 Diagnostic Contract Table 完整建立 `_SPECS`**
+- [x] **Step 6: 按 Diagnostic Contract Table 完整建立 `_SPECS`**
 
 固定文本使用 `_fixed(0)`；固定参数使用 `_fixed(n)`；三个环路使用 `_cycle`；分支错误使用以下精确校验：
 
@@ -299,7 +299,7 @@ _variant({"duplicate": 1, "not_conclusions": 2})
 
 每个 `render_message` 必须产生表中完整事实。所有参数先经 `_safe`；环路只在渲染时用 ` → ` 连接。`operation.inconsistent_state` 是唯一明确要求附加 `完整上下文请使用 --json` 的现有错误码。
 
-- [ ] **Step 7: 实现公共渲染函数和 JSON 载荷函数**
+- [x] **Step 7: 实现公共渲染函数和 JSON 载荷函数**
 
 ```python
 KNOWN_CHECK_CODES = frozenset(_SPECS)
@@ -330,11 +330,11 @@ def issue_payload(issue: CheckIssue) -> dict[str, object]:
     }
 ```
 
-- [ ] **Step 8: 扩充参数化测试以逐项覆盖表中所有错误码**
+- [x] **Step 8: 扩充参数化测试以逐项覆盖表中所有错误码**
 
 测试数据必须手写 `CheckIssue`、预期完整中文事实和合法位置；不能从 `_SPECS` 生成预期。为六个分支协议分别增加每个分支的正例，并为环路增加未闭合反例。
 
-- [ ] **Step 9: 运行诊断目录测试并确认通过**
+- [x] **Step 9: 运行诊断目录测试并确认通过**
 
 Run:
 
@@ -345,7 +345,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime \
 
 Expected: all tests pass.
 
-- [ ] **Step 10: 运行静态检查并提交任务**
+- [x] **Step 10: 运行静态检查并提交任务**
 
 ```bash
 uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pyright
@@ -373,7 +373,7 @@ Expected: pyright and ruff pass; commit contains only the catalog and its tests.
 - Consumes: Task 1 的错误码与 `details` 协议。
 - Produces: `page.*`、`link.missing`、`link.escape` 的完整 `CheckIssue`；后续 CLI 可以直接渲染，不重新读取文件。
 
-- [ ] **Step 1: 扩充 Markdown 解析错误失败测试**
+- [x] **Step 1: 扩充 Markdown 解析错误失败测试**
 
 ```python
 def test_unknown_label_preserves_only_the_label_operand() -> None:
@@ -401,7 +401,7 @@ def test_invalid_status_uses_stable_reason(value: str, details: tuple[str, ...])
 
 为 `page.invalid_relation` 的两个分支增加断言：`("link_cardinality_or_image", "依赖")` 和 `("extra_content", "父主题")`。为机器区域懒惰延续行增加 `page.parse_error` 与 `("lazy_continuation",)` 断言。
 
-- [ ] **Step 2: 扩充链接事实和多错误失败测试**
+- [x] **Step 2: 扩充链接事实和多错误失败测试**
 
 ```python
 def test_missing_link_reports_source_line_literal_and_normalized_target(
@@ -431,7 +431,7 @@ def test_two_missing_links_on_one_line_remain_distinguishable(
 
 另加关系链接目标缺失用例，断言同一 `source + line + target` 只产生一条 `link.missing`，防止 `page.links` 与 `page.relations` 两次报告同一事实。
 
-- [ ] **Step 3: 运行定向测试并确认旧中文详情和空详情导致失败**
+- [x] **Step 3: 运行定向测试并确认旧中文详情和空详情导致失败**
 
 Run:
 
@@ -444,7 +444,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
 
 Expected: assertions fail because current `details` 是中文整句或空元组，并且关系死链可能重复。
 
-- [ ] **Step 4: 把 Markdown 错误改成稳定分支参数**
+- [x] **Step 4: 把 Markdown 错误改成稳定分支参数**
 
 按以下精确替换构造 `DraftError.details`：
 
@@ -465,7 +465,7 @@ Expected: assertions fail because current `details` 是中文整句或空元组�
 
 不得改变异常错误码、来源路径、来源行或解析接受集合。
 
-- [ ] **Step 5: 让图加载器在第一次解析链接时保存完整结果**
+- [x] **Step 5: 让图加载器在第一次解析链接时保存完整结果**
 
 把辅助函数扩展为接收原始参数：
 
@@ -500,7 +500,7 @@ error_issue(
 )
 ```
 
-- [ ] **Step 6: 复用第一次链接解析结果，消除关系链接的重复诊断**
+- [x] **Step 6: 复用第一次链接解析结果，消除关系链接的重复诊断**
 
 在每个页面第一次遍历 `page.links` 时建立：
 
@@ -511,7 +511,7 @@ resolved_links[link.whole_span] = target
 
 第二次遍历 `page.relations` 时只读取 `resolved_links[relation.link.whole_span]`；目标为 `None` 或不在 `managed_set` 时不再追加错误，只是不建立关系边。不得对同一链接再次调用 `resolve_link`。
 
-- [ ] **Step 7: 运行 Markdown、检查器和图相关结构测试**
+- [x] **Step 7: 运行 Markdown、检查器和图相关结构测试**
 
 ```bash
 uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q \
@@ -522,7 +522,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
 
 Expected: all tests pass; missing relation target reports once.
 
-- [ ] **Step 8: 运行静态检查并提交任务**
+- [x] **Step 8: 运行静态检查并提交任务**
 
 ```bash
 uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pyright
@@ -551,7 +551,7 @@ git commit -m "fix(draft): preserve link diagnostic facts"
 - Consumes: Task 1 的所有非 `page.*`/`link.*` 参数协议和 Task 2 的 `DraftGraph.relations`。
 - Produces: 每个关系事实的来源行、闭合路径和原始参数；`check_draft` 返回顺序和严重级别不变。
 
-- [ ] **Step 1: 写关系来源行和对端参数失败测试**
+- [x] **Step 1: 写关系来源行和对端参数失败测试**
 
 在现有 `test_duplicate_normalized_relation_target_is_an_error`、`test_replacement_pair_missing` 和 `test_challenge_pair_missing` 中增加精确断言：
 
@@ -568,7 +568,7 @@ assert challenge.details == ("pages/question.md", "被质疑")
 
 再增加反向分支用例，确认从“被取代”或“被质疑”出发时 `expected_counterpart` 分别是 `取代` 或 `质疑`。
 
-- [ ] **Step 2: 写闭合环路、自依赖行号和状态分支失败测试**
+- [x] **Step 2: 写闭合环路、自依赖行号和状态分支失败测试**
 
 ```python
 assert parent_cycle.details == ("pages/a.md", "pages/b.md", "pages/a.md")
@@ -581,7 +581,7 @@ assert status_requires_relation.details == ("status_requires_relation",)
 assert status_requires_relation.line is None
 ```
 
-- [ ] **Step 3: 写输出、布局、容量和生命周期参数失败测试**
+- [x] **Step 3: 写输出、布局、容量和生命周期参数失败测试**
 
 ```python
 assert layout_mismatch.details == ("index.md", "pages/sub/index.md")
@@ -594,7 +594,7 @@ assert recovery_required.details == ("4" * 32,)
 
 容量测试中的期望行数必须写成夹具对应的确定常量；字节数可以从测试自己构造的输入字节计算，不能调用被测容量函数。
 
-- [ ] **Step 4: 运行定向检查器测试并确认失败**
+- [x] **Step 4: 运行定向检查器测试并确认失败**
 
 ```bash
 uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q \
@@ -605,7 +605,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
 
 Expected: failures show missing line numbers、未闭合字符串详情或中文预渲染详情。
 
-- [ ] **Step 5: 新增保留边行号的辅助结构**
+- [x] **Step 5: 新增保留边行号的辅助结构**
 
 ```python
 def _relation_lines(
@@ -622,7 +622,7 @@ def _cycle_details(cycle: tuple[Path, ...]) -> tuple[str, ...]:
 
 保留 `_multi_edges` 供环路计算使用；不能让渲染器接触 `DraftGraph`。
 
-- [ ] **Step 6: 改造关系、父主题与依赖诊断生产者**
+- [x] **Step 6: 改造关系、父主题与依赖诊断生产者**
 
 - `relation.duplicate`: `details=(label.value, target.as_posix())`，行号使用第二次声明行。
 - `layout.parent_mismatch`: `details=(declared_target.as_posix(), physical.as_posix())`。
@@ -637,7 +637,7 @@ _error("dependency.self", source, min(lines))
 _error("parent.cycle", cycle[0], None, *_cycle_details(cycle))
 ```
 
-- [ ] **Step 7: 改造取代、质疑与产出诊断生产者**
+- [x] **Step 7: 改造取代、质疑与产出诊断生产者**
 
 - 配对检查从 `_relation_lines` 读取最小来源行。
 - `replacement.pair_missing` 和 `challenge.pair_missing` 保存 `(target, expected_counterpart)`。
@@ -647,7 +647,7 @@ _error("parent.cycle", cycle[0], None, *_cycle_details(cycle))
 
 不要修改 `output.forbidden`、`output.missing` 的判定或严重级别。
 
-- [ ] **Step 8: 改造容量并冻结生命周期原始参数**
+- [x] **Step 8: 改造容量并冻结生命周期原始参数**
 
 ```python
 _review("page.capacity", path, str(lines), str(size))
@@ -655,7 +655,7 @@ _review("page.capacity", path, str(lines), str(size))
 
 操作和回收诊断当前已经分别保存 `phase.value` 或 `operation_id`；只补充测试，不重写其状态判断。`operation.journal_corrupt` 和 `operation.orphan_allocating` 继续使用空 `details`。
 
-- [ ] **Step 9: 运行检查器、操作和回收测试**
+- [x] **Step 9: 运行检查器、操作和回收测试**
 
 ```bash
 uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q \
@@ -667,7 +667,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
 
 Expected: all tests pass; issue ordering and severity assertions remain unchanged.
 
-- [ ] **Step 10: 运行静态检查并提交任务**
+- [x] **Step 10: 运行静态检查并提交任务**
 
 ```bash
 uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pyright
@@ -693,7 +693,7 @@ git commit -m "fix(draft): retain checker diagnostic context"
 - Consumes: Task 1 的 `render_issue` 和 `issue_payload`；Tasks 2-3 产生的完整 `CheckReport`。
 - Produces: `check` 普通输出、JSON 信封和既有退出码；后续文档与烟雾测试以此作为公开行为。
 
-- [ ] **Step 1: 写同文件多错误普通输出失败测试**
+- [x] **Step 1: 写同文件多错误普通输出失败测试**
 
 ```python
 def test_check_human_reports_actionable_multiple_locations(
@@ -718,14 +718,14 @@ def test_check_human_reports_actionable_multiple_locations(
     ]
 ```
 
-- [ ] **Step 2: 写全绿、候选提示和四档摘要失败测试**
+- [x] **Step 2: 写全绿、候选提示和四档摘要失败测试**
 
 - 全绿精确等于 `检查通过：未发现客观错误。\n`。
 - `candidate.already_registered` 的诊断行自身包含 `--candidate`；输出中不再出现独立 `提示：` 行。
 - 构造 `CheckReport` 或使用现有回收夹具，精确断言四档按 `errors`、`warnings`、`infos`、`reviews` 顺序输出，末行计数全部正确。
 - 拍摄运行前后 `snapshot_tree(root)`，确认普通模式同样只读。
 
-- [ ] **Step 3: 扩充 JSON 失败测试**
+- [x] **Step 3: 扩充 JSON 失败测试**
 
 在 `test_check_clean_and_errors` 和 `test_check_json_separates_errors_warnings_infos_and_reviews` 中逐项断言：
 
@@ -743,7 +743,7 @@ for severity, key in (
 
 再断言普通模式和 JSON 模式对同一损坏草稿都返回 `1`，JSON `details` 保持 Tasks 2-3 的原始参数。
 
-- [ ] **Step 4: 运行 CLI 定向测试并确认当前输出导致失败**
+- [x] **Step 4: 运行 CLI 定向测试并确认当前输出导致失败**
 
 ```bash
 uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q \
@@ -753,7 +753,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
 
 Expected: failures show current普通输出缺行号/事实/摘要，JSON 缺 `severity`。
 
-- [ ] **Step 5: 让 CLI 委托诊断模块**
+- [x] **Step 5: 让 CLI 委托诊断模块**
 
 删除本地 `_issue_payload`，改为：
 
@@ -779,11 +779,11 @@ else:
 
 不要改 `return 0 if ok else 1`。
 
-- [ ] **Step 6: 删除候选检查的独立提示分支**
+- [x] **Step 6: 删除候选检查的独立提示分支**
 
 删除 `main` 中 `_render_check` 之后打印 `提示：目标已是登记草稿...` 的条件块；Task 1 的 `candidate.already_registered` 模板已经在同一诊断行保存 `--candidate` 适用边界。
 
-- [ ] **Step 7: 运行完整 CLI 测试和只读回归**
+- [x] **Step 7: 运行完整 CLI 测试和只读回归**
 
 ```bash
 uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q \
@@ -792,7 +792,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
 
 Expected: all tests pass; no existing非 `check` 命令文本或错误信封发生变化。
 
-- [ ] **Step 8: 运行静态检查并提交任务**
+- [x] **Step 8: 运行静态检查并提交任务**
 
 ```bash
 uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pyright
@@ -820,7 +820,7 @@ git commit -m "feat(draft): render actionable check output"
 - Consumes: Tasks 1-4 的最终公开诊断行为。
 - Produces: 发布级 `0.2.0` 自包含 Draft skill、正式协议文档和全门禁证据。
 
-- [ ] **Step 1: 先把复制 skill 版本断言改为 `0.2.0` 并确认失败**
+- [x] **Step 1: 先把复制 skill 版本断言改为 `0.2.0` 并确认失败**
 
 把 `test_setup_syncs_version_environment_without_domain_cli` 和 `test_copied_skill_runs_standalone_with_isolated_runtime_dir` 中的 `envs/0.1.0` 精确改为 `envs/0.2.0`。
 
@@ -834,7 +834,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
 
 Expected: fail because runtime still reports and selects `0.1.0`.
 
-- [ ] **Step 2: 同步提升三个发布版本字段**
+- [x] **Step 2: 同步提升三个发布版本字段**
 
 ```toml
 # scripts/runtime/pyproject.toml
@@ -848,7 +848,7 @@ version = "0.2.0"
 
 不得改变插件名称、hooks、skills 路径或界面元数据。
 
-- [ ] **Step 3: 用 uv 更新锁文件并检查只改变项目版本**
+- [x] **Step 3: 用 uv 更新锁文件并检查只改变项目版本**
 
 ```bash
 uv lock --project plugins/draft/skills/draft/scripts/runtime
@@ -857,7 +857,7 @@ git diff -- plugins/draft/skills/draft/scripts/runtime/uv.lock
 
 Expected: `draft-runtime` 从 `0.1.0` 变为 `0.2.0`；第三方依赖版本和来源不变。
 
-- [ ] **Step 4: 更新正式检查诊断协议**
+- [x] **Step 4: 更新正式检查诊断协议**
 
 在 `draft-format.md` 的“检查器严重级别”之前新增：
 
@@ -871,7 +871,7 @@ Expected: `draft-runtime` 从 `0.1.0` 变为 `0.2.0`；第三方依赖版本和�
 
 这一步必须复制本计划的完整参数协议，不能只链接实现源码。
 
-- [ ] **Step 5: 运行协议、版本和复制入口定向测试**
+- [x] **Step 5: 运行协议、版本和复制入口定向测试**
 
 ```bash
 uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q \
@@ -884,7 +884,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
 
 Expected: all tests pass; copied skill creates only `envs/0.2.0` and uses public `scripts/draft.py`.
 
-- [ ] **Step 6: 运行完整 pytest**
+- [x] **Step 6: 运行完整 pytest**
 
 ```bash
 uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
@@ -892,7 +892,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
 
 Expected: all tests pass with no warnings promoted to failures.
 
-- [ ] **Step 7: 运行完整静态和格式门禁**
+- [x] **Step 7: 运行完整静态和格式门禁**
 
 ```bash
 uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pyright
@@ -902,7 +902,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime ruff form
 
 Expected: all commands exit `0` without changing files.
 
-- [ ] **Step 8: 检查发布差异和版本一致性**
+- [x] **Step 8: 检查发布差异和版本一致性**
 
 ```bash
 git diff --check
@@ -913,7 +913,7 @@ uv run --isolated --project plugins/draft/skills/draft/scripts/runtime pytest -q
 
 Expected: no whitespace errors; diff only包含本计划列出的诊断、测试、协议和版本文件；三个版本均为 `0.2.0`。
 
-- [ ] **Step 9: 提交协议与发布版本**
+- [x] **Step 9: 提交协议与发布版本**
 
 ```bash
 git add plugins/draft/skills/draft/references/draft-format.md \
@@ -925,7 +925,7 @@ git add plugins/draft/skills/draft/references/draft-format.md \
 git commit -m "docs(draft): publish actionable check diagnostics"
 ```
 
-- [ ] **Step 10: 提交后复验并记录证据**
+- [x] **Step 10: 提交后复验并记录证据**
 
 ```bash
 git status --short

@@ -574,6 +574,41 @@ def test_replacement_cycle(draft_factory: DraftFactory) -> None:
     assert "replacement.status_mismatch" not in codes(report)
 
 
+def test_replacement_self_loop_is_a_cycle(draft_factory: DraftFactory) -> None:
+    files = healthy()
+    files["pages/a.md"] = (
+        "# A\n\n> 状态：`已取代`\n>\n> 父主题：[根索引](../index.md)\n>\n"
+        "> 取代：[A](a.md)\n>\n> 被取代：[A](a.md)\n\n正文。\n"
+    )
+    files["index.md"] = ROOT_PAGE.replace(
+        "- [问题](pages/question.md)",
+        "- [问题](pages/question.md)\n- [A](pages/a.md)",
+    )
+    root = draft_factory(files)
+
+    report = check_draft(root)
+
+    cycle = [issue for issue in report.errors if issue.code == "replacement.cycle"]
+    assert len(cycle) == 1
+    assert cycle[0].details == ("pages/a.md", "pages/a.md")
+
+
+def test_parent_self_loop_is_a_cycle(draft_factory: DraftFactory) -> None:
+    files = healthy()
+    files["pages/a.md"] = "# A\n\n> 状态：`待讨论`\n>\n> 父主题：[A](a.md)\n\n正文。\n"
+    files["index.md"] = ROOT_PAGE.replace(
+        "- [问题](pages/question.md)",
+        "- [问题](pages/question.md)\n- [A](pages/a.md)",
+    )
+    root = draft_factory(files)
+
+    report = check_draft(root)
+
+    cycle = [issue for issue in report.errors if issue.code == "parent.cycle"]
+    assert len(cycle) == 1
+    assert cycle[0].details == ("pages/a.md", "pages/a.md")
+
+
 def test_challenge_pair_missing(draft_factory: DraftFactory) -> None:
     files = healthy()
     files["pages/challenger.md"] = (
@@ -666,6 +701,50 @@ def test_output_duplicate_declaration_is_wrong_target(draft_factory: DraftFactor
     assert wrong[0].path == Path("pages/question.md")
     assert wrong[0].line == 9
     assert wrong[0].details == ("duplicate",)
+
+
+def test_output_correct_then_wrong_locates_the_wrong_declaration(
+    draft_factory: DraftFactory,
+) -> None:
+    files = healthy()
+    files["pages/question.md"] = QUESTION.replace(
+        "> 产出：[结论汇总](../conclusions.md)",
+        "> 产出：[结论汇总](../conclusions.md)\n>\n> 产出：[根索引](../index.md)",
+    )
+    root = draft_factory(files)
+
+    report = check_draft(root)
+
+    wrong = [issue for issue in report.errors if issue.code == "output.wrong_target"]
+    duplicate = [i for i in wrong if i.details == ("duplicate",)]
+    not_conclusions = [i for i in wrong if i.details and i.details[0] == "not_conclusions"]
+    assert len(duplicate) == 1
+    assert duplicate[0].line == 9
+    assert len(not_conclusions) == 1
+    assert not_conclusions[0].line == 9
+    assert not_conclusions[0].details == ("not_conclusions", "../index.md")
+
+
+def test_output_wrong_then_correct_locates_the_wrong_declaration(
+    draft_factory: DraftFactory,
+) -> None:
+    files = healthy()
+    files["pages/question.md"] = QUESTION.replace(
+        "> 产出：[结论汇总](../conclusions.md)",
+        "> 产出：[根索引](../index.md)\n>\n> 产出：[结论汇总](../conclusions.md)",
+    )
+    root = draft_factory(files)
+
+    report = check_draft(root)
+
+    wrong = [issue for issue in report.errors if issue.code == "output.wrong_target"]
+    duplicate = [i for i in wrong if i.details == ("duplicate",)]
+    not_conclusions = [i for i in wrong if i.details and i.details[0] == "not_conclusions"]
+    assert len(duplicate) == 1
+    assert duplicate[0].line == 9
+    assert len(not_conclusions) == 1
+    assert not_conclusions[0].line == 7
+    assert not_conclusions[0].details == ("not_conclusions", "../index.md")
 
 
 def test_non_confirmed_page_declaring_output(draft_factory: DraftFactory) -> None:
