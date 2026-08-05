@@ -83,14 +83,12 @@ draft collapse ROOT HUB
 draft trash ROOT PAGE
 draft restore ROOT OPERATION_ID
 draft recover ROOT
-draft bind ROOT --session SESSION_ID [--last-page-hint PAGE]
-draft unbind --session SESSION_ID
 ```
 
 - `ROOT` 永远显式给出；`SOURCE`、`TARGET`、`PAGE`、`CHILD`、`HUB` 是草稿根内规范相对页面路径（如 `pages/a.md`、`pages/hub/index.md`），不接受目录别名。
 - `check ROOT --candidate` 只读检查未登记候选布局，要求不存在任何 `.draft/` 内部状态；对最终登记根返回 `candidate.already_registered`（退出 1），对临时登记态返回 `adopt.recovery_required`（退出 3）。程序不提供来源格式迁移器，旧布局由 Agent 复制到新空候选根后重写。
 - `--json` 可放在程序名后或子命令后，输出稳定信封（`ok`、`result_type`、错误 `code`、路径、严重级别）。
-- `.draft/` 下的操作日志、权威删除包、锁和绑定文件是工具内部状态，绝不手工编辑；任何手工改动都会被识别为状态损坏。
+- `.draft/` 下的操作日志、权威删除包和锁是工具内部状态，绝不手工编辑；任何手工改动都会被识别为状态损坏。
 
 ## 回收生命周期
 
@@ -221,4 +219,4 @@ trash
 | 1 | `check` 完成并发现客观结构错误 |
 | 2 | 参数、根、路径、版本或领域前置条件无效 |
 | 3 | 需要恢复、锁/日志损坏、外部修改或不安全恢复冲突 |
-| 4 | 运行环境、安装或平台适配失败 |
+| 4 | 运行时 OSError（领域操作期间的文件系统错误） |
