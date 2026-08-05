@@ -1,6 +1,6 @@
 {
   "name": "draft",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Maintain long-running, branching design drafts as self-contained Markdown.",
   "author": {"name": "CLD"},
   "skills": "./skills/",

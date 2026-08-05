@@ -123,7 +123,7 @@ def test_setup_syncs_version_environment_without_domain_cli(tmp_path: Path) -> N
         assert flag in inner
     assert inner.endswith(" draft --version")
     env_line = lines[2]
-    assert f"UV_PROJECT_ENVIRONMENT={xdg}/draft/envs/0.1.0" in env_line
+    assert f"UV_PROJECT_ENVIRONMENT={xdg}/draft/envs/0.2.0" in env_line
     assert "PYTHONPATH=unset" in env_line
     assert "DRAFT_DATA=unset" in env_line
     assert "VIRTUAL_ENV=unset" in env_line
@@ -166,7 +166,7 @@ def test_copied_skill_runs_standalone_with_isolated_runtime_dir(tmp_path: Path) 
     assert not (root / "pages" / "a.md").exists()
     assert (root / "pages" / "b.md").is_file()
 
-    envs = xdg / "draft" / "envs" / "0.1.0"
+    envs = xdg / "draft" / "envs" / "0.2.0"
     assert envs.is_dir()
     assert not list((case_dir).rglob(".env"))
     assert not list(artifact.rglob(".venv"))

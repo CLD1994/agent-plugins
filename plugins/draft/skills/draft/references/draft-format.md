@@ -124,6 +124,91 @@ trash
 - 非检查命令的 JSON 把结构化生命周期警告渲染为对象 `{"code","operation_id","details"}`（如 `trash.handoff_failed`），警告文本只在人类输出中生成；`trash` 成功为 `phase=trash_retained` 并带 `restore_expires_at`、`purge_eligible_at`。
 - 权威删除包、清单、原 `T` mutation、恢复日志或内容摘要互不匹配不是普通恢复冲突，而是 `trash.package_corrupt` 或 `operation.inconsistent_state`，保留现场。
 
+## 检查诊断输出
+
+`draft check ROOT` 在普通模式按确定性顺序遍历同一份 `CheckReport`，每条诊断渲染为单行编译器式格式：
+
+```text
+<path>[:<line>]: <级别> <code>：<客观事实及关键对象>
+```
+
+- `path` 是草稿根内规范 POSIX 相对来源路径；真正根级事实（`path=None`）显示为 `<ROOT>`，不输出空字符串。
+- `line` 是与编辑器一致的一基行号；存在具体结构行时显示为 `path:line`，不存在具体来源行时只显示 `path`，绝不伪造 `0` 或 `1`。
+- 四档中文级别固定为 `错误`、`警告`、`信息`、`提醒`，分别对应 `error`、`warning`、`info`、`review`。
+- 参数中的换行符和其他控制字符必须转义，不能破坏单行边界。
+- 不按文件折叠、不合并来源不同的诊断、不输出颜色、对齐空格或源码摘录。
+
+全部诊断之后输出四档计数摘要：
+
+```text
+检查完成：2 个错误，1 个警告，0 个信息，0 个提醒。
+```
+
+四档全部为空时输出全绿句子：
+
+```text
+检查通过：未发现客观错误。
+```
+
+`--json` 保留 `ok`、`result_type=check` 和 `errors`、`warnings`、`infos`、`reviews` 四个分类数组。每个条目统一包含五字段：`code`、`severity`（与外层分类一致）、`path`（根级为 `null`）、`line`（无来源行为 `null`）、`details`（错误码判别的稳定原始参数数组）。普通输出和 JSON 使用同一份排序后的 `CheckReport`，条目数量、顺序和事实一致；两种模式都只读，不修改草稿任何字节，退出码不变（只有 `errors` 使 `check` 返回 `1`）。
+
+### 诊断契约表
+
+位置模式：`line` 要求 `path` 和正整数 `line`；`file` 要求 `path` 且 `line=None`；`line|file` 允许二者；`root` 要求 `path=None` 和 `line=None`。`details` 只保存错误码判别的稳定字符串参数，不保存预渲染中文整句；环路只在渲染时用 ` -> ` 连接，`details` 保存有序闭合路径（首尾重复）。
+
+| Code | Location | `details` schema | Human fact |
+| --- | --- | --- | --- |
+| `candidate.already_registered` | `file` | `()` | `目标已经登记，--candidate 仅适用于未登记候选` |
+| `candidate.internal_state` | `file` | `()` | `候选目录包含 Draft 内部状态` |
+| `format.missing` | `file` | `()` | `登记文件不存在` |
+| `format.invalid` | `file` | `()` | `登记文件格式无效` |
+| `format.unsupported` | `file` | `()` | `登记文件版本不受支持` |
+| `root.missing_file` | `file` | `()` | `必需文件或目录不存在` |
+| `page.unmanaged_path` | `file` | `()` | `Markdown 文件不在受管理路径中` |
+| `page.missing_title` | `file` | `()` | `缺少一级标题` |
+| `page.missing_machine_block` | `file` | `()` | `一级标题后缺少机器引用块` |
+| `page.missing_status` | `file` | `()` | `机器引用块缺少“状态”` |
+| `page.duplicate_status` | `line` | `()` | `重复声明“状态”` |
+| `page.unknown_label` | `line` | `(label,)` | `机器引用块包含未知标签：{label}` |
+| `page.invalid_status` | `line` | `(not_single_code_span,)` / `(empty_explanation,)` / `(unknown_prefix, prefix)` | 分别说明状态值不是单一反引号值、说明为空、前缀无效 |
+| `page.invalid_relation` | `line` | `(link_cardinality_or_image, label)` / `(extra_content, label)` | 分别说明关系必须恰有一个非图片链接、链接外有额外内容 |
+| `page.parse_error` | `line\|file` | `(link_destination_missing,)` / `(image_destination_missing,)` / `(source_alignment_failed, destination)` / `(lazy_continuation,)` / `(machine_block_map_missing,)` | 对应说明解析器无法取得目标、无法对齐源码、出现懒惰延续行或缺少行映射 |
+| `link.missing` | `line` | `(literal_destination, normalized_target)` | 相同时 `链接目标不存在：{normalized_target}`；不同时说明 `{literal_destination} 解析到 {normalized_target} 后不存在` |
+| `link.escape` | `line\|file` | `(destination, literal_destination)` / `(managed_path, relative_path)` | 分别说明链接越出草稿根、受管理路径是越界符号链接 |
+| `path.symlink_escape` | `file` | `()` | `路径包含越出受管理树的符号链接` |
+| `relation.duplicate` | `line` | `(label, target)` | `{label} 重复指向 {target}` |
+| `parent.root_declared` | `line` | `()` | `根页面不得声明“父主题”` |
+| `parent.missing` | `file` | `()` | `缺少“父主题”声明` |
+| `parent.multiple` | `line` | `()` | `声明了多个“父主题”` |
+| `layout.parent_mismatch` | `line` | `(declared_target, physical_target)` | `父主题声明为 {declared_target}，物理父主题应为 {physical_target}` |
+| `parent.cycle` | `file` | `(path_1, ..., path_1)` | `父主题形成环路：path_1 -> ... -> path_1` |
+| `parent.unreachable` | `file` | `()` | `父主题链无法到达根页面` |
+| `parent.navigation_missing` | `file` | `(child,)` | `正文缺少对子页面 {child} 的导航链接` |
+| `hub.empty` | `file` | `()` | `非根枢纽没有子页面` |
+| `dependency.self` | `line` | `()` | `页面不能依赖自己` |
+| `dependency.cycle` | `file` | `(path_1, ..., path_1)` | `依赖形成环路：path_1 -> ... -> path_1` |
+| `replacement.pair_missing` | `line` | `(target, expected_counterpart)` | `{target} 缺少对应的“{expected_counterpart}”关系` |
+| `replacement.status_mismatch` | `line\|file` | `(relation_requires_status,)` / `(status_requires_relation,)` | 分别说明“被取代”关系要求已取代状态、已取代状态要求“被取代”关系 |
+| `replacement.cycle` | `file` | `(path_1, ..., path_1)` | `取代形成环路：path_1 -> ... -> path_1` |
+| `challenge.pair_missing` | `line` | `(target, expected_counterpart)` | `{target} 缺少对应的“{expected_counterpart}”关系` |
+| `output.forbidden` | `line` | `()` | `当前页面或状态不允许声明“产出”` |
+| `output.missing` | `file` | `()` | `已确认页面缺少“产出”声明` |
+| `output.wrong_target` | `line` | `(duplicate,)` / `(not_conclusions, literal_destination)` | 分别说明重复产出、产出必须指向根级 `conclusions.md` 并显示当前目标 |
+| `output.backlink_missing` | `file` | `(source_page,)` | `缺少对已确认页面 {source_page} 的正文反向链接` |
+| `page.capacity` | `file` | `(line_count, byte_count)` | `页面容量为 {line_count} 行 / {byte_count} 字节，建议审查是否拆分` |
+| `operation.journal_corrupt` | `file` | `()` | `操作锁或日志损坏` |
+| `operation.recovery_required` | `file` | `(operation_id,)` | `操作 {operation_id} 需要恢复` |
+| `operation.orphan_allocating` | `file` | `()` | `发现未持锁的 allocating 操作日志` |
+| `operation.inconsistent_state` | `file` | `(phase,)` | `操作处于无锁不一致阶段：{phase}；完整上下文请使用 --json` |
+| `trash.deadlines_invalid` | `file` | `(operation_id,)` | `回收操作 {operation_id} 的期限字段无效` |
+| `trash.package_missing` | `file` | `(operation_id,)` | `回收操作 {operation_id} 的权威删除包不存在` |
+| `trash.package_corrupt` | `file` | `(operation_id,)` | `回收操作 {operation_id} 的权威删除包损坏` |
+| `trash.retained` | `file` | `(operation_id,)` | `回收操作 {operation_id} 仍处于保留态` |
+| `trash.handoff_pending` | `file` | `(operation_id,)` | `回收操作 {operation_id} 的系统回收站移交等待重试` |
+| `trash.pending_unexplained` | `file` | `(operation_id,)` | `回收操作 {operation_id} 处于无有效失败记录的待移交态` |
+
+`operation.inconsistent_state` 是唯一明确要求普通摘要附加 `完整上下文请使用 --json` 的错误码：普通输出只给出阶段事实，完整参数通过 `--json` 的 `details` 查看。未知错误码或参数数量不符合目录协议时，JSON 仍输出原始条目，普通输出退回到包含来源位置、错误码和全部转义参数的通用单行 `未登记诊断参数：[…]`，不崩溃或吞掉已发现的问题。
+
 ## 检查器严重级别
 
 检查器输出四档：`errors`（客观结构损坏）、`warnings`（合法但需注意的运行状态，如投递失败）、`infos`（合法未结束的生命周期事实，如 `trash_retained`）、`reviews`（容量等审查提醒）。回收生命周期诊断固定为：恢复窗口内或已过期但未推进的 `trash_retained` 是 `INFO`；带有效失败记录的无锁 `trash_handoff_pending` 是 `WARNING`；无有效失败记录的 `trash_handoff_pending` 或包缺失/损坏是 `ERROR`。警告不使 `check` 非零退出，错误才退出 1。
