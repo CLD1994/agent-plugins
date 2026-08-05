@@ -123,7 +123,9 @@ class _ExternalReadSentinel:
         sentinel = self
 
         def stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-            if sentinel._touches(self):
+            # lstat (follow_symlinks=False) 是检测符号链接的安全机制，不触达目标；
+            # 只有跟随式 stat 才会读取越界目标，需要记录。
+            if follow_symlinks and sentinel._touches(self):
                 sentinel.hits.append("stat")
             return original_stat(self, follow_symlinks=follow_symlinks)
 
