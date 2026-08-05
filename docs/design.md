@@ -383,7 +383,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft recover ROOT
 
 共同规则：
 
-- 所有读取或修改草稿的命令都要求显式 `ROOT`；`unbind` 以显式会话标识定位绑定；
+- 所有读取或修改草稿的命令都要求显式 `ROOT`；
 - 不从当前目录向上寻找写入目标；
 - `SOURCE`、`TARGET`、`PAGE` 必须是草稿根内的规范相对路径；
 - 拒绝绝对路径、`..` 越界、符号链接逃逸和非 Markdown 页面；

@@ -204,10 +204,10 @@ OSError 必须在最窄文件操作边界转换为稳定错误码并保留异常
 
 - `plugin.context_invalid`：bridge JSON 损坏、字段不符或权限/所有权/文件类型异常。先确认没有手工改动 bridge 目录；无法解释时停止并询问用户。确认要重来时执行 `uv run <plugin_entry> plugin-context reset`，下一次 SessionStart 重新发布。
 - `plugin.context_conflict`：同一安装键被两个不同数据目录争夺（重复加载）。先停止重复加载，再执行同一条 reset 命令。
-- `plugin.context_unavailable`：当前是独立模式（bridge 未发布），`bind`/`unbind` 不可用；需要宿主 Hook 发布 bridge 后的插件增强模式。
+- `plugin.context_unavailable`：当前 bridge 未发布（`missing` 状态），`bind`/`unbind` 不可用；需要宿主 Hook 发布 bridge（进入 `valid` 状态）后才能使用。
 - `binding.session_mismatch`：绑定载荷与查找键不一致，绑定文件被改动过。先 `uv run <plugin_entry> unbind --session SESSION_ID` 移除它，再重新 bind。
 - `hook.environment_missing`：钩子路径缺少宿主注入的插件根或数据目录变量；确认宿主版本支持该钩子协议。
-- 内层 `uv run` 自身失败：退出码原样传播，bridge 已发布并保留；按 uv 的诊断处理（Python、网络、解释器策略）后重试。
+- `uv run`（插件入口启动）自身失败：退出码原样传播，bridge 已发布并保留；按 uv 的诊断处理（Python、网络、解释器策略）后重试。
 
 草稿结构（领域与操作退出码）：
 

@@ -664,8 +664,15 @@ def test_smoke_full_distribution_no_repo_parent(tmp_path: Path, host: str) -> No
     assert not cache_logs, f"hook.jsonl in cache: {cache_logs}"
     assert not cache_draft, f".draft in cache: {cache_draft}"
 
-    # 输出/状态中无路径解析回仓库检出
-    for output in (result.stdout, rebind_result.stdout, next_hook.stdout):
+    # 输出/状态中无路径解析回仓库检出（stdout + stderr）
+    for output in (
+        result.stdout,
+        result.stderr,
+        rebind_result.stdout,
+        rebind_result.stderr,
+        next_hook.stdout,
+        next_hook.stderr,
+    ):
         assert str(REPO_ROOT) not in output, f"repo path leaked: {output}"
         assert str(PLUGIN_ROOT) not in output, f"plugin path leaked: {output}"
 
@@ -682,7 +689,10 @@ def test_smoke_offline_reuses_cache_after_online_run(tmp_path: Path, host: str) 
     assert online_version.returncode == 0, online_version.stderr
     assert online_version.stdout.strip() == "0.3.0"
 
-    # 同一缓存 + --offline 重跑核心 smoke
+    # 同一缓存 + --offline 重跑核心 smoke；联网与离线都不泄漏仓库路径
+    for output in (online_version.stdout, online_version.stderr):
+        assert str(REPO_ROOT) not in output
+        assert str(PLUGIN_ROOT) not in output
     for args in (("--version",), ("init", str(offline_root)), ("check", str(offline_root))):
         offline_result = _run_uvx(case, *args, offline=True)
         assert offline_result.returncode == 0, (
@@ -690,8 +700,6 @@ def test_smoke_offline_reuses_cache_after_online_run(tmp_path: Path, host: str) 
         )
         if args == ("--version",):
             assert offline_result.stdout.strip() == "0.3.0"
-
-    # 离线阶段也不泄漏仓库路径
-    for output in (online_version.stdout, online_version.stderr):
-        assert str(REPO_ROOT) not in output
-        assert str(PLUGIN_ROOT) not in output
+        for output in (offline_result.stdout, offline_result.stderr):
+            assert str(REPO_ROOT) not in output, f"repo path leaked: {output}"
+            assert str(PLUGIN_ROOT) not in output, f"plugin path leaked: {output}"
