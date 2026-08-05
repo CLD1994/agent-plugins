@@ -271,6 +271,16 @@ def test_bind_and_load_round_trip(workspace: tuple[Path, Path]) -> None:
     assert loaded == Binding("session-1", root.resolve(), Path("pages/a.md"))
 
 
+def test_bind_and_load_round_trip_empty_session(
+    workspace: tuple[Path, Path],
+) -> None:
+    """空 session_id 是合法的不透明身份，bind 写入后 load 必须原样读回。"""
+    data_dir, root = workspace
+    bind(data_dir, Binding("", root, None))
+    loaded = load_binding(data_dir, "")
+    assert loaded == Binding("", root.resolve(), None)
+
+
 def test_rebind_overwrites_same_session(workspace: tuple[Path, Path]) -> None:
     data_dir, root = workspace
     bind(data_dir, Binding("s", root, None))

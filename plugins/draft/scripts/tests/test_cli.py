@@ -329,6 +329,13 @@ def test_no_args_is_usage_error(setup: Setup, capsys: pytest.CaptureFixture[str]
     assert "plugin.invalid_arguments" in err
 
 
+def test_help_exits_zero(setup: Setup, capsys: pytest.CaptureFixture[str]) -> None:
+    # argparse 打印帮助后 SystemExit(0)，入口捕获并以 0 返回；不触达 bridge 加载。
+    code, out, _ = call_main(["--help"], setup, capsys)
+    assert code == 0
+    assert "usage:" in out
+
+
 def test_json_on_reset_is_usage_error(setup: Setup, capsys: pytest.CaptureFixture[str]) -> None:
     code, _, err = call_main(["plugin-context", "reset", "--json"], setup, capsys)
     assert code == EXIT_USAGE

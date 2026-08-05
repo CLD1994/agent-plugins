@@ -315,7 +315,7 @@ def _parse_binding(raw: object, path: Path, session_id: str) -> Binding:
     root_str = data["root"]
     hint = data["last_page_hint"]
 
-    if not isinstance(payload_session, str) or not payload_session:
+    if not isinstance(payload_session, str):
         raise _invalid(path)
     if not isinstance(root_str, str) or not root_str:
         raise _invalid(path)
