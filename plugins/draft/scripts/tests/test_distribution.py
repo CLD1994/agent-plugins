@@ -33,6 +33,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -514,24 +515,29 @@ def _run_entry(
 
 
 def _run_uvx(
-    case: SmokeCase, *draft_args: str, offline: bool = False
+    case: SmokeCase, *draft_args: str, offline: bool = False, online_retries: int = 0
 ) -> subprocess.CompletedProcess[str]:
     env = _clean_smoke_env()
     extra: list[str] = []
     if offline:
         extra.append("--offline")
-    return subprocess.run(
-        [
-            "uvx",
-            "--isolated",
-            "--cache-dir",
-            str(case.cache_dir),
-            *extra,
-            "--from",
-            str(case.runtime_root),
-            "draft",
-            *draft_args,
-        ],
+    cmd = [
+        "uvx",
+        "--isolated",
+        "--cache-dir",
+        str(case.cache_dir),
+        *extra,
+        "--from",
+        str(case.runtime_root),
+        "draft",
+        *draft_args,
+    ]
+    # 联网冷缓存解析可能因瞬时网络抖动失败；仅对联网调用重试以吸收抖动，不掩盖持续失败
+    # （重试后仍失败则原样返回，断言照常失败）。离线阶段不重试：必须使用联网阶段预热好的
+    # 缓存，重试会掩盖真实的缓存未命中失败。
+    attempts = 1 + (online_retries if not offline else 0)
+    result = subprocess.run(
+        cmd,
         cwd=str(case.parent),
         env=env,
         text=True,
@@ -539,6 +545,20 @@ def _run_uvx(
         check=False,
         timeout=UVX_TIMEOUT,
     )
+    for _ in range(attempts - 1):
+        if result.returncode == 0:
+            break
+        time.sleep(1)
+        result = subprocess.run(
+            cmd,
+            cwd=str(case.parent),
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=UVX_TIMEOUT,
+        )
+    return result
 
 
 def _parse_unbound_envelope(stdout: str) -> dict[str, str]:
@@ -626,7 +646,7 @@ def test_smoke_full_distribution_no_repo_parent(tmp_path: Path, host: str) -> No
     # 5. 用测试专用缓存通过 uvx --isolated --from 跑 version/init/check
     #    联网首次解析（空缓存 + 网络）
     for args in (("--version",), ("init", str(case.draft_root)), ("check", str(case.draft_root))):
-        uvx_result = _run_uvx(case, *args, offline=False)
+        uvx_result = _run_uvx(case, *args, offline=False, online_retries=1)
         assert uvx_result.returncode == 0, uvx_result.stderr + uvx_result.stdout
         if args == ("--version",):
             assert uvx_result.stdout.strip() == "0.3.0", uvx_result.stdout
