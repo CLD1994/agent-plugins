@@ -2,7 +2,7 @@
 
 ## 状态与优先级
 
-状态：设计已批准，待实施。
+状态：已实施（plugin 0.3.0 / runtime 0.3.0）。
 
 本规格重划 Draft 核心能力与 Codex/Claude 插件增强能力的物理目录、命令入口、状态所有权和
 失败边界。实施完成后，它取代以下文档中与 bridge、binding、`SessionStart`、插件数据目录、

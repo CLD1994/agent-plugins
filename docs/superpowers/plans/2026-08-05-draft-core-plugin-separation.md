@@ -103,7 +103,7 @@
 - Produces: `publish_context(entry_path, data_dir, runtime_dir=None) -> PluginContext`、`load_context(...) -> PluginContext | None`、`reset_context(...) -> None`。
 - Later tasks use the plugin entry `plugins/draft/scripts/draft.py` as `installation_key` input; the deleted core launcher path must never be used as the new key.
 
-- [ ] **Step 1: 建立适配层测试导入边界并迁移 bridge 安全矩阵**
+- [x] **Step 1: 建立适配层测试导入边界并迁移 bridge 安全矩阵**
 
 Create `conftest.py` with the exact import boundary:
 
@@ -149,7 +149,7 @@ def test_installation_key_uses_plugin_entry(tmp_path: Path) -> None:
     assert installation_key(entry) == expected
 ```
 
-- [ ] **Step 2: 写错误载荷与退出码失败测试**
+- [x] **Step 2: 写错误载荷与退出码失败测试**
 
 ```python
 def test_adapter_error_has_stable_text_and_json() -> None:
@@ -177,7 +177,7 @@ def test_usage_error_keeps_exit_two() -> None:
     assert AdapterError("binding.root_unavailable", exit_code=EXIT_USAGE).exit_code == 2
 ```
 
-- [ ] **Step 3: 运行新测试并确认缺少适配模块**
+- [x] **Step 3: 运行新测试并确认缺少适配模块**
 
 Run:
 
@@ -188,7 +188,7 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
 
 Expected: collection fails with `ModuleNotFoundError: No module named 'adapter'`.
 
-- [ ] **Step 4: 实现错误模型**
+- [x] **Step 4: 实现错误模型**
 
 ```python
 from __future__ import annotations
@@ -230,7 +230,7 @@ def render_error(error: AdapterError) -> str:
     return " ".join(parts)
 ```
 
-- [ ] **Step 5: 从旧 launcher 原样提取 bridge 的安全边界**
+- [x] **Step 5: 从旧 launcher 原样提取 bridge 的安全边界**
 
 Move these exact definitions from `plugins/draft/skills/draft/scripts/draft.py` into `adapter/bridge.py`:
 
@@ -260,7 +260,7 @@ plugin/scripts/draft.py
 
 Do not weaken `lstat`, ownership/mode checks, `O_NOFOLLOW`, locking, atomic replacement, conflict sentinel, directory fsync or cleanup-note behavior.
 
-- [ ] **Step 6: 运行 bridge 定向测试**
+- [x] **Step 6: 运行 bridge 定向测试**
 
 Run:
 
@@ -271,7 +271,7 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
 
 Expected: all bridge/error tests pass; concurrent tests finish without timeout.
 
-- [ ] **Step 7: 提交 bridge 提取**
+- [x] **Step 7: 提交 bridge 提取**
 
 ```bash
 git add plugins/draft/scripts/adapter plugins/draft/scripts/tests/conftest.py \
@@ -295,7 +295,7 @@ git commit -m "feat(draft): extract plugin bridge adapter"
 - Produces: `binding_root_is_current(binding: Binding) -> bool`、`binding_hint_is_current(binding: Binding) -> bool`，供 Hook 复用同一路径安全规则。
 - Root validity is filesystem validity only; no later task may add `check_draft`, `load_graph`, `.draft/` or skill digest checks.
 
-- [ ] **Step 1: 写三字段 schema、普通目录和不透明 session 测试**
+- [x] **Step 1: 写三字段 schema、普通目录和不透明 session 测试**
 
 ```python
 def test_bind_accepts_unregistered_directory_and_writes_exact_schema(
@@ -325,7 +325,7 @@ def test_binding_key_never_uses_session_as_a_path(tmp_path: Path) -> None:
     )
 ```
 
-- [ ] **Step 2: 写根与页面提示状态矩阵**
+- [x] **Step 2: 写根与页面提示状态矩阵**
 
 Parameterize exact invalid roots: missing path, regular file, root itself a symlink, and an inaccessible/non-canonical `data_dir`. All root failures are `binding.root_unavailable` with exit `2`; data directory failures are `binding.data_dir_unavailable` with exit `4`.
 
@@ -360,7 +360,7 @@ def test_hint_requires_regular_file_without_symlink_segments(
 
 Also cover a symlink in an intermediate hint segment and both POSIX/Windows `..` parsing.
 
-- [ ] **Step 3: 写严格加载、原子覆盖和直接解除测试**
+- [x] **Step 3: 写严格加载、原子覆盖和直接解除测试**
 
 ```python
 def test_old_five_field_payload_is_invalid_but_rebind_overwrites_it(
@@ -391,7 +391,7 @@ def test_unbind_removes_malformed_regular_payload_without_parsing(
 
 Add exact failures for missing/extra fields, wrong field types, relative or lexically non-canonical persisted roots, lexically invalid persisted hints, session mismatch, corrupt JSON, a symlink/non-directory `bindings/` container, symlink/non-regular record, failed `mkdir`/temporary write/fsync/replace/unlink, and cleanup failure preserving the primary error.
 
-- [ ] **Step 4: 运行新测试并确认模块不存在**
+- [x] **Step 4: 运行新测试并确认模块不存在**
 
 Run:
 
@@ -402,7 +402,7 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
 
 Expected: collection fails with `ModuleNotFoundError: No module named 'adapter.bindings'`.
 
-- [ ] **Step 5: 实现三字段模型和验证边界**
+- [x] **Step 5: 实现三字段模型和验证边界**
 
 Start with these exact declarations:
 
@@ -434,7 +434,7 @@ Implement `load_binding` as the only parser of an existing payload and distingui
 
 Map unsafe/inaccessible data or binding-container creation, temporary write, file `fsync`, replace and unlink failures to `binding.data_dir_unavailable`; map an unsafe target object, target read failure, invalid JSON/schema and lookup failure after a valid container to `binding.invalid`. Preserve the original exception chain. Directory `fsync` remains best-effort; temporary cleanup failure is appended to an existing primary error instead of replacing it.
 
-- [ ] **Step 6: 运行 binding 定向测试**
+- [x] **Step 6: 运行 binding 定向测试**
 
 Run:
 
@@ -445,7 +445,7 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
 
 Expected: all tests pass; no test fixture calls `draft.lifecycle.initialize` or creates `.draft/`.
 
-- [ ] **Step 7: 静态证明适配层未导入核心**
+- [x] **Step 7: 静态证明适配层未导入核心**
 
 Run:
 
@@ -457,7 +457,7 @@ fi
 
 Expected: no matches and exit `0`.
 
-- [ ] **Step 8: 提交 binding 协议**
+- [x] **Step 8: 提交 binding 协议**
 
 ```bash
 git add plugins/draft/scripts/adapter/bindings.py \
@@ -479,7 +479,7 @@ git commit -m "feat(draft): add plugin binding protocol"
 - Produces: `resolve_host_context(host, entry_path, environ) -> HostContext`、`read_hook_payload(stream, host) -> HookPayload`、`run_session_start(host, *, entry_path, environ, stdin, runtime_dir=None) -> int`。
 - Invariant: `run_session_start` 可执行后，所有参数、宿主环境、布局、bridge、载荷、binding 和日志失败都产生模型可见诊断并返回 `0`。
 
-- [ ] **Step 1: 写宿主选择、布局和执行顺序失败测试**
+- [x] **Step 1: 写宿主选择、布局和执行顺序失败测试**
 
 Create a copied-plugin fixture with the exact target layout:
 
@@ -516,7 +516,7 @@ def test_bridge_is_published_before_payload_validation(setup: Setup) -> None:
 
 Layout or host-context failure occurs before bridge publication. Payload validation, including missing session, occurs after publication.
 
-- [ ] **Step 2: 写载荷与所有字符串 session 的协议矩阵**
+- [x] **Step 2: 写载荷与所有字符串 session 的协议矩阵**
 
 Cover the 64 KiB boundary, oversized input, an `OSError` from `stream.read`, invalid JSON, non-object JSON, wrong event name, missing/non-string `session_id`, non-string source, and a source not legal for the selected host. Every failure must print exactly one diagnostic envelope containing its code and return `0`; none may be silently logged and discarded.
 
@@ -533,7 +533,7 @@ def test_every_string_is_an_opaque_session_identity(setup: Setup, session: str) 
 
 The raw value is shown as a JSON string on its own line. Command examples keep the literal placeholder `SESSION_ID`; they never interpolate the session into a path or shell fragment.
 
-- [ ] **Step 3: 写未绑定、恢复和损坏状态的信封测试**
+- [x] **Step 3: 写未绑定、恢复和损坏状态的信封测试**
 
 For an unbound session require byte-identical output containing:
 
@@ -563,7 +563,7 @@ Add state tests for:
 
 Paths in command examples must be POSIX-shell quoted with one shared helper based on `shlex.quote`; tests include spaces and a single quote in plugin/root paths.
 
-- [ ] **Step 4: 写 Hook 失败归一化和日志降级测试**
+- [x] **Step 4: 写 Hook 失败归一化和日志降级测试**
 
 Parameterize every `AdapterError` from host selection, layout, bridge publication, binding load and logging setup. Assert:
 
@@ -576,7 +576,7 @@ assert expected_code in output
 
 Patch `logs.mkdir`, log open and log write separately to raise `OSError`, and supply a pre-existing symlink/non-directory `logs` object; each is best-effort, preserves the already selected session fact/rebind/binding diagnostic, appends one `hook.log_unavailable` model-visible diagnostic, and still returns `0`. Assert `subprocess`, `draft`, `.draft`, `check_draft` and `load_graph` are never imported or invoked.
 
-- [ ] **Step 5: 运行新测试并确认模块不存在**
+- [x] **Step 5: 运行新测试并确认模块不存在**
 
 Run:
 
@@ -587,7 +587,7 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
 
 Expected: collection fails with `ModuleNotFoundError: No module named 'adapter.session_hook'`.
 
-- [ ] **Step 6: 实现宿主上下文、载荷、信封和 Hook 边界**
+- [x] **Step 6: 实现宿主上下文、载荷、信封和 Hook 边界**
 
 Start with these declarations:
 
@@ -614,7 +614,7 @@ class HookPayload:
 
 Implement `render_session_fact`, `render_rebind` and `render_diagnostic` as pure functions. Implement `log_hook(...) -> AdapterError | None` as the only explicitly best-effort file operation: it returns `hook.log_unavailable` instead of raising, and the caller appends that diagnostic without discarding its primary branch. Convert each `OSError` at its host-layout, stdin-read, binding or log operation into a stable `AdapterError` (`hook.stdin_unavailable` for stream reads); do not rely on one broad filesystem catch. `run_session_start` follows the eight-step order in the design specification, uses `binding_root_is_current`/`binding_hint_is_current`, catches `AdapterError` at the Hook boundary, and always returns `0`.
 
-- [ ] **Step 7: 运行 SessionStart 定向测试和无核心依赖检查**
+- [x] **Step 7: 运行 SessionStart 定向测试和无核心依赖检查**
 
 Run:
 
@@ -629,7 +629,7 @@ fi
 
 Expected: tests pass; static check has no matches.
 
-- [ ] **Step 8: 提交 Hook 协议**
+- [x] **Step 8: 提交 Hook 协议**
 
 ```bash
 git add plugins/draft/scripts/adapter/session_hook.py \
@@ -653,7 +653,7 @@ git commit -m "feat(draft): add plugin session hook adapter"
 - Ordinary bind/unbind loads bridge by the canonical plugin entry; reset acts on that installation key without loading bridge.
 - PEP 723 declares `requires-python = ">=3.12,<3.15"` and `dependencies = []`.
 
-- [ ] **Step 1: 写参数、分派、输出和退出码失败测试**
+- [x] **Step 1: 写参数、分派、输出和退出码失败测试**
 
 Create subprocess and in-process tests for:
 
@@ -681,7 +681,7 @@ Use these exact ordinary success lines so human and Agent callers receive the sa
 解除成功 removed=false
 ```
 
-- [ ] **Step 2: 写 bridge 加载和 reset 顺序测试**
+- [x] **Step 2: 写 bridge 加载和 reset 顺序测试**
 
 Cover missing, invalid and conflict bridge states for both bind and unbind. Missing maps to `plugin.context_unavailable`, not a fallback data directory. A valid bridge allows binding an ordinary directory with no `.draft/`.
 
@@ -695,11 +695,11 @@ def test_reset_precedes_and_avoids_bridge_load(monkeypatch: pytest.MonkeyPatch) 
 
 Reset removes only bridge JSON/conflict/lock for the current entry, remains silent on success, and leaves `data_dir`, bindings and logs untouched.
 
-- [ ] **Step 3: 写 Hook CLI 的“始终成功启动会话”测试**
+- [x] **Step 3: 写 Hook CLI 的“始终成功启动会话”测试**
 
 Monkeypatch `run_session_start` over all success and failure branches. Assert `hook session-start HOST` forwards the canonical current entry, environment, stdin and optional test runtime directory exactly once and returns `0`, including when the adapter reports bad host/layout/bridge/payload/binding/log states. `hook session-start` with zero or more than one host prints `hook.invalid_arguments` and returns `0`; only shapes that do not enter the `hook session-start` namespace use argparse's exit `2`.
 
-- [ ] **Step 4: 运行新 CLI 测试并确认入口不存在**
+- [x] **Step 4: 运行新 CLI 测试并确认入口不存在**
 
 Run:
 
@@ -710,7 +710,7 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
 
 Expected: failures show missing `plugins/draft/scripts/draft.py` or importable plugin CLI.
 
-- [ ] **Step 5: 实现无第三方依赖插件入口**
+- [x] **Step 5: 实现无第三方依赖插件入口**
 
 Use this header and callable boundary:
 
@@ -743,7 +743,7 @@ def main(
 
 Pre-dispatch the exact `hook session-start` prefix so even its argument-count failures use a model-visible Hook diagnostic and return `0`. Normalize `--json` only for bind/unbind before ordinary argparse dispatch so all documented positions are equivalent. Use a small `ArgumentParser` subclass whose `error()` raises `AdapterError("plugin.invalid_arguments", details=(message,), exit_code=2)` while `--help` still exits `0`. For ordinary operations call `load_context(entry)` exactly once; turn `None` into `AdapterError("plugin.context_unavailable")`. Construct `Binding` only from CLI values. Catch `AdapterError` once at the ordinary-command boundary and select text/JSON rendering without traceback. Dispatch reset before bridge loading and delegate a well-shaped Hook entirely to `run_session_start`.
 
-- [ ] **Step 6: 切换两个宿主 Hook 到插件入口**
+- [x] **Step 6: 切换两个宿主 Hook 到插件入口**
 
 Set the command literals exactly:
 
@@ -754,7 +754,7 @@ Set the command literals exactly:
 
 Do not add runtime/project flags or `_session-start` compatibility aliases.
 
-- [ ] **Step 7: 运行适配层全量定向测试**
+- [x] **Step 7: 运行适配层全量定向测试**
 
 Run:
 
@@ -765,7 +765,7 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
 
 Expected: bridge, binding, SessionStart and CLI suites pass.
 
-- [ ] **Step 8: 提交插件入口和 Hook 切换**
+- [x] **Step 8: 提交插件入口和 Hook 切换**
 
 ```bash
 git add plugins/draft/scripts/draft.py plugins/draft/scripts/tests/test_cli.py \
@@ -790,7 +790,7 @@ git commit -m "feat(draft): route plugin commands through adapter"
 
 **Behavior contract:** Core public commands remain `init`、`adopt`、`check`、`move`、`promote`、`collapse`、`trash`、`restore`、`recover` and `--version`; all domain output and error semantics remain unchanged.
 
-- [ ] **Step 1: 先增加核心命令面和边界失败测试**
+- [x] **Step 1: 先增加核心命令面和边界失败测试**
 
 Extend `test_cli.py`:
 
@@ -820,13 +820,13 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
 
 Expected: the new command-surface and `Binding` absence assertions fail while retained domain cases stay green.
 
-- [ ] **Step 2: 删除 CLI 分支、模型和插件模块**
+- [x] **Step 2: 删除 CLI 分支、模型和插件模块**
 
 Remove bind/unbind parser construction, `_session-start` pre-dispatch, `DRAFT_DATA`/`DRAFT_SKILL_PATH` reads, plugin result serialization and binding imports from `cli.py`. Remove `Binding` from `models.py` without changing domain dataclasses.
 
 Delete `src/draft/bindings.py` and `src/draft/session_hook.py`. Delete their old location-specific suites only after the equivalent safety and protocol matrices pass under `plugins/draft/scripts/tests`; delete `test_plugin_context.py` because its complete matrix was migrated in Task 1. Remove only plugin-specific cases from core `test_cli.py`.
 
-- [ ] **Step 3: 运行核心定向回归与插件适配测试**
+- [x] **Step 3: 运行核心定向回归与插件适配测试**
 
 Run:
 
@@ -839,7 +839,7 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
 
 Expected: all pass; core domain help matrix still covers every retained command.
 
-- [ ] **Step 4: 静态审计整个核心子树**
+- [x] **Step 4: 静态审计整个核心子树**
 
 Run:
 
@@ -852,7 +852,7 @@ fi
 
 Expected: no matches. Do not broaden the pattern to the design history under `docs/`.
 
-- [ ] **Step 5: 提交核心职责删除**
+- [x] **Step 5: 提交核心职责删除**
 
 ```bash
 git add -A plugins/draft/skills/draft/scripts/runtime/src \
@@ -881,7 +881,7 @@ git commit -m "refactor(draft): remove plugin behavior from core"
 
 **Behavior contract:** The only core invocation prefix is `uvx --isolated --from "<skill_root>/scripts/runtime" draft`; uv owns environment selection and cache reuse, while uv startup failures retain uv stderr and exit status.
 
-- [ ] **Step 1: 重写 bootstrap/distribution 测试并先得到红灯**
+- [x] **Step 1: 重写 bootstrap/distribution 测试并先得到红灯**
 
 Replace fake-launcher tests with subprocess tests that copy only `skills/draft` beneath unrelated parent directories, then compute the runtime path from that copy. Assert:
 
@@ -899,7 +899,7 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
          plugins/draft/skills/draft/scripts/runtime/tests/test_distribution.py -q
 ```
 
-- [ ] **Step 2: 写最低边界和最高可用组合测试**
+- [x] **Step 2: 写最低边界和最高可用组合测试**
 
 Create exact constraint files:
 
@@ -940,7 +940,7 @@ uvx --isolated --cache-dir "$HIGH_CACHE" --refresh --resolution highest \
 
 Precede that command with the same `python -c` metadata probe in the same cache and assert the reported `(major, minor)` pairs are `(4, 2)` and `(2, 1)`. Do not pin or assert patch or transitive dependency versions.
 
-- [ ] **Step 3: 写缓存复用与同名工具隔离测试**
+- [x] **Step 3: 写缓存复用与同名工具隔离测试**
 
 With an initially empty cache, run version/init/check once without `--offline`; snapshot the relative paths and nanosecond mtimes beneath that cache's `environments-v2/`, then repeat the same commands against the same copied runtime and cache with `--offline`. The second run must pass and leave the environment snapshot identical, proving `--isolated` reused the uv tool environment rather than rebuilding it. No Draft-managed environment may appear anywhere in the copied skill, business root or host data.
 
@@ -954,7 +954,7 @@ uvx --isolated --from "<copied-skill>/scripts/runtime" draft --version
 
 Assert output is `0.3.0` and never contains `wrong global draft`. This proves `--isolated` ignores installed tools while the online/offline pair proves it still reuses the uv tool environment and dependency cache.
 
-- [ ] **Step 4: 更新核心包元数据与上级 Ruff 配置**
+- [x] **Step 4: 更新核心包元数据与上级 Ruff 配置**
 
 Set these exact declarations:
 
@@ -983,7 +983,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 The executor must preserve the user's pre-existing worktree edits to these two Ruff files and incorporate them as this target state, not overwrite unrelated changes.
 
-- [ ] **Step 5: 删除 launcher 并更新开发锁**
+- [x] **Step 5: 删除 launcher 并更新开发锁**
 
 Delete `plugins/draft/skills/draft/scripts/draft.py` and `runtime/tests/test_launcher.py`. Remove launcher/platform-parent assumptions from `test_distribution.py`; retain assertions that runtime belongs to the copied skill, provides `draft.cli:main`, and contains no plugin-only modules.
 
@@ -997,7 +997,7 @@ uv lock --check
 
 Expected: lock resolves within every declared direct/build range. Do not add a runtime wrapper, managed cache directory, `--locked`, `--no-env-file`, or fallback command.
 
-- [ ] **Step 6: 运行 uvx 启动、边界与缓存门禁**
+- [x] **Step 6: 运行 uvx 启动、边界与缓存门禁**
 
 Run:
 
@@ -1009,7 +1009,7 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
 
 Then run the lowest-bound and highest-available commands implemented in Step 2. Expected: copied-skill, offline reuse, conflicting-tool, lowest and highest suites all pass.
 
-- [ ] **Step 7: 提交 uvx 核心入口迁移**
+- [x] **Step 7: 提交 uvx 核心入口迁移**
 
 ```bash
 git add -A plugins/draft/skills/draft/scripts/draft.py \
@@ -1034,7 +1034,7 @@ git commit -m "refactor(draft): run core through path-based uvx"
 - Modify: `docs/design.md`
 - Create: `plugins/draft/scripts/tests/test_distribution.py`
 
-- [ ] **Step 1: 写 manifest、物理边界和版本关系失败测试**
+- [x] **Step 1: 写 manifest、物理边界和版本关系失败测试**
 
 In plugin-level `test_distribution.py`, assert:
 
@@ -1053,7 +1053,7 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
   pytest plugins/draft/scripts/tests/test_distribution.py -q
 ```
 
-- [ ] **Step 2: 写无仓库父目录的完整插件分发 smoke test**
+- [x] **Step 2: 写无仓库父目录的完整插件分发 smoke test**
 
 For each host, create an independent copy of `plugins/draft/`, host `data_dir` and safe runtime directory beneath a temporary parent that has no `.git` and no repository parent. This isolation avoids correctly triggering a bridge conflict by publishing two hosts' different data directories under one installation key. In each parameterized case:
 
@@ -1066,7 +1066,7 @@ For each host, create an independent copy of `plugins/draft/`, host `data_dir` a
 
 Run once with an empty cache and network permitted, then repeat core smoke with the same cache plus `--offline`. Assert no path in output or state resolves back to the repository checkout.
 
-- [ ] **Step 3: 分离核心和插件文档**
+- [x] **Step 3: 分离核心和插件文档**
 
 Update `SKILL.md` so setup and every domain example derive `<skill_root>` from the loaded skill and use exactly:
 
@@ -1078,13 +1078,13 @@ It must explain that uv startup failures keep uv diagnostics, `setup` means runn
 
 Remove plugin material from `references/draft-format.md`. Move and rewrite `references/platform-setup.md` at plugin root to document host variables, bridge states, three-field binding, plugin CLI command forms, reset scope, Hook diagnostics/return behavior, and recovery. The core skill must not link to this plugin-only reference.
 
-- [ ] **Step 4: 更新主设计和独立版本说明**
+- [x] **Step 4: 更新主设计和独立版本说明**
 
 Update the affected architecture, command-flow, state, setup, failure, testing and release sections in `docs/design.md` to match the approved specification. Explicitly state that plugin and runtime both happen to become `0.3.0` in this release but have independent version semantics thereafter. Remove all claims that core owns plugin bridge/binding/SessionStart or that final-user uvx consumes `uv.lock`.
 
 Set both plugin manifests to `0.3.0`; retain their existing names, skill paths and Hook file declarations.
 
-- [ ] **Step 5: 运行分发和文档边界测试**
+- [x] **Step 5: 运行分发和文档边界测试**
 
 Run:
 
@@ -1108,7 +1108,7 @@ fi
 
 Expected: tests pass and audit has no matches.
 
-- [ ] **Step 6: 运行最终质量门禁**
+- [x] **Step 6: 运行最终质量门禁**
 
 Run from the repository root:
 
@@ -1135,7 +1135,7 @@ git diff --check
 
 Also rerun Task 6's minimum-bound, fresh-highest, copied-skill online/offline and conflicting-global-tool suites. Review every Global Constraint against the final tree; green tests alone do not waive that semantic audit.
 
-- [ ] **Step 7: 提交文档、版本和分发门禁**
+- [x] **Step 7: 提交文档、版本和分发门禁**
 
 ```bash
 git add plugins/draft/.codex-plugin/plugin.json \
