@@ -21,6 +21,7 @@ from adapter.session_hook import (
     render_diagnostic,
     render_rebind,
     render_session_fact,
+    resolve_host_context,
     run_session_start,
 )
 
@@ -223,6 +224,28 @@ def test_relative_data_dir_renders_environment_missing(
     assert code == 0
     assert "hook.environment_missing" in output
     assert load_context(setup.entry, setup.runtime_dir) is None
+
+
+def test_non_canonical_absolute_data_dir_is_canonicalized(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 绝对但含 .. 的 data_dir 被词法规范化，不视为 environment_missing；
+    # 中间段 <base>/a 无需存在，resolve(strict=False) 仅做词法规范化。
+    raw_data = setup.base / "a" / ".." / "host-data"
+    assert raw_data != setup.data_dir  # 原始形式确实非规范
+    env = {**default_env(setup, "codex"), "PLUGIN_DATA": str(raw_data)}
+
+    ctx = resolve_host_context("codex", setup.entry, env)
+    assert ctx.data_dir == setup.data_dir
+    assert ctx.data_dir == setup.data_dir.resolve()
+
+    code, output = run_hook(
+        setup, capsys, host="codex", env=env, stdin=session_stdin("x", "startup")
+    )
+    assert code == 0
+    assert "Draft 会话未绑定" in output
+    # bridge 发布到规范路径，而非原始 .. 形式
+    assert load_context(setup.entry, setup.runtime_dir) == PluginContext(setup.data_dir)
 
 
 @pytest.mark.parametrize("host", HOSTS)
@@ -904,6 +927,31 @@ def test_log_degradation_preserves_rebind_branch(
     assert f"- 草稿根：{bound.root}" in output
     assert "hook.log_unavailable" in output
     assert output.count("Draft 插件诊断") == 1
+
+
+def test_log_degradation_preserves_diagnostic_primary(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import shutil
+
+    bound = bind_session(setup)
+    shutil.rmtree(bound.root)  # 主分支为 binding.root_missing 诊断
+    real_mkdir = Path.mkdir
+
+    def failing_mkdir(
+        self: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False
+    ) -> None:
+        if self.name == "logs":
+            raise OSError("mkdir failed")
+        real_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", failing_mkdir)
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "compact"))
+    assert code == 0
+    # 主诊断与日志诊断同时保留
+    assert "binding.root_missing" in output
+    assert "hook.log_unavailable" in output
+    assert output.count("Draft 插件诊断") == 2
 
 
 def test_log_is_recorded_on_success(setup: Setup, capsys: pytest.CaptureFixture[str]) -> None:

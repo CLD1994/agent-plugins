@@ -94,6 +94,10 @@ def resolve_host_context(host: str, entry_path: Path, environ: Mapping[str, str]
     data_dir = Path(raw_data)
     if not plugin_root_raw.is_absolute() or not data_dir.is_absolute():
         raise _environment_missing(plugin_root_raw, data_dir)
+    # data_dir 词法规范化（消除 . / ..，解析已存在的符号链接组件），不要求存在：
+    # 相对路径已在上方拒绝；不存在的绝对 data_dir 仍由 publish_context 的
+    # _canonical_data_dir(resolve(strict=True)) 归一为 plugin.context_invalid。
+    data_dir = data_dir.resolve(strict=False)
 
     # lstat 入口：不跟随符号链接，必须为普通文件
     try:
