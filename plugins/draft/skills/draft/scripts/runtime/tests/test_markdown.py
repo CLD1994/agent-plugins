@@ -282,3 +282,65 @@ def test_remove_link_markup_replaces_whole_link_with_visible_label() -> None:
     stripped = remove_link_markup(text, [navigation])
 
     assert "见 导航页 与 [第二页](pages/b.md)。" in stripped
+
+
+def test_unknown_label_preserves_only_the_label_operand() -> None:
+    text = VALID_PAGE.replace("> 依赖：", "> 状态依据：")
+    with pytest.raises(DraftError) as caught:
+        parse_page(Path("pages/request.md"), text)
+    assert caught.value.code == "page.unknown_label"
+    assert caught.value.line == 7
+    assert caught.value.details == ("状态依据",)
+
+
+@pytest.mark.parametrize(
+    ("value", "details"),
+    [
+        ("已关闭", ("not_single_code_span",)),
+        ("`已关闭：`", ("empty_explanation",)),
+        ("`进行中`", ("unknown_prefix", "进行中")),
+    ],
+)
+def test_invalid_status_uses_stable_reason(value: str, details: tuple[str, ...]) -> None:
+    with pytest.raises(DraftError) as caught:
+        parse_page(Path("pages/x.md"), make_page(value))
+    assert caught.value.code == "page.invalid_status"
+    assert caught.value.details == details
+
+
+def test_invalid_relation_cardinality_branch_keeps_label() -> None:
+    text = make_page("`待讨论`").replace(
+        "> 父主题：[根](../index.md)", "> 依赖：[甲](a.md) 与 [乙](b.md)"
+    )
+    with pytest.raises(DraftError) as caught:
+        parse_page(Path("pages/x.md"), text)
+    assert caught.value.code == "page.invalid_relation"
+    assert caught.value.details == ("link_cardinality_or_image", "依赖")
+
+
+def test_invalid_relation_extra_content_branch_keeps_label() -> None:
+    text = make_page("`待讨论`").replace(
+        "> 父主题：[根](../index.md)", "> 父主题：[根](../index.md) 额外"
+    )
+    with pytest.raises(DraftError) as caught:
+        parse_page(Path("pages/x.md"), text)
+    assert caught.value.code == "page.invalid_relation"
+    assert caught.value.details == ("extra_content", "父主题")
+
+
+def test_duplicate_status_uses_empty_details_with_line() -> None:
+    text = "# 标题\n\n> 状态：`待讨论`\n>\n> 状态：`已确认`\n>\n> 父主题：[根](../index.md)\n\nx\n"
+    with pytest.raises(DraftError) as caught:
+        parse_page(Path("pages/x.md"), text)
+    assert caught.value.code == "page.duplicate_status"
+    assert caught.value.details == ()
+    assert caught.value.line == 5
+
+
+def test_machine_block_lazy_continuation_is_a_parse_error() -> None:
+    text = "# 标题\n\n> 状态：`待讨论`\n普通文本\n>\n> 父主题：[根](../index.md)\n"
+    with pytest.raises(DraftError) as caught:
+        parse_page(Path("pages/x.md"), text)
+    assert caught.value.code == "page.parse_error"
+    assert caught.value.details == ("lazy_continuation",)
+    assert caught.value.line == 4

@@ -16,6 +16,7 @@ from draft.models import (
     MarkdownLink,
     PageDocument,
     RelationLabel,
+    SourceSpan,
     ValidationMode,
 )
 from draft.paths import resolve_draft_root
@@ -49,8 +50,15 @@ class LoadResult:
     issues: list[CheckIssue]
 
 
-def error_issue(code: str, path: Path | None, line: int | None = None) -> CheckIssue:
-    return CheckIssue(code=code, severity=IssueSeverity.ERROR, path=path, line=line)
+def error_issue(
+    code: str,
+    path: Path | None,
+    line: int | None = None,
+    *details: str,
+) -> CheckIssue:
+    return CheckIssue(
+        code=code, severity=IssueSeverity.ERROR, path=path, line=line, details=details
+    )
 
 
 @dataclass(frozen=True)
@@ -205,13 +213,19 @@ def _discover(root: Path) -> tuple[list[Path], list[CheckIssue]]:
         if entry.name == INTERNAL_DIR:
             continue
         if entry.is_symlink():
-            issues.append(error_issue("link.escape", Path(entry.name)))
+            issues.append(
+                error_issue("link.escape", Path(entry.name), None, "managed_path", entry.name)
+            )
             continue
         if entry.is_dir():
             for descendant in sorted(entry.rglob("*")):
                 relative = descendant.relative_to(root)
                 if descendant.is_symlink():
-                    issues.append(error_issue("link.escape", relative))
+                    issues.append(
+                        error_issue(
+                            "link.escape", relative, None, "managed_path", relative.as_posix()
+                        )
+                    )
                     continue
                 if not descendant.is_file() or descendant.suffix != ".md":
                     continue
@@ -263,30 +277,48 @@ def _load(root: Path) -> LoadResult:
         except DraftError as error:
             if error.code == "link.external":
                 return None
-            link_issues.append(error_issue("link.escape", source, link.line))
+            link_issues.append(
+                error_issue("link.escape", source, link.line, "destination", link.destination)
+            )
             return None
         return target
 
     for source in sorted(pages):
         page = pages[source]
+        # 同一链接既属于正文链接又属于关系链接；首次解析后缓存结果，关系遍历不再重复解析或重复报错。
+        resolved_links: dict[SourceSpan, Path | None] = {}
         for link in page.links:
             target = resolve_link(source, link)
+            resolved_links[link.whole_span] = target
             if target is None:
                 continue
             if target.suffix == ".md":
                 if target not in managed_set:
-                    link_issues.append(error_issue("link.missing", source, link.line))
+                    link_issues.append(
+                        error_issue(
+                            "link.missing",
+                            source,
+                            link.line,
+                            link.destination,
+                            target.as_posix(),
+                        )
+                    )
                     continue
             elif not (root / target).exists():
-                link_issues.append(error_issue("link.missing", source, link.line))
+                link_issues.append(
+                    error_issue(
+                        "link.missing",
+                        source,
+                        link.line,
+                        link.destination,
+                        target.as_posix(),
+                    )
+                )
                 continue
             inbound.setdefault(target, []).append((source, link))
         for relation in page.relations:
-            target = resolve_link(source, relation.link)
-            if target is None:
-                continue
-            if target not in managed_set:
-                link_issues.append(error_issue("link.missing", source, relation.link.line))
+            target = resolved_links.get(relation.link.whole_span)
+            if target is None or target not in managed_set:
                 continue
             relation_edges[relation.label].append((source, target, relation.link.line))
     issues.extend(link_issues)

@@ -396,7 +396,7 @@ def _token_links(tokens: Sequence[Token]) -> list[_TokenLink]:
             if child.type == "link_open":
                 href = child.attrGet("href")
                 if not isinstance(href, str):
-                    raise DraftError("page.parse_error", details=("链接缺少字符串目标",))
+                    raise DraftError("page.parse_error", details=("link_destination_missing",))
                 depth = 1
                 label_parts: list[str] = []
                 index += 1
@@ -413,7 +413,7 @@ def _token_links(tokens: Sequence[Token]) -> list[_TokenLink]:
             elif child.type == "image":
                 source = child.attrGet("src")
                 if not isinstance(source, str):
-                    raise DraftError("page.parse_error", details=("图片缺少字符串目标",))
+                    raise DraftError("page.parse_error", details=("image_destination_missing",))
                 label = "".join(
                     part.content
                     for part in (child.children or [])
@@ -457,7 +457,7 @@ def _align_candidates(
         if found == -1:
             raise DraftError(
                 "page.parse_error",
-                details=(f"无法在源码中定位链接 {token_link.destination!r}",),
+                details=("source_alignment_failed", token_link.destination),
             )
         aligned.append((candidates[found], token_link))
         cursor = found + 1
@@ -476,7 +476,7 @@ def _machine_lines(
             if raw.strip():
                 raise DraftError(
                     "page.parse_error",
-                    details=(f"第 {line_index + 1} 行是机器区域的懒惰延续行",),
+                    details=("lazy_continuation",),
                     line=line_index + 1,
                 )
             continue
@@ -494,7 +494,7 @@ def _machine_lines(
             else:
                 raise DraftError(
                     "page.unknown_label",
-                    details=(f"第 {line_index + 1} 行存在未知标签 {candidate_label!r}",),
+                    details=(candidate_label,),
                     line=line_index + 1,
                 )
         result.append(
@@ -520,7 +520,7 @@ def _parse_status_value(value: str, path: Path, line: int) -> StatusValue:
         raise DraftError(
             "page.invalid_status",
             path,
-            details=(f"第 {line} 行状态值必须是单个反引号值",),
+            details=("not_single_code_span",),
             line=line,
         )
     inner = stripped[1:-1]
@@ -530,7 +530,7 @@ def _parse_status_value(value: str, path: Path, line: int) -> StatusValue:
             raise DraftError(
                 "page.invalid_status",
                 path,
-                details=(f"第 {line} 行状态说明不能为空",),
+                details=("empty_explanation",),
                 line=line,
             )
     else:
@@ -541,7 +541,7 @@ def _parse_status_value(value: str, path: Path, line: int) -> StatusValue:
         raise DraftError(
             "page.invalid_status",
             path,
-            details=(f"第 {line} 行状态前缀 {prefix_text!r} 无效",),
+            details=("unknown_prefix", prefix_text),
             line=line,
         ) from exc
     return StatusValue(prefix=prefix, explanation=explanation)
@@ -560,7 +560,7 @@ def parse_page(path: Path, text: str) -> PageDocument:
         raise DraftError("page.missing_machine_block", path)
     blockquote_map = tokens[machine_open_index].map
     if blockquote_map is None:
-        raise DraftError("page.parse_error", path, details=("机器区域缺少行映射",))
+        raise DraftError("page.parse_error", path, details=("machine_block_map_missing",))
 
     lines = text.split("\n")
     definitions = _scan_definitions(lines, starts, _fenced_line_ranges(lines))
@@ -598,7 +598,7 @@ def parse_page(path: Path, text: str) -> PageDocument:
                 raise DraftError(
                     "page.duplicate_status",
                     path,
-                    details=(f"第 {machine_line.line} 行",),
+                    details=(),
                     line=machine_line.line,
                 )
             status = _parse_status_value(machine_line.value, path, machine_line.line)
@@ -615,7 +615,7 @@ def parse_page(path: Path, text: str) -> PageDocument:
             raise DraftError(
                 "page.invalid_relation",
                 path,
-                details=(f"第 {machine_line.line} 行关系必须恰好包含一个非图片链接",),
+                details=("link_cardinality_or_image", machine_line.label),
                 line=machine_line.line,
             )
         link = contained[0]
@@ -625,7 +625,7 @@ def parse_page(path: Path, text: str) -> PageDocument:
             raise DraftError(
                 "page.invalid_relation",
                 path,
-                details=(f"第 {machine_line.line} 行关系链接之外存在额外内容",),
+                details=("extra_content", machine_line.label),
                 line=machine_line.line,
             )
         relations.append(Relation(label=relation_label, link=link))

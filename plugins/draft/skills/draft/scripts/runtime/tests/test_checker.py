@@ -241,6 +241,57 @@ def test_missing_link_target(draft_factory: DraftFactory) -> None:
     assert codes(report) == ["link.missing"]
 
 
+def test_missing_link_reports_source_line_literal_and_normalized_target(
+    draft_factory: DraftFactory,
+) -> None:
+    files = healthy()
+    files["pages/question.md"] = QUESTION.replace("使用显式状态前缀。", "见 [不存在](missing.md)。")
+    report = check_draft(draft_factory(files))
+    issue = next(issue for issue in report.errors if issue.code == "link.missing")
+    assert issue.path == Path("pages/question.md")
+    assert issue.line == 9
+    assert issue.details == ("missing.md", "pages/missing.md")
+
+
+def test_missing_link_with_distinct_literal_and_normalized_target(
+    draft_factory: DraftFactory,
+) -> None:
+    files = healthy()
+    files["pages/question.md"] = QUESTION.replace(
+        "使用显式状态前缀。", "见 [不存在](./missing.md)。"
+    )
+    report = check_draft(draft_factory(files))
+    issue = next(issue for issue in report.errors if issue.code == "link.missing")
+    assert issue.details == ("./missing.md", "pages/missing.md")
+
+
+def test_two_missing_links_on_one_line_remain_distinguishable(
+    draft_factory: DraftFactory,
+) -> None:
+    files = healthy()
+    files["conclusions.md"] = CONCLUSIONS + "[甲](pages/a.md) [乙](pages/b.md)\n"
+    report = check_draft(draft_factory(files))
+    issues = [i for i in report.errors if i.code == "link.missing"]
+    assert [(i.line, i.details) for i in issues] == [
+        (8, ("pages/a.md", "pages/a.md")),
+        (8, ("pages/b.md", "pages/b.md")),
+    ]
+
+
+def test_missing_relation_target_reports_link_missing_once(
+    draft_factory: DraftFactory,
+) -> None:
+    files = healthy()
+    files["pages/question.md"] = QUESTION.replace(
+        "> 产出：", "> 依赖：[缺失](missing.md)\n>\n> 产出："
+    )
+    report = check_draft(draft_factory(files))
+    missing = [i for i in report.errors if i.code == "link.missing"]
+    assert len(missing) == 1
+    assert missing[0].path == Path("pages/question.md")
+    assert missing[0].details == ("missing.md", "pages/missing.md")
+
+
 def test_link_escaping_root(draft_factory: DraftFactory) -> None:
     files = healthy()
     files["pages/question.md"] = QUESTION.replace(
@@ -253,6 +304,18 @@ def test_link_escaping_root(draft_factory: DraftFactory) -> None:
     assert codes(report) == ["link.escape"]
 
 
+def test_link_escape_preserves_literal_destination(draft_factory: DraftFactory) -> None:
+    files = healthy()
+    files["pages/question.md"] = QUESTION.replace(
+        "使用显式状态前缀。", "见 [外部](../../outside.md)。"
+    )
+    report = check_draft(draft_factory(files))
+    issue = next(issue for issue in report.errors if issue.code == "link.escape")
+    assert issue.path == Path("pages/question.md")
+    assert issue.line == 9
+    assert issue.details == ("destination", "../../outside.md")
+
+
 def test_page_file_through_symlink(draft_factory: DraftFactory) -> None:
     files = healthy()
     root = draft_factory(files)
@@ -263,6 +326,20 @@ def test_page_file_through_symlink(draft_factory: DraftFactory) -> None:
     report = check_draft(root)
 
     assert "link.escape" in codes(report)
+
+
+def test_managed_path_symlink_escape_preserves_relative_path(
+    draft_factory: DraftFactory,
+) -> None:
+    files = healthy()
+    root = draft_factory(files)
+    outside = root.parent / "outside.md"
+    outside.write_text("# 外部\n", encoding="utf-8")
+    (root / "pages/linked.md").symlink_to(outside)
+
+    report = check_draft(root)
+    issue = next(issue for issue in report.errors if issue.code == "link.escape")
+    assert issue.details == ("managed_path", "pages/linked.md")
 
 
 def test_non_root_page_without_parent(draft_factory: DraftFactory) -> None:
