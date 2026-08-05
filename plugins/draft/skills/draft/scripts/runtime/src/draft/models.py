@@ -166,12 +166,3 @@ class TrashResult:
     restore_expires_at: datetime | None = None
     purge_eligible_at: datetime | None = None
     warnings: tuple[LifecycleWarning, ...] = ()
-
-
-@dataclass(frozen=True)
-class Binding:
-    session_id: str
-    root: Path
-    last_page_hint: Path | None
-    skill_name: str
-    skill_digest: str

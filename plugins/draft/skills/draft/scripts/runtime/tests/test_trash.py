@@ -3,7 +3,6 @@ from pathlib import Path
 
 import pytest
 from conftest import DraftFactory
-
 from draft.checker import check_draft
 from draft.errors import DraftError
 from draft.models import OperationPhase

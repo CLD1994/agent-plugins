@@ -81,11 +81,9 @@ def hook_commands() -> tuple[str, str]:
 
 def test_hook_commands_run_the_same_python_launcher() -> None:
     codex_command, claude_command = hook_commands()
-    assert codex_command == (
-        'uv run "${PLUGIN_ROOT}/skills/draft/scripts/draft.py" _session-start codex'
-    )
+    assert codex_command == ('uv run "${PLUGIN_ROOT}/scripts/draft.py" hook session-start codex')
     assert claude_command == (
-        'uv run "${CLAUDE_PLUGIN_ROOT}/skills/draft/scripts/draft.py" _session-start claude'
+        'uv run "${CLAUDE_PLUGIN_ROOT}/scripts/draft.py" hook session-start claude'
     )
     for command in (codex_command, claude_command):
         assert "--python" not in command

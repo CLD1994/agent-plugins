@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import pytest
-
 from draft.diagnostics import KNOWN_CHECK_CODES, issue_payload, render_issue
 from draft.models import CheckIssue, IssueSeverity
 

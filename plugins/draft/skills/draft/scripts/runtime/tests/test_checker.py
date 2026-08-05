@@ -3,7 +3,6 @@ from pathlib import Path
 
 import pytest
 from conftest import DraftFactory, snapshot_tree, write_raw_journal
-
 from draft.checker import check_draft
 from draft.errors import DraftError
 from draft.models import CheckReport, IssueSeverity

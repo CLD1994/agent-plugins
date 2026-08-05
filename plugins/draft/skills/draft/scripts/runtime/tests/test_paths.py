@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import pytest
-
 from draft.errors import DraftError
 from draft.paths import resolve_draft_root, resolve_page_operand
 

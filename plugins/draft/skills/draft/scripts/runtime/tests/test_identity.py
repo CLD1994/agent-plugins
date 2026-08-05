@@ -33,6 +33,30 @@ def test_root_domain_exports_use_draft() -> None:
     assert hasattr(lifecycle, "draft_manifest")
 
 
+def test_core_runtime_owns_no_plugin_responsibilities() -> None:
+    import draft.models
+
+    assert not hasattr(draft.models, "Binding")
+
+    forbidden = (
+        "PLUGIN_ROOT",
+        "PLUGIN_DATA",
+        "CLAUDE_PLUGIN_ROOT",
+        "CLAUDE_PLUGIN_DATA",
+        "DRAFT_DATA",
+        "DRAFT_SKILL_PATH",
+        "SessionStart",
+        "session-start",
+        "plugin.context",
+        "binding.",
+    )
+    src_root = RUNTIME_ROOT / "src" / "draft"
+    for path in sorted(src_root.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for term in forbidden:
+            assert term not in text, f"{term} in {path}"
+
+
 def test_initialize_writes_only_draft_markers(tmp_path: Path) -> None:
     from draft.lifecycle import initialize
 

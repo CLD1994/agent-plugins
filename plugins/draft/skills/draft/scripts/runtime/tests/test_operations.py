@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 from conftest import write_raw_journal
-
 from draft.errors import DraftError
 from draft.models import FileMutation, MutationKind, OperationPlan
 from draft.operations import (

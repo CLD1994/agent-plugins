@@ -75,14 +75,6 @@ def build_parser() -> argparse.ArgumentParser:
     recover = subparsers.add_parser("recover", parents=[shared])
     recover.add_argument("root", metavar="ROOT")
 
-    bind_cmd = subparsers.add_parser("bind", parents=[shared])
-    bind_cmd.add_argument("root", metavar="ROOT")
-    bind_cmd.add_argument("--session", required=True, metavar="SESSION_ID")
-    bind_cmd.add_argument("--last-page-hint", metavar="PAGE")
-
-    unbind_cmd = subparsers.add_parser("unbind", parents=[shared])
-    unbind_cmd.add_argument("--session", required=True, metavar="SESSION_ID")
-
     return parser
 
 
@@ -277,57 +269,6 @@ def _dispatch(args: argparse.Namespace) -> tuple[dict[str, object], str, int]:
             "results": results_payload,
         }
         return payload, f"恢复完成：{len(report.results)} 项结果", 0
-    if command == "bind":
-        import os
-
-        from draft import bindings
-        from draft.models import Binding
-
-        data_value = os.environ.get("DRAFT_DATA")
-        if data_value is None:
-            raise DraftError("binding.plugin_context_unavailable")
-        session = cast(str, args.session)
-        root = Path(cast(str, args.root))
-        hint_value = cast("str | None", args.last_page_hint)
-        hint = _page_operand(root, hint_value) if hint_value else None
-        skill_path = bindings.required_skill_path(os.environ.get("DRAFT_SKILL_PATH"))
-        digest = bindings.skill_digest(skill_path)
-        binding = bindings.bind(
-            Path(data_value),
-            Binding(
-                session_id=session,
-                root=root,
-                last_page_hint=hint,
-                skill_name=bindings.SKILL_NAME,
-                skill_digest=digest,
-            ),
-        )
-        return (
-            {
-                "result_type": "bind",
-                "root": str(binding.root),
-            },
-            f"已绑定会话到 {binding.root}",
-            0,
-        )
-    if command == "unbind":
-        import os
-
-        from draft import bindings
-
-        data_value = os.environ.get("DRAFT_DATA")
-        if data_value is None:
-            raise DraftError("binding.plugin_context_unavailable")
-        session = cast(str, args.session)
-        removed = bindings.unbind(Path(data_value), session)
-        return (
-            {
-                "result_type": "unbind",
-                "removed": removed,
-            },
-            ("已解除绑定" if removed else "绑定不存在"),
-            0,
-        )
     raise DraftError("cli.unknown_command")
 
 
@@ -368,21 +309,11 @@ def _structure_preflight_human(report: LifecycleAdvanceReport) -> str:
 def _exit_for_error(error: DraftError) -> int:
     if error.code.startswith("operation.") or error.code == "adopt.recovery_required":
         return _EXIT_OPERATION
-    if error.code in (
-        "binding.plugin_context_unavailable",
-        "binding.data_dir_unavailable",
-        "binding.skill_unavailable",
-    ):
-        return _EXIT_RUNTIME
     return _EXIT_DOMAIN
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments[:1] == ["_session-start"]:
-        from draft import session_hook
-
-        return session_hook.main(arguments[1:])
     parser = build_parser()
     args = parser.parse_args(arguments)
     if getattr(args, "version", False):
