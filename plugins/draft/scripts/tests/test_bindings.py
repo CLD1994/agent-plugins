@@ -18,9 +18,10 @@ from adapter.bindings import (
     binding_path,
     binding_root_is_current,
     load_binding,
+    session_id_is_valid,
     unbind,
 )
-from adapter.errors import EXIT_RUNTIME, EXIT_USAGE, AdapterError
+from adapter.errors import EXIT_RUNTIME, EXIT_USAGE, AdapterError, error_payload, render_error
 
 _PAYLOAD_KEYS = {"session_id", "root", "last_page_hint"}
 
@@ -854,3 +855,233 @@ def test_invalid_uses_exit_four(workspace: tuple[Path, Path]) -> None:
     with pytest.raises(AdapterError, match="binding.invalid") as caught:
         load_binding(data_dir, "s")
     assert caught.value.exit_code == EXIT_RUNTIME
+
+
+# ---------------------------------------------------------------------------
+# session_id 编码边界（Task 8 契约 B）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("session_id", "expected"),
+    [
+        ("", True),
+        ("ordinary", True),
+        ("会话-１２３", True),
+        ("😀🚀", True),
+        ("é", True),
+        ("é", True),
+        ("\ud800", False),
+        ("abc\udc00", False),
+        ("\ud800\udc00", False),
+    ],
+)
+def test_session_id_is_valid_matrix(session_id: str, expected: bool) -> None:
+    assert session_id_is_valid(session_id) is expected
+
+
+@pytest.mark.parametrize("session", ["", "会话", "😀", "é"])
+def test_bind_load_round_trip_unicode_sessions(workspace: tuple[Path, Path], session: str) -> None:
+    data_dir, root = workspace
+    bind(data_dir, Binding(session, root, None))
+    assert load_binding(data_dir, session) == Binding(session, root.resolve(), None)
+
+
+def test_visually_identical_sessions_map_to_different_files(
+    workspace: tuple[Path, Path],
+) -> None:
+    """预组合 é 与 e+组合重音符是不同码点序列：不得规范化，必须映射为不同会话文件。"""
+    data_dir, root = workspace
+    precomposed, decomposed = "é", "é"
+    assert binding_key(precomposed) != binding_key(decomposed)
+    assert binding_path(data_dir, precomposed) != binding_path(data_dir, decomposed)
+    bind(data_dir, Binding(precomposed, root, None))
+    bind(data_dir, Binding(decomposed, root, None))
+    assert binding_path(data_dir, precomposed).exists()
+    assert binding_path(data_dir, decomposed).exists()
+    assert load_binding(data_dir, precomposed) == Binding(precomposed, root.resolve(), None)
+    assert load_binding(data_dir, decomposed) == Binding(decomposed, root.resolve(), None)
+
+
+@pytest.mark.parametrize("entrypoint", ["bind", "unbind", "load_binding"])
+def test_lone_surrogate_session_rejected_before_any_side_effect(
+    workspace: tuple[Path, Path], entrypoint: str
+) -> None:
+    """孤立代理 session_id 在三个入口都报 binding.invalid_session（退出 2），
+    且早于 binding_key/binding_path 计算与 bindings/ 目录创建。"""
+    data_dir, root = workspace
+    with pytest.raises(AdapterError, match="binding.invalid_session") as caught:
+        if entrypoint == "bind":
+            bind(data_dir, Binding("\ud800", root, None))
+        elif entrypoint == "unbind":
+            unbind(data_dir, "\ud800")
+        else:
+            load_binding(data_dir, "\ud800")
+    assert caught.value.exit_code == EXIT_USAGE
+    assert not (data_dir / "bindings").exists()
+
+
+# ---------------------------------------------------------------------------
+# 持久载荷解码与孤立代理字段（Task 8 契约 A）
+# ---------------------------------------------------------------------------
+
+
+def test_load_invalid_utf8_record_is_binding_invalid(
+    workspace: tuple[Path, Path],
+) -> None:
+    """损坏 binding 文件（无效 UTF-8 字节）：解码边界先于字段处理，归一为 binding.invalid。"""
+    data_dir, _ = workspace
+    target = binding_path(data_dir, "s")
+    target.parent.mkdir()
+    target.write_bytes(b"\xff\xfe{ invalid utf-8")
+    with pytest.raises(AdapterError, match="binding.invalid") as caught:
+        load_binding(data_dir, "s")
+    assert caught.value.exit_code == EXIT_RUNTIME
+    assert isinstance(caught.value.__cause__, UnicodeDecodeError)
+
+
+@pytest.mark.parametrize("field", ["session_id", "root", "last_page_hint"])
+def test_load_rejects_lone_surrogate_fields(workspace: tuple[Path, Path], field: str) -> None:
+    """已存储 binding 的任一字符串字段含孤立代理码位 → binding.invalid（退出 4）。"""
+    data_dir, root = workspace
+    target = binding_path(data_dir, "s")
+    payload: dict[str, object] = {
+        "session_id": "s",
+        "root": str(root.resolve()),
+        "last_page_hint": None,
+    }
+    if field == "session_id":
+        payload[field] = "\ud800"
+    elif field == "root":
+        payload[field] = str(root.resolve()) + "/\ud800"
+    else:
+        payload[field] = "\ud800.md"
+    # ensure_ascii=True（默认）：孤立代理以 \\ud800 转义写入，文件本身是合法 UTF-8
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(AdapterError, match="binding.invalid") as caught:
+        load_binding(data_dir, "s")
+    assert caught.value.exit_code == EXIT_RUNTIME
+
+
+# ---------------------------------------------------------------------------
+# 根展开与 hint 遍历的编码边界（Task 8 契约 C）
+# ---------------------------------------------------------------------------
+
+
+def test_bind_expanduser_runtime_error_is_root_unavailable(
+    workspace: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir, root = workspace
+
+    def denied(self: Path) -> Path:
+        raise RuntimeError("could not determine home directory")
+
+    monkeypatch.setattr(Path, "expanduser", denied)
+    with pytest.raises(AdapterError, match="binding.root_unavailable") as caught:
+        bind(data_dir, Binding("s", root, None))
+    assert caught.value.exit_code == EXIT_USAGE
+
+
+def test_bind_lone_surrogate_root_is_root_unavailable(
+    workspace: tuple[Path, Path], tmp_path: Path
+) -> None:
+    data_dir, _ = workspace
+    with pytest.raises(AdapterError, match="binding.root_unavailable") as caught:
+        bind(data_dir, Binding("s", tmp_path / "root\ud800", None))
+    assert caught.value.exit_code == EXIT_USAGE
+
+
+def test_bind_lone_surrogate_hint_is_invalid_hint(workspace: tuple[Path, Path]) -> None:
+    data_dir, root = workspace
+    with pytest.raises(AdapterError, match="binding.invalid_hint") as caught:
+        bind(data_dir, Binding("s", root, Path("\ud800.md")))
+    assert caught.value.exit_code == EXIT_USAGE
+
+
+# ---------------------------------------------------------------------------
+# binding 原子写清理明细（Task 8 契约 D）
+# ---------------------------------------------------------------------------
+
+
+def test_atomic_write_unlink_cleanup_detail_appended_to_primary(
+    workspace: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir, root = workspace
+    real_unlink = os.unlink
+
+    def failing_unlink(path: Any) -> None:
+        if Path(str(path)).name.startswith("."):
+            raise OSError("cleanup unlink failed")
+        real_unlink(path)
+
+    def failing_fsync(descriptor: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(os, "fsync", failing_fsync)
+    monkeypatch.setattr(os, "unlink", failing_unlink)
+    with pytest.raises(AdapterError, match="binding.data_dir_unavailable") as caught:
+        bind(data_dir, Binding("s", root, None))
+    error = caught.value
+    assert error.details == ("cleanup.unlink_failed",)
+    assert error.exit_code == EXIT_RUNTIME
+    assert isinstance(error.__cause__, OSError)
+    assert any("cleanup" in note for note in error.__notes__)
+    assert "cleanup.unlink_failed" in render_error(error)
+    assert error_payload(error) == {
+        "ok": False,
+        "result_type": "error",
+        "error": {
+            "code": "binding.data_dir_unavailable",
+            "severity": "error",
+            "paths": [binding_path(data_dir, "s").as_posix()],
+            "details": ["cleanup.unlink_failed"],
+        },
+    }
+
+
+def test_atomic_write_close_and_unlink_cleanup_details_in_order(
+    workspace: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fdopen 失败（描述符未托管）后 close 与 unlink 均失败：明细按执行顺序保留。"""
+    data_dir, root = workspace
+
+    def denied_fdopen(descriptor: int, mode: str = "r") -> Any:
+        raise OSError("fdopen failed")
+
+    def denied_close(descriptor: int) -> None:
+        raise OSError("close failed")
+
+    def denied_unlink(path: Any) -> None:
+        raise OSError("unlink failed")
+
+    monkeypatch.setattr(os, "fdopen", denied_fdopen)
+    monkeypatch.setattr(os, "close", denied_close)
+    monkeypatch.setattr(os, "unlink", denied_unlink)
+    with pytest.raises(AdapterError, match="binding.data_dir_unavailable") as caught:
+        bind(data_dir, Binding("s", root, None))
+    assert caught.value.details == ("cleanup.close_failed", "cleanup.unlink_failed")
+    assert isinstance(caught.value.__cause__, OSError)
+
+
+def test_atomic_write_non_oserror_primary_keeps_cleanup_note(
+    workspace: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """非 OSError 主错误（无 AdapterError 渲染面）：清理失败保留 add_note。"""
+    data_dir, root = workspace
+    real_unlink = os.unlink
+
+    def failing_unlink(path: Any) -> None:
+        if Path(str(path)).name.startswith("."):
+            raise OSError("cleanup unlink failed")
+        real_unlink(path)
+
+    def denied_replace(source: object, target: object) -> None:
+        raise MemoryError("replace failed unexpectedly")
+
+    monkeypatch.setattr(os, "replace", denied_replace)
+    monkeypatch.setattr(os, "unlink", failing_unlink)
+    with pytest.raises(MemoryError) as caught:
+        bind(data_dir, Binding("s", root, None))
+    assert caught.value.__notes__ is not None
+    assert any("unlink" in note for note in caught.value.__notes__)

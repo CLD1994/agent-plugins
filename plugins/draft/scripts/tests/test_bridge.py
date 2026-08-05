@@ -748,3 +748,223 @@ def test_adapter_error_has_stable_text_and_json() -> None:
 
 def test_usage_error_keeps_exit_two() -> None:
     assert AdapterError("binding.root_unavailable", exit_code=EXIT_USAGE).exit_code == 2
+
+
+# 持久文件解码归一化（Task 8 契约 A）：无效 UTF-8 与 JSON 损坏同等归一，
+# 孤立代理码位字段按持久载荷无效处理；转换只发生在读取/字段验证边界。
+
+
+def test_load_invalid_utf8_bridge_is_context_invalid(tmp_path: Path) -> None:
+    entry, data_dir, runtime_dir = make_paths(tmp_path)
+    publish_context(entry, data_dir, runtime_dir)
+    path = bridge_paths(entry, runtime_dir).json
+    path.write_bytes(b"\xff\xfe{ invalid utf-8")
+    with pytest.raises(AdapterError, match="plugin.context_invalid") as caught:
+        load_context(entry, runtime_dir)
+    assert isinstance(caught.value.__cause__, UnicodeDecodeError)
+    assert caught.value.exit_code == 4
+
+
+def test_publish_rewrites_invalid_utf8_regular_file(tmp_path: Path) -> None:
+    """普通 bridge 文件含无效 UTF-8：与 JSON 损坏同等，允许原子重写、不报冲突。"""
+    entry, data_dir, runtime_dir = make_paths(tmp_path)
+    publish_context(entry, data_dir, runtime_dir)
+    paths = bridge_paths(entry, runtime_dir)
+    paths.json.write_bytes(b"\xff\xfe{ invalid utf-8")
+    context = publish_context(entry, data_dir, runtime_dir)
+    assert context == PluginContext(data_dir=data_dir.resolve())
+    payload = json.loads(paths.json.read_text(encoding="utf-8"))
+    assert payload == {"schema_version": 1, "data_dir": str(data_dir.resolve())}
+    assert not paths.conflict.exists()
+
+
+def test_load_data_dir_with_lone_surrogate_is_context_invalid(tmp_path: Path) -> None:
+    entry, data_dir, runtime_dir = make_paths(tmp_path)
+    publish_context(entry, data_dir, runtime_dir)
+    path = bridge_paths(entry, runtime_dir).json
+    write_bridge(path, {"schema_version": 1, "data_dir": str(data_dir) + "/\ud800"})
+    with pytest.raises(AdapterError, match="plugin.context_invalid"):
+        load_context(entry, runtime_dir)
+
+
+def test_publish_existing_bridge_with_surrogate_data_dir_is_invalid_not_conflict(
+    tmp_path: Path,
+) -> None:
+    entry, data_dir, runtime_dir = make_paths(tmp_path)
+    publish_context(entry, data_dir, runtime_dir)
+    path = bridge_paths(entry, runtime_dir).json
+    write_bridge(path, {"schema_version": 1, "data_dir": str(data_dir) + "/\ud800"})
+    with pytest.raises(AdapterError, match="plugin.context_invalid"):
+        publish_context(entry, data_dir, runtime_dir)
+    assert not bridge_paths(entry, runtime_dir).conflict.exists()
+
+
+def test_publish_data_dir_argument_with_lone_surrogate_is_context_invalid(
+    tmp_path: Path,
+) -> None:
+    entry, data_dir, runtime_dir = make_paths(tmp_path)
+    with pytest.raises(AdapterError, match="plugin.context_invalid"):
+        publish_context(entry, data_dir / "\ud800", runtime_dir)
+
+
+# 清理明细码（Task 8 契约 D）：主错误在途时清理失败追加稳定明细码，
+# 顺序与执行顺序一致；主错误码、路径、退出码、异常链不变。
+
+
+def patch_unlink_failure(monkeypatch: pytest.MonkeyPatch, marker: str) -> None:
+    """让 os.unlink 只对路径包含 marker 的目标失败，其余正常删除。"""
+    real_unlink = os.unlink
+
+    def selective_unlink(path: Any) -> None:
+        if marker in str(path):
+            raise OSError("unlink failed")
+        real_unlink(path)
+
+    monkeypatch.setattr(os, "unlink", selective_unlink)
+
+
+def test_lock_cleanup_failures_append_details_in_execution_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entry, data_dir, runtime_dir = make_paths(tmp_path)
+    publish_context(entry, data_dir, runtime_dir)
+    paths = bridge_paths(entry, runtime_dir)
+    paths.json.write_text("{ not json", encoding="utf-8")
+
+    def denied_unlock(descriptor: int) -> None:
+        raise OSError("unlock failed")
+
+    monkeypatch.setattr(bridge_mod, "_unlock_os", denied_unlock)
+    patch_close_failure(monkeypatch, ".lock")
+    with pytest.raises(AdapterError, match="plugin.context_invalid") as caught:
+        load_context(entry, runtime_dir)
+    error = caught.value
+    assert error.details == ("cleanup.unlock_failed", "cleanup.close_failed")
+    assert error.paths == (paths.json,)
+    assert error.exit_code == 4
+    assert isinstance(error.__cause__, json.JSONDecodeError)
+    assert any("unlock" in note for note in error.__notes__)
+    assert any("close" in note for note in error.__notes__)
+    assert render_error(error) == (
+        f"错误 plugin.context_invalid {paths.json} cleanup.unlock_failed cleanup.close_failed"
+    )
+    assert error_payload(error) == {
+        "ok": False,
+        "result_type": "error",
+        "error": {
+            "code": "plugin.context_invalid",
+            "severity": "error",
+            "paths": [paths.json.as_posix()],
+            "details": ["cleanup.unlock_failed", "cleanup.close_failed"],
+        },
+    }
+
+
+def test_atomic_write_close_and_unlink_cleanup_details_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fdopen 失败（描述符未托管）后 close 与 unlink 均失败：两个明细按执行顺序保留。"""
+    entry, data_dir, runtime_dir = make_paths(tmp_path)
+    paths = bridge_paths(entry, runtime_dir)
+
+    def denied_fdopen(descriptor: int, mode: str = "r") -> object:
+        raise OSError("fdopen failed")
+
+    monkeypatch.setattr(os, "fdopen", denied_fdopen)
+    # 仅临时文件的描述符 close 失败（marker 命中 mkstemp 前缀）；锁描述符正常关闭
+    patch_close_failure(monkeypatch, f".{paths.json.name}.")
+    patch_unlink_failure(monkeypatch, f".{paths.json.name}.")
+    with pytest.raises(AdapterError, match="plugin.context_invalid") as caught:
+        publish_context(entry, data_dir, runtime_dir)
+    assert caught.value.details == ("cleanup.close_failed", "cleanup.unlink_failed")
+    assert isinstance(caught.value.__cause__, OSError)
+
+
+def test_atomic_write_unlink_cleanup_detail_without_spurious_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fdopen 成功后描述符已由文件对象关闭：清理明细只有 unlink_failed，无虚假 close_failed。"""
+    entry, data_dir, runtime_dir = make_paths(tmp_path)
+    paths = bridge_paths(entry, runtime_dir)
+
+    def denied_fsync(descriptor: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(os, "fsync", denied_fsync)
+    patch_unlink_failure(monkeypatch, f".{paths.json.name}.")
+    with pytest.raises(AdapterError, match="plugin.context_invalid") as caught:
+        publish_context(entry, data_dir, runtime_dir)
+    assert caught.value.details == ("cleanup.unlink_failed",)
+
+
+def test_atomic_write_non_oserror_primary_keeps_cleanup_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """非 OSError 主错误（无 AdapterError 渲染面）：清理失败保留 add_note。"""
+    entry, data_dir, runtime_dir = make_paths(tmp_path)
+    paths = bridge_paths(entry, runtime_dir)
+
+    def denied_replace(source: object, target: object) -> None:
+        raise MemoryError("replace failed unexpectedly")
+
+    monkeypatch.setattr(os, "replace", denied_replace)
+    patch_unlink_failure(monkeypatch, f".{paths.json.name}.")
+    with pytest.raises(MemoryError) as caught:
+        publish_context(entry, data_dir, runtime_dir)
+    assert caught.value.__notes__ is not None
+    assert any("unlink" in note for note in caught.value.__notes__)
+
+
+def test_lock_cleanup_failure_on_non_adapter_primary_keeps_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entry, data_dir, runtime_dir = make_paths(tmp_path)
+    publish_context(entry, data_dir, runtime_dir)
+
+    def bad_loads(*args: object, **kwargs: object) -> object:
+        raise ValueError("not an AdapterError")
+
+    def denied_unlock(descriptor: int) -> None:
+        raise OSError("unlock failed")
+
+    monkeypatch.setattr(json, "loads", bad_loads)
+    monkeypatch.setattr(bridge_mod, "_unlock_os", denied_unlock)
+    with pytest.raises(ValueError) as caught:
+        load_context(entry, runtime_dir)
+    assert caught.value.__notes__ is not None
+    assert any("unlock" in note for note in caught.value.__notes__)
+
+
+def test_add_detail_appends_keeps_tuple_and_primary_fields() -> None:
+    error = AdapterError("plugin.context_invalid", Path("/tmp/x.json"))
+    error.add_detail("cleanup.close_failed")
+    error.add_detail("cleanup.unlink_failed")
+    assert error.details == ("cleanup.close_failed", "cleanup.unlink_failed")
+    assert error.code == "plugin.context_invalid"
+    assert error.paths == (Path("/tmp/x.json"),)
+    assert error.exit_code == 4
+    assert render_error(error) == (
+        "错误 plugin.context_invalid /tmp/x.json cleanup.close_failed cleanup.unlink_failed"
+    )
+    assert error_payload(error) == {
+        "ok": False,
+        "result_type": "error",
+        "error": {
+            "code": "plugin.context_invalid",
+            "severity": "error",
+            "paths": ["/tmp/x.json"],
+            "details": ["cleanup.close_failed", "cleanup.unlink_failed"],
+        },
+    }
+
+
+def test_cleanup_details_do_not_leak_into_hook_diagnostic() -> None:
+    """Hook 渲染只显示错误码：明细与路径不得进入模型可见诊断。"""
+    from adapter.session_hook import render_diagnostic
+
+    error = AdapterError("plugin.context_invalid", Path("/secret/path.json"))
+    error.add_detail("cleanup.unlink_failed")
+    text = render_diagnostic(error)
+    assert "plugin.context_invalid" in text
+    assert "cleanup.unlink_failed" not in text
+    assert "/secret/path.json" not in text

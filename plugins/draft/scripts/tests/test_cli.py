@@ -648,3 +648,70 @@ def test_subprocess_root_unavailable_exit_2(subproc_setup: SubprocSetup) -> None
     )
     assert code == EXIT_USAGE
     assert "binding.root_unavailable" in err
+
+
+# ---------------------------------------------------------------------------
+# Step 4: bind/unbind 会话标识编码边界（Task 8）
+# ---------------------------------------------------------------------------
+
+
+def test_bind_lone_surrogate_session_is_invalid_session_text(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = call_main(["bind", str(setup.root), "--session", "\ud800"], setup, capsys)
+    assert code == EXIT_USAGE
+    assert out == ""
+    assert "binding.invalid_session" in err
+    assert "Traceback" not in err
+    # 验证早于 bindings/ 目录创建
+    assert not (setup.data_dir / "bindings").exists()
+
+
+def test_bind_lone_surrogate_session_is_invalid_session_json(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = call_main(
+        ["--json", "bind", str(setup.root), "--session", "\ud800"], setup, capsys
+    )
+    assert code == EXIT_USAGE
+    assert err == ""
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "binding.invalid_session"
+    assert not (setup.data_dir / "bindings").exists()
+
+
+def test_unbind_lone_surrogate_session_is_invalid_session_text(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = call_main(["unbind", "--session", "\ud800"], setup, capsys)
+    assert code == EXIT_USAGE
+    assert out == ""
+    assert "binding.invalid_session" in err
+    assert "Traceback" not in err
+    assert not (setup.data_dir / "bindings").exists()
+
+
+def test_unbind_lone_surrogate_session_is_invalid_session_json(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = call_main(["--json", "unbind", "--session", "\ud800"], setup, capsys)
+    assert code == EXIT_USAGE
+    assert err == ""
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "binding.invalid_session"
+    assert not (setup.data_dir / "bindings").exists()
+
+
+def test_bind_unbind_unicode_session_round_trip(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    session = "会话-😀"
+    code, out, _ = call_main(["bind", str(setup.root), "--session", session], setup, capsys)
+    assert code == 0
+    assert out == f"绑定成功 {setup.root}\n"
+    assert binding_path(setup.data_dir, session).exists()
+    code, out, _ = call_main(["unbind", "--session", session], setup, capsys)
+    assert code == 0
+    assert out == "解除成功 removed=true\n"

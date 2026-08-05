@@ -21,6 +21,10 @@ class AdapterError(Exception):
         self.details = tuple(details)
         self.exit_code = exit_code
 
+    def add_detail(self, detail: str) -> None:
+        """追加一条明细，details 保持 tuple。主错误码、路径、退出码与异常链不变。"""
+        self.details = (*self.details, detail)
+
 
 def error_payload(error: AdapterError) -> dict[str, object]:
     return {

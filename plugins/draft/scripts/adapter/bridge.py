@@ -171,7 +171,8 @@ def _bridge_lock(path: Path) -> Generator[None]:
             primary = exc
             raise
     finally:
-        # 清理阶段：主错误在途时保留主错误、清理失败降级为 note；
+        # 清理阶段：主错误在途时保留主错误，清理失败以稳定明细码进入 AdapterError
+        # 的 details（note 继续保留底层诊断，无渲染面）；
         # 无主错误时清理失败本身必须明确失败。
         if primary is None:
             cleanup_error: OSError | None = None
@@ -188,10 +189,17 @@ def _bridge_lock(path: Path) -> Generator[None]:
             if cleanup_error is not None:
                 raise _invalid(path) from cleanup_error
         else:
-            for action in (_unlock_os, os.close) if locked else (os.close,):
+            actions = (
+                ((_unlock_os, "cleanup.unlock_failed"), (os.close, "cleanup.close_failed"))
+                if locked
+                else ((os.close, "cleanup.close_failed"),)
+            )
+            for action, detail in actions:
                 try:
                     action(descriptor)
                 except OSError as exc:
+                    if isinstance(primary, AdapterError):
+                        primary.add_detail(detail)
                     primary.add_note(f"cleanup {action.__name__} failed for {path}: {exc}")
 
 
@@ -216,20 +224,36 @@ def _write_json_atomic(path: Path, payload: bytes) -> None:
         descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     except OSError as exc:
         raise _invalid(path) from exc
+    handle = None
     try:
-        with os.fdopen(descriptor, "wb") as handle:
+        handle = os.fdopen(descriptor, "wb")
+        with handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
     except BaseException as exc:
-        # fdopen 失败时描述符尚未托管，补关；已关闭时这次 close 被 suppress
-        with suppress(OSError):
-            os.close(descriptor)
-        with suppress(OSError):
+        # 主错误：OSError 映射为 _invalid；非 OSError 原样重抛（清理失败仅留 note）
+        primary = _invalid(path) if isinstance(exc, OSError) else None
+        # fdopen 失败时描述符尚未托管，补关；fdopen 成功时描述符已由 with 块关闭，
+        # 不重复 close（否则会误报 close 失败）
+        if handle is None:
+            try:
+                os.close(descriptor)
+            except OSError as cleanup_exc:
+                if primary is not None:
+                    primary.add_detail("cleanup.close_failed")
+                else:
+                    exc.add_note(f"cleanup close failed for {temporary}: {cleanup_exc}")
+        try:
             os.unlink(temporary)
-        if isinstance(exc, OSError):
-            raise _invalid(path) from exc
+        except OSError as cleanup_exc:
+            if primary is not None:
+                primary.add_detail("cleanup.unlink_failed")
+            else:
+                exc.add_note(f"cleanup unlink failed for {temporary}: {cleanup_exc}")
+        if primary is not None:
+            raise primary from exc
         raise
     _fsync_directory(path.parent)
 
@@ -249,6 +273,12 @@ def _create_sentinel(path: Path) -> None:
 
 
 def _canonical_data_dir(data_dir: Path) -> Path:
+    # 孤立代理码位无法安全进入协议或文件系统操作：
+    # 顶部可编码性检查同时覆盖持久载荷与宿主变量两条来源路径。
+    try:
+        str(data_dir).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _invalid(data_dir) from exc
     if not data_dir.is_absolute():
         raise _invalid(data_dir)
     try:
@@ -306,8 +336,8 @@ def publish_context(
         if _verify_regular_file(paths.json):
             try:
                 raw = json.loads(paths.json.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                pass  # 普通文件仅 JSON 损坏：允许原子重写
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                pass  # 普通文件仅 JSON 损坏或含无效 UTF-8：允许原子重写
             else:
                 existing = _parse_data_dir(raw, paths.json)
                 if existing != canonical:
@@ -332,7 +362,7 @@ def load_context(entry_path: Path, runtime_dir: Path | None = None) -> PluginCon
             return None
         try:
             raw = json.loads(paths.json.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise _invalid(paths.json) from exc
         return PluginContext(data_dir=_parse_data_dir(raw, paths.json))
 

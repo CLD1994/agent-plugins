@@ -23,6 +23,24 @@ class Binding:
     last_page_hint: Path | None
 
 
+def _strict_utf8(value: str) -> bool:
+    """能以严格 UTF-8 编码（孤立代理码位非法）。"""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def session_id_is_valid(session_id: str) -> bool:
+    """合法会话标识 = 能以严格 UTF-8 编码。
+
+    空字符串合法；不截断、不解释、不做 Unicode 规范化。
+    码点序列不同（即使视觉相同）的字符串映射为不同会话。
+    """
+    return _strict_utf8(session_id)
+
+
 def binding_key(session_id: str) -> str:
     return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
 
@@ -38,6 +56,10 @@ def binding_path(data_dir: Path, session_id: str) -> Path:
 
 def _data_dir_unavailable(path: Path) -> AdapterError:
     return AdapterError("binding.data_dir_unavailable", path, exit_code=EXIT_RUNTIME)
+
+
+def _invalid_session() -> AdapterError:
+    return AdapterError("binding.invalid_session", exit_code=EXIT_USAGE)
 
 
 def _root_unavailable(path: Path) -> AdapterError:
@@ -91,17 +113,24 @@ def _require_data_dir(data_dir: Path) -> Path:
 
 
 def _canonical_root(root: Path) -> Path:
-    """展开 ~，要求 root 自身为非符号链接目录，再严格 resolve。不做 Draft 校验。"""
-    expanded = root.expanduser()
+    """展开 ~，要求 root 自身为非符号链接目录，再严格 resolve。不做 Draft 校验。
+
+    展开失败（RuntimeError）与孤立代理导致的编码失败（UnicodeEncodeError）
+    同样归一为 binding.root_unavailable。
+    """
+    try:
+        expanded = root.expanduser()
+    except (RuntimeError, UnicodeEncodeError) as exc:
+        raise _root_unavailable(root) from exc
     try:
         status = expanded.lstat()
-    except OSError as exc:
+    except (OSError, UnicodeEncodeError) as exc:
         raise _root_unavailable(root) from exc
     if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
         raise _root_unavailable(root)
     try:
         return expanded.resolve(strict=True)
-    except OSError as exc:
+    except (OSError, UnicodeEncodeError) as exc:
         raise _root_unavailable(root) from exc
 
 
@@ -143,12 +172,12 @@ def _walk_hint_segments(hint: PurePosixPath, canonical_root: Path) -> os.stat_re
 
 
 def _require_hint_current(hint: PurePosixPath, canonical_root: Path) -> None:
-    """bind 用：词法 + 当前文件系统双重校验。"""
+    """bind 用：词法 + 当前文件系统双重校验。孤立代理导致的编码失败同样归一。"""
     try:
         status = _walk_hint_segments(hint, canonical_root)
     except _HintSymlink as exc:
         raise _invalid_hint(Path(hint)) from exc
-    except OSError as exc:
+    except (OSError, UnicodeEncodeError) as exc:
         raise _invalid_hint(Path(hint)) from exc
     if not stat.S_ISREG(status.st_mode):
         raise _invalid_hint(Path(hint))
@@ -243,31 +272,44 @@ def _write_binding_atomic(path: Path, payload: bytes) -> None:
         descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     except OSError as exc:
         raise _data_dir_unavailable(path) from exc
+    handle = None
     try:
-        with os.fdopen(descriptor, "wb") as handle:
+        handle = os.fdopen(descriptor, "wb")
+        with handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
     except BaseException as exc:
-        # fdopen 失败时描述符尚未托管，补关；已关闭时这次 close 被 suppress
-        with suppress(OSError):
-            os.close(descriptor)
-        # 主错误：OSError 映射为 data_dir_unavailable；非 OSError 原样重抛
-        error: AdapterError | None = None
+        # 主错误：OSError 映射为 data_dir_unavailable；非 OSError 原样重抛（清理失败仅留 note）
+        primary: AdapterError | None = None
         if isinstance(exc, OSError):
-            error = _data_dir_unavailable(path)
-        # 清理临时文件：失败时作为 note 附加到主错误，不替换主错误
+            primary = _data_dir_unavailable(path)
+        # fdopen 失败时描述符尚未托管，补关；fdopen 成功时描述符已由 with 块关闭，
+        # 不重复 close（否则会误报 close 失败）
+        if handle is None:
+            try:
+                os.close(descriptor)
+            except OSError as cleanup_exc:
+                note = f"cleanup close failed for {temporary}: {cleanup_exc}"
+                if primary is not None:
+                    primary.add_detail("cleanup.close_failed")
+                    primary.add_note(note)
+                else:
+                    exc.add_note(note)
+        # 清理临时文件：失败时以稳定明细码进入 AdapterError 主错误的 details，
+        # note 继续保留底层诊断；不替换主错误
         try:
             os.unlink(temporary)
         except OSError as cleanup_exc:
             note = f"cleanup unlink failed for {temporary}: {cleanup_exc}"
-            if error is not None:
-                error.add_note(note)
+            if primary is not None:
+                primary.add_detail("cleanup.unlink_failed")
+                primary.add_note(note)
             else:
                 exc.add_note(note)
-        if error is not None:
-            raise error from exc
+        if primary is not None:
+            raise primary from exc
         raise
     _fsync_directory(path.parent)
 
@@ -322,6 +364,15 @@ def _parse_binding(raw: object, path: Path, session_id: str) -> Binding:
     if not (hint is None or isinstance(hint, str)):
         raise _invalid(path)
 
+    # 孤立代理码位无法安全进入协议或文件系统操作：持久载荷无效。
+    # 字段有效性先于会话一致性比较。
+    if not (
+        _strict_utf8(payload_session)
+        and _strict_utf8(root_str)
+        and (hint is None or _strict_utf8(hint))
+    ):
+        raise _invalid(path)
+
     if payload_session != session_id:
         raise _session_mismatch(path)
 
@@ -346,6 +397,9 @@ def _parse_binding(raw: object, path: Path, session_id: str) -> Binding:
 
 
 def bind(data_dir: Path, binding: Binding) -> Binding:
+    # 会话标识验证必须是入口第一步：早于任何路径计算与 bindings/ 目录创建
+    if not session_id_is_valid(binding.session_id):
+        raise _invalid_session()
     canonical_data_dir = _require_data_dir(data_dir)
     canonical_root = _canonical_root(binding.root)
 
@@ -371,6 +425,9 @@ def bind(data_dir: Path, binding: Binding) -> Binding:
 
 
 def load_binding(data_dir: Path, session_id: str) -> Binding | None:
+    # 会话标识验证必须是入口第一步：早于任何路径计算与 bindings/ 目录创建
+    if not session_id_is_valid(session_id):
+        raise _invalid_session()
     canonical_data_dir = _require_data_dir(data_dir)
     container = canonical_data_dir / "bindings"
     if not _container_is_real(container):
@@ -382,12 +439,15 @@ def load_binding(data_dir: Path, session_id: str) -> Binding | None:
 
     try:
         decoded = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise _invalid(target) from exc
     return _parse_binding(decoded, target, session_id)
 
 
 def unbind(data_dir: Path, session_id: str) -> bool:
+    # 会话标识验证必须是入口第一步：早于任何路径计算与 bindings/ 目录创建
+    if not session_id_is_valid(session_id):
+        raise _invalid_session()
     canonical_data_dir = _require_data_dir(data_dir)
     container = canonical_data_dir / "bindings"
     if not _container_is_real(container):
