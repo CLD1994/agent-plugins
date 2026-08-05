@@ -98,3 +98,13 @@ def snapshot_tree(root: Path) -> dict[str, bytes]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+
+
+@pytest.fixture
+def unresolvable_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Simulate an environment where Path.expanduser() cannot determine the home directory."""
+
+    def raise_runtime_error(self: Path) -> Path:
+        raise RuntimeError("Could not determine home directory")
+
+    monkeypatch.setattr(Path, "expanduser", raise_runtime_error)

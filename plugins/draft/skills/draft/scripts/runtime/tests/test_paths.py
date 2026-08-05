@@ -76,3 +76,36 @@ def test_relative_root_still_rejects_escape(
 
     with pytest.raises(DraftError, match="path.escape"):
         resolve_page_operand(Path("topic"), "../outside.md")
+
+
+def test_resolve_draft_root_maps_unresolvable_home_to_root_missing(
+    unresolvable_home: None,
+) -> None:
+    value = Path("~/topic")
+
+    with pytest.raises(DraftError) as excinfo:
+        resolve_draft_root(value)
+
+    assert excinfo.value.code == "root.missing"
+    assert excinfo.value.paths == (value,)
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+
+def test_resolve_draft_root_maps_unresolvable_home_with_allow_missing(
+    unresolvable_home: None,
+) -> None:
+    with pytest.raises(DraftError) as excinfo:
+        resolve_draft_root(Path("~/topic"), allow_missing=True)
+
+    assert excinfo.value.code == "root.missing"
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+
+def test_page_operand_maps_unresolvable_home_to_root_missing(
+    unresolvable_home: None,
+) -> None:
+    with pytest.raises(DraftError) as excinfo:
+        resolve_page_operand(Path("~/topic"), "pages/a.md")
+
+    assert excinfo.value.code == "root.missing"
+    assert isinstance(excinfo.value.__cause__, RuntimeError)

@@ -15,8 +15,15 @@ class ResolvedPath:
     absolute: Path
 
 
+def _expand_root(value: Path) -> Path:
+    try:
+        return value.expanduser()
+    except RuntimeError as exc:
+        raise DraftError("root.missing", value) from exc
+
+
 def resolve_draft_root(value: Path, *, allow_missing: bool = False) -> Path:
-    expanded = value.expanduser()
+    expanded = _expand_root(value)
     if not allow_missing and not expanded.exists():
         raise DraftError("root.missing", expanded)
     if expanded.exists() and (expanded.is_symlink() or not expanded.is_dir()):
@@ -25,7 +32,7 @@ def resolve_draft_root(value: Path, *, allow_missing: bool = False) -> Path:
 
 
 def resolve_page_operand(root: Path, value: str) -> ResolvedPath:
-    canonical_root = root.expanduser().resolve(strict=False)
+    canonical_root = _expand_root(root).resolve(strict=False)
     posix = PurePosixPath(value)
     if posix.is_absolute():
         raise DraftError("path.escape", Path(value))

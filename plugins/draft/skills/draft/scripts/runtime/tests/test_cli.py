@@ -617,6 +617,41 @@ def test_missing_root_is_exit_two(tmp_path: Path, capsys: pytest.CaptureFixture[
     assert error["code"] == "root.missing"
 
 
+def test_unresolvable_home_maps_to_root_missing_json(
+    unresolvable_home: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for args in (["check", "~/topic", "--json"], ["init", "~/topic", "--json"]):
+        code, payload = run_json(args, capsys)
+        assert code == 2
+        assert payload["ok"] is False
+        assert payload["result_type"] == "error"
+        error = payload["error"]
+        assert isinstance(error, dict)
+        assert error["code"] == "root.missing"
+        assert error["paths"] == ["~/topic"]
+
+
+def test_unresolvable_home_maps_to_root_missing_text(
+    unresolvable_home: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["check", "~/topic"]) == 2
+    output = capsys.readouterr().out
+    assert "root.missing" in output
+
+
+def test_unresolvable_home_page_operand_maps_to_root_missing(
+    unresolvable_home: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # move/promote/collapse/trash resolve page operands against the raw root
+    # before resolve_draft_root runs, so the page-operand expansion must also
+    # normalize the failure instead of leaking a RuntimeError traceback.
+    code, payload = run_json(["move", "~/topic", "a.md", "b.md", "--json"], capsys)
+    assert code == 2
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "root.missing"
+
+
 def test_help_matrix_exits_zero() -> None:
     for args in (
         ["--help"],
