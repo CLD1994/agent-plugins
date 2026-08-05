@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import cast
 
 from draft import __version__
+from draft.diagnostics import issue_payload, render_issue
 from draft.errors import DraftError
 from draft.models import (
-    CheckIssue,
     CheckReport,
     LifecycleWarning,
     OperationPhase,
@@ -86,15 +86,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _issue_payload(issue: CheckIssue) -> dict[str, object]:
-    return {
-        "code": issue.code,
-        "path": None if issue.path is None else issue.path.as_posix(),
-        "line": issue.line,
-        "details": list(issue.details),
-    }
-
-
 def _warning_payload(warning: LifecycleWarning) -> dict[str, object]:
     return {
         "code": warning.code,
@@ -153,28 +144,25 @@ def _render_check(report: CheckReport, json_mode: bool) -> int:
     payload: dict[str, object] = {
         "ok": ok,
         "result_type": "check",
-        "errors": [_issue_payload(issue) for issue in report.errors],
-        "warnings": [_issue_payload(issue) for issue in report.warnings],
-        "infos": [_issue_payload(issue) for issue in report.infos],
-        "reviews": [_issue_payload(issue) for issue in report.reviews],
+        "errors": [issue_payload(issue) for issue in report.errors],
+        "warnings": [issue_payload(issue) for issue in report.warnings],
+        "infos": [issue_payload(issue) for issue in report.infos],
+        "reviews": [issue_payload(issue) for issue in report.reviews],
     }
     if json_mode:
         print(json.dumps(payload, ensure_ascii=False))
     else:
-        if ok and not report.reviews and not report.warnings and not report.infos:
+        groups = (report.errors, report.warnings, report.infos, report.reviews)
+        if not any(groups):
             print("检查通过：未发现客观错误。")
-        for issue in report.errors:
-            location = "" if issue.path is None else str(issue.path)
-            print(f"错误 {issue.code} {location}")
-        for issue in report.warnings:
-            location = "" if issue.path is None else str(issue.path)
-            print(f"警告 {issue.code} {location}")
-        for issue in report.infos:
-            location = "" if issue.path is None else str(issue.path)
-            print(f"信息 {issue.code} {location}")
-        for issue in report.reviews:
-            location = "" if issue.path is None else str(issue.path)
-            print(f"提醒 {issue.code} {location}")
+        else:
+            for issues in groups:
+                for issue in issues:
+                    print(render_issue(issue))
+            print(
+                f"检查完成：{len(report.errors)} 个错误，{len(report.warnings)} 个警告，"
+                f"{len(report.infos)} 个信息，{len(report.reviews)} 个提醒。"
+            )
     return 0 if ok else 1
 
 
@@ -415,12 +403,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             _emit_error(error, json_mode)
             return _exit_for_error(error)
         code = _render_check(report, json_mode)
-        if (
-            mode == "candidate"
-            and not json_mode
-            and any(issue.code == "candidate.already_registered" for issue in report.errors)
-        ):
-            print("提示：目标已是登记草稿；请移除 --candidate 并运行普通 check。")
         return code
     try:
         payload, human, code = _dispatch(args)

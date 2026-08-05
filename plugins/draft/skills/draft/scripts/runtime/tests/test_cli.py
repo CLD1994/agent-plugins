@@ -126,8 +126,13 @@ def test_candidate_check_registered_root_human_hint(
     code = main(["check", str(registered_draft), "--candidate"])
     output = capsys.readouterr().out
     assert code == 1
-    assert "candidate.already_registered" in output
-    assert "--candidate" in output
+    lines = output.splitlines()
+    assert lines[0] == (
+        ".draft/draft.json: 错误 candidate.already_registered："
+        "目标已经登记，--candidate 仅适用于未登记候选"
+    )
+    assert lines[1] == "检查完成：1 个错误，0 个警告，0 个信息，0 个提醒。"
+    assert "提示：" not in output
 
 
 def test_candidate_check_provisional_marker_is_recovery_required(
@@ -208,6 +213,129 @@ def test_check_clean_and_errors(tmp_path: Path, capsys: pytest.CaptureFixture[st
     assert "path" in first
     assert "line" in first
     assert "details" in first
+    for issue in error_dicts:
+        assert issue["severity"] == "error"
+        assert set(issue) == {"code", "severity", "path", "line", "details"}
+
+
+def test_check_human_clean_prints_pass_sentence(
+    registered_draft: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["check", str(registered_draft)]) == 0
+    assert capsys.readouterr().out == "检查通过：未发现客观错误。\n"
+
+
+def test_check_human_is_read_only(
+    registered_draft: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before = snapshot_tree(registered_draft)
+    main(["check", str(registered_draft)])
+    assert snapshot_tree(registered_draft) == before
+
+
+def test_check_human_reports_actionable_multiple_locations(
+    registered_draft: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (registered_draft / "index.md").write_text(
+        "# 主题\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n- [结论汇总](conclusions.md)\n",
+        encoding="utf-8",
+    )
+    (registered_draft / "conclusions.md").write_text(
+        "# 结论汇总\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](index.md)\n\n"
+        "[甲](pages/missing-a.md)\n[乙](pages/missing-b.md)\n",
+        encoding="utf-8",
+    )
+
+    assert main(["check", str(registered_draft)]) == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "conclusions.md:7: 错误 link.missing：链接目标不存在：pages/missing-a.md",
+        "conclusions.md:8: 错误 link.missing：链接目标不存在：pages/missing-b.md",
+        "检查完成：2 个错误，0 个警告，0 个信息，0 个提醒。",
+    ]
+
+
+def test_check_human_orders_four_severities_and_summarizes(
+    registered_draft: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from draft import checker as checker_module
+    from draft.models import CheckIssue, CheckReport, IssueSeverity
+
+    def fixed_report(*_args: object, **_kwargs: object) -> CheckReport:
+        return CheckReport(
+            issues=(
+                CheckIssue("output.missing", IssueSeverity.ERROR, Path("pages/a.md"), None),
+                CheckIssue(
+                    "trash.handoff_pending",
+                    IssueSeverity.WARNING,
+                    Path(".draft/operations/x/journal.json"),
+                    None,
+                    ("op",),
+                ),
+                CheckIssue(
+                    "trash.retained",
+                    IssueSeverity.INFO,
+                    Path(".draft/operations/y/journal.json"),
+                    None,
+                    ("op",),
+                ),
+                CheckIssue(
+                    "page.capacity",
+                    IssueSeverity.REVIEW,
+                    Path("pages/big.md"),
+                    None,
+                    ("700", "80000"),
+                ),
+            )
+        )
+
+    monkeypatch.setattr(checker_module, "check_draft", fixed_report)
+    code = main(["check", str(registered_draft)])
+    out = capsys.readouterr().out.splitlines()
+    assert code == 1
+    assert out[0] == "pages/a.md: 错误 output.missing：已确认页面缺少“产出”声明"
+    assert out[1] == (
+        ".draft/operations/x/journal.json: 警告 trash.handoff_pending："
+        "回收操作 op 的系统回收站移交等待重试"
+    )
+    assert out[2] == (
+        ".draft/operations/y/journal.json: 信息 trash.retained：回收操作 op 仍处于保留态"
+    )
+    assert out[3] == (
+        "pages/big.md: 提醒 page.capacity：页面容量为 700 行 / 80000 字节，建议审查是否拆分"
+    )
+    assert out[4] == "检查完成：1 个错误，1 个警告，1 个信息，1 个提醒。"
+
+
+def test_check_plain_and_json_agree_on_exit_code_and_raw_details(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "topic"
+    assert main(["init", str(root)]) == 0
+    (root / "pages/question.md").write_text(
+        "# 问题\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n\n"
+        "见 [不存在](missing.md)。\n",
+        encoding="utf-8",
+    )
+    index = root / "index.md"
+    index.write_text(
+        index.read_text(encoding="utf-8") + "- [问题](pages/question.md)\n", encoding="utf-8"
+    )
+    capsys.readouterr()
+
+    assert main(["check", str(root)]) == 1
+    human = capsys.readouterr().out
+    assert "link.missing：missing.md 解析到 pages/missing.md 后不存在" in human
+
+    code, payload = run_json(["check", str(root), "--json"], capsys)
+    assert code == 1
+    link_issues = [
+        issue for issue in as_dicts(payload["errors"]) if issue["code"] == "link.missing"
+    ]
+    assert link_issues
+    assert link_issues[0]["details"] == ["missing.md", "pages/missing.md"]
+    assert link_issues[0]["severity"] == "error"
 
 
 def test_json_flag_both_positions_identical(
@@ -804,6 +932,15 @@ def test_check_json_separates_errors_warnings_infos_and_reviews(
     infos = payload["infos"]
     assert isinstance(infos, list) and infos
     assert isinstance(payload["reviews"], list)
+    for severity, key in (
+        ("error", "errors"),
+        ("warning", "warnings"),
+        ("info", "infos"),
+        ("review", "reviews"),
+    ):
+        for issue in as_dicts(payload[key]):
+            assert issue["severity"] == severity
+            assert set(issue) == {"code", "severity", "path", "line", "details"}
 
 
 def test_recover_json_preserves_partial_results_on_later_corruption(
