@@ -36,8 +36,10 @@ submodule 额外维护实体化发布分支或独立发布仓库，在当前阶�
 - 在同一仓库内完成严格职责拆分，使该子树可独立运行且不反向依赖插件；
 - 远程 marketplace 继续直接安装 `plugins/draft/`，不需要 submodule、生成式发布树或安装后
   下载；
+- 核心 runtime 直接作为本地包源交给 `uvx`，环境解析、隔离和缓存归 uv 所有；这不要求发布
+  Python 包，也不改变 marketplace 安装的源码来源；
 - 等宿主出现可靠的插件依赖/递归源码能力，或 Draft 具备独立包发布条件后，再评估仓库提取
-  与 `uvx`。
+  与短命令 `uvx draft`。
 
 ## 目标
 
@@ -52,7 +54,8 @@ submodule 额外维护实体化发布分支或独立发布仓库，在当前阶�
 ## 非目标
 
 - 不创建 Git submodule、`.gitmodules`、`dist` 分支或第二个发布仓库。
-- 不发布 Python 包，不引入 `uvx`，不承诺短命令 `uvx draft`。
+- 不发布 Python 包，不承诺短命令 `uvx draft`，也不让执行时从远程地址下载 Draft 自身源码。
+- 不要求最终用户执行时消费 `uv.lock`，不承诺依赖的补丁版本在不同首次解析时间点完全相同。
 - 不新增 `inspect` CLI 或仅为 binding 服务的核心公共 API。
 - 不让插件适配层验证目标是否为已登记 Draft。
 - 不迁移或合并不同宿主的 binding、日志和 bridge 状态。
@@ -87,7 +90,6 @@ plugins/draft/
         ├── references/
         │   └── draft-format.md
         └── scripts/
-            ├── draft.py
             ├── ruff.toml
             └── runtime/
                 ├── pyproject.toml
@@ -100,8 +102,9 @@ plugins/draft/
 分派；不再增加只有它消费的 `adapter/cli.py`。`adapter/` 保存可独立测试的 bridge、binding
 和 Hook 协议实现。
 
-`plugins/draft/skills/draft/scripts/draft.py` 是 Draft 核心的独立入口。两个入口同名但路径和
-职责不同，调用方不得搜索、猜测或互相降级。
+Draft 核心不再保留外层 Python 启动器。`plugins/draft/skills/draft/scripts/runtime` 是本地包
+源，其中 `draft-runtime` 发行包提供 `draft` 控制台命令。Agent 必须使用当前 skill 的准确
+`<skill_root>` 构造 `uvx --from` 路径，不得搜索、猜测其他副本或降级到插件适配入口。
 
 ## 责任边界
 
@@ -111,9 +114,10 @@ plugins/draft/
 
 - `SKILL.md`、Draft 格式和领域工作流；
 - `init`、`adopt`、`check`、`move`、`promote`、`collapse`、`trash`、`restore`、`recover`
-  及 `setup`；
+  及版本输出；`setup` 是 SKILL 中通过版本输出触发 uvx 环境准备的工作流，不是核心 CLI
+  子命令；
 - Markdown 解析、Draft 图、检查、结构操作、回收和恢复；
-- 独立 runtime 的版本、依赖锁和缓存环境；
+- 独立 runtime 的版本和有界依赖声明；
 - 与上述领域能力直接相关的错误码、JSON 和普通文本输出。
 
 `skills/draft` 不得包含或引用：
@@ -145,11 +149,21 @@ plugins/draft/
 Agent 从已加载 skill 得到 `<skill_root>`，并执行：
 
 ```text
-uv run <skill_root>/scripts/draft.py <core-command> ...
+uvx --isolated --from "<skill_root>/scripts/runtime" draft <core-command> ...
 ```
 
-核心入口只接受核心命令。独立运行和插件安装后的普通 Draft 操作使用同一入口、同一源码和
-同一依赖锁。
+`setup` 工作流执行：
+
+```text
+uvx --isolated --from "<skill_root>/scripts/runtime" draft --version
+```
+
+`--isolated` 只保证忽略通过 `uv tool install` 安装的同名工具，仍复用 uv 的工具环境缓存；
+不得增加 `--no-cache`。不使用 `--no-env-file`，uv 的用户级配置和已有进程环境按 uv 标准语义
+生效。
+
+独立运行和插件安装后的普通 Draft 操作使用同一本地包源和同一命令。命令不依赖当前工作
+目录中的项目环境，也不从包索引查找名为 `draft` 的发行包。
 
 ### 插件命令
 
@@ -188,25 +202,38 @@ uv run "${CLAUDE_PLUGIN_ROOT}/scripts/draft.py" hook session-start claude
 插件入口继续使用 PEP 723 元数据声明兼容 Python 和空依赖，因此只要求 `uv`，不需要插件
 自己的虚拟环境、runtime 项目或第三方包。
 
-## 核心运行环境
+## 核心运行环境与依赖范围
 
-核心入口保留当前 `uv run --project ... --locked --exact --no-dev --no-editable --no-env-file`
-一类的锁定运行策略，但不再选择宿主插件 `data_dir`。它使用当前用户的平台缓存目录：
+核心 runtime 由 `uvx --isolated --from <local-runtime-path> draft ...` 构建并执行。工具环境
+位于 uv 自己的平台缓存目录，属于可丢弃、可自动重建的 uv 缓存；Draft 不选择环境路径、
+不创建 `envs/<runtime_version>`，也不定义 `runtime.cache_unavailable`。不同来源、解析结果和
+Python 版本的环境隔离由 uv 的工具缓存语义负责。
 
-- Linux：`$XDG_CACHE_HOME/draft`；未设置时为 `~/.cache/draft`；
-- macOS：`~/Library/Caches/draft`；
-- Windows：`%LOCALAPPDATA%/draft/cache`。
+runtime 的直接运行依赖使用基于当前已验证版本的补丁窗口：
 
-Linux 只接受绝对的 `XDG_CACHE_HOME`，否则按未设置处理；Windows 在 `LOCALAPPDATA` 缺失或
-不是绝对路径时使用 `~/AppData/Local/draft/cache`。缓存根无法创建或安全写入时报告
-`runtime.cache_unavailable` 并退出 4，不降级到公共临时目录。
+```toml
+dependencies = [
+    "markdown-it-py>=4.2,<4.3",
+    "Send2Trash>=2.1,<2.2",
+]
+```
 
-版本环境仍位于缓存根的 `envs/<runtime_version>`。不同版本隔离，相同不可变版本可以跨
-宿主和独立会话共享。缓存只保存可重建的运行环境；binding、宿主日志和其他插件业务状态
-不得写入这里。
+本地源码首次构建还会解析构建后端，因此 `[build-system].requires` 同样使用有界补丁窗口：
 
-核心入口不读取 bridge，也不区分“独立模式”和“插件增强模式”。对核心而言始终只有同一种
-运行模式。
+```toml
+requires = ["hatchling>=1.31,<1.32"]
+```
+
+直接依赖的新补丁版本可以在范围内被首次解析采用；新次版本必须先通过兼容性门禁，再显式
+扩展范围。Draft 不直接约束未直接使用的传递依赖；其可接受范围由直接依赖的包元数据决定。
+
+`runtime/uv.lock` 保留，但只用于仓库开发、测试和静态门禁的可重复环境。最终用户的 `uvx`
+命令不读取该锁文件，锁文件内容也不是最终用户执行协议。首次执行可能从配置的包索引下载
+第三方运行依赖和构建依赖；缓存命中后复用已有工具环境。该设计不承诺无网络首次执行，但
+不得联网取得 Draft 自身源码。
+
+核心不读取 bridge，不区分“独立模式”和“插件增强模式”，也不拥有任何业务状态目录。binding、
+宿主日志和其他插件业务状态仍只能写入宿主 `data_dir`，不得写入 uv 缓存。
 
 ## bridge 协议
 
@@ -336,6 +363,11 @@ Hook 的协议错误不得阻止宿主会话启动：脚本可执行时，`hook 
 binding、布局和日志错误都输出或记录诊断并返回 0。`uv` 无法启动脚本属于宿主执行层失败，
 不在脚本能够转换的范围内。
 
+普通核心命令只有在 `draft` 控制台命令启动后才进入 Draft 的错误协议。`uvx` 自身的 Python
+发现、包索引访问、依赖解析、构建或缓存错误直接保留 uv 的标准错误输出和退出码；外层没有
+启动器将其转换为 Draft 错误码或 `--json` 载荷。调用方不得把 uvx 启动失败解释为 Draft
+检查失败、目标不存在或命令成功。
+
 ## 失败语义与退出码
 
 普通插件命令遵循：用户输入错误退出 2，插件上下文或持久化运行时错误退出 4。
@@ -375,10 +407,11 @@ OSError 必须在最窄文件操作边界转换为稳定错误码并保留异常
 
 - 插件 manifest 版本描述整个安装包；适配层或内嵌核心任何发布级变化都必须提升插件版本；
 - Codex 与 Claude 的 plugin manifest 必须声明相同插件版本；
-- runtime `project.version` 只描述 Draft 核心可执行实现；核心入口、runtime 源码、依赖或锁
-  发生发布级变化时必须提升 runtime 版本；
+- runtime `project.version` 只描述 Draft 核心可执行实现；runtime 源码、直接依赖范围、构建
+  依赖范围或控制台入口发生发布级变化时必须提升 runtime 版本；
 - 只修改适配层时，runtime 版本保持不变；
-- 相同 runtime 版本的源码和依赖必须不可变，保证共享缓存环境安全。
+- 相同 runtime 版本的源码和依赖范围必须不可变，使 uv 的本地包缓存身份与发布语义一致；
+- 只更新开发依赖或 `uv.lock` 中不影响最终用户解析的条目时，不要求提升 runtime 版本。
 
 由于适配层不调用核心 API，不需要运行时兼容握手。远程 marketplace 始终安装同一插件提交
 中的适配层与核心普通文件。
@@ -390,11 +423,13 @@ OSError 必须在最窄文件操作边界转换为稳定错误码并保留异常
 1. 先在插件根建立标准库适配模块及独立测试，复制现有 bridge、binding 和 SessionStart
    行为并按本规格调整；
 2. 将 Hook 改到插件入口，并验证新入口能独立完成 bridge、bind、unbind 和 SessionStart；
-3. 从核心 CLI、模型、错误码和 launcher 中删除插件分支，改用平台缓存；
+3. 从核心 CLI、模型和错误码中删除插件分支，删除核心外层 launcher，改由 SKILL 通过本地
+   runtime 路径执行 `uvx --isolated --from`；
 4. 从核心 SKILL/格式参考移除插件说明，新增插件级平台文档；
 5. 删除核心中的 `bindings.py`、`session_hook.py` 及不再使用的测试；
-6. 更新主设计、manifest 版本、runtime 版本和锁文件；
-7. 从复制后的完整 `plugins/draft/` 执行无仓库外依赖的端到端烟雾测试。
+6. 为运行依赖和构建依赖增加补丁版本窗口，更新主设计、manifest 版本、runtime 版本和开发
+   锁文件；
+7. 从复制后的完整 `plugins/draft/` 使用本地 runtime 包源执行端到端烟雾测试。
 
 旧 binding 不进行静默迁移。首次 SessionStart 将其报告为无效；用户显式重新 bind 后写入新
 格式。bridge 两字段协议保持版本 1，不需要迁移。
@@ -404,11 +439,15 @@ OSError 必须在最窄文件操作边界转换为稳定错误码并保留异常
 ### 核心门禁
 
 - 全量领域测试继续通过；
-- 从 `skills/draft` 复制出的临时目录能独立执行 `setup`、`init` 和 `check`；
+- 从 `skills/draft` 复制出的临时目录能通过路径式 `uvx` 独立执行版本输出、`init` 和 `check`；
 - 核心测试不依赖插件 manifest、Hook 或仓库父目录；
 - 核心子树不存在宿主环境变量、bridge、binding、SessionStart 和插件错误码引用；
-- Linux 平台缓存选择、版本隔离、环境安全和并发同步有定向测试；Windows/macOS 路径选择
-  由平台参数化测试覆盖，真实 Windows 复验在有宿主时执行。
+- 删除 launcher 后不存在 Draft 自管缓存路径、环境目标校验或平台缓存选择测试；
+- 使用最低边界 `markdown-it-py==4.2.0`、`Send2Trash==2.1.0` 和 `hatchling==1.31.0` 执行构建
+  与领域测试，并在独立新缓存中解析各范围内最高可用组合再次执行；
+- 同一命令连续运行时复用 uv 缓存；预装同名全局工具时，`--isolated --from <local-path>` 仍
+  执行当前 skill 的 runtime；
+- `uv.lock` 继续通过开发锁一致性检查，但分发 smoke test 不依赖该锁文件被 uvx 消费。
 
 ### 适配层门禁
 
@@ -425,24 +464,30 @@ OSError 必须在最窄文件操作边界转换为稳定错误码并保留异常
 
 - 两个 manifest 指向 `./skills/` 和各自 Hook 文件；
 - Hook 命令严格使用 `scripts/draft.py hook session-start HOST`；
-- `plugins/draft/skills/draft/SKILL.md`、核心入口、runtime 项目和适配入口都是普通文件；
+- `plugins/draft/skills/draft/SKILL.md`、runtime 项目和适配入口都是普通文件，核心外层
+  `scripts/draft.py` 不存在；
 - 仓库不存在 `.gitmodules`，skill 路径不是 gitlink；
 - 把 `plugins/draft/` 复制到无 `.git`、无仓库父目录的临时位置后：
   1. 模拟 Codex 和 Claude Hook 发布 bridge；
   2. 使用信封中的插件入口 bind/unbind；
-  3. 使用 skill 入口执行核心 smoke test；
-  4. 证明全部路径都位于复制后的插件目录或宿主临时 `data_dir`；
+  3. 使用 `uvx --isolated --from <copied-skill>/scripts/runtime draft` 执行核心 smoke test；
+  4. 证明 Draft 源码只来自复制后的插件目录，插件业务状态只进入宿主临时 `data_dir`；允许
+     可重建工具环境进入该测试指定的独立 uv 缓存；
+- 使用空 uv 缓存完成一次允许联网的首次解析，再使用同一缓存和 `--offline` 重复 smoke test，
+  证明第三方依赖缓存可复用；不承诺空缓存离线启动；
 - pytest、pyright strict、ruff check 和 ruff format 全部门禁通过。
 
 ## 验收标准
 
-- 远程 Git marketplace 取得一个普通、自包含的 `plugins/draft/` 目录，不执行 submodule 或
-  运行时下载步骤；
+- 远程 Git marketplace 取得一个普通、自包含的 `plugins/draft/` 目录，不执行 submodule，
+  也不在运行时下载 Draft 自身源码；第三方依赖首次解析仍可访问配置的包索引；
 - `skills/draft` 从任意父目录复制后仍能运行核心命令；
 - 插件适配层不导入或执行 Draft 核心；
 - 核心不知道宿主、bridge、binding 或插件数据目录；
 - binding 只表达 session 到目录的关联，允许关联尚未 init/adopt 的现存目录；
 - SessionStart 每次提供当前 skill 和插件入口的准确路径，不用摘要使 binding 失效；
-- 插件状态只写入当前宿主 `data_dir`，核心缓存只保存可重建环境；
+- 插件状态只写入当前宿主 `data_dir`；uv 缓存只保存可重建的构建产物、依赖和工具环境，
+  不包含 Draft 业务状态；
+- 普通核心命令精确使用当前 skill 内的本地 runtime 包源，不会被已安装的同名工具替代；
 - 现有远程 marketplace 安装路径保持直接可用；
 - 将来提取独立仓库时，核心子树无需先清理宿主专用逻辑。
