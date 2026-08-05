@@ -1,4 +1,4 @@
-"""Cache reuse, shared-cache, and conflicting-tool isolation tests.
+"""Cache reuse, concurrent-release, and conflicting-tool isolation tests.
 
 Step 3 of Task 6. These tests prove three properties of the path-based uvx
 core invocation:
@@ -7,10 +7,14 @@ core invocation:
    uv tool environment; a second ``--offline`` run over the same cache and
    copied runtime reuses that environment (the ``environments-v2/`` snapshot
    of relative paths + nanosecond lstat mtimes is identical).
-2. **Distinct releases on a shared cache**: two independent runtime copies at
-   versions ``0.3.0`` and a synthetic ``0.3.1`` run over one shared cache and
-   each reports its own version; the shared environment ends up referencing
-   both versions' archives, proving neither clobbered the other.
+2. **Concurrent distinct releases on a shared cache**: two independent runtime
+   copies at versions ``0.3.0`` and a synthetic ``0.3.1`` are launched
+   concurrently over one shared cache and each reports its own version; a
+   post-concurrent re-run of the 0.3.0 copy still reports ``0.3.0``, proving
+   the 0.3.1 invocation did not clobber it. (uv's tool env identity is keyed
+   by command name, not version, so the brief's "two distinct environment
+   identities" is unachievable; the clobber check is the strengthened
+   substitute.)
 3. **Conflicting global tool**: a temporary package exposing a conflicting
    ``draft`` console script (output ``wrong global draft``) is installed into
    a test-specific ``UV_TOOL_DIR``/``UV_TOOL_BIN_DIR``; ``uvx --isolated
@@ -23,6 +27,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
@@ -220,26 +225,47 @@ def test_distinct_releases_share_cache_without_corruption(tmp_path: Path) -> Non
     cache = tmp_path / "shared-cache"
     env = clean_env()
 
-    # Run both releases over the shared cache. uv's tool environment identity
-    # for ``uvx --isolated --from <path> draft`` is shared across source
-    # versions (keyed by the command name and Python, not the package version),
-    # so the second run reinstalls its version into the same environment.
-    # Concurrent launches race on uv's shared archive cache (a uv limitation),
-    # so each release is run to completion before the next; this still proves
-    # both immutable releases resolve and report their own version over the
-    # same cache without clobbering each other's archive references.
-    first_runtime = first / "scripts" / "runtime"
-    first_result = run_uvx_from(first_runtime, cache, "--version", env=env, cwd=first.parent)
-    assert first_result.returncode == 0, first_result.stderr
-    assert first_result.stdout.strip() == "0.3.0", first_result.stdout
+    # Launch both releases concurrently over the shared cache. uv's tool
+    # environment identity for ``uvx --isolated --from <path> draft`` is shared
+    # across source versions (keyed by the command name and Python, not the
+    # package version), so the "two distinct environment identities" the brief
+    # asks for is not achievable; uv instead rebuilds the shared environment
+    # per invocation. The concurrent launches prove simultaneous sessions using
+    # different immutable runtime releases each resolve and report their own
+    # version without corrupting each other.
+    outcomes: dict[str, subprocess.CompletedProcess[str]] = {}
 
-    second_runtime = second / "scripts" / "runtime"
-    second_result = run_uvx_from(second_runtime, cache, "--version", env=env, cwd=second.parent)
-    assert second_result.returncode == 0, second_result.stderr
-    assert second_result.stdout.strip() == "0.3.1", second_result.stdout
+    def launch(label: str, artifact: Path) -> None:
+        runtime = artifact / "scripts" / "runtime"
+        outcomes[label] = run_uvx_from(runtime, cache, "--version", env=env, cwd=artifact.parent)
 
-    # The shared environment must reference both versions' archives, proving
-    # neither release clobbered the other.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(launch, "first", first),
+            executor.submit(launch, "second", second),
+        ]
+        for future in futures:
+            future.result()
+
+    assert outcomes["first"].returncode == 0, outcomes["first"].stderr
+    assert outcomes["second"].returncode == 0, outcomes["second"].stderr
+    assert outcomes["first"].stdout.strip() == "0.3.0", outcomes["first"].stdout
+    assert outcomes["second"].stdout.strip() == "0.3.1", outcomes["second"].stdout
+
+    # Clobber check: re-run the 0.3.0 copy after the 0.3.1 run has completed
+    # and assert it STILL reports 0.3.0. This proves the 0.3.1 invocation did
+    # not permanently clobber the 0.3.0 environment (uv rebuilds the env per
+    # invocation from the source version, rather than silently sharing the last
+    # installed version). This is the strengthened substitute for the brief's
+    # unachievable "two distinct environment identities" requirement.
+    rerun_first = run_uvx_from(
+        first / "scripts" / "runtime", cache, "--version", env=env, cwd=first.parent
+    )
+    assert rerun_first.returncode == 0, rerun_first.stderr
+    assert rerun_first.stdout.strip() == "0.3.0", rerun_first.stdout
+
+    # The shared environment references both versions' archives, proving both
+    # releases were installed without one clobbering the other's archive.
     refs = environment_archive_refs(cache)
     assert len(refs) >= 2, f"expected >=2 archive references, got {refs}"
 

@@ -13,14 +13,14 @@ domain test suite passes under each resolution.
   highest`` resolves every dependency to the latest version inside its
   declared window.
 
-Both suites run the runtime's domain tests via ``uvx --isolated --from .``
-with ``cwd=RUNTIME_ROOT``, ignoring the integration suites
-(bootstrap/distribution/bounds) so only domain tests execute under the
-constrained environment.
-
-A ``python -c`` metadata probe (using ``importlib.metadata.version``, never
-imports of the packages under test) asserts the resolved versions before the
-domain suite runs.
+For each bound, a ``python -c`` metadata probe (using
+``importlib.metadata.version``, never imports of the packages under test) runs
+first in the SAME cache, asserting the resolved versions; then the domain
+suite runs in that same cache. Sharing the cache means the probe verifies the
+exact wheel versions the domain suite will install. The domain suite runs via
+``uvx --isolated --from .`` with ``cwd=RUNTIME_ROOT``, ignoring the
+integration suites (bootstrap/distribution/bounds) so only domain tests
+execute under the constrained environment.
 """
 
 from __future__ import annotations
@@ -101,9 +101,11 @@ def _major_minor(version: str) -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
-def test_lowest_bound_probe_reports_exact_minimum_versions(tmp_path: Path) -> None:
+def test_lowest_bound_probe_and_domain_suite_share_cache(tmp_path: Path) -> None:
     cache = tmp_path / "low-cache"
-    result = _run_uvx(
+
+    # Probe first in the shared cache: assert exact minimum versions resolved.
+    probe = _run_uvx(
         cache,
         "--constraints",
         str(CONSTRAINTS_RUNTIME),
@@ -115,15 +117,15 @@ def test_lowest_bound_probe_reports_exact_minimum_versions(tmp_path: Path) -> No
         "-c",
         VERSION_PROBE,
     )
-    assert result.returncode == 0, result.stderr
-    pairs = _parse_probe(result.stdout)
+    assert probe.returncode == 0, probe.stderr
+    pairs = _parse_probe(probe.stdout)
     assert pairs.get("markdown-it-py") == "4.2.0", pairs
     assert pairs.get("Send2Trash") == "2.1.0", pairs
 
-
-def test_lowest_bound_domain_suite_passes(tmp_path: Path) -> None:
-    cache = tmp_path / "low-cache"
-    result = _run_uvx(
+    # Domain suite in the SAME cache: the constrained wheels the probe verified
+    # are the ones the suite installs. The fresh-cache local build plus
+    # ``--build-constraints`` proves the build backend works at hatchling 1.31.0.
+    suite = _run_uvx(
         cache,
         "--constraints",
         str(CONSTRAINTS_RUNTIME),
@@ -138,12 +140,15 @@ def test_lowest_bound_domain_suite_passes(tmp_path: Path) -> None:
         "-q",
         *IGNORED_INTEGRATION_TESTS,
     )
-    assert result.returncode == 0, result.stderr + result.stdout
+    assert suite.returncode == 0, suite.stderr + suite.stdout
 
 
-def test_highest_available_probe_reports_window_major_minor(tmp_path: Path) -> None:
+def test_highest_available_probe_and_domain_suite_share_cache(tmp_path: Path) -> None:
     cache = tmp_path / "high-cache"
-    result = _run_uvx(
+
+    # Probe first in the shared cache: assert major.minor stays inside the
+    # declared window (do not pin patch or transitive versions).
+    probe = _run_uvx(
         cache,
         "--refresh",
         "--resolution",
@@ -154,15 +159,13 @@ def test_highest_available_probe_reports_window_major_minor(tmp_path: Path) -> N
         "-c",
         VERSION_PROBE,
     )
-    assert result.returncode == 0, result.stderr
-    pairs = _parse_probe(result.stdout)
+    assert probe.returncode == 0, probe.stderr
+    pairs = _parse_probe(probe.stdout)
     assert _major_minor(pairs["markdown-it-py"]) == (4, 2), pairs
     assert _major_minor(pairs["Send2Trash"]) == (2, 1), pairs
 
-
-def test_highest_available_domain_suite_passes(tmp_path: Path) -> None:
-    cache = tmp_path / "high-cache"
-    result = _run_uvx(
+    # Domain suite in the SAME cache at the highest-available resolution.
+    suite = _run_uvx(
         cache,
         "--refresh",
         "--resolution",
@@ -176,4 +179,4 @@ def test_highest_available_domain_suite_passes(tmp_path: Path) -> None:
         "-q",
         *IGNORED_INTEGRATION_TESTS,
     )
-    assert result.returncode == 0, result.stderr + result.stdout
+    assert suite.returncode == 0, suite.stderr + suite.stdout
