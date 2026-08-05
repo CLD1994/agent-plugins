@@ -104,23 +104,41 @@ def _multi_edges(graph: DraftGraph, label: RelationLabel) -> dict[Path, tuple[Pa
     return {source: tuple(sorted(targets)) for source, targets in edges.items()}
 
 
+def _relation_lines(
+    graph: DraftGraph, label: RelationLabel
+) -> dict[tuple[Path, Path], tuple[int, ...]]:
+    """Group relation edges by (source, target) and retain each declaration line.
+
+    Cycle detection only needs the edge set (``_multi_edges``); pair and self
+    checks need the original source lines, so they read from this grouping.
+    """
+    grouped: dict[tuple[Path, Path], list[int]] = {}
+    for source, target, line in graph.relations.get(label, ()):
+        grouped.setdefault((source, target), []).append(line)
+    return {edge: tuple(sorted(lines)) for edge, lines in grouped.items()}
+
+
+def _cycle_details(cycle: tuple[Path, ...]) -> tuple[str, ...]:
+    """Ordered closed path as POSIX strings, with the first node repeated at the end."""
+    return tuple(path.as_posix() for path in (*cycle, cycle[0]))
+
+
 def _check_relation_duplicates(graph: DraftGraph) -> list[CheckIssue]:
     """同一来源页的同一标签重复指向同一规范化目标（父主题由基数检查覆盖）。"""
     issues: list[CheckIssue] = []
     for label in RelationLabel:
         if label is RelationLabel.PARENT:
             continue
-        seen: dict[tuple[Path, Path], list[int]] = {}
-        for source, target, line in graph.relations.get(label, ()):
-            seen.setdefault((source, target), []).append(line)
+        seen = _relation_lines(graph, label)
         for (source, target), lines in sorted(seen.items()):
             if len(lines) > 1:
                 issues.append(
                     _error(
                         "relation.duplicate",
                         source,
-                        sorted(lines)[1],
-                        f"{label.value} 重复指向 {target}",
+                        lines[1],
+                        label.value,
+                        target.as_posix(),
                     )
                 )
     return issues
@@ -170,14 +188,15 @@ def _check_parents(graph: DraftGraph) -> list[CheckIssue]:
                         "layout.parent_mismatch",
                         path,
                         declared[0].link.line,
-                        f"声明 {declared_target}，物理 {physical}",
+                        declared_target.as_posix(),
+                        physical.as_posix(),
                     )
                 )
 
     cycles = _find_cycles({source: targets for source, targets in parent_edges.items()})
     cycle_members = {member for cycle in cycles for member in cycle}
     for cycle in cycles:
-        issues.append(_error("parent.cycle", cycle[0], None, " -> ".join(map(str, cycle))))
+        issues.append(_error("parent.cycle", cycle[0], None, *_cycle_details(cycle)))
 
     reachable: set[Path] = set()
     frontier = [ROOT_PAGE]
@@ -196,7 +215,7 @@ def _check_parents(graph: DraftGraph) -> list[CheckIssue]:
         if parent not in graph.pages:
             continue
         if child not in _body_links_to(graph, parent):
-            issues.append(_error("parent.navigation_missing", parent, None, str(child)))
+            issues.append(_error("parent.navigation_missing", parent, None, child.as_posix()))
 
     for path in graph.pages:
         if path.name == ROOT_PAGE.name and path != ROOT_PAGE and not graph.children.get(path):
@@ -207,69 +226,92 @@ def _check_parents(graph: DraftGraph) -> list[CheckIssue]:
 def _check_dependencies(graph: DraftGraph) -> list[CheckIssue]:
     issues: list[CheckIssue] = []
     edges = _multi_edges(graph, RelationLabel.DEPENDS_ON)
-    for source, targets in edges.items():
-        if source in targets:
-            issues.append(_error("dependency.self", source))
+    depends_lines = _relation_lines(graph, RelationLabel.DEPENDS_ON)
+    for (source, target), lines in sorted(depends_lines.items()):
+        if source == target:
+            issues.append(_error("dependency.self", source, min(lines)))
     non_self = {
         source: tuple(target for target in targets if target != source)
         for source, targets in edges.items()
     }
     for cycle in _find_cycles(non_self):
-        issues.append(_error("dependency.cycle", cycle[0], None, " -> ".join(map(str, cycle))))
+        issues.append(_error("dependency.cycle", cycle[0], None, *_cycle_details(cycle)))
     return issues
 
 
 def _check_replacements(graph: DraftGraph) -> list[CheckIssue]:
     issues: list[CheckIssue] = []
-    supersedes = {
-        (source, target)
-        for source, target, _line in graph.relations.get(RelationLabel.SUPERSEDES, ())
-    }
-    superseded_by = {
-        (source, target)
-        for source, target, _line in graph.relations.get(RelationLabel.SUPERSEDED_BY, ())
-    }
-    for source, target in sorted(supersedes):
+    supersedes = _relation_lines(graph, RelationLabel.SUPERSEDES)
+    superseded_by = _relation_lines(graph, RelationLabel.SUPERSEDED_BY)
+    for (source, target), lines in sorted(supersedes.items()):
         if (target, source) not in superseded_by:
-            issues.append(_error("replacement.pair_missing", source, None, str(target)))
-    for source, target in sorted(superseded_by):
+            issues.append(
+                _error(
+                    "replacement.pair_missing",
+                    source,
+                    min(lines),
+                    target.as_posix(),
+                    RelationLabel.SUPERSEDED_BY.value,
+                )
+            )
+    for (source, target), lines in sorted(superseded_by.items()):
         if (target, source) not in supersedes:
-            issues.append(_error("replacement.pair_missing", source, None, str(target)))
+            issues.append(
+                _error(
+                    "replacement.pair_missing",
+                    source,
+                    min(lines),
+                    target.as_posix(),
+                    RelationLabel.SUPERSEDES.value,
+                )
+            )
     for path, page in graph.pages.items():
-        declares_superseded_by = any(
-            relation.label is RelationLabel.SUPERSEDED_BY for relation in page.relations
-        )
+        superseded_by_relations = [
+            relation for relation in page.relations if relation.label is RelationLabel.SUPERSEDED_BY
+        ]
+        declares_superseded_by = bool(superseded_by_relations)
         is_superseded = page.status.prefix is StatusPrefix.SUPERSEDED
         if declares_superseded_by and not is_superseded:
+            line = min(relation.link.line for relation in superseded_by_relations)
             issues.append(
-                _error("replacement.status_mismatch", path, None, "被取代页面必须使用已取代状态")
+                _error("replacement.status_mismatch", path, line, "relation_requires_status")
             )
         if is_superseded and not declares_superseded_by:
             issues.append(
-                _error("replacement.status_mismatch", path, None, "已取代页面必须声明被取代")
+                _error("replacement.status_mismatch", path, None, "status_requires_relation")
             )
     edges = _multi_edges(graph, RelationLabel.SUPERSEDES)
     for cycle in _find_cycles(edges):
-        issues.append(_error("replacement.cycle", cycle[0], None, " -> ".join(map(str, cycle))))
+        issues.append(_error("replacement.cycle", cycle[0], None, *_cycle_details(cycle)))
     return issues
 
 
 def _check_challenges(graph: DraftGraph) -> list[CheckIssue]:
     issues: list[CheckIssue] = []
-    challenges = {
-        (source, target)
-        for source, target, _line in graph.relations.get(RelationLabel.CHALLENGES, ())
-    }
-    challenged_by = {
-        (source, target)
-        for source, target, _line in graph.relations.get(RelationLabel.CHALLENGED_BY, ())
-    }
-    for source, target in sorted(challenges):
+    challenges = _relation_lines(graph, RelationLabel.CHALLENGES)
+    challenged_by = _relation_lines(graph, RelationLabel.CHALLENGED_BY)
+    for (source, target), lines in sorted(challenges.items()):
         if (target, source) not in challenged_by:
-            issues.append(_error("challenge.pair_missing", source, None, str(target)))
-    for source, target in sorted(challenged_by):
+            issues.append(
+                _error(
+                    "challenge.pair_missing",
+                    source,
+                    min(lines),
+                    target.as_posix(),
+                    RelationLabel.CHALLENGED_BY.value,
+                )
+            )
+    for (source, target), lines in sorted(challenged_by.items()):
         if (target, source) not in challenges:
-            issues.append(_error("challenge.pair_missing", source, None, str(target)))
+            issues.append(
+                _error(
+                    "challenge.pair_missing",
+                    source,
+                    min(lines),
+                    target.as_posix(),
+                    RelationLabel.CHALLENGES.value,
+                )
+            )
     return issues
 
 
@@ -294,15 +336,23 @@ def _check_outputs(graph: DraftGraph) -> list[CheckIssue]:
             issues.append(_error("output.missing", path))
             continue
         if len(declared) > 1:
-            issues.append(_error("output.wrong_target", path, declared[1].link.line, "重复产出"))
+            issues.append(_error("output.wrong_target", path, declared[1].link.line, "duplicate"))
         if targets != (CONCLUSIONS_PAGE,):
             line = declared[0].link.line
             issues.append(
-                _error("output.wrong_target", path, line, "产出必须指向根级 conclusions.md")
+                _error(
+                    "output.wrong_target",
+                    path,
+                    line,
+                    "not_conclusions",
+                    declared[0].link.destination,
+                )
             )
             continue
         if path not in _body_links_to(graph, CONCLUSIONS_PAGE):
-            issues.append(_error("output.backlink_missing", CONCLUSIONS_PAGE, None, str(path)))
+            issues.append(
+                _error("output.backlink_missing", CONCLUSIONS_PAGE, None, path.as_posix())
+            )
     return issues
 
 
@@ -314,7 +364,7 @@ def _check_capacity(graph: DraftGraph) -> list[CheckIssue]:
         lines = page.text.count("\n") + 1 if page.text else 0
         size = len(page.text.encode("utf-8"))
         if lines > CAPACITY_LINES or size > CAPACITY_BYTES:
-            issues.append(_review("page.capacity", path, f"{lines} 行 / {size} 字节，建议审查拆分"))
+            issues.append(_review("page.capacity", path, str(lines), str(size)))
     return issues
 
 

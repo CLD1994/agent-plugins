@@ -509,7 +509,10 @@ def test_checker_reports_operation_states(operation_draft: Path) -> None:
 
     write_journal(root, "3" * 32, "prepared")
     report = check_draft(root)
-    assert "operation.inconsistent_state" in [issue.code for issue in report.errors]
+    inconsistent = next(
+        issue for issue in report.errors if issue.code == "operation.inconsistent_state"
+    )
+    assert inconsistent.details == ("prepared",)
     shutil.rmtree(root / ".draft/operations" / ("3" * 32))
 
     lock = root / ".draft/operation.lock"
@@ -519,7 +522,8 @@ def test_checker_reports_operation_states(operation_draft: Path) -> None:
 
     write_journal(root, "4" * 32, "applying")
     report = check_draft(root)
-    assert "operation.recovery_required" in [issue.code for issue in report.errors]
+    recovery = next(issue for issue in report.errors if issue.code == "operation.recovery_required")
+    assert recovery.details == ("4" * 32,)
 
 
 @pytest.mark.parametrize(

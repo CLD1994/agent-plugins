@@ -389,6 +389,7 @@ def test_parent_cycle_reports_one_canonical_cycle(draft_factory: DraftFactory) -
 
     cycle_issues = [issue for issue in report.errors if issue.code == "parent.cycle"]
     assert len(cycle_issues) == 1
+    assert cycle_issues[0].details == ("pages/a.md", "pages/b.md", "pages/a.md")
     assert "parent.unreachable" not in codes(report)
 
 
@@ -413,7 +414,9 @@ def test_declared_parent_differs_from_physical_parent(draft_factory: DraftFactor
 
     report = check_draft(root)
 
-    assert "layout.parent_mismatch" in codes(report)
+    mismatch = [issue for issue in report.errors if issue.code == "layout.parent_mismatch"]
+    assert len(mismatch) == 1
+    assert mismatch[0].details == ("index.md", "pages/sub/index.md")
 
 
 def test_parent_without_visible_navigation_back(draft_factory: DraftFactory) -> None:
@@ -447,7 +450,11 @@ def test_dependency_self_loop(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert "dependency.self" in codes(report)
+    self_issues = [issue for issue in report.errors if issue.code == "dependency.self"]
+    assert len(self_issues) == 1
+    assert self_issues[0].path == Path("pages/question.md")
+    assert self_issues[0].line == 7
+    assert self_issues[0].details == ()
 
 
 def test_dependency_cycle_reports_one_cycle(draft_factory: DraftFactory) -> None:
@@ -466,6 +473,7 @@ def test_dependency_cycle_reports_one_cycle(draft_factory: DraftFactory) -> None
 
     cycle_issues = [issue for issue in report.errors if issue.code == "dependency.cycle"]
     assert len(cycle_issues) == 1
+    assert cycle_issues[0].details == ("pages/a.md", "pages/b.md", "pages/a.md")
 
 
 def test_replacement_pair_missing(draft_factory: DraftFactory) -> None:
@@ -478,7 +486,35 @@ def test_replacement_pair_missing(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert "replacement.pair_missing" in codes(report)
+    pair = [issue for issue in report.errors if issue.code == "replacement.pair_missing"]
+    assert len(pair) == 1
+    assert pair[0].path == Path("pages/new.md")
+    assert pair[0].line == 7
+    assert pair[0].details == ("pages/question.md", "被取代")
+
+
+def test_replacement_pair_missing_reverse_branch_uses_forward_label(
+    draft_factory: DraftFactory,
+) -> None:
+    files = healthy()
+    files["pages/old.md"] = (
+        "# 旧\n\n> 状态：`待讨论`\n>\n> 父主题：[根](../index.md)\n>\n"
+        "> 被取代：[新](new.md)\n\n正文。\n"
+    )
+    files["pages/new.md"] = "# 新\n\n> 状态：`待讨论`\n>\n> 父主题：[根](../index.md)\n\n正文。\n"
+    files["index.md"] = ROOT_PAGE.replace(
+        "- [问题](pages/question.md)",
+        "- [问题](pages/question.md)\n- [新](pages/new.md)\n- [旧](pages/old.md)",
+    )
+    root = draft_factory(files)
+
+    report = check_draft(root)
+
+    pair = [issue for issue in report.errors if issue.code == "replacement.pair_missing"]
+    assert len(pair) == 1
+    assert pair[0].path == Path("pages/old.md")
+    assert pair[0].line == 7
+    assert pair[0].details == ("pages/new.md", "取代")
 
 
 def test_superseded_status_mismatch(draft_factory: DraftFactory) -> None:
@@ -496,7 +532,11 @@ def test_superseded_status_mismatch(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert "replacement.status_mismatch" in codes(report)
+    mismatch = [issue for issue in report.errors if issue.code == "replacement.status_mismatch"]
+    assert len(mismatch) == 1
+    assert mismatch[0].path == Path("pages/question.md")
+    assert mismatch[0].line == 7
+    assert mismatch[0].details == ("relation_requires_status",)
 
 
 def test_confirmed_status_without_superseded_by(draft_factory: DraftFactory) -> None:
@@ -506,7 +546,11 @@ def test_confirmed_status_without_superseded_by(draft_factory: DraftFactory) -> 
 
     report = check_draft(root)
 
-    assert "replacement.status_mismatch" in codes(report)
+    mismatch = [issue for issue in report.errors if issue.code == "replacement.status_mismatch"]
+    assert len(mismatch) == 1
+    assert mismatch[0].path == Path("pages/old.md")
+    assert mismatch[0].line is None
+    assert mismatch[0].details == ("status_requires_relation",)
 
 
 def test_replacement_cycle(draft_factory: DraftFactory) -> None:
@@ -525,6 +569,7 @@ def test_replacement_cycle(draft_factory: DraftFactory) -> None:
 
     cycle_issues = [issue for issue in report.errors if issue.code == "replacement.cycle"]
     assert len(cycle_issues) == 1
+    assert cycle_issues[0].details == ("pages/a.md", "pages/b.md", "pages/a.md")
     assert "replacement.pair_missing" not in codes(report)
     assert "replacement.status_mismatch" not in codes(report)
 
@@ -539,7 +584,35 @@ def test_challenge_pair_missing(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert "challenge.pair_missing" in codes(report)
+    pair = [issue for issue in report.errors if issue.code == "challenge.pair_missing"]
+    assert len(pair) == 1
+    assert pair[0].path == Path("pages/challenger.md")
+    assert pair[0].line == 7
+    assert pair[0].details == ("pages/question.md", "被质疑")
+
+
+def test_challenge_pair_missing_reverse_branch_uses_forward_label(
+    draft_factory: DraftFactory,
+) -> None:
+    files = healthy()
+    files["pages/old.md"] = (
+        "# 旧\n\n> 状态：`待讨论`\n>\n> 父主题：[根](../index.md)\n>\n"
+        "> 被质疑：[新](new.md)\n\n正文。\n"
+    )
+    files["pages/new.md"] = "# 新\n\n> 状态：`待讨论`\n>\n> 父主题：[根](../index.md)\n\n正文。\n"
+    files["index.md"] = ROOT_PAGE.replace(
+        "- [问题](pages/question.md)",
+        "- [问题](pages/question.md)\n- [新](pages/new.md)\n- [旧](pages/old.md)",
+    )
+    root = draft_factory(files)
+
+    report = check_draft(root)
+
+    pair = [issue for issue in report.errors if issue.code == "challenge.pair_missing"]
+    assert len(pair) == 1
+    assert pair[0].path == Path("pages/old.md")
+    assert pair[0].line == 7
+    assert pair[0].details == ("pages/new.md", "质疑")
 
 
 def test_confirmed_page_with_open_challenge_is_accepted(draft_factory: DraftFactory) -> None:
@@ -571,7 +644,28 @@ def test_output_to_wrong_target(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert "output.wrong_target" in codes(report)
+    wrong = [issue for issue in report.errors if issue.code == "output.wrong_target"]
+    assert len(wrong) == 1
+    assert wrong[0].path == Path("pages/question.md")
+    assert wrong[0].line == 7
+    assert wrong[0].details == ("not_conclusions", "../index.md")
+
+
+def test_output_duplicate_declaration_is_wrong_target(draft_factory: DraftFactory) -> None:
+    files = healthy()
+    files["pages/question.md"] = QUESTION.replace(
+        "> 产出：[结论汇总](../conclusions.md)",
+        "> 产出：[结论汇总](../conclusions.md)\n>\n> 产出：[结论汇总](../conclusions.md)",
+    )
+    root = draft_factory(files)
+
+    report = check_draft(root)
+
+    wrong = [issue for issue in report.errors if issue.code == "output.wrong_target"]
+    assert len(wrong) == 1
+    assert wrong[0].path == Path("pages/question.md")
+    assert wrong[0].line == 9
+    assert wrong[0].details == ("duplicate",)
 
 
 def test_non_confirmed_page_declaring_output(draft_factory: DraftFactory) -> None:
@@ -594,6 +688,8 @@ def test_conclusions_missing_backlink(draft_factory: DraftFactory) -> None:
     report = check_draft(root)
 
     assert codes(report) == ["output.backlink_missing"]
+    assert report.errors[0].path == Path("conclusions.md")
+    assert report.errors[0].details == ("pages/question.md",)
 
 
 def test_oversized_ordinary_page_is_review_only(draft_factory: DraftFactory) -> None:
@@ -607,6 +703,10 @@ def test_oversized_ordinary_page_is_review_only(draft_factory: DraftFactory) -> 
     assert report.errors == ()
     assert [issue.code for issue in report.reviews] == ["page.capacity"]
     assert report.reviews[0].severity is IssueSeverity.REVIEW
+    assert report.reviews[0].details == (
+        "620",
+        str(len(files["pages/question.md"].encode("utf-8"))),
+    )
 
 
 def test_oversized_conclusions_page_is_exempt(draft_factory: DraftFactory) -> None:
@@ -674,7 +774,8 @@ def test_duplicate_normalized_relation_target_is_an_error(
     assert codes(report) == ["relation.duplicate"]
     issue = report.errors[0]
     assert issue.path == Path("pages/question.md")
-    assert issue.line is not None
+    assert issue.line == 9
+    assert issue.details == ("依赖", "pages/other.md")
 
 
 def test_same_label_with_distinct_targets_is_allowed(
