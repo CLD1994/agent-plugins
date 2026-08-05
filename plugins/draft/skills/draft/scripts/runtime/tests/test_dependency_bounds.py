@@ -1,0 +1,179 @@
+"""Lowest-bound and highest-available dependency-window subprocess suites.
+
+Step 2 of Task 6. These tests prove the declared dependency windows in
+``pyproject.toml`` are satisfiable at both extremes and that the runtime's
+domain test suite passes under each resolution.
+
+* Lowest-bound: a fresh cache with ``--constraints minimum-runtime.txt`` and
+  ``--build-constraints minimum-build.txt`` pins every direct dependency to
+  the exact minimum declared in ``pyproject.toml``. The fresh-cache local
+  build plus ``--build-constraints`` proves the build backend works at
+  ``hatchling==1.31.0``.
+* Highest-available: another empty cache with ``--refresh --resolution
+  highest`` resolves every dependency to the latest version inside its
+  declared window.
+
+Both suites run the runtime's domain tests via ``uvx --isolated --from .``
+with ``cwd=RUNTIME_ROOT``, ignoring the integration suites
+(bootstrap/distribution/bounds) so only domain tests execute under the
+constrained environment.
+
+A ``python -c`` metadata probe (using ``importlib.metadata.version``, never
+imports of the packages under test) asserts the resolved versions before the
+domain suite runs.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+from pathlib import Path
+
+RUNTIME_ROOT = Path(__file__).resolve().parents[1]
+
+CONSTRAINTS_RUNTIME = RUNTIME_ROOT / "tests" / "constraints" / "minimum-runtime.txt"
+CONSTRAINTS_BUILD = RUNTIME_ROOT / "tests" / "constraints" / "minimum-build.txt"
+
+# Domain tests run under the constrained environment; the three integration
+# suites are ignored to avoid recursive subprocess invocation.
+IGNORED_INTEGRATION_TESTS = (
+    "--ignore=tests/test_bootstrap.py",
+    "--ignore=tests/test_dependency_bounds.py",
+    "--ignore=tests/test_distribution.py",
+)
+
+# Metadata probe: uses importlib.metadata.version (stdlib) with the package
+# name as a string. Never imports markdown_it or send2trash.
+VERSION_PROBE = (
+    "from importlib.metadata import version\n"
+    "print(f\"markdown-it-py={version('markdown-it-py')}\")\n"
+    "print(f\"Send2Trash={version('Send2Trash')}\")"
+)
+
+# Generous timeout: resolution + build + install + full domain suite.
+BOUNDS_TIMEOUT = 600
+
+
+def _clean_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in (
+        "UV_CACHE_DIR",
+        "UV_TOOL_DIR",
+        "UV_PYTHON",
+        "UV_PYTHON_DOWNLOADS",
+        "UV_OFFLINE",
+        "UV_RESOLUTION",
+        "UV_PROJECT_ENVIRONMENT",
+        "PYTHONPATH",
+        "VIRTUAL_ENV",
+    ):
+        env.pop(name, None)
+    return env
+
+
+def _run_uvx(cache_dir: Path, *uvx_args: str) -> subprocess.CompletedProcess[str]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return subprocess.run(
+        ["uvx", "--isolated", "--cache-dir", str(cache_dir), *uvx_args],
+        cwd=RUNTIME_ROOT,
+        env=_clean_env(),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=BOUNDS_TIMEOUT,
+    )
+
+
+def _parse_probe(output: str) -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    for line in output.strip().splitlines():
+        if "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        pairs[name] = value
+    return pairs
+
+
+def _major_minor(version: str) -> tuple[int, int]:
+    match = re.match(r"^(\d+)\.(\d+)", version)
+    assert match is not None, f"unparseable version: {version!r}"
+    return int(match.group(1)), int(match.group(2))
+
+
+def test_lowest_bound_probe_reports_exact_minimum_versions(tmp_path: Path) -> None:
+    cache = tmp_path / "low-cache"
+    result = _run_uvx(
+        cache,
+        "--constraints",
+        str(CONSTRAINTS_RUNTIME),
+        "--build-constraints",
+        str(CONSTRAINTS_BUILD),
+        "--from",
+        ".",
+        "python",
+        "-c",
+        VERSION_PROBE,
+    )
+    assert result.returncode == 0, result.stderr
+    pairs = _parse_probe(result.stdout)
+    assert pairs.get("markdown-it-py") == "4.2.0", pairs
+    assert pairs.get("Send2Trash") == "2.1.0", pairs
+
+
+def test_lowest_bound_domain_suite_passes(tmp_path: Path) -> None:
+    cache = tmp_path / "low-cache"
+    result = _run_uvx(
+        cache,
+        "--constraints",
+        str(CONSTRAINTS_RUNTIME),
+        "--build-constraints",
+        str(CONSTRAINTS_BUILD),
+        "--from",
+        ".",
+        "--with",
+        "pytest",
+        "pytest",
+        "tests",
+        "-q",
+        *IGNORED_INTEGRATION_TESTS,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_highest_available_probe_reports_window_major_minor(tmp_path: Path) -> None:
+    cache = tmp_path / "high-cache"
+    result = _run_uvx(
+        cache,
+        "--refresh",
+        "--resolution",
+        "highest",
+        "--from",
+        ".",
+        "python",
+        "-c",
+        VERSION_PROBE,
+    )
+    assert result.returncode == 0, result.stderr
+    pairs = _parse_probe(result.stdout)
+    assert _major_minor(pairs["markdown-it-py"]) == (4, 2), pairs
+    assert _major_minor(pairs["Send2Trash"]) == (2, 1), pairs
+
+
+def test_highest_available_domain_suite_passes(tmp_path: Path) -> None:
+    cache = tmp_path / "high-cache"
+    result = _run_uvx(
+        cache,
+        "--refresh",
+        "--resolution",
+        "highest",
+        "--from",
+        ".",
+        "--with",
+        "pytest",
+        "pytest",
+        "tests",
+        "-q",
+        *IGNORED_INTEGRATION_TESTS,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout

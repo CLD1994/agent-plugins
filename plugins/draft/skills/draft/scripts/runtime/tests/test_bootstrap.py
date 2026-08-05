@@ -1,192 +1,229 @@
+"""Path-based uvx bootstrap tests.
+
+These tests replace the old fake-launcher suite. The only core invocation prefix
+is ``uvx --isolated --from "<skill_root>/scripts/runtime" draft``; uv owns
+environment selection and cache reuse, while uv startup failures retain uv's
+stderr and exit status.
+
+Each test copies only ``skills/draft`` beneath an unrelated parent directory
+(no ``.git``, no repository parent), computes the runtime path from that copy,
+and asserts the behavior contract from Task 6 Step 1.
+"""
+
 from __future__ import annotations
 
 import os
 import shutil
 import subprocess
-import sys
-import tempfile
 from pathlib import Path
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = RUNTIME_ROOT.parents[1]
 
-FORBIDDEN = ("bootstrap", "data/bin", "installed-runtime-manifest", "setup-status.json")
+# Legacy launcher/bootstrap tokens that must never reappear in the core
+# invocation path or its outputs.
+FORBIDDEN_TOKENS = (
+    "bootstrap",
+    "data/bin",
+    "installed-runtime-manifest",
+    "setup-status.json",
+)
+
+# Host environment variables that would leak host state into the isolated uvx
+# subprocess. Stripped from every clean baseline environment.
+_STRIP_ENV = (
+    "PLUGIN_ROOT",
+    "PLUGIN_DATA",
+    "CLAUDE_PLUGIN_ROOT",
+    "CLAUDE_PLUGIN_DATA",
+    "DRAFT_DATA",
+    "DRAFT_SKILL_PATH",
+    "PYTHONPATH",
+    "VIRTUAL_ENV",
+    "UV_PROJECT_ENVIRONMENT",
+    "UV_CACHE_DIR",
+    "UV_TOOL_DIR",
+    "UV_PYTHON",
+    "UV_PYTHON_DOWNLOADS",
+    "UV_OFFLINE",
+    "UV_RESOLUTION",
+)
+
+# Generous timeout for every uvx subprocess: resolution plus build plus install
+# plus command execution. Correctness over speed.
+UVX_TIMEOUT = 600
 
 
-def _write_fake_uv(bin_dir: Path) -> None:
-    uv = bin_dir / "uv"
-    uv.write_text(
-        """#!/bin/sh
-echo "$*" >> "$UV_LOG"
-if [ "$1" = "--version" ]; then
-    echo "uv 0.8.11"
-    exit 0
-fi
-if [ "$1" != "run" ]; then
-    echo "unexpected fake uv call: $*" >&2
-    exit 99
-fi
-shift
-if [ "$1" = "--project" ]; then
-    project="$2"
-    shift 2
-    echo "ENV UV_PROJECT_ENVIRONMENT=$UV_PROJECT_ENVIRONMENT" \
-        "PYTHONPATH=${PYTHONPATH-unset} DRAFT_DATA=${DRAFT_DATA-unset}" \
-        "VIRTUAL_ENV=${VIRTUAL_ENV-unset}" >> "$UV_LOG"
-    mkdir -p "$UV_PROJECT_ENVIRONMENT"
-    while [ "$1" != "draft" ]; do shift; done
-    shift
-    echo "draft $*" >> "$PY_LOG"
-    PYTHONPATH="$project/src"
-    export PYTHONPATH
-    exec "$TEST_PYTHON" -m draft "$@"
-fi
-script="$1"
-shift
-exec "$TEST_PYTHON" "$script" "$@"
-""",
-        encoding="utf-8",
+def clean_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in _STRIP_ENV:
+        env.pop(name, None)
+    return env
+
+
+def copy_skill(tmp_path: Path, *, drop_lock: bool = False) -> Path:
+    """Copy only ``skills/draft`` beneath an unrelated parent directory.
+
+    The parent has no ``.git`` and no repository parent, proving the runtime is
+    self-contained and does not walk up to find a repository.
+    """
+    parent = tmp_path / "host"
+    parent.mkdir()
+    artifact = parent / "draft-skill"
+    shutil.copytree(
+        SKILL_ROOT,
+        artifact,
+        ignore=shutil.ignore_patterns(
+            "__pycache__",
+            ".venv",
+            ".pytest_cache",
+            ".ruff_cache",
+        ),
     )
-    uv.chmod(0o755)
-
-
-def copy_skill(tmp_path: Path) -> Path:
-    case_dir = Path(tempfile.mkdtemp(prefix="case-", dir=tmp_path))
-    artifact = case_dir / "draft-skill"
-    shutil.copytree(SKILL_ROOT, artifact, ignore=shutil.ignore_patterns("__pycache__", ".venv"))
+    if drop_lock:
+        (artifact / "scripts" / "runtime" / "uv.lock").unlink()
     return artifact
 
 
-def make_case(tmp_path: Path) -> tuple[Path, Path, Path, Path, dict[str, str]]:
-    artifact = copy_skill(tmp_path)
-    case_dir = artifact.parent
-    fake_bin = case_dir / "bin"
-    fake_bin.mkdir()
-    _write_fake_uv(fake_bin)
-    xdg = case_dir / "xdg"
-    xdg.mkdir()
-    xdg.chmod(0o700)
-    uv_log = case_dir / "uv.log"
-    py_log = case_dir / "py.log"
-    env = os.environ.copy()
-    for name in (
-        "PLUGIN_ROOT",
-        "PLUGIN_DATA",
-        "CLAUDE_PLUGIN_ROOT",
-        "CLAUDE_PLUGIN_DATA",
-        "DRAFT_DATA",
-        "DRAFT_SKILL_PATH",
-        "PYTHONPATH",
-        "VIRTUAL_ENV",
-    ):
-        env.pop(name, None)
-    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-    env["XDG_RUNTIME_DIR"] = str(xdg)
-    env["UV_LOG"] = str(uv_log)
-    env["PY_LOG"] = str(py_log)
-    env["TEST_PYTHON"] = sys.executable
-    return artifact, xdg, uv_log, py_log, env
-
-
-def run_launcher(
-    artifact: Path, env: dict[str, str], *args: str
+def run_uvx(
+    artifact: Path,
+    env: dict[str, str],
+    cache_dir: Path,
+    *draft_args: str,
+    extra_uvx_args: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
+    """Run ``uvx --isolated --from <copy>/scripts/runtime draft ...``.
+
+    The cache dir is passed explicitly via ``--cache-dir`` so the exact cache
+    path is under test control (snapshotting, fresh-cache isolation).
+    """
+    runtime = artifact / "scripts" / "runtime"
+    cache_dir.mkdir(parents=True, exist_ok=True)
     return subprocess.run(
-        ["uv", "run", str(artifact / "scripts/draft.py"), *args],
+        [
+            "uvx",
+            "--isolated",
+            "--cache-dir",
+            str(cache_dir),
+            *extra_uvx_args,
+            "--from",
+            str(runtime),
+            "draft",
+            *draft_args,
+        ],
         cwd=artifact.parent,
         env=env,
         text=True,
         capture_output=True,
         check=False,
+        timeout=UVX_TIMEOUT,
     )
 
 
-def _assert_no_forbidden_references(*logs: Path) -> None:
-    for log in logs:
-        if not log.exists():
-            continue
-        text = log.read_text(encoding="utf-8")
-        for token in FORBIDDEN:
-            assert token not in text, f"{token} referenced in {log}"
+def _assert_no_forbidden_outputs(result: subprocess.CompletedProcess[str]) -> None:
+    for token in FORBIDDEN_TOKENS:
+        assert token not in result.stdout, f"{token!r} leaked into stdout"
+        assert token not in result.stderr, f"{token!r} leaked into stderr"
 
 
-def test_setup_syncs_version_environment_without_domain_cli(tmp_path: Path) -> None:
-    artifact, xdg, uv_log, py_log, env = make_case(tmp_path)
-    result = run_launcher(artifact, env, "setup")
+def _assert_no_draft_managed_envs(artifact: Path, *roots: Path) -> None:
+    """No ``.venv`` or Draft-managed ``envs/`` appears in the skill or business root.
+
+    uvx's tool environment lives beneath the cache dir's ``environments-v2/``,
+    never inside the copied skill or a Draft business root.
+    """
+    assert not list(artifact.rglob(".venv"))
+    for root in roots:
+        assert not list(root.rglob(".venv"))
+    # The old launcher created ``envs/<version>`` beneath a Draft data dir; the
+    # path-based uvx runtime must not create any ``envs`` directory inside the
+    # copied skill or business root.
+    for base in (artifact, *roots):
+        assert not list(base.rglob("envs"))
+
+
+def test_version_reports_runtime_version_from_copy(tmp_path: Path) -> None:
+    artifact = copy_skill(tmp_path)
+    env = clean_env()
+    cache = tmp_path / "uv-cache"
+    result = run_uvx(artifact, env, cache, "--version")
     assert result.returncode == 0, result.stderr
-
-    lines = uv_log.read_text(encoding="utf-8").splitlines()
-    assert lines[0] == f"run {artifact}/scripts/draft.py setup"
-    inner = lines[1]
-    assert inner.startswith(f"run --project {artifact}/scripts/runtime ")
-    for flag in ("--locked", "--exact", "--no-dev", "--no-editable", "--no-env-file"):
-        assert flag in inner
-    assert inner.endswith(" draft --version")
-    env_line = lines[2]
-    assert f"UV_PROJECT_ENVIRONMENT={xdg}/draft/envs/0.2.0" in env_line
-    assert "PYTHONPATH=unset" in env_line
-    assert "DRAFT_DATA=unset" in env_line
-    assert "VIRTUAL_ENV=unset" in env_line
-    assert py_log.read_text(encoding="utf-8").splitlines() == ["draft --version"]
-    _assert_no_forbidden_references(uv_log, py_log)
+    # The existing output shape is the bare version on stdout.
+    assert result.stdout.strip() == "0.3.0"
+    _assert_no_forbidden_outputs(result)
+    # The launcher script is absent and no Draft-managed envs were created.
+    assert not (artifact / "scripts" / "draft.py").exists()
+    _assert_no_draft_managed_envs(artifact)
 
 
-def test_domain_command_exit_code_propagates(tmp_path: Path) -> None:
-    artifact, _, uv_log, py_log, env = make_case(tmp_path)
-    result = run_launcher(artifact, env, "check", "missing-root")
-    assert result.returncode == 2, result.stderr
-    lines = uv_log.read_text(encoding="utf-8").splitlines()
-    assert lines[0] == f"run {artifact}/scripts/draft.py check missing-root"
-    assert py_log.read_text(encoding="utf-8").splitlines() == ["draft check missing-root"]
-    _assert_no_forbidden_references(uv_log, py_log)
+def test_init_and_check_pass_without_plugin_files_or_repo_parents(
+    tmp_path: Path,
+) -> None:
+    artifact = copy_skill(tmp_path)
+    env = clean_env()
+    cache = tmp_path / "uv-cache"
+    root = tmp_path / "draft-root"
 
+    init = run_uvx(artifact, env, cache, "init", str(root))
+    assert init.returncode == 0, init.stderr
+    _assert_no_forbidden_outputs(init)
 
-def test_copied_skill_runs_standalone_with_isolated_runtime_dir(tmp_path: Path) -> None:
-    artifact, xdg, uv_log, py_log, env = make_case(tmp_path)
-    case_dir = artifact.parent
-
-    def run(*args: str) -> subprocess.CompletedProcess[str]:
-        result = run_launcher(artifact, env, *args)
-        assert result.returncode == 0, f"{args}: {result.stderr}{result.stdout}"
-        return result
-
-    root = case_dir / "draft-root"
-    run("setup")
-    run("init", str(root))
+    # Add a valid child page so check has real structural work beyond the
+    # freshly-initialized skeleton.
     index = root / "index.md"
-    index.write_text(index.read_text(encoding="utf-8") + "- [A](pages/a.md)\n", encoding="utf-8")
+    index.write_text(
+        index.read_text(encoding="utf-8") + "- [A](pages/a.md)\n",
+        encoding="utf-8",
+    )
     (root / "pages" / "a.md").write_text(
         "# A\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n",
         encoding="utf-8",
     )
-    run("check", str(root))
-    run("move", str(root), "pages/a.md", "pages/b.md")
-    run("check", str(root))
 
-    assert not (root / "pages" / "a.md").exists()
-    assert (root / "pages" / "b.md").is_file()
+    check = run_uvx(artifact, env, cache, "check", str(root))
+    assert check.returncode == 0, check.stderr
+    _assert_no_forbidden_outputs(check)
 
-    envs = xdg / "draft" / "envs" / "0.2.0"
-    assert envs.is_dir()
-    assert not list((case_dir).rglob(".env"))
-    assert not list(artifact.rglob(".venv"))
-    internal = [path for path in case_dir.rglob(".draft")]
-    assert internal and all(root in path.parents for path in internal)
-    managed = [
-        path
-        for path in case_dir.rglob("*.md")
-        if artifact not in path.parents and ".draft" not in path.parts
-    ]
-    assert managed and all(root in path.parents for path in managed)
-
-    for line in uv_log.read_text(encoding="utf-8").splitlines():
-        if line.startswith("ENV "):
-            assert "PYTHONPATH=unset" in line
-            assert "DRAFT_DATA=unset" in line
-    _assert_no_forbidden_references(uv_log, py_log)
+    # No plugin files or repository parents: the copied skill sits beneath an
+    # unrelated host dir with no ``.git`` and no plugin/manifest ancestors.
+    assert not (artifact / "scripts" / "draft.py").exists()
+    assert not (artifact / ".git").exists()
+    assert not (artifact.parent / ".git").exists()
+    # No plugin manifest or plugin-only directories carried into the skill.
+    assert not (artifact / ".codex-plugin").exists()
+    assert not (artifact / ".claude-plugin").exists()
+    assert not (artifact / "hooks").exists()
+    _assert_no_draft_managed_envs(artifact, root)
 
 
-def test_launcher_does_not_reference_legacy_layout() -> None:
-    text = (SKILL_ROOT / "scripts" / "draft.py").read_text(encoding="utf-8")
-    for token in FORBIDDEN:
-        assert token not in text, f"{token} referenced in scripts/draft.py"
+def test_missing_interpreter_returns_uv_error_not_draft_json(
+    tmp_path: Path,
+) -> None:
+    artifact = copy_skill(tmp_path)
+    env = clean_env()
+    env["UV_PYTHON"] = str(tmp_path / "nonexistent" / "python")
+    env["UV_PYTHON_DOWNLOADS"] = "never"
+    cache = tmp_path / "uv-cache"
+    result = run_uvx(artifact, env, cache, "--version")
+    # uv's nonzero status, not a Draft exit code.
+    assert result.returncode != 0
+    # uv's stderr is present and reports the interpreter failure.
+    assert result.stderr, "expected uv stderr for missing interpreter"
+    assert "interpreter" in result.stderr.lower() or "python" in result.stderr.lower()
+    # Must NOT be a Draft JSON error envelope on stdout.
+    assert not result.stdout.strip().startswith("{")
+    assert '"code"' not in result.stdout
+    assert '"result_type"' not in result.stdout
+
+
+def test_uvx_resolves_from_pyproject_when_lock_absent(tmp_path: Path) -> None:
+    artifact = copy_skill(tmp_path, drop_lock=True)
+    assert not (artifact / "scripts" / "runtime" / "uv.lock").exists()
+    env = clean_env()
+    cache = tmp_path / "uv-cache"
+    result = run_uvx(artifact, env, cache, "--version")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "0.3.0"
+    _assert_no_forbidden_outputs(result)
+    assert not (artifact / "scripts" / "draft.py").exists()
+    _assert_no_draft_managed_envs(artifact)

@@ -1,11 +1,11 @@
 [project]
 name = "draft-runtime"
-version = "0.2.0"
+version = "0.3.0"
 description = "Deterministic runtime for recursive discussion drafts."
 requires-python = ">=3.12,<3.15"
 dependencies = [
-    "markdown-it-py",
-    "Send2Trash",
+    "markdown-it-py>=4.2,<4.3",
+    "Send2Trash>=2.1,<2.2",
 ]
 
 [project.scripts]
@@ -13,14 +13,14 @@ draft = "draft.cli:main"
 
 [dependency-groups]
 dev = [
-    "hatchling",
+    "hatchling>=1.31,<1.32",
     "pytest",
     "pyright",
     "ruff",
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.31,<1.32"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
@@ -33,13 +33,6 @@ package = true
 testpaths = ["tests"]
 
 [tool.pyright]
-include = ["src", "tests", "../draft.py"]
+include = ["src", "tests"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
-
-[tool.ruff]
-line-length = 100
-target-version = "py312"
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
