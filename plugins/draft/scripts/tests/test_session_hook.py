@@ -1,0 +1,942 @@
+"""SessionStart Hook 适配层测试：不导入核心、不调用子进程，仅依赖标准库与 adapter。"""
+
+from __future__ import annotations
+
+import io
+import json
+import shlex
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TextIO, cast
+
+import pytest
+from adapter.bindings import Binding, bind, binding_path
+from adapter.bridge import PluginContext, load_context
+from adapter.errors import AdapterError
+from adapter.session_hook import (
+    HOST_ENV,
+    HOST_SOURCES,
+    MAX_STDIN,
+    render_diagnostic,
+    render_rebind,
+    render_session_fact,
+    run_session_start,
+)
+
+HOSTS = ("codex", "claude")
+
+
+# ---------------------------------------------------------------------------
+# 固件
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Setup:
+    entry: Path
+    runtime_dir: Path
+    data_dir: Path
+    skill_path: Path
+    plugin_root: Path
+    base: Path
+
+
+@pytest.fixture
+def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Setup:
+    """复制插件布局：<plugin>/scripts/draft.py、<plugin>/skills/draft/SKILL.md、<plugin-data>/。
+
+    plugin_root 名字带空格，覆盖命令示例中的 shell 引用。
+    """
+    base = tmp_path.resolve()
+    plugin_root = base / "plug in"
+    entry = plugin_root / "scripts" / "draft.py"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("# plugin entry\n", encoding="utf-8")
+    skill_path = plugin_root / "skills" / "draft" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text("# Draft skill\n", encoding="utf-8")
+    data_dir = (base / "host-data").resolve()
+    data_dir.mkdir()
+    runtime_dir = (base / "xdg").resolve()
+    runtime_dir.mkdir()
+    runtime_dir.chmod(0o700)
+    for root_var, data_var in HOST_ENV.values():
+        monkeypatch.delenv(root_var, raising=False)
+        monkeypatch.delenv(data_var, raising=False)
+    return Setup(
+        entry=entry,
+        runtime_dir=runtime_dir,
+        data_dir=data_dir,
+        skill_path=skill_path,
+        plugin_root=plugin_root,
+        base=base,
+    )
+
+
+def default_env(setup: Setup, host: str) -> dict[str, str]:
+    root_var, data_var = HOST_ENV[host]
+    env: dict[str, str] = {
+        root_var: str(setup.plugin_root),
+        data_var: str(setup.data_dir),
+    }
+    # 另一宿主变量设为诱饵（不存在的路径），证明不被读取
+    for other_host, (other_root, other_data) in HOST_ENV.items():
+        if other_host != host:
+            env[other_root] = str(setup.base / "decoy-root")
+            env[other_data] = str(setup.base / "decoy-data")
+    return env
+
+
+def session_stdin(
+    session: object = "abc123",
+    source: str = "startup",
+    *,
+    event: str = "SessionStart",
+) -> str:
+    payload: dict[str, object] = {
+        "session_id": session,
+        "hook_event_name": event,
+        "source": source,
+        "transcript_path": "/not/read/transcript.jsonl",
+        "cwd": "/workspace",
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def run_hook(
+    setup: Setup,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    host: str = "codex",
+    stdin: str | None = None,
+    env: Mapping[str, str] | None = None,
+    entry_path: Path | None = None,
+) -> tuple[int, str]:
+    if env is None:
+        env = default_env(setup, host)
+    if stdin is None:
+        stdin = session_stdin("abc123", "startup")
+    code = run_session_start(
+        host,
+        entry_path=entry_path if entry_path is not None else setup.entry,
+        environ=dict(env),
+        stdin=io.StringIO(stdin),
+        runtime_dir=setup.runtime_dir,
+    )
+    captured = capsys.readouterr()
+    return code, captured.out
+
+
+def bind_session(
+    setup: Setup,
+    *,
+    session: str = "abc123",
+    root: Path | None = None,
+    hint: Path | None = None,
+) -> Binding:
+    if root is None:
+        root = setup.base / "topic"
+    root.mkdir(parents=True, exist_ok=True)
+    return bind(setup.data_dir, Binding(session_id=session, root=root, last_page_hint=hint))
+
+
+# ---------------------------------------------------------------------------
+# Step 1: 宿主选择、布局与执行顺序
+# ---------------------------------------------------------------------------
+
+
+def test_host_env_and_sources_are_the_exact_protocol_tables() -> None:
+    assert HOST_ENV == {
+        "codex": ("PLUGIN_ROOT", "PLUGIN_DATA"),
+        "claude": ("CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA"),
+    }
+    assert HOST_SOURCES == {
+        "codex": ("startup", "resume", "clear", "compact"),
+        "claude": ("startup", "resume", "clear", "compact", "fork"),
+    }
+    assert MAX_STDIN == 64 * 1024
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_each_host_reads_only_its_own_variables(
+    setup: Setup, host: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, output = run_hook(setup, capsys, host=host, stdin=session_stdin("new-session"))
+    assert code == 0
+    assert "Draft 会话未绑定" in output
+    assert "new-session" in output
+    # bridge 发布了当前宿主的 data_dir
+    assert load_context(setup.entry, setup.runtime_dir) == PluginContext(setup.data_dir)
+
+
+def test_unknown_host_does_not_probe_either_pair(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 两组宿主变量都设为合法值，未知宿主仍必须报 unknown_host
+    env: dict[str, str] = {}
+    for root_var, data_var in HOST_ENV.values():
+        env[root_var] = str(setup.plugin_root)
+        env[data_var] = str(setup.data_dir)
+    code, output = run_hook(setup, capsys, host="bogus", env=env)
+    assert code == 0
+    assert "hook.unknown_host" in output
+    assert output.count("Draft 插件诊断") == 1
+    assert load_context(setup.entry, setup.runtime_dir) is None
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_missing_root_variable_renders_environment_missing(
+    setup: Setup, host: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = default_env(setup, host)
+    root_var, _ = HOST_ENV[host]
+    del env[root_var]
+    code, output = run_hook(setup, capsys, host=host, env=env)
+    assert code == 0
+    assert "hook.environment_missing" in output
+    assert output.count("Draft 插件诊断") == 1
+    assert load_context(setup.entry, setup.runtime_dir) is None
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_missing_data_variable_renders_environment_missing(
+    setup: Setup, host: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = default_env(setup, host)
+    _, data_var = HOST_ENV[host]
+    del env[data_var]
+    code, output = run_hook(setup, capsys, host=host, env=env)
+    assert code == 0
+    assert "hook.environment_missing" in output
+    assert output.count("Draft 插件诊断") == 1
+    assert load_context(setup.entry, setup.runtime_dir) is None
+
+
+def test_relative_data_dir_renders_environment_missing(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = default_env(setup, "codex")
+    _, data_var = HOST_ENV["codex"]
+    env[data_var] = "relative/data"
+    code, output = run_hook(setup, capsys, host="codex", env=env)
+    assert code == 0
+    assert "hook.environment_missing" in output
+    assert load_context(setup.entry, setup.runtime_dir) is None
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_symlink_plugin_root_renders_plugin_root_mismatch(
+    setup: Setup, host: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    real = tmp_path / "real-plugin"
+    real.mkdir()
+    (real / "scripts").mkdir()
+    (real / "scripts" / "draft.py").write_text("#\n", encoding="utf-8")
+    link = setup.base / "plugin-link"
+    link.symlink_to(real)
+    env = default_env(setup, host)
+    root_var, _ = HOST_ENV[host]
+    env[root_var] = str(link)
+    # 入口仍指向真实插件，确保唯一错误来源是 plugin_root 是符号链接
+    code, output = run_hook(setup, capsys, host=host, env=env, entry_path=setup.entry)
+    assert code == 0
+    assert "hook.plugin_root_mismatch" in output
+    assert output.count("Draft 插件诊断") == 1
+    assert load_context(setup.entry, setup.runtime_dir) is None
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_entry_outside_plugin_scripts_renders_plugin_root_mismatch(
+    setup: Setup, host: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # plugin_root 合法，但传入的 entry 不在 plugin_root/scripts/draft.py
+    other_entry = setup.base / "other-entry.py"
+    other_entry.write_text("#\n", encoding="utf-8")
+    code, output = run_hook(setup, capsys, host=host, entry_path=other_entry)
+    assert code == 0
+    assert "hook.plugin_root_mismatch" in output
+    assert output.count("Draft 插件诊断") == 1
+    assert load_context(other_entry, setup.runtime_dir) is None
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_missing_skill_md_renders_layout_invalid(
+    setup: Setup, host: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    setup.skill_path.unlink()
+    code, output = run_hook(setup, capsys, host=host)
+    assert code == 0
+    assert "hook.layout_invalid" in output
+    assert output.count("Draft 插件诊断") == 1
+    assert load_context(setup.entry, setup.runtime_dir) is None
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_non_regular_skill_md_renders_layout_invalid(
+    setup: Setup, host: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    setup.skill_path.unlink()
+    setup.skill_path.mkdir()
+    code, output = run_hook(setup, capsys, host=host)
+    assert code == 0
+    assert "hook.layout_invalid" in output
+    assert load_context(setup.entry, setup.runtime_dir) is None
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_symlink_skill_md_renders_layout_invalid(
+    setup: Setup, host: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    real = setup.base / "real-skill.md"
+    real.write_text("#\n", encoding="utf-8")
+    setup.skill_path.unlink()
+    setup.skill_path.symlink_to(real)
+    code, output = run_hook(setup, capsys, host=host)
+    assert code == 0
+    assert "hook.layout_invalid" in output
+    assert load_context(setup.entry, setup.runtime_dir) is None
+
+
+def test_bridge_is_published_before_payload_validation(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, output = run_hook(setup, capsys, host="codex", stdin="{bad json")
+    assert code == 0
+    assert "hook.stdin_invalid" in output
+    # 布局成功 -> bridge 已发布；载荷错误发生在发布之后
+    assert load_context(setup.entry, setup.runtime_dir) == PluginContext(setup.data_dir)
+
+
+def test_layout_failure_occurs_before_bridge_publication(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    setup.skill_path.unlink()
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123"))
+    assert code == 0
+    assert "hook.layout_invalid" in output
+    assert load_context(setup.entry, setup.runtime_dir) is None
+
+
+# ---------------------------------------------------------------------------
+# Step 2: 载荷协议矩阵与不透明 session
+# ---------------------------------------------------------------------------
+
+
+def test_stdin_at_64kib_boundary_is_accepted(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    boundary = session_stdin("x" * 10, "startup")
+    padding = " " * (MAX_STDIN - len(boundary))
+    code, output = run_hook(setup, capsys, host="codex", stdin=boundary + padding)
+    assert code == 0
+    assert "Draft 会话未绑定" in output
+
+
+def test_oversized_stdin_renders_oversized(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, output = run_hook(setup, capsys, host="codex", stdin=" " * (MAX_STDIN + 1))
+    assert code == 0
+    assert "hook.stdin_oversized" in output
+    assert output.count("Draft 插件诊断") == 1
+    assert load_context(setup.entry, setup.runtime_dir) == PluginContext(setup.data_dir)
+
+
+def test_stream_read_oserror_renders_stdin_unavailable(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class _BadStream:
+        def read(self, size: int | None = -1) -> str:
+            raise OSError("stream broken")
+
+    bad_stream: TextIO = cast("TextIO", _BadStream())
+    code = run_session_start(
+        "codex",
+        entry_path=setup.entry,
+        environ=default_env(setup, "codex"),
+        stdin=bad_stream,
+        runtime_dir=setup.runtime_dir,
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "hook.stdin_unavailable" in captured.out
+    assert captured.err == ""
+
+
+def test_invalid_json_renders_stdin_invalid(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, output = run_hook(setup, capsys, host="codex", stdin="{not json")
+    assert code == 0
+    assert "hook.stdin_invalid" in output
+    assert output.count("Draft 插件诊断") == 1
+
+
+def test_non_object_json_renders_stdin_not_object(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, output = run_hook(setup, capsys, host="codex", stdin="[1, 2, 3]")
+    assert code == 0
+    assert "hook.stdin_not_object" in output
+    assert output.count("Draft 插件诊断") == 1
+
+
+def test_wrong_event_renders_unexpected_event(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, output = run_hook(
+        setup, capsys, host="codex", stdin=session_stdin("abc123", "startup", event="PreCompact")
+    )
+    assert code == 0
+    assert "hook.unexpected_event" in output
+    assert output.count("Draft 插件诊断") == 1
+
+
+@pytest.mark.parametrize("bad_session", [None, 123, [1, 2], {"id": "x"}])
+def test_non_string_or_missing_session_renders_session_unavailable(
+    setup: Setup, bad_session: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload: dict[str, object] = {
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+    }
+    if bad_session is not _MISSING:
+        payload["session_id"] = bad_session
+    code, output = run_hook(
+        setup, capsys, host="codex", stdin=json.dumps(payload, ensure_ascii=False)
+    )
+    assert code == 0
+    assert "binding.session_unavailable" in output
+    assert output.count("Draft 插件诊断") == 1
+
+
+class _Missing:
+    pass
+
+
+_MISSING = _Missing()
+
+
+@pytest.mark.parametrize("bad_source", [123, None, ["startup"]])
+def test_non_string_source_renders_unexpected_source(
+    setup: Setup, bad_source: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload: dict[str, object] = {
+        "session_id": "abc123",
+        "hook_event_name": "SessionStart",
+        "source": bad_source,
+    }
+    code, output = run_hook(
+        setup, capsys, host="codex", stdin=json.dumps(payload, ensure_ascii=False)
+    )
+    assert code == 0
+    assert "hook.unexpected_source" in output
+    assert output.count("Draft 插件诊断") == 1
+
+
+def test_codex_rejects_fork_source(setup: Setup, capsys: pytest.CaptureFixture[str]) -> None:
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "fork"))
+    assert code == 0
+    assert "hook.unexpected_source" in output
+
+
+def test_claude_accepts_fork_source(setup: Setup, capsys: pytest.CaptureFixture[str]) -> None:
+    code, output = run_hook(setup, capsys, host="claude", stdin=session_stdin("abc123", "fork"))
+    assert code == 0
+    assert "Draft 会话未绑定" in output
+
+
+@pytest.mark.parametrize("host", HOSTS)
+@pytest.mark.parametrize("source", ["bogus", "STARTUP", ""])
+def test_source_not_legal_for_host_renders_unexpected_source(
+    setup: Setup, host: str, source: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, output = run_hook(setup, capsys, host=host, stdin=session_stdin("abc123", source))
+    assert code == 0
+    assert "hook.unexpected_source" in output
+
+
+@pytest.mark.parametrize("session", ["", "abc123", "会话-☃-123", "a b\tc", "../x\\y"])
+def test_every_string_is_an_opaque_session_identity(
+    setup: Setup, session: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin(session, "startup"))
+    assert code == 0
+    assert json.dumps(session, ensure_ascii=False) in output
+    assert "SESSION_ID" in output
+    # session 原样作为 JSON 字符串独占一行，未被插入路径或 shell 片段
+    assert f"session_id：{json.dumps(session, ensure_ascii=False)}" in output
+
+
+# ---------------------------------------------------------------------------
+# Step 3: 未绑定、恢复与损坏状态信封
+# ---------------------------------------------------------------------------
+
+
+def test_unbound_session_byte_identical_output(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    session = "new-session"
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin(session, "startup"))
+    assert code == 0
+    expected = (
+        "Draft 会话未绑定\n"
+        f"- 宿主 session_id：{json.dumps(session, ensure_ascii=False)}\n"
+        f"- 插件入口：{setup.entry}\n"
+        f"- 绑定格式：uv run {shlex.quote(str(setup.entry))} bind ROOT --session SESSION_ID "
+        "[--last-page-hint PAGE]\n"
+        f"- 解除格式：uv run {shlex.quote(str(setup.entry))} unbind --session SESSION_ID\n"
+    )
+    assert output == expected
+
+
+def test_render_session_fact_is_pure_function(setup: Setup) -> None:
+    text = render_session_fact("opaque", setup.entry)
+    assert "Draft 会话未绑定" in text
+    assert json.dumps("opaque", ensure_ascii=False) in text
+    assert str(setup.entry) in text
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_bound_valid_root_without_hint(
+    setup: Setup, host: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bound = bind_session(setup)
+    code, output = run_hook(setup, capsys, host=host, stdin=session_stdin("abc123", "resume"))
+    assert code == 0
+    assert "Draft 会话已绑定" in output
+    assert f"- 草稿根：{bound.root}" in output
+    assert "最后页面提示" not in output
+    assert "- 宿主触发原因：resume" in output
+    assert f"- 当前 skill：{setup.skill_path}" in output
+    assert f"- 插件入口：{setup.entry}" in output
+    assert "重新完整阅读当前 SKILL.md" in output
+    skill_root = setup.skill_path.parent
+    assert (
+        f"uvx --isolated --from {shlex.quote(str(skill_root / 'scripts' / 'runtime'))} "
+        f"draft check {shlex.quote(str(bound.root))}"
+    ) in output
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_bound_valid_root_with_hint(
+    setup: Setup, host: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = setup.base / "topic"
+    root.mkdir()
+    (root / "pages").mkdir()
+    (root / "pages" / "a.md").write_text("# A\n", encoding="utf-8")
+    bound = bind(
+        setup.data_dir,
+        Binding(session_id="abc123", root=root, last_page_hint=Path("pages/a.md")),
+    )
+    code, output = run_hook(setup, capsys, host=host, stdin=session_stdin("abc123", "compact"))
+    assert code == 0
+    assert f"- 草稿根：{bound.root}" in output
+    assert "- 最后页面提示：pages/a.md" in output
+
+
+def test_hint_later_missing_omits_hint_retains_root(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = setup.base / "topic"
+    root.mkdir()
+    (root / "pages").mkdir()
+    (root / "pages" / "a.md").write_text("# A\n", encoding="utf-8")
+    bound = bind(
+        setup.data_dir,
+        Binding(session_id="abc123", root=root, last_page_hint=Path("pages/a.md")),
+    )
+    (bound.root / "pages" / "a.md").unlink()
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "compact"))
+    assert code == 0
+    assert f"- 草稿根：{bound.root}" in output
+    assert "最后页面提示" not in output
+
+
+def test_hint_replaced_by_symlink_omits_hint(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = setup.base / "topic"
+    root.mkdir()
+    (root / "pages").mkdir()
+    target = root / "pages" / "a.md"
+    target.write_text("# A\n", encoding="utf-8")
+    bound = bind(
+        setup.data_dir,
+        Binding(session_id="abc123", root=root, last_page_hint=Path("pages/a.md")),
+    )
+    target.unlink()
+    real = root / "real.md"
+    real.write_text("#\n", encoding="utf-8")
+    target.symlink_to(real)
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "compact"))
+    assert code == 0
+    assert f"- 草稿根：{bound.root}" in output
+    assert "最后页面提示" not in output
+
+
+def test_root_later_missing_renders_root_missing(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bound = bind_session(setup)
+    import shutil
+
+    shutil.rmtree(bound.root)
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "compact"))
+    assert code == 0
+    assert "binding.root_missing" in output
+    assert output.count("Draft 插件诊断") == 1
+    assert str(bound.root) not in output
+
+
+def test_root_replaced_by_symlink_renders_root_missing(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bound = bind_session(setup)
+    bound.root.rmdir()
+    real = setup.base / "real-topic"
+    real.mkdir()
+    bound.root.symlink_to(real)
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "compact"))
+    assert code == 0
+    assert "binding.root_missing" in output
+    assert output.count("Draft 插件诊断") == 1
+
+
+def test_root_replaced_by_non_directory_renders_root_missing(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bound = bind_session(setup)
+    bound.root.rmdir()
+    bound.root.write_text("x", encoding="utf-8")
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "compact"))
+    assert code == 0
+    assert "binding.root_missing" in output
+
+
+def test_malformed_binding_renders_invalid(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bind_session(setup)
+    target = binding_path(setup.data_dir, "abc123")
+    target.write_text("{损坏", encoding="utf-8")
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "compact"))
+    assert code == 0
+    assert "binding.invalid" in output
+    assert output.count("Draft 插件诊断") == 1
+
+
+def test_old_schema_binding_renders_invalid(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = setup.base / "topic"
+    root.mkdir()
+    target = binding_path(setup.data_dir, "abc123")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(
+            {
+                "session_id": "abc123",
+                "root": str(root),
+                "last_page_hint": None,
+                "skill_name": "draft",
+                "skill_digest": "old",
+            }
+        ),
+        encoding="utf-8",
+    )
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "compact"))
+    assert code == 0
+    assert "binding.invalid" in output
+    assert output.count("Draft 插件诊断") == 1
+
+
+def test_payload_session_mismatch_renders_session_mismatch(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = setup.base / "topic"
+    root.mkdir()
+    target = binding_path(setup.data_dir, "abc123")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(
+            {
+                "session_id": "other-session",
+                "root": str(root),
+                "last_page_hint": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "compact"))
+    assert code == 0
+    assert "binding.session_mismatch" in output
+    assert output.count("Draft 插件诊断") == 1
+
+
+def test_repeated_invocation_with_identical_state_is_byte_identical(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = setup.base / "topic"
+    root.mkdir()
+    (root / "pages").mkdir()
+    (root / "pages" / "a.md").write_text("# A\n", encoding="utf-8")
+    bind(
+        setup.data_dir,
+        Binding(session_id="abc123", root=root, last_page_hint=Path("pages/a.md")),
+    )
+    stdin_text = session_stdin("abc123", "compact")
+    _, first = run_hook(setup, capsys, host="codex", stdin=stdin_text)
+    _, second = run_hook(setup, capsys, host="codex", stdin=stdin_text)
+    assert first == second
+
+    _, third = run_hook(setup, capsys, host="codex", stdin=session_stdin("unbound", "startup"))
+    _, fourth = run_hook(setup, capsys, host="codex", stdin=session_stdin("unbound", "startup"))
+    assert third == fourth
+
+
+def test_skill_contents_changed_binding_remains_valid(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bound = bind_session(setup)
+    setup.skill_path.write_text("# 全新 skill 内容\n", encoding="utf-8")
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "resume"))
+    assert code == 0
+    assert "Draft 会话已绑定" in output
+    assert f"- 草稿根：{bound.root}" in output
+    assert f"- 当前 skill：{setup.skill_path}" in output
+    # skill 内容变化不使 binding 失效，不出现摘要/digest 分支
+    assert "摘要" not in output
+    assert "digest" not in output
+    assert "skill_mismatch" not in output
+
+
+def test_paths_with_spaces_and_single_quotes_are_shell_quoted(
+    setup: Setup, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # plugin_root 已带空格；bound root 带单引号
+    root = (tmp_path / "top'ic").resolve()
+    root.mkdir()
+    bind(setup.data_dir, Binding(session_id="abc123", root=root, last_page_hint=None))
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "resume"))
+    assert code == 0
+    # 核心命令中的路径经 shlex.quote 处理
+    skill_root = setup.skill_path.parent
+    assert (
+        f"uvx --isolated --from {shlex.quote(str(skill_root / 'scripts' / 'runtime'))} "
+        f"draft check {shlex.quote(str(root))}"
+    ) in output
+
+
+def test_unbound_command_examples_quote_plugin_entry(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("x", "startup"))
+    assert code == 0
+    quoted = shlex.quote(str(setup.entry))
+    assert f"uv run {quoted} bind ROOT --session SESSION_ID" in output
+    assert f"uv run {quoted} unbind --session SESSION_ID" in output
+
+
+def test_render_rebind_and_diagnostic_are_pure_functions(setup: Setup) -> None:
+    root = setup.base / "topic"
+    root.mkdir()
+    binding = Binding(session_id="s", root=root, last_page_hint=None)
+    text = render_rebind(binding, "resume", None, setup.skill_path, setup.entry)
+    assert "Draft 会话已绑定" in text
+    assert f"- 草稿根：{root}" in text
+    diag = render_diagnostic(AdapterError("binding.invalid", setup.data_dir))
+    assert "Draft 插件诊断" in diag
+    assert "binding.invalid" in diag
+
+
+# ---------------------------------------------------------------------------
+# Step 4: Hook 失败归一化与日志降级
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "case,expected_code,setup_binding",
+    [
+        ("unknown_host", "hook.unknown_host", False),
+        ("environment_missing", "hook.environment_missing", False),
+        ("plugin_root_mismatch", "hook.plugin_root_mismatch", False),
+        ("layout_invalid", "hook.layout_invalid", False),
+        ("stdin_invalid", "hook.stdin_invalid", False),
+        ("bridge_publication", "plugin.context_invalid", False),
+        ("binding_invalid", "binding.invalid", True),
+        ("session_mismatch", "binding.session_mismatch", True),
+        ("root_missing", "binding.root_missing", True),
+    ],
+)
+def test_failure_normalization(
+    setup: Setup,
+    case: str,
+    expected_code: str,
+    setup_binding: bool,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    env = default_env(setup, "codex")
+    stdin = session_stdin("abc123", "compact")
+    root: Path | None = None
+    host = "bogus" if case == "unknown_host" else "codex"
+
+    if case == "environment_missing":
+        del env["PLUGIN_DATA"]
+    elif case == "plugin_root_mismatch":
+        env["PLUGIN_ROOT"] = str(setup.base / "decoy-root")
+    elif case == "layout_invalid":
+        setup.skill_path.unlink()
+    elif case == "stdin_invalid":
+        stdin = "{bad"
+    elif case == "bridge_publication":
+        # 绝对但无效的 data_dir：bridge 发布失败归一为 plugin.context_invalid
+        env["PLUGIN_DATA"] = str(setup.base / "nonexistent-data-dir")
+    elif case == "binding_invalid":
+        root = setup.base / "topic"
+        root.mkdir()
+        target = binding_path(setup.data_dir, "abc123")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{broken", encoding="utf-8")
+    elif case == "session_mismatch":
+        root = setup.base / "topic"
+        root.mkdir()
+        target = binding_path(setup.data_dir, "abc123")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps({"session_id": "other", "root": str(root), "last_page_hint": None}),
+            encoding="utf-8",
+        )
+    elif case == "root_missing":
+        root = setup.base / "topic"
+        root.mkdir()
+        bind(setup.data_dir, Binding("abc123", root, None))
+        import shutil
+
+        shutil.rmtree(root)
+
+    code, output = run_hook(setup, capsys, host=host, env=env, stdin=stdin)
+    assert code == 0
+    assert output.count("Draft 插件诊断") == 1
+    assert expected_code in output
+
+
+@pytest.mark.parametrize(
+    "degrade",
+    ["mkdir", "open", "write", "non_directory"],
+)
+def test_log_degradation_appends_log_unavailable_without_discarding_primary(
+    setup: Setup,
+    degrade: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # 主分支为未绑定 session fact（不含“Draft 插件诊断”）
+    if degrade == "mkdir":
+        real_mkdir = Path.mkdir
+
+        def failing_mkdir(
+            self: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False
+        ) -> None:
+            if self.name == "logs":
+                raise OSError("mkdir failed")
+            real_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+        monkeypatch.setattr(Path, "mkdir", failing_mkdir)
+    elif degrade == "non_directory":
+        (setup.data_dir / "logs").write_text("x", encoding="utf-8")
+    elif degrade == "open":
+        logs = setup.data_dir / "logs"
+        logs.mkdir()
+        (logs / "hook.jsonl").mkdir()
+    elif degrade == "write":
+
+        class _BadHandle:
+            def __enter__(self) -> _BadHandle:
+                return self
+
+            def __exit__(self, *_a: object) -> bool:
+                return False
+
+            def write(self, _data: str) -> int:
+                raise OSError("write failed")
+
+        real_open = Path.open
+
+        def failing_open(self: Path, *args: object, **kwargs: object) -> object:
+            if self.name == "hook.jsonl":
+                return _BadHandle()
+            return real_open(self, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "open", failing_open)
+
+    code, output = run_hook(
+        setup, capsys, host="codex", stdin=session_stdin("unbound-session", "startup")
+    )
+    assert code == 0
+    # 主分支保留
+    assert "Draft 会话未绑定" in output
+    assert "unbound-session" in output
+    # 追加一条日志诊断
+    assert "hook.log_unavailable" in output
+    assert output.count("Draft 插件诊断") == 1
+
+
+def test_log_degradation_preserves_rebind_branch(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bound = bind_session(setup)
+    real_mkdir = Path.mkdir
+
+    def failing_mkdir(
+        self: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False
+    ) -> None:
+        if self.name == "logs":
+            raise OSError("mkdir failed")
+        real_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", failing_mkdir)
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "resume"))
+    assert code == 0
+    assert "Draft 会话已绑定" in output
+    assert f"- 草稿根：{bound.root}" in output
+    assert "hook.log_unavailable" in output
+    assert output.count("Draft 插件诊断") == 1
+
+
+def test_log_is_recorded_on_success(setup: Setup, capsys: pytest.CaptureFixture[str]) -> None:
+    run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "startup"))
+    log_path = setup.data_dir / "logs" / "hook.jsonl"
+    assert log_path.exists()
+    record = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert record["host"] == "codex"
+    assert record["branch"] == "session_fact"
+    assert record["source"] == "startup"
+
+
+def test_never_imports_subprocess_draft_or_core() -> None:
+    import adapter.session_hook as mod
+
+    source = Path(mod.__file__).read_text(encoding="utf-8")
+    for forbidden in [
+        "import subprocess",
+        "from subprocess",
+        "import draft",
+        "from draft",
+        "check_draft",
+        "load_graph",
+        ".draft/",
+    ]:
+        assert forbidden not in source, forbidden
+
+
+def test_run_session_start_always_returns_zero_on_binding_load_error(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bind_session(setup)
+    target = binding_path(setup.data_dir, "abc123")
+    target.write_text("{broken", encoding="utf-8")
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "compact"))
+    assert code == 0
