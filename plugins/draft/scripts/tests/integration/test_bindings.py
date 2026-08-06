@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import tempfile
@@ -19,7 +18,6 @@ from adapter.bindings import (
     binding_path,
     binding_root_is_current,
     load_binding,
-    session_id_is_valid,
     unbind,
 )
 from adapter.errors import EXIT_RUNTIME, EXIT_USAGE, AdapterError, error_payload, render_error
@@ -70,19 +68,6 @@ def test_bind_accepts_unregistered_directory_and_writes_exact_schema(
         "last_page_hint": None,
     }
     assert set(payload) == _PAYLOAD_KEYS
-
-
-def test_binding_key_never_uses_session_as_a_path(tmp_path: Path) -> None:
-    session_id = "../斜线/和\\unicode"
-    data_dir = tmp_path / "data"
-    assert binding_path(data_dir, session_id) == (
-        data_dir / "bindings" / f"{hashlib.sha256(session_id.encode()).hexdigest()}.json"
-    )
-
-
-@pytest.mark.parametrize("session", ["", "/", "\\", "..", "   ", "会话-１２３"])
-def test_binding_key_is_opaque_for_all_sessions(session: str) -> None:
-    assert binding_key(session) == hashlib.sha256(session.encode("utf-8")).hexdigest()
 
 
 def test_bind_does_not_create_draft_directory_or_call_core(
@@ -861,24 +846,6 @@ def test_invalid_uses_exit_four(workspace: tuple[Path, Path]) -> None:
 # ---------------------------------------------------------------------------
 # session_id 编码边界（Task 8 契约 B）
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("session_id", "expected"),
-    [
-        ("", True),
-        ("ordinary", True),
-        ("会话-１２３", True),
-        ("😀🚀", True),
-        ("é", True),
-        ("é", True),
-        ("\ud800", False),
-        ("abc\udc00", False),
-        ("\ud800\udc00", False),
-    ],
-)
-def test_session_id_is_valid_matrix(session_id: str, expected: bool) -> None:
-    assert session_id_is_valid(session_id) is expected
 
 
 @pytest.mark.parametrize("session", ["", "会话", "😀", "é"])

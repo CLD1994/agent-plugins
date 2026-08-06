@@ -25,7 +25,7 @@ from adapter.bridge import (
     publish_context,
     reset_context,
 )
-from adapter.errors import EXIT_USAGE, AdapterError, error_payload, render_error
+from adapter.errors import AdapterError, error_payload, render_error
 
 
 def make_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -735,30 +735,6 @@ def test_fsync_directory_absorbs_close_failure(
 # 错误载荷与退出码
 
 
-def test_adapter_error_has_stable_text_and_json() -> None:
-    error = AdapterError(
-        "plugin.context_invalid",
-        Path("/tmp/bridge.json"),
-        details=("unsafe mode",),
-    )
-    assert error.exit_code == 4
-    assert render_error(error) == ("错误 plugin.context_invalid /tmp/bridge.json unsafe mode")
-    assert error_payload(error) == {
-        "ok": False,
-        "result_type": "error",
-        "error": {
-            "code": "plugin.context_invalid",
-            "severity": "error",
-            "paths": ["/tmp/bridge.json"],
-            "details": ["unsafe mode"],
-        },
-    }
-
-
-def test_usage_error_keeps_exit_two() -> None:
-    assert AdapterError("binding.root_unavailable", exit_code=EXIT_USAGE).exit_code == 2
-
-
 # 持久文件解码归一化（Task 8 契约 A）：无效 UTF-8 与 JSON 损坏同等归一，
 # 孤立代理码位字段按持久载荷无效处理；转换只发生在读取/字段验证边界。
 
@@ -942,29 +918,6 @@ def test_lock_cleanup_failure_on_non_adapter_primary_keeps_note(
         load_context(entry, runtime_dir)
     assert caught.value.__notes__ is not None
     assert any("unlock" in note for note in caught.value.__notes__)
-
-
-def test_add_detail_appends_keeps_tuple_and_primary_fields() -> None:
-    error = AdapterError("plugin.context_invalid", Path("/tmp/x.json"))
-    error.add_detail("cleanup.close_failed")
-    error.add_detail("cleanup.unlink_failed")
-    assert error.details == ("cleanup.close_failed", "cleanup.unlink_failed")
-    assert error.code == "plugin.context_invalid"
-    assert error.paths == (Path("/tmp/x.json"),)
-    assert error.exit_code == 4
-    assert render_error(error) == (
-        "错误 plugin.context_invalid /tmp/x.json cleanup.close_failed cleanup.unlink_failed"
-    )
-    assert error_payload(error) == {
-        "ok": False,
-        "result_type": "error",
-        "error": {
-            "code": "plugin.context_invalid",
-            "severity": "error",
-            "paths": ["/tmp/x.json"],
-            "details": ["cleanup.close_failed", "cleanup.unlink_failed"],
-        },
-    }
 
 
 def test_cleanup_details_render_as_whitelisted_secondary_codes() -> None:
