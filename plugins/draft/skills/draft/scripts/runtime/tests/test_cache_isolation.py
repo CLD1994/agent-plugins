@@ -10,16 +10,22 @@ core invocation:
 2. **Concurrent distinct releases on a shared cache**: two independent runtime
    copies at versions ``0.3.0`` and a synthetic ``0.3.1`` are launched
    concurrently over one shared cache and each reports its own version; a
-   post-concurrent re-run of the 0.3.0 copy still reports ``0.3.0``, proving
-   the 0.3.1 invocation did not clobber it. (uv's tool env identity is keyed
-   by command name, not version, so the brief's "two distinct environment
-   identities" is unachievable; the clobber check is the strengthened
-   substitute.)
+   post-concurrent re-run of the 0.3.0 copy still reports ``0.3.0``. uv keys
+   tool environments by a two-layer identity: the first layer is the Python
+   interpreter digest, the second layer is the full resolution digest
+   (package versions and local source paths). The two releases therefore
+   resolve to two distinct second-layer references beneath the shared first
+   layer — two physically independent environments — and the test asserts
+   that directly.
 3. **Conflicting global tool**: a temporary package exposing a conflicting
    ``draft`` console script (output ``wrong global draft``) is installed into
    a test-specific ``UV_TOOL_DIR``/``UV_TOOL_BIN_DIR``; ``uvx --isolated
    --from <runtime>`` still reports the runtime version and never the
    conflicting output.
+
+All tests run behind a version gate: the actually executed ``uv`` and ``uvx``
+must both report the supported version (``0.12.1``); any other version fails
+the test explicitly instead of passing silently.
 """
 
 from __future__ import annotations
@@ -30,10 +36,13 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = RUNTIME_ROOT.parents[1]
 
 UVX_TIMEOUT = 600
+SUPPORTED_UV_VERSION = "0.12.1"
 
 _STRIP_ENV = (
     "PLUGIN_ROOT",
@@ -60,6 +69,43 @@ def clean_env() -> dict[str, str]:
     for name in _STRIP_ENV:
         env.pop(name, None)
     return env
+
+
+def parse_uv_version(output: str) -> str:
+    """Extract the version field from ``uv --version`` / ``uvx --version`` output.
+
+    Example: ``"uv 0.12.1 (x86_64-unknown-linux-gnu)"`` -> ``"0.12.1"``.
+    """
+    fields = output.split()
+    if len(fields) < 2:
+        pytest.fail(f"unparseable uv version output: {output!r}")
+    return fields[1]
+
+
+def assert_supported_uv_versions(uv_output: str, uvx_output: str) -> None:
+    """Fail explicitly unless both uv and uvx report SUPPORTED_UV_VERSION."""
+    uv_version = parse_uv_version(uv_output)
+    uvx_version = parse_uv_version(uvx_output)
+    if uv_version != SUPPORTED_UV_VERSION or uvx_version != SUPPORTED_UV_VERSION:
+        pytest.fail(
+            f"unsupported uv/uvx versions: expected uv and uvx {SUPPORTED_UV_VERSION}, "
+            f"got uv {uv_version} and uvx {uvx_version}"
+        )
+
+
+@pytest.fixture(autouse=True)
+def uv_version_gate() -> None:
+    """Gate every test in this module on the actually executed uv/uvx versions."""
+    env = clean_env()
+    uv = subprocess.run(
+        ["uv", "--version"], env=env, text=True, capture_output=True, check=False, timeout=60
+    )
+    uvx = subprocess.run(
+        ["uvx", "--version"], env=env, text=True, capture_output=True, check=False, timeout=60
+    )
+    if uv.returncode != 0 or uvx.returncode != 0:
+        pytest.fail(f"uv/uvx version probe failed: uv={uv.stderr!r} uvx={uvx.stderr!r}")
+    assert_supported_uv_versions(uv.stdout.strip(), uvx.stdout.strip())
 
 
 def copy_skill(tmp_path: Path, *, name: str = "draft-skill") -> Path:
@@ -100,12 +146,13 @@ def snapshot_environments(cache_dir: Path) -> dict[str, int]:
 
 
 def environment_archive_refs(cache_dir: Path) -> set[str]:
-    """Distinct archive reference names (symlinks) within environments-v2/.
+    """Distinct second-layer reference names (symlinks) within environments-v2/.
 
-    Each uv tool environment is a directory beneath ``environments-v2/`` whose
-    entries are symlinks into ``archive-v0/``. Different source versions
-    produce distinct archive references, so the count of distinct references
-    across all environments proves how many distinct versions were installed.
+    Each uv tool environment is a second-layer reference beneath
+    ``environments-v2/<first layer>/`` and is itself a symlink into
+    ``archive-v0/``. Different resolution results produce distinct references,
+    so the count of distinct references proves how many distinct environments
+    the cache holds.
     """
     env_root = cache_dir / "environments-v2"
     refs: set[str] = set()
@@ -118,6 +165,40 @@ def environment_archive_refs(cache_dir: Path) -> set[str]:
             if child.is_symlink():
                 refs.add(child.name)
     return refs
+
+
+def second_layer_environments(cache_dir: Path) -> list[Path]:
+    """All second-layer tool-environment references beneath environments-v2/.
+
+    uv's tool environment identity is two-layered:
+    ``environments-v2/<interpreter digest>/<resolution digest>``. Each
+    second-layer reference points at one complete virtual environment.
+    """
+    env_root = cache_dir / "environments-v2"
+    if not env_root.is_dir():
+        return []
+    return [
+        second
+        for first in sorted(env_root.iterdir())
+        if first.is_dir()
+        for second in sorted(first.iterdir())
+        if second.is_dir()
+    ]
+
+
+def draft_runtime_metadata_version(env_dir: Path) -> str:
+    """The Version field of the draft_runtime dist-info METADATA in env_dir."""
+    metadata_files = sorted(
+        env_dir.glob("lib/python*/site-packages/draft_runtime-*.dist-info/METADATA")
+    )
+    if len(metadata_files) != 1:
+        pytest.fail(
+            f"expected exactly one draft_runtime METADATA in {env_dir}, got {metadata_files}"
+        )
+    for line in metadata_files[0].read_text(encoding="utf-8").splitlines():
+        if line.startswith("Version:"):
+            return line.split(":", 1)[1].strip()
+    pytest.fail(f"no Version field in {metadata_files[0]}")
 
 
 def run_uvx_from(
@@ -225,14 +306,14 @@ def test_distinct_releases_share_cache_without_corruption(tmp_path: Path) -> Non
     cache = tmp_path / "shared-cache"
     env = clean_env()
 
-    # Launch both releases concurrently over the shared cache. uv's tool
-    # environment identity for ``uvx --isolated --from <path> draft`` is shared
-    # across source versions (keyed by the command name and Python, not the
-    # package version), so the "two distinct environment identities" the brief
-    # asks for is not achievable; uv instead rebuilds the shared environment
-    # per invocation. The concurrent launches prove simultaneous sessions using
-    # different immutable runtime releases each resolve and report their own
-    # version without corrupting each other.
+    # Launch both releases concurrently over the shared cache. uv keys tool
+    # environments by a two-layer identity: the first layer is the Python
+    # interpreter digest, the second layer is the full resolution digest
+    # (package versions and local source paths). Different runtime paths or
+    # versions therefore resolve to distinct second-layer references, i.e.
+    # physically independent environments. The concurrent launches prove
+    # simultaneous sessions using different immutable runtime releases each
+    # resolve and report their own version without corrupting each other.
     outcomes: dict[str, subprocess.CompletedProcess[str]] = {}
 
     def launch(label: str, artifact: Path) -> None:
@@ -252,20 +333,41 @@ def test_distinct_releases_share_cache_without_corruption(tmp_path: Path) -> Non
     assert outcomes["first"].stdout.strip() == "0.3.0", outcomes["first"].stdout
     assert outcomes["second"].stdout.strip() == "0.3.1", outcomes["second"].stdout
 
+    # Second-layer identity assertions: with both releases run, environments-v2/
+    # must hold at least two distinct second-layer references, each a complete
+    # environment, covering exactly the two release versions; the two releases'
+    # environments must not be the same filesystem object.
+    env_dirs = second_layer_environments(cache)
+    second_layer_names = {env_dir.name for env_dir in env_dirs}
+    assert len(second_layer_names) >= 2, (
+        f"expected >=2 distinct second-layer references, got {sorted(second_layer_names)}"
+    )
+    env_by_version: dict[str, Path] = {}
+    for env_dir in env_dirs:
+        assert (env_dir / "bin").is_dir(), f"{env_dir} is not a complete environment (bin/)"
+        assert (env_dir / "pyvenv.cfg").is_file(), f"{env_dir} is not a complete environment"
+        env_by_version[draft_runtime_metadata_version(env_dir)] = env_dir
+    assert set(env_by_version) == {"0.3.0", "0.3.1"}, sorted(env_by_version)
+    env_030 = env_by_version["0.3.0"]
+    env_031 = env_by_version["0.3.1"]
+    assert env_030.resolve() != env_031.resolve()
+    stat_030 = env_030.resolve().stat()
+    stat_031 = env_031.resolve().stat()
+    assert (stat_030.st_dev, stat_030.st_ino) != (stat_031.st_dev, stat_031.st_ino)
+
     # Clobber check: re-run the 0.3.0 copy after the 0.3.1 run has completed
-    # and assert it STILL reports 0.3.0. This proves the 0.3.1 invocation did
-    # not permanently clobber the 0.3.0 environment (uv rebuilds the env per
-    # invocation from the source version, rather than silently sharing the last
-    # installed version). This is the strengthened substitute for the brief's
-    # unachievable "two distinct environment identities" requirement.
+    # and assert it STILL reports 0.3.0. Each release owns its own
+    # second-layer environment, so the 0.3.1 invocation cannot have replaced
+    # the 0.3.0 environment; the re-run must reuse it.
     rerun_first = run_uvx_from(
         first / "scripts" / "runtime", cache, "--version", env=env, cwd=first.parent
     )
     assert rerun_first.returncode == 0, rerun_first.stderr
     assert rerun_first.stdout.strip() == "0.3.0", rerun_first.stdout
 
-    # The shared environment references both versions' archives, proving both
-    # releases were installed without one clobbering the other's archive.
+    # The environments-v2 tree holds distinct second-layer references into
+    # archive-v0 for both releases, proving both were installed without one
+    # clobbering the other's archive.
     refs = environment_archive_refs(cache)
     assert len(refs) >= 2, f"expected >=2 archive references, got {refs}"
 
@@ -353,3 +455,17 @@ def test_isolated_uvx_ignores_conflicting_global_tool(tmp_path: Path) -> None:
     assert result.stdout.strip() == "0.3.0"
     assert "wrong global draft" not in result.stdout
     assert "wrong global draft" not in result.stderr
+
+
+def test_version_gate_rejects_unsupported_versions() -> None:
+    """The gate helper passes on the supported version and fails explicitly otherwise."""
+    assert_supported_uv_versions(
+        "uv 0.12.1 (x86_64-unknown-linux-gnu)",
+        "uvx 0.12.1 (x86_64-unknown-linux-gnu)",
+    )
+    with pytest.raises(pytest.fail.Exception):
+        assert_supported_uv_versions("uv 0.9.9 (x86_64)", "uvx 0.12.1 (x86_64)")
+    with pytest.raises(pytest.fail.Exception):
+        assert_supported_uv_versions("uv 0.12.1 (x86_64)", "uvx 0.13.0 (x86_64)")
+    with pytest.raises(pytest.fail.Exception):
+        assert_supported_uv_versions("", "uvx 0.12.1 (x86_64)")
