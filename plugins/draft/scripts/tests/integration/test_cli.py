@@ -1,9 +1,13 @@
-"""插件 CLI 测试：参数、分派、输出与退出码；bridge 加载与 reset 顺序；Hook 始终成功。
+"""插件 CLI 集成测试：真实 bridge/binding 持久化、子进程入口与退出码。
 
-覆盖三条路径：
-- bind/unbind 的 subprocess 与 in-process 调用、--json 位置等价性、退出码与输出；
-- bridge 缺失/无效/冲突映射到 plugin.context_*；reset 先于 bridge 加载且不加载 bridge；
-- hook session-start 始终返回 0，仅转发宿主与上下文；非 hook session-start 形态走 argparse 退出 2。
+覆盖：
+- bind/unbind 在真实 bridge 与真实持久化下的 in-process 调用、--json 位置等价性、
+  输出与退出码；
+- bridge 缺失/无效/冲突映射到 plugin.context_*；reset 移除真实 bridge 而保留
+  data_dir 与 bindings；
+- PEP 723 子进程入口的真实标准输出/标准错误与退出码。
+
+纯进程内路由、--json 归一化、参数错误与早期错误分支由 tests/unit/test_cli.py 负责。
 """
 
 from __future__ import annotations
@@ -16,7 +20,6 @@ import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 import pytest
 
@@ -28,8 +31,6 @@ from tests.support.paths import ENTRY_FILE
 # 以 importlib 导入入口模块，避免 `import draft` 语法与核心 draft 包同名冲突；
 # conftest 已将 plugins/draft/scripts/ 插入 sys.path[0]，运行时解析到入口模块。
 plugin_cli = importlib.import_module("draft")
-
-HOSTS = ("codex", "claude")
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +158,14 @@ def write_conflict_bridge(entry: Path, runtime_dir: Path) -> None:
     paths.conflict.write_text("", encoding="utf-8")
 
 
+def _ordinary_args(command: str, setup: Setup, *, session: str) -> list[str]:
+    if command == "bind":
+        return [command, str(setup.root), "--session", session]
+    return [command, "--session", session]
+
+
 # ---------------------------------------------------------------------------
-# Step 1: 参数、分派、输出与退出码
+# Step 1: 真实 bridge 与持久化下的输出与退出码
 # ---------------------------------------------------------------------------
 
 
@@ -200,23 +207,6 @@ def test_bind_json_all_positions_equivalent(
     assert err == ""
     payload = json.loads(out)
     assert payload == {"ok": True, "result_type": "bind", "root": str(setup.root)}
-
-
-def test_bind_missing_root_arg_is_usage_error(
-    setup: Setup, capsys: pytest.CaptureFixture[str]
-) -> None:
-    code, out, err = call_main(["bind", "--session", "s"], setup, capsys)
-    assert code == EXIT_USAGE
-    assert "plugin.invalid_arguments" in err
-    assert "Traceback" not in err
-
-
-def test_bind_missing_session_is_usage_error(
-    setup: Setup, capsys: pytest.CaptureFixture[str]
-) -> None:
-    code, _, err = call_main(["bind", str(setup.root)], setup, capsys)
-    assert code == EXIT_USAGE
-    assert "plugin.invalid_arguments" in err
 
 
 def test_bind_nonexistent_root_is_root_unavailable(
@@ -309,55 +299,8 @@ def test_unbind_json_absent_removed_false(setup: Setup, capsys: pytest.CaptureFi
     assert payload == {"ok": True, "result_type": "unbind", "removed": False}
 
 
-def test_unbind_missing_session_is_usage_error(
-    setup: Setup, capsys: pytest.CaptureFixture[str]
-) -> None:
-    code, _, err = call_main(["unbind"], setup, capsys)
-    assert code == EXIT_USAGE
-    assert "plugin.invalid_arguments" in err
-
-
-def test_unknown_command_is_usage_error(setup: Setup, capsys: pytest.CaptureFixture[str]) -> None:
-    code, _, err = call_main(["bogus"], setup, capsys)
-    assert code == EXIT_USAGE
-    assert "plugin.invalid_arguments" in err
-
-
-def test_no_args_is_usage_error(setup: Setup, capsys: pytest.CaptureFixture[str]) -> None:
-    code, _, err = call_main([], setup, capsys)
-    assert code == EXIT_USAGE
-    assert "plugin.invalid_arguments" in err
-
-
-def test_help_exits_zero(setup: Setup, capsys: pytest.CaptureFixture[str]) -> None:
-    # argparse 打印帮助后 SystemExit(0)，入口捕获并以 0 返回；不触达 bridge 加载。
-    code, out, _ = call_main(["--help"], setup, capsys)
-    assert code == 0
-    assert "usage:" in out
-
-
-def test_json_on_reset_is_usage_error(setup: Setup, capsys: pytest.CaptureFixture[str]) -> None:
-    code, _, err = call_main(["plugin-context", "reset", "--json"], setup, capsys)
-    assert code == EXIT_USAGE
-    assert "plugin.invalid_arguments" in err
-
-
-def test_json_before_reset_is_usage_error(setup: Setup, capsys: pytest.CaptureFixture[str]) -> None:
-    code, _, err = call_main(["--json", "plugin-context", "reset"], setup, capsys)
-    assert code == EXIT_USAGE
-    assert "plugin.invalid_arguments" in err
-
-
-def test_json_on_hook_outside_namespace_is_usage_error(
-    setup: Setup, capsys: pytest.CaptureFixture[str]
-) -> None:
-    code, _, err = call_main(["hook", "--json"], setup, capsys)
-    assert code == EXIT_USAGE
-    assert "plugin.invalid_arguments" in err
-
-
 # ---------------------------------------------------------------------------
-# Step 2: bridge 加载与 reset 顺序
+# Step 2: 真实 bridge 状态映射与 reset
 # ---------------------------------------------------------------------------
 
 
@@ -443,142 +386,6 @@ def test_reset_on_missing_bridge_is_silent_success(
     assert err == ""
 
 
-def test_reset_with_extra_args_is_usage_error(
-    setup: Setup, capsys: pytest.CaptureFixture[str]
-) -> None:
-    code, _, err = call_main(["plugin-context", "reset", "extra"], setup, capsys)
-    assert code == EXIT_USAGE
-    assert "plugin.invalid_arguments" in err
-
-
-def test_reset_precedes_and_avoids_bridge_load(
-    setup: Setup, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    def unexpected_call(*args: object, **kwargs: object) -> object:
-        raise AssertionError("load_context must not be called during reset")
-
-    monkeypatch.setattr(plugin_cli, "load_context", unexpected_call)
-    code, out, err = call_main(["plugin-context", "reset"], setup, capsys)
-    assert code == 0
-    assert out == ""
-    assert err == ""
-
-
-def test_bind_calls_load_context_exactly_once(
-    setup: Setup, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    real_load = plugin_cli.load_context  # type: ignore[reportAttributeAccessIssue]
-    calls: list[int] = []
-
-    def counting_load(*args: object, **kwargs: object) -> object:
-        calls.append(1)
-        return real_load(*cast(tuple, args), **cast(Mapping, kwargs))
-
-    monkeypatch.setattr(plugin_cli, "load_context", counting_load)
-    code, out, _ = call_main(["bind", str(setup.root), "--session", "s"], setup, capsys)
-    assert code == 0
-    assert len(calls) == 1
-
-
-# ---------------------------------------------------------------------------
-# Step 3: Hook CLI 始终成功
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("host", HOSTS)
-def test_hook_session_start_forwards_canonical_args_once(
-    setup: Setup,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-    host: str,
-) -> None:
-    calls: list[tuple[object, ...]] = []
-
-    def fake(
-        host_arg: str,
-        *,
-        entry_path: Path,
-        environ: Mapping[str, str],
-        stdin: io.BytesIO,
-        runtime_dir: Path | None,
-    ) -> int:
-        calls.append((host_arg, entry_path, dict(environ), stdin.read(), runtime_dir))
-        return 0
-
-    monkeypatch.setattr(plugin_cli, "run_session_start", fake)
-    env = {"PLUGIN_ROOT": "/x", "PLUGIN_DATA": "/y"}
-    stdin_text = json.dumps(
-        {"hook_event_name": "SessionStart", "session_id": "s", "source": "startup"}
-    )
-    code, out, err = call_main(
-        ["hook", "session-start", host],
-        setup,
-        capsys,
-        stdin=stdin_text,
-        env=env,
-    )
-    assert code == 0
-    assert err == ""
-    assert len(calls) == 1
-    forwarded_host, forwarded_entry, forwarded_env, forwarded_stdin, forwarded_runtime = calls[0]
-    assert forwarded_host == host
-    assert forwarded_entry == setup.entry
-    assert forwarded_env == env
-    assert forwarded_stdin == stdin_text.encode("utf-8")
-    assert forwarded_runtime == setup.runtime_dir
-
-
-@pytest.mark.parametrize("rest", [[], ["codex", "claude"], ["--json", "codex"]])
-def test_hook_session_start_bad_host_count_returns_zero(
-    setup: Setup,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-    rest: list[str],
-) -> None:
-    def unexpected_call(*args: object, **kwargs: object) -> int:
-        raise AssertionError("run_session_start must not be called for bad host count")
-
-    monkeypatch.setattr(plugin_cli, "run_session_start", unexpected_call)
-    code, out, _ = call_main(["hook", "session-start", *rest], setup, capsys, stdin="", env={})
-    assert code == 0
-    assert "hook.invalid_arguments" in out
-
-
-def test_hook_session_start_returns_zero_on_adapter_diagnostic(
-    setup: Setup,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """适配层报告任何失败分支时，CLI 仍返回 0 并透传诊断。"""
-
-    def fake(*args: object, **kwargs: object) -> int:
-        sys = __import__("sys")
-        sys.stdout.write("Draft 插件诊断\n- 错误码：binding.root_missing\n")
-        return 0
-
-    monkeypatch.setattr(plugin_cli, "run_session_start", fake)
-    code, out, _ = call_main(["hook", "session-start", "codex"], setup, capsys, stdin="", env={})
-    assert code == 0
-    assert "binding.root_missing" in out
-
-
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["hook"],
-        ["hook", "foo"],
-        ["hook", "session-startx", "codex"],
-        ["bogus"],
-    ],
-)
-def test_non_hook_session_start_shapes_exit_2(
-    setup: Setup, capsys: pytest.CaptureFixture[str], argv: list[str]
-) -> None:
-    code, _, err = call_main(argv, setup, capsys)
-    assert code == EXIT_USAGE
-    assert "plugin.invalid_arguments" in err
-
-
 # ---------------------------------------------------------------------------
 # Subprocess 入口
 # ---------------------------------------------------------------------------
@@ -651,57 +458,8 @@ def test_subprocess_root_unavailable_exit_2(subproc_setup: SubprocSetup) -> None
 
 
 # ---------------------------------------------------------------------------
-# Step 4: bind/unbind 会话标识编码边界（Task 8）
+# Step 4: bind/unbind 会话标识编码边界（真实持久化往返）
 # ---------------------------------------------------------------------------
-
-
-def test_bind_lone_surrogate_session_is_invalid_session_text(
-    setup: Setup, capsys: pytest.CaptureFixture[str]
-) -> None:
-    code, out, err = call_main(["bind", str(setup.root), "--session", "\ud800"], setup, capsys)
-    assert code == EXIT_USAGE
-    assert out == ""
-    assert "binding.invalid_session" in err
-    assert "Traceback" not in err
-    # 验证早于 bindings/ 目录创建
-    assert not (setup.data_dir / "bindings").exists()
-
-
-def test_bind_lone_surrogate_session_is_invalid_session_json(
-    setup: Setup, capsys: pytest.CaptureFixture[str]
-) -> None:
-    code, out, err = call_main(
-        ["--json", "bind", str(setup.root), "--session", "\ud800"], setup, capsys
-    )
-    assert code == EXIT_USAGE
-    assert err == ""
-    payload = json.loads(out)
-    assert payload["ok"] is False
-    assert payload["error"]["code"] == "binding.invalid_session"
-    assert not (setup.data_dir / "bindings").exists()
-
-
-def test_unbind_lone_surrogate_session_is_invalid_session_text(
-    setup: Setup, capsys: pytest.CaptureFixture[str]
-) -> None:
-    code, out, err = call_main(["unbind", "--session", "\ud800"], setup, capsys)
-    assert code == EXIT_USAGE
-    assert out == ""
-    assert "binding.invalid_session" in err
-    assert "Traceback" not in err
-    assert not (setup.data_dir / "bindings").exists()
-
-
-def test_unbind_lone_surrogate_session_is_invalid_session_json(
-    setup: Setup, capsys: pytest.CaptureFixture[str]
-) -> None:
-    code, out, err = call_main(["--json", "unbind", "--session", "\ud800"], setup, capsys)
-    assert code == EXIT_USAGE
-    assert err == ""
-    payload = json.loads(out)
-    assert payload["ok"] is False
-    assert payload["error"]["code"] == "binding.invalid_session"
-    assert not (setup.data_dir / "bindings").exists()
 
 
 def test_bind_unbind_unicode_session_round_trip(
@@ -715,98 +473,6 @@ def test_bind_unbind_unicode_session_round_trip(
     code, out, _ = call_main(["unbind", "--session", session], setup, capsys)
     assert code == 0
     assert out == "解除成功 removed=true\n"
-
-
-# ---------------------------------------------------------------------------
-# Step 4.1: bind/unbind 的 session 校验先于 bridge 加载（双故障优先级）
-# ---------------------------------------------------------------------------
-
-
-# 无效 session：孤立高代理码位，无法严格 UTF-8 编码
-_INVALID_SESSION = "\ud800"
-
-
-def _prepare_bridge_state(setup: Setup, state: str) -> None:
-    """在已发布有效 bridge 的 setup 上构造目标 bridge 状态。"""
-    if state == "valid":
-        return
-    if state == "missing":
-        bridge_paths(setup.entry, setup.runtime_dir).json.unlink()
-    elif state == "invalid":
-        write_invalid_bridge(setup.entry, setup.runtime_dir)
-    elif state == "conflict":
-        write_conflict_bridge(setup.entry, setup.runtime_dir)
-    else:  # pragma: no cover - 防御
-        raise AssertionError(f"unknown bridge state: {state}")
-
-
-def _ordinary_args(command: str, setup: Setup, *, session: str) -> list[str]:
-    if command == "bind":
-        return [command, str(setup.root), "--session", session]
-    return [command, "--session", session]
-
-
-@pytest.mark.parametrize("bridge_state", ["missing", "invalid", "conflict", "valid"])
-@pytest.mark.parametrize("command", ["bind", "unbind"])
-def test_invalid_session_preempts_bridge_state_text(
-    setup: Setup,
-    bridge_state: str,
-    command: str,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """无效 session 先于 bridge 加载：任意状态报 binding.invalid_session（退出 2）。"""
-    _prepare_bridge_state(setup, bridge_state)
-    code, out, err = call_main(
-        _ordinary_args(command, setup, session=_INVALID_SESSION), setup, capsys
-    )
-    assert code == EXIT_USAGE
-    assert out == ""
-    assert "binding.invalid_session" in err
-    # 双故障优先级：不应出现 bridge 状态错误
-    assert "plugin.context_" not in err
-    assert "Traceback" not in err
-    # 不创建 bindings/ 或 binding 文件
-    assert not (setup.data_dir / "bindings").exists()
-
-
-@pytest.mark.parametrize("bridge_state", ["missing", "invalid", "conflict", "valid"])
-@pytest.mark.parametrize("command", ["bind", "unbind"])
-def test_invalid_session_preempts_bridge_state_json(
-    setup: Setup,
-    bridge_state: str,
-    command: str,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """--json 下无效 session 同样先于 bridge 状态：标准 error_payload，退出 2。"""
-    _prepare_bridge_state(setup, bridge_state)
-    args = ["--json", *_ordinary_args(command, setup, session=_INVALID_SESSION)]
-    code, out, err = call_main(args, setup, capsys)
-    assert code == EXIT_USAGE
-    assert err == ""
-    payload = json.loads(out)
-    assert payload["ok"] is False
-    assert payload["error"]["code"] == "binding.invalid_session"
-    assert not (setup.data_dir / "bindings").exists()
-
-
-def test_invalid_session_does_not_load_bridge(
-    setup: Setup, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """无效 session 时 load_context 不得被调用（先于 bridge 加载）。"""
-    called = {"count": 0}
-    real_load_context = plugin_cli.load_context
-
-    def spy(*args: object, **kwargs: object) -> object:
-        called["count"] += 1
-        return real_load_context(*args, **kwargs)
-
-    monkeypatch.setattr(plugin_cli, "load_context", spy)
-    code, out, err = call_main(
-        _ordinary_args("bind", setup, session=_INVALID_SESSION), setup, capsys
-    )
-    assert code == EXIT_USAGE
-    assert "binding.invalid_session" in err
-    assert called["count"] == 0
 
 
 def test_empty_session_with_valid_bridge_binds_and_unbinds(
