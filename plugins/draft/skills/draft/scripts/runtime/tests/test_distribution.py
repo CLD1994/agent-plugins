@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tomllib
 from pathlib import Path
 from typing import Any, cast
@@ -33,6 +34,27 @@ def test_skill_is_a_self_contained_runtime_unit() -> None:
     assert (scripts / "runtime/uv.lock").is_file()
     assert (scripts / "runtime/src/draft/__main__.py").is_file()
     assert not (PLUGIN_ROOT / "runtime").exists()
+
+
+def test_runtime_ruff_configuration_is_auto_discovered() -> None:
+    """核心检查必须从 runtime 项目自身发现 Ruff 配置和源码根。"""
+    result = subprocess.run(
+        ["ruff", "check", "--show-settings", str(RUNTIME_ROOT / "src/draft/cli.py")],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f'Settings path: "{RUNTIME_ROOT / "pyproject.toml"}"' in result.stdout
+    assert f'linter.project_root = "{RUNTIME_ROOT}"' in result.stdout
+    assert f'linter.src = [\n\t"{RUNTIME_ROOT / "src"}",\n]' in result.stdout
+    assert "linter.unresolved_target_version = 3.12" in result.stdout
+    assert "linter.line_length = 100" in result.stdout
+    assert "unsorted-imports (I001)" in result.stdout
+    assert "assignment-to-os-environ (B003)" in result.stdout
+    assert "collapsible-if (SIM102)" in result.stdout
 
 
 def test_runtime_provides_draft_cli_main_entry_point() -> None:

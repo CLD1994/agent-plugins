@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
 from adapter.bindings import (
     Binding,
     bind,

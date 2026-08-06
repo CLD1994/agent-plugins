@@ -87,6 +87,7 @@ Agent 判断讨论意味着什么；程序只处理能够从文件事实证明�
 │       ├── references/
 │       │   └── platform-setup.md
 │       ├── scripts/
+│       │   ├── ruff.toml
 │       │   ├── draft.py
 │       │   ├── adapter/
 │       │   └── tests/
@@ -95,7 +96,6 @@ Agent 判断讨论意味着什么；程序只处理能够从文件事实证明�
 │               ├── SKILL.md
 │               ├── references/
 │               └── scripts/
-│                   ├── ruff.toml
 │                   └── runtime/
 │                       ├── pyproject.toml
 │                       ├── uv.lock
@@ -776,8 +776,10 @@ Python 代码使用：
 ```bash
 uv run --project plugins/draft/skills/draft/scripts/runtime --locked pytest
 uv run --project plugins/draft/skills/draft/scripts/runtime --locked pyright
-uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff check --config plugins/draft/skills/draft/scripts/ruff.toml .
-uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff format --check --config plugins/draft/skills/draft/scripts/ruff.toml .
+uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff check plugins/draft/skills/draft/scripts/runtime
+uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff check plugins/draft/scripts
+uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff format --check plugins/draft/skills/draft/scripts/runtime
+uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff format --check plugins/draft/scripts
 ```
 
 `pyright` 从第一版启用 strict。测试使用小型人工目录验证真实行为，包括：

@@ -5,6 +5,7 @@ from typing import cast
 
 import pytest
 from conftest import build_valid_candidate, snapshot_tree
+
 from draft import __version__
 from draft.cli import main
 

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
 from adapter import bridge as bridge_mod
 from adapter.bridge import (
     BridgePaths,
@@ -966,13 +967,60 @@ def test_add_detail_appends_keeps_tuple_and_primary_fields() -> None:
     }
 
 
-def test_cleanup_details_do_not_leak_into_hook_diagnostic() -> None:
-    """Hook 渲染只显示错误码：明细与路径不得进入模型可见诊断。"""
+def test_cleanup_details_render_as_whitelisted_secondary_codes() -> None:
+    """Hook 渲染显示主错误码与白名单 cleanup.* 次要诊断码（按执行顺序）。
+
+    路径、非白名单 detail、note 文本与临时路径不得进入模型可见诊断。
+    """
     from adapter.session_hook import render_diagnostic
 
     error = AdapterError("plugin.context_invalid", Path("/secret/path.json"))
+    error.add_detail("cleanup.unlock_failed")
+    error.add_detail("cleanup.close_failed")
     error.add_detail("cleanup.unlink_failed")
+    # 非白名单 detail 不得可见
+    error.add_detail("internal.not_whitelisted")
+    # note 含临时路径与底层错误文本，不得可见
+    error.add_note("cleanup unlink failed for /tmp/.secret.json: boom")
     text = render_diagnostic(error)
+    # 主错误码可见
     assert "plugin.context_invalid" in text
-    assert "cleanup.unlink_failed" not in text
+    assert text.count("Draft 插件诊断") == 1
+    # 三种白名单清理码按执行顺序可见
+    assert "cleanup.unlock_failed" in text
+    assert "cleanup.close_failed" in text
+    assert "cleanup.unlink_failed" in text
+    unlock = text.index("cleanup.unlock_failed")
+    close = text.index("cleanup.close_failed")
+    unlink = text.index("cleanup.unlink_failed")
+    assert unlock < close < unlink
+    # 路径、非白名单 detail、note 文本与临时路径不得可见
     assert "/secret/path.json" not in text
+    assert "internal.not_whitelisted" not in text
+    assert "boom" not in text
+    assert "/tmp/.secret.json" not in text
+
+
+def test_hook_diagnostic_without_cleanup_details_has_no_secondary_line() -> None:
+    """无白名单 cleanup.* 明细时，诊断只含主错误码，不出现次要诊断码行。"""
+    from adapter.session_hook import render_diagnostic
+
+    error = AdapterError("hook.invalid_arguments", exit_code=4)
+    text = render_diagnostic(error)
+    assert "hook.invalid_arguments" in text
+    assert "次要诊断码" not in text
+    assert text.count("Draft 插件诊断") == 1
+
+
+def test_hook_diagnostic_drops_non_whitelisted_details_only() -> None:
+    """仅有非白名单 detail 时，次要诊断码行不出现，主错误码仍可见。"""
+    from adapter.session_hook import render_diagnostic
+
+    error = AdapterError("binding.root_missing", exit_code=4)
+    error.add_detail("internal.debug")
+    error.add_detail("cleanup.unknown_future_code")
+    text = render_diagnostic(error)
+    assert "binding.root_missing" in text
+    assert "次要诊断码" not in text
+    assert "internal.debug" not in text
+    assert "cleanup.unknown_future_code" not in text

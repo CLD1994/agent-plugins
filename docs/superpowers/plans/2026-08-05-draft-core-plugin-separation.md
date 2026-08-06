@@ -25,7 +25,10 @@
 - 本次发布把插件 manifest 和 runtime 分别提升到 `0.3.0`；测试不得继续断言二者永远相同。
 - Hook 协议、bridge/binding/layout/log 错误必须产生模型可见诊断并返回 `0`；普通插件命令的用户输入错误返回 `2`，上下文或持久化错误返回 `4`。
 - 每个任务先增加或迁移失败测试并确认红灯，再做最小实现；不得删除未被新协议明确取代的安全矩阵测试。
-- 计划编写时工作区已有用户改动：`plugins/draft/skills/draft/scripts/ruff.toml` 未跟踪，runtime `pyproject.toml` 已移除内嵌 Ruff 配置。执行时把这两项作为 Task 6 的目标状态处理，不提前覆盖或丢弃。
+- 插件适配层从 `plugins/draft/scripts/ruff.toml`、核心从 runtime `pyproject.toml` 的
+  `[tool.ruff]` 自动发现配置；两侧规则一致，门禁不得用单个 `--config` 跨越所有权边界。
+- 计划编写时工作区已有用户 Ruff 配置改动；最终所有权修正把核心配置迁入 runtime
+  `pyproject.toml`，不在 skill 的 `scripts/` 上级保留第二份核心配置。
 
 ---
 
@@ -52,6 +55,7 @@
 - Create: `plugins/draft/scripts/tests/test_session_hook.py`
 - Create: `plugins/draft/scripts/tests/test_cli.py`
 - Create: `plugins/draft/scripts/tests/test_distribution.py`
+- Create: `plugins/draft/scripts/ruff.toml`
 
 ### 核心 runtime
 
@@ -71,7 +75,7 @@
 - Modify: `plugins/draft/skills/draft/scripts/runtime/pyproject.toml`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/uv.lock`
 - Create: `plugins/draft/skills/draft/scripts/runtime/tests/constraints/minimum-build.txt`
-- Create or retain: `plugins/draft/skills/draft/scripts/ruff.toml`
+- Delete: `plugins/draft/skills/draft/scripts/ruff.toml`
 
 ### 接线与文档
 
@@ -877,7 +881,7 @@ git commit -m "refactor(draft): remove plugin behavior from core"
 - Modify: `plugins/draft/skills/draft/scripts/runtime/uv.lock`
 - Create: `plugins/draft/skills/draft/scripts/runtime/tests/constraints/minimum-runtime.txt`
 - Create: `plugins/draft/skills/draft/scripts/runtime/tests/constraints/minimum-build.txt`
-- Create or retain: `plugins/draft/skills/draft/scripts/ruff.toml`
+- Delete: `plugins/draft/skills/draft/scripts/ruff.toml`
 
 **Behavior contract:** The only core invocation prefix is `uvx --isolated --from "<skill_root>/scripts/runtime" draft`; uv owns environment selection and cache reuse, while uv startup failures retain uv stderr and exit status.
 
@@ -954,7 +958,7 @@ uvx --isolated --from "<copied-skill>/scripts/runtime" draft --version
 
 Assert output is `0.3.0` and never contains `wrong global draft`. This proves `--isolated` ignores installed tools while the online/offline pair proves it still reuses the uv tool environment and dependency cache.
 
-- [x] **Step 4: 更新核心包元数据与上级 Ruff 配置**
+- [x] **Step 4: 更新核心包元数据与项目内 Ruff 配置**
 
 Set these exact declarations:
 
@@ -970,18 +974,19 @@ dependencies = [
 requires = ["hatchling>=1.31,<1.32"]
 ```
 
-Keep development tools in `dependency-groups.dev`, using the same `hatchling>=1.31,<1.32` window for its Hatchling entry; remove `../draft.py` from `tool.pyright.include`, and do not re-add Ruff configuration to `runtime/pyproject.toml`. Retain/create `plugins/draft/skills/draft/scripts/ruff.toml` exactly as:
+Keep development tools in `dependency-groups.dev`, using the same `hatchling>=1.31,<1.32` window for its Hatchling entry; remove `../draft.py` from `tool.pyright.include`, and configure Ruff in `runtime/pyproject.toml` exactly as:
 
 ```toml
+[tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["runtime/src"]
+src = ["src"]
 
-[lint]
+[tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 ```
 
-The executor must preserve the user's pre-existing worktree edits to these two Ruff files and incorporate them as this target state, not overwrite unrelated changes.
+Delete `plugins/draft/skills/draft/scripts/ruff.toml`; the adapter's separate configuration remains at `plugins/draft/scripts/ruff.toml`.
 
 - [x] **Step 5: 删除 launcher 并更新开发锁**
 
@@ -1033,6 +1038,7 @@ git commit -m "refactor(draft): run core through path-based uvx"
 - Create: `plugins/draft/references/platform-setup.md`
 - Modify: `docs/design.md`
 - Create: `plugins/draft/scripts/tests/test_distribution.py`
+- Create: `plugins/draft/scripts/ruff.toml`
 
 - [x] **Step 1: 写 manifest、物理边界和版本关系失败测试**
 
@@ -1043,6 +1049,8 @@ In plugin-level `test_distribution.py`, assert:
 - Codex and Claude marketplace registries still select the ordinary `plugins/draft` directory and require no recursive Git operation;
 - Hook command literals are exactly those from Task 4;
 - plugin entry, skill, runtime project and adapter modules are ordinary files;
+- plugin adapter Ruff settings are auto-discovered from `plugins/draft/scripts/ruff.toml` when
+  invoked from the repository root, with `plugins/draft/scripts` as `src`;
 - skill-level `scripts/draft.py`, `.gitmodules`, gitlink mode `160000`, generated distribution trees and plugin imports under the core source do not exist;
 - adapter source has no non-stdlib import and no execution/import reference to Draft core.
 
@@ -1123,13 +1131,13 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
           plugins/draft/skills/draft/scripts/runtime/tests \
           plugins/draft/scripts
 uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
-  ruff check --config plugins/draft/skills/draft/scripts/ruff.toml \
-             plugins/draft/skills/draft/scripts/runtime \
-             plugins/draft/scripts
+  ruff check plugins/draft/skills/draft/scripts/runtime
 uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
-  ruff format --check --config plugins/draft/skills/draft/scripts/ruff.toml \
-             plugins/draft/skills/draft/scripts/runtime \
-             plugins/draft/scripts
+  ruff check plugins/draft/scripts
+uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
+  ruff format --check plugins/draft/skills/draft/scripts/runtime
+uv run --project plugins/draft/skills/draft/scripts/runtime --locked \
+  ruff format --check plugins/draft/scripts
 git diff --check
 ```
 

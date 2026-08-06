@@ -6,6 +6,7 @@ Step 1 静态断言：
 - Codex/Claude marketplace 选择普通 ``plugins/draft`` 目录，不需要递归 Git 操作；
 - Hook 命令字面量严格使用 ``scripts/draft.py hook session-start HOST``；
 - 插件入口、skill、runtime 项目和适配层模块都是普通文件；
+- 适配层从仓库根检查时自动发现自己的 Ruff 配置和源码根；
 - skill 级 ``scripts/draft.py``、``.gitmodules``、gitlink 模式 ``160000``、生成式发布树、
   核心源码下的插件导入都不存在；
 - 适配层源码没有非标准库导入，也没有对 Draft 核心的执行/导入引用。
@@ -178,9 +179,30 @@ def test_skill_level_launcher_does_not_exist() -> None:
     skill_scripts = SKILL_ROOT / "scripts"
     assert skill_scripts.is_dir()
     assert not (skill_scripts / "draft.py").exists(), "skill-level launcher must not exist"
-    # 必需文件存在（忽略 __pycache__、.ruff_cache 等构建产物）
-    assert (skill_scripts / "ruff.toml").is_file()
+    # 核心开发配置归 runtime 项目所有，不在 skill scripts 上级保留第二份 Ruff 配置。
+    assert not (skill_scripts / "ruff.toml").exists()
     assert (skill_scripts / "runtime").is_dir()
+
+
+def test_plugin_adapter_ruff_configuration_is_auto_discovered() -> None:
+    """适配层从仓库根检查时也必须使用自己负责的 Ruff 配置。"""
+    result = subprocess.run(
+        ["ruff", "check", "--show-settings", str(SCRIPTS_ROOT / "draft.py")],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f'Settings path: "{SCRIPTS_ROOT / "ruff.toml"}"' in result.stdout
+    assert f'linter.project_root = "{SCRIPTS_ROOT}"' in result.stdout
+    assert f'linter.src = [\n\t"{SCRIPTS_ROOT}",\n]' in result.stdout
+    assert "linter.unresolved_target_version = 3.12" in result.stdout
+    assert "linter.line_length = 100" in result.stdout
+    assert "unsorted-imports (I001)" in result.stdout
+    assert "assignment-to-os-environ (B003)" in result.stdout
+    assert "collapsible-if (SIM102)" in result.stdout
 
 
 def test_no_gitmodules_or_gitlink_in_skill_or_plugin() -> None:

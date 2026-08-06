@@ -41,6 +41,14 @@ HOST_SOURCES = {
 
 _SESSION_START_EVENT = "SessionStart"
 
+# Hook 诊断允许进入模型可见输出的稳定清理码白名单（按执行顺序）。
+# 路径、note、底层 OSError 文本与任意非清理用途的 detail 一律不在此列。
+_HOOK_DIAGNOSTIC_DETAIL_WHITELIST = (
+    "cleanup.unlock_failed",
+    "cleanup.close_failed",
+    "cleanup.unlink_failed",
+)
+
 
 @dataclass(frozen=True)
 class HostContext:
@@ -247,17 +255,21 @@ def render_rebind(
 
 
 def render_diagnostic(error: AdapterError) -> str:
-    """诊断信封：恰好一处“Draft 插件诊断”，包含错误码。
+    """诊断信封：恰好一处“Draft 插件诊断”，包含错误码与白名单清理次要诊断码。
 
-    不输出路径，避免向模型暴露可能已失效的绑定根或宿主数据目录。
+    仅显示白名单 cleanup.* 稳定码（按 details 中的执行顺序）；不输出路径、note、
+    底层错误文本或任意非清理用途的 detail，避免向模型暴露可能已失效的绑定根、
+    宿主数据目录或临时文件路径。
     """
-    return "\n".join(
-        [
-            "Draft 插件诊断",
-            f"- 错误码：{error.code}",
-            "- 请检查插件安装或重新执行 bind。",
-        ]
-    )
+    lines = [
+        "Draft 插件诊断",
+        f"- 错误码：{error.code}",
+    ]
+    for detail in error.details:
+        if detail in _HOOK_DIAGNOSTIC_DETAIL_WHITELIST:
+            lines.append(f"- 次要诊断码：{detail}")
+    lines.append("- 请检查插件安装或重新执行 bind。")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

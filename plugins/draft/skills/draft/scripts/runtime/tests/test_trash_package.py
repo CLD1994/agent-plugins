@@ -9,6 +9,7 @@ from typing import IO, Any, cast
 
 import pytest
 from conftest import DraftFactory
+
 from draft.errors import DraftError
 from draft.models import TrashResult
 from draft.operations import read_journal

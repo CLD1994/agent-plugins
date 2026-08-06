@@ -2,9 +2,10 @@ import json
 from pathlib import Path
 from typing import cast
 
-import draft.lifecycle as lifecycle_module
 import pytest
 from conftest import add_valid_child, build_valid_candidate
+
+import draft.lifecycle as lifecycle_module
 from draft.checker import check_draft
 from draft.errors import DraftError
 from draft.lifecycle import adopt, initialize

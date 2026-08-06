@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+
 from draft.errors import DraftError
 from draft.markdown import (
     parse_page,

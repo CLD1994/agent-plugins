@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import BinaryIO, cast
 
 import pytest
+
 from adapter.bindings import Binding, bind, binding_path
 from adapter.bridge import PluginContext, load_context
 from adapter.errors import AdapterError
@@ -920,6 +921,49 @@ def test_failure_normalization(
     assert code == 0
     assert output.count("Draft 插件诊断") == 1
     assert expected_code in output
+
+
+def test_hook_diagnostic_shows_cleanup_codes_alongside_primary(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """主错误附带清理失败明细时，Hook 诊断同时显示主码与白名单清理码。
+
+    bridge 发布产生主错误并伴随 unlock/close 清理失败：返回 0，stdout 含主错误码与
+    清理码（保序），stderr 为空，不出现 traceback、路径或原始系统错误。
+    """
+    import adapter.session_hook as hook_mod
+
+    sentinel_path = Path("/sentinel/bridge.json")
+
+    def failing_publish(*_args: object, **_kwargs: object) -> None:
+        error = AdapterError("plugin.context_invalid", sentinel_path, exit_code=4)
+        error.add_detail("cleanup.unlock_failed")
+        error.add_detail("cleanup.close_failed")
+        # 非白名单 detail 不得进入诊断
+        error.add_detail("internal.not_whitelisted")
+        raise error
+
+    monkeypatch.setattr(hook_mod, "publish_context", failing_publish)
+    code = run_session_start(
+        "codex",
+        entry_path=setup.entry,
+        environ=dict(default_env(setup, "codex")),
+        stdin=io.BytesIO(session_stdin("abc123", "startup").encode("utf-8")),
+        runtime_dir=setup.runtime_dir,
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.err == ""
+    assert captured.out.count("Draft 插件诊断") == 1
+    assert "plugin.context_invalid" in captured.out
+    # 白名单清理码按执行顺序可见
+    assert "cleanup.unlock_failed" in captured.out
+    assert "cleanup.close_failed" in captured.out
+    assert captured.out.index("cleanup.unlock_failed") < captured.out.index("cleanup.close_failed")
+    # 非白名单 detail、路径、traceback 不得可见
+    assert "internal.not_whitelisted" not in captured.out
+    assert str(sentinel_path) not in captured.out
+    assert "Traceback" not in captured.out
 
 
 @pytest.mark.parametrize(

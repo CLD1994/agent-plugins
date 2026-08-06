@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from conftest import DraftFactory
+
 from draft.models import OperationPhase
 from draft.operations import TrashDeadlines
 from draft.trash import trash_page

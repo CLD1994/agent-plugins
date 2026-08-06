@@ -76,6 +76,7 @@ plugins/draft/
 ├── references/
 │   └── platform-setup.md
 ├── scripts/
+│   ├── ruff.toml
 │   ├── draft.py
 │   ├── adapter/
 │   │   ├── __init__.py
@@ -90,7 +91,6 @@ plugins/draft/
         ├── references/
         │   └── draft-format.md
         └── scripts/
-            ├── ruff.toml
             └── runtime/
                 ├── pyproject.toml
                 ├── uv.lock
@@ -484,6 +484,9 @@ OSError 必须在最窄文件操作边界转换为稳定错误码并保留异常
      可重建工具环境进入该测试指定的独立 uv 缓存；
 - 使用空 uv 缓存完成一次允许联网的首次解析，再使用同一缓存和 `--offline` 重复 smoke test，
   证明第三方依赖缓存可复用；不承诺空缓存离线启动；
+- 插件适配层从 `plugins/draft/scripts/ruff.toml`、核心从 runtime `pyproject.toml` 的
+  `[tool.ruff]` 自动发现配置；两侧规则一致，但 `src` 分别解析为插件 `scripts/` 和核心
+  `runtime/src/`，门禁不跨边界强制指定配置；
 - pytest、pyright strict、ruff check 和 ruff format 全部门禁通过。
 
 ## 验收标准

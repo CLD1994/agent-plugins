@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+
 from adapter.bindings import Binding, binding_path
 from adapter.bridge import bridge_paths, publish_context
 from adapter.errors import EXIT_RUNTIME, EXIT_USAGE
@@ -715,3 +716,110 @@ def test_bind_unbind_unicode_session_round_trip(
     code, out, _ = call_main(["unbind", "--session", session], setup, capsys)
     assert code == 0
     assert out == "解除成功 removed=true\n"
+
+
+# ---------------------------------------------------------------------------
+# Step 4.1: bind/unbind 的 session 校验先于 bridge 加载（双故障优先级）
+# ---------------------------------------------------------------------------
+
+
+# 无效 session：孤立高代理码位，无法严格 UTF-8 编码
+_INVALID_SESSION = "\ud800"
+
+
+def _prepare_bridge_state(setup: Setup, state: str) -> None:
+    """在已发布有效 bridge 的 setup 上构造目标 bridge 状态。"""
+    if state == "valid":
+        return
+    if state == "missing":
+        bridge_paths(setup.entry, setup.runtime_dir).json.unlink()
+    elif state == "invalid":
+        write_invalid_bridge(setup.entry, setup.runtime_dir)
+    elif state == "conflict":
+        write_conflict_bridge(setup.entry, setup.runtime_dir)
+    else:  # pragma: no cover - 防御
+        raise AssertionError(f"unknown bridge state: {state}")
+
+
+def _ordinary_args(command: str, setup: Setup, *, session: str) -> list[str]:
+    if command == "bind":
+        return [command, str(setup.root), "--session", session]
+    return [command, "--session", session]
+
+
+@pytest.mark.parametrize("bridge_state", ["missing", "invalid", "conflict", "valid"])
+@pytest.mark.parametrize("command", ["bind", "unbind"])
+def test_invalid_session_preempts_bridge_state_text(
+    setup: Setup,
+    bridge_state: str,
+    command: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """无效 session 先于 bridge 加载：任意状态报 binding.invalid_session（退出 2）。"""
+    _prepare_bridge_state(setup, bridge_state)
+    code, out, err = call_main(
+        _ordinary_args(command, setup, session=_INVALID_SESSION), setup, capsys
+    )
+    assert code == EXIT_USAGE
+    assert out == ""
+    assert "binding.invalid_session" in err
+    # 双故障优先级：不应出现 bridge 状态错误
+    assert "plugin.context_" not in err
+    assert "Traceback" not in err
+    # 不创建 bindings/ 或 binding 文件
+    assert not (setup.data_dir / "bindings").exists()
+
+
+@pytest.mark.parametrize("bridge_state", ["missing", "invalid", "conflict", "valid"])
+@pytest.mark.parametrize("command", ["bind", "unbind"])
+def test_invalid_session_preempts_bridge_state_json(
+    setup: Setup,
+    bridge_state: str,
+    command: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--json 下无效 session 同样先于 bridge 状态：标准 error_payload，退出 2。"""
+    _prepare_bridge_state(setup, bridge_state)
+    args = ["--json", *_ordinary_args(command, setup, session=_INVALID_SESSION)]
+    code, out, err = call_main(args, setup, capsys)
+    assert code == EXIT_USAGE
+    assert err == ""
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "binding.invalid_session"
+    assert not (setup.data_dir / "bindings").exists()
+
+
+def test_invalid_session_does_not_load_bridge(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """无效 session 时 load_context 不得被调用（先于 bridge 加载）。"""
+    called = {"count": 0}
+    real_load_context = plugin_cli.load_context
+
+    def spy(*args: object, **kwargs: object) -> object:
+        called["count"] += 1
+        return real_load_context(*args, **kwargs)
+
+    monkeypatch.setattr(plugin_cli, "load_context", spy)
+    code, out, err = call_main(
+        _ordinary_args("bind", setup, session=_INVALID_SESSION), setup, capsys
+    )
+    assert code == EXIT_USAGE
+    assert "binding.invalid_session" in err
+    assert called["count"] == 0
+
+
+def test_empty_session_with_valid_bridge_binds_and_unbinds(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """空字符串 session 合法：valid bridge 下 bind/unbind 正常往返，不被前置校验拒绝。"""
+    code, out, err = call_main(_ordinary_args("bind", setup, session=""), setup, capsys)
+    assert code == 0
+    assert out == f"绑定成功 {setup.root}\n"
+    assert err == ""
+    assert binding_path(setup.data_dir, "").exists()
+    code, out, err = call_main(_ordinary_args("unbind", setup, session=""), setup, capsys)
+    assert code == 0
+    assert out == "解除成功 removed=true\n"
+    assert not binding_path(setup.data_dir, "").exists()

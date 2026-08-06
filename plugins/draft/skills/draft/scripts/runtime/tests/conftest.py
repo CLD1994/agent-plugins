@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Protocol
 
 import pytest
+
 from draft.lifecycle import initialize
 
 

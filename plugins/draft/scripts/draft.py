@@ -19,7 +19,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import BinaryIO, NoReturn, cast
 
-from adapter.bindings import Binding, bind, unbind
+from adapter.bindings import Binding, bind, session_id_is_valid, unbind
 from adapter.bridge import load_context, reset_context
 from adapter.errors import EXIT_RUNTIME, EXIT_USAGE, AdapterError, error_payload, render_error
 from adapter.session_hook import render_diagnostic, run_session_start
@@ -168,13 +168,21 @@ def _dispatch_ordinary(
         _emit_error(exc, json_mode)
         return exc.exit_code
 
+    command = cast(str, namespace.command)
+    # 用户参数错误先于外部持久状态错误：bind/unbind 的 --session 在加载 bridge 前校验。
+    # 仅复用 binding 层的会话编码不变量（能严格 UTF-8 编码），不提前计算 binding 路径、
+    # 不创建 bindings/、不加载 bridge，也不引入新的 session 格式规则。
+    if command in ("bind", "unbind") and not session_id_is_valid(cast(str, namespace.session)):
+        error = AdapterError("binding.invalid_session", exit_code=EXIT_USAGE)
+        _emit_error(error, json_mode)
+        return error.exit_code
+
     try:
         # load_context 恰好调用一次；None 映射为 plugin.context_unavailable。
         context = load_context(entry_path, runtime_dir)
         if context is None:
             raise AdapterError("plugin.context_unavailable", exit_code=EXIT_RUNTIME)
 
-        command = cast(str, namespace.command)
         if command == "bind":
             binding = Binding(
                 session_id=cast(str, namespace.session),
