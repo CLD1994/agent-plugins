@@ -2,35 +2,10 @@ import json
 from pathlib import Path
 from typing import Protocol
 
-import pytest
-
-from draft.lifecycle import initialize
-
 
 class DraftFactory(Protocol):
     def __call__(self, files: dict[str, str], *, registered: bool = True) -> Path:
         raise AssertionError("typing protocol method is not executed")
-
-
-@pytest.fixture
-def draft_factory(tmp_path: Path) -> DraftFactory:
-    def create(files: dict[str, str], *, registered: bool = True) -> Path:
-        root = tmp_path / "topic"
-        root.mkdir()
-        for relative, text in files.items():
-            path = root / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
-        (root / "pages").mkdir(exist_ok=True)
-        if registered:
-            internal = root / ".draft"
-            internal.mkdir()
-            (internal / "operations").mkdir()
-            (internal / "trash" / "outgoing").mkdir(parents=True)
-            (internal / "draft.json").write_text('{"format_version":1}\n', encoding="utf-8")
-        return root
-
-    return create
 
 
 def write_raw_journal(
@@ -56,13 +31,6 @@ def write_raw_journal(
     journal_path = directory / "journal.json"
     journal_path.write_text(json.dumps(journal), encoding="utf-8")
     return journal_path
-
-
-@pytest.fixture
-def registered_draft(tmp_path: Path) -> Path:
-    root = tmp_path / "registered"
-    initialize(root)
-    return root
 
 
 def build_valid_candidate(root: Path) -> None:
@@ -99,13 +67,3 @@ def snapshot_tree(root: Path) -> dict[str, bytes]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
-
-
-@pytest.fixture
-def unresolvable_home(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Simulate an environment where Path.expanduser() cannot determine the home directory."""
-
-    def raise_runtime_error(self: Path) -> Path:
-        raise RuntimeError("Could not determine home directory")
-
-    monkeypatch.setattr(Path, "expanduser", raise_runtime_error)

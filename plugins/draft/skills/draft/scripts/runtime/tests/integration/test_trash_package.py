@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import IO, Any, cast
 
 import pytest
-from conftest import DraftFactory
 
 from draft.errors import DraftError
 from draft.models import TrashResult
@@ -19,6 +18,7 @@ from draft.trash import (
     trash_page,
 )
 from draft.trash_package import load_verified_package
+from tests.integration.support import DraftFactory
 
 TRASH_INDEX = """# Topic
 

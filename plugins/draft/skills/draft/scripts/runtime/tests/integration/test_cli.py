@@ -4,10 +4,10 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from conftest import build_valid_candidate, snapshot_tree
 
 from draft import __version__
 from draft.cli import main
+from tests.integration.support import build_valid_candidate, snapshot_tree
 
 
 def test_version_prints_package_version(capsys: pytest.CaptureFixture[str]) -> None:

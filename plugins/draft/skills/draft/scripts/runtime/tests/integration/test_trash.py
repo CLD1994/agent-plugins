@@ -2,13 +2,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from conftest import DraftFactory
 
 from draft.checker import check_draft
 from draft.errors import DraftError
 from draft.models import OperationPhase
 from draft.trash import restore_retained_trash, trash_page
 from draft.trash_lifecycle import recover_draft
+from tests.integration.support import DraftFactory
 
 TRASH_INDEX = """# Topic
 

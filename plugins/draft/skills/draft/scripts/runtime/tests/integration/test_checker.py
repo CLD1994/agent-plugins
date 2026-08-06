@@ -2,13 +2,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from conftest import DraftFactory, snapshot_tree, write_raw_journal
 
 from draft.checker import check_draft
 from draft.errors import DraftError
 from draft.models import CheckReport, IssueSeverity
 from draft.operations import JOURNAL_VERSION
 from draft.trash import trash_page
+from tests.integration.support import DraftFactory, snapshot_tree, write_raw_journal
 
 ROOT_PAGE = """# Topic
 

@@ -6,7 +6,8 @@ import tomllib
 from pathlib import Path
 from typing import Any, cast
 
-RUNTIME_ROOT = Path(__file__).resolve().parents[1]
+from tests.support.paths import RUNTIME_ROOT
+
 SKILL_ROOT = RUNTIME_ROOT.parents[1]
 PLUGIN_ROOT = SKILL_ROOT.parents[1]
 REPO_ROOT = PLUGIN_ROOT.parents[1]

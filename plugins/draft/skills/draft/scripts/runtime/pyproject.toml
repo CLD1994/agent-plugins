@@ -30,7 +30,12 @@ packages = ["src/draft"]
 package = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests/unit"]
+addopts = ["--strict-markers"]
+pythonpath = ["."]
+markers = [
+    "network: 需要外部依赖解析、下载或冷 uv 缓存的集成测试",
+]
 
 [tool.pyright]
 include = ["src", "tests"]

@@ -3,12 +3,12 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from conftest import add_valid_child, build_valid_candidate
 
 import draft.lifecycle as lifecycle_module
 from draft.checker import check_draft
 from draft.errors import DraftError
 from draft.lifecycle import adopt, initialize
+from tests.integration.support import add_valid_child, build_valid_candidate
 
 FINAL_MARKER_BYTES = b'{"format_version":1}\n'
 

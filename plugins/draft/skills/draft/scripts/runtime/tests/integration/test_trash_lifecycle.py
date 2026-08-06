@@ -3,7 +3,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from conftest import DraftFactory
 
 from draft.models import OperationPhase
 from draft.operations import TrashDeadlines
@@ -12,6 +11,7 @@ from draft.trash_lifecycle import (
     advance_trash_lifecycle,
     recover_draft,
 )
+from tests.integration.support import DraftFactory
 
 TRASH_INDEX = """# Topic
 

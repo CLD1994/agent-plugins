@@ -4,7 +4,7 @@ import importlib.util
 import tomllib
 from pathlib import Path
 
-RUNTIME_ROOT = Path(__file__).resolve().parents[1]
+from tests.support.paths import RUNTIME_ROOT
 
 
 def test_runtime_uses_draft_identity() -> None:

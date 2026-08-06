@@ -30,17 +30,17 @@ import re
 import subprocess
 from pathlib import Path
 
-RUNTIME_ROOT = Path(__file__).resolve().parents[1]
+from tests.support.paths import CONSTRAINTS_ROOT, RUNTIME_ROOT
 
-CONSTRAINTS_RUNTIME = RUNTIME_ROOT / "tests" / "constraints" / "minimum-runtime.txt"
-CONSTRAINTS_BUILD = RUNTIME_ROOT / "tests" / "constraints" / "minimum-build.txt"
+CONSTRAINTS_RUNTIME = CONSTRAINTS_ROOT / "minimum-runtime.txt"
+CONSTRAINTS_BUILD = CONSTRAINTS_ROOT / "minimum-build.txt"
 
 # Domain tests run under the constrained environment; the three integration
 # suites are ignored to avoid recursive subprocess invocation.
 IGNORED_INTEGRATION_TESTS = (
-    "--ignore=tests/test_bootstrap.py",
-    "--ignore=tests/test_dependency_bounds.py",
-    "--ignore=tests/test_distribution.py",
+    "--ignore=tests/integration/test_bootstrap.py",
+    "--ignore=tests/integration/test_dependency_bounds.py",
+    "--ignore=tests/integration/test_distribution.py",
 )
 
 # Metadata probe: uses importlib.metadata.version (stdlib) with the package

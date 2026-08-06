@@ -17,7 +17,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-RUNTIME_ROOT = Path(__file__).resolve().parents[1]
+from tests.support.paths import RUNTIME_ROOT
+
 SKILL_ROOT = RUNTIME_ROOT.parents[1]
 
 # Legacy launcher/bootstrap tokens that must never reappear in the core

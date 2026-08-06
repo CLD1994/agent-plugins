@@ -38,7 +38,8 @@ from pathlib import Path
 
 import pytest
 
-RUNTIME_ROOT = Path(__file__).resolve().parents[1]
+from tests.support.paths import RUNTIME_ROOT
+
 SKILL_ROOT = RUNTIME_ROOT.parents[1]
 
 UVX_TIMEOUT = 600
