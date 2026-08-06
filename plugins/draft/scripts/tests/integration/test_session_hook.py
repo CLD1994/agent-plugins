@@ -21,9 +21,6 @@ from adapter.session_hook import (
     HOST_ENV,
     HOST_SOURCES,
     MAX_STDIN,
-    render_diagnostic,
-    render_rebind,
-    render_session_fact,
     resolve_host_context,
     run_session_start,
 )
@@ -591,13 +588,6 @@ def test_unbound_session_byte_identical_output(
     assert output == expected
 
 
-def test_render_session_fact_is_pure_function(setup: Setup) -> None:
-    text = render_session_fact("opaque", setup.entry)
-    assert "Draft 会话未绑定" in text
-    assert json.dumps("opaque", ensure_ascii=False) in text
-    assert str(setup.entry) in text
-
-
 @pytest.mark.parametrize("host", HOSTS)
 def test_bound_valid_root_without_hint(
     setup: Setup, host: str, capsys: pytest.CaptureFixture[str]
@@ -838,18 +828,6 @@ def test_unbound_command_examples_quote_plugin_entry(
     quoted = shlex.quote(str(setup.entry))
     assert f"uv run {quoted} bind ROOT --session SESSION_ID" in output
     assert f"uv run {quoted} unbind --session SESSION_ID" in output
-
-
-def test_render_rebind_and_diagnostic_are_pure_functions(setup: Setup) -> None:
-    root = setup.base / "topic"
-    root.mkdir()
-    binding = Binding(session_id="s", root=root, last_page_hint=None)
-    text = render_rebind(binding, "resume", None, setup.skill_path, setup.entry)
-    assert "Draft 会话已绑定" in text
-    assert f"- 草稿根：{root}" in text
-    diag = render_diagnostic(AdapterError("binding.invalid", setup.data_dir))
-    assert "Draft 插件诊断" in diag
-    assert "binding.invalid" in diag
 
 
 # ---------------------------------------------------------------------------
