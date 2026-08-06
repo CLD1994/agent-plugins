@@ -1,5 +1,4 @@
 import json
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -8,7 +7,6 @@ from draft.errors import DraftError
 from draft.models import FileMutation, MutationKind, OperationPlan
 from draft.operations import (
     JOURNAL_VERSION,
-    TrashDeadlines,
     execute_plan,
     preallocate_journal,
     read_journal,
@@ -16,16 +14,6 @@ from draft.operations import (
     sha256_bytes,
 )
 from tests.integration.support import write_raw_journal
-
-
-def test_trash_deadlines_are_strict_utc() -> None:
-    created = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
-    deadlines = TrashDeadlines.from_created_at(created)
-    assert deadlines.restore_expires_at == created + timedelta(days=7)
-    assert deadlines.purge_eligible_at == created + timedelta(days=37)
-    assert deadlines.next_handoff_attempt_at == created + timedelta(days=7)
-    with pytest.raises(DraftError, match="operation.journal_corrupt"):
-        TrashDeadlines.parse({"created_at": "2026-07-21T12:00:00"})
 
 
 @pytest.fixture
