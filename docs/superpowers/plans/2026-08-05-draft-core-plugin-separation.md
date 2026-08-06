@@ -136,7 +136,7 @@ from adapter.errors import AdapterError
 
 The migrated tests must still cover: exact two-field schema; missing/valid/invalid/conflict states; boolean/unknown schema versions; relative/missing/file `data_dir`; symlink, non-regular, wrong-owner and group-writable bridge objects; secure/fallback runtime directory; same/different-data concurrent publishers; every lock/open/fstat/acquire/release/close, temporary-file, fsync, replace, sentinel and unlink failure; preservation of a primary error when cleanup also fails.
 
-Keep the state distinctions exact: missing `load_context` returns `None`; valid returns `PluginContext`; unsafe/invalid bridge state raises `plugin.context_invalid`; a conflict sentinel or a second publisher with a different canonical data directory raises `plugin.context_conflict`. `reset_context` removes only the current entry's bridge JSON, conflict sentinel and lock, and remains idempotent when all are absent.
+Keep the state distinctions exact: missing `load_context` returns `None`; valid returns `PluginContext`; unsafe/invalid bridge state raises `plugin.context_invalid`; a conflict sentinel or a second publisher with a different canonical data directory raises `plugin.context_conflict`. `reset_context` removes only the current entry's bridge JSON and conflict sentinel (the lock file is permanently retained as the shared synchronization anchor), and remains idempotent when all are absent.
 
 Add this installation-identity assertion so the new key cannot silently remain tied to the skill launcher:
 
@@ -610,7 +610,7 @@ class HookPayload:
 
 `resolve_host_context` selects exactly one `HOST_ENV` pair, `lstat`-validates the supplied entry and declared plugin root without following symlinks, resolves them strictly, requires `entry == plugin_root / "scripts/draft.py"`, and `lstat`-validates a regular non-symlink `skills/draft/SKILL.md`. It returns only canonical absolute paths. Use stable codes `hook.unknown_host`, `hook.environment_missing`, `hook.plugin_root_mismatch`, and `hook.layout_invalid`.
 
-`read_hook_payload` reads at most `MAX_STDIN + 1`, then applies object, event, session and per-host source validation without modifying string values. Use `hook.stdin_oversized`, `hook.stdin_invalid`, `hook.stdin_not_object`, `hook.unexpected_event`, `binding.session_unavailable`, and `hook.unexpected_source`.
+`read_hook_payload` reads a binary stream up to `MAX_STDIN + 1` raw bytes, checks the byte limit before any UTF-8 decoding, then applies strict-UTF-8 decode, object, event, session and per-host source validation without modifying string values. Use `hook.stdin_too_large`, `hook.stdin_invalid`, `hook.stdin_not_object`, `hook.unexpected_event`, `binding.session_unavailable`, and `hook.unexpected_source`.
 
 Implement `render_session_fact`, `render_rebind` and `render_diagnostic` as pure functions. Implement `log_hook(...) -> AdapterError | None` as the only explicitly best-effort file operation: it returns `hook.log_unavailable` instead of raising, and the caller appends that diagnostic without discarding its primary branch. Convert each `OSError` at its host-layout, stdin-read, binding or log operation into a stable `AdapterError` (`hook.stdin_unavailable` for stream reads); do not rely on one broad filesystem catch. `run_session_start` follows the eight-step order in the design specification, uses `binding_root_is_current`/`binding_hint_is_current`, catches `AdapterError` at the Hook boundary, and always returns `0`.
 

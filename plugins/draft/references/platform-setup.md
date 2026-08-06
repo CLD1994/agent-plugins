@@ -80,7 +80,7 @@ binding 表示"宿主会话与工作目录的关联"，不证明目录是有效�
 
 ### 输入
 
-- `session_id` 是宿主提供的不透明字符串，原样参与载荷，不截断、规范化或解释；
+- `session_id` 是宿主提供的不透明字符串，原样参与载荷，不截断、规范化或解释；必须能以严格 UTF-8 编码（孤立代理码位非法），空字符串合法，不同码点序列（即使视觉相同）映射为不同会话；
 - `ROOT` 展开用户目录后必须存在、是目录且自身不是符号链接；保存前规范化为绝对真实路径；
 - `last_page_hint` 可省略；若提供，必须是根内非空相对 Markdown 路径，两平台语义下都不是绝对路径、不含 `..`，路径段不得经过符号链接，目标当前必须是普通文件。
 
@@ -142,7 +142,7 @@ uv run <plugin_entry> plugin-context reset
 
 ## plugin-context reset
 
-`plugin-context reset` 只删除以当前插件入口为安装键的临时 bridge、冲突哨兵和锁，不读取或删除任何宿主 `data_dir`、binding 或日志。下一次合法 SessionStart 会重新发布 bridge。该命令不属于 Draft 核心。
+`plugin-context reset` 只删除以当前插件入口为安装键的临时 bridge JSON 和冲突哨兵，不读取或删除任何宿主 `data_dir`、binding 或日志。锁文件永久保留，作为所有进程共同使用的同步锚点，reset 不删除它。下一次合法 SessionStart 会重新发布 bridge。该命令不属于 Draft 核心。
 
 它是唯一允许在普通 bridge 解析失败前分派的维护动作：先于 bridge 加载执行，不需要合法 bridge 上下文。
 
@@ -153,7 +153,7 @@ uv run <plugin_entry> plugin-context reset
 1. 根据 `HOST` 只读取对应宿主的 root/data 变量；不混用两个宿主的变量；
 2. 验证插件根、入口和 `skills/draft/SKILL.md` 均位于预期布局；
 3. 发布或验证 bridge；
-4. 最多读取 64 KiB 标准输入，解析并验证 `SessionStart` 载荷；
+4. 最多读取 65,536 字节标准输入（按字节而非字符计长，超限检查先于 UTF-8 解码），严格 UTF-8 解码并解析验证 `SessionStart` 载荷；
 5. 提取原始 `session_id` 和启动 `source`；
 6. 从宿主 `data_dir` 加载 binding；
 7. 记录尽力而为的宿主 Hook 日志；
@@ -195,8 +195,9 @@ Hook 的协议错误不得阻止宿主会话启动：脚本可执行时，`hook 
 | binding 载荷字段、类型或 JSON 无效 | `binding.invalid`，退出 4 |
 | binding 载荷的 session 与查找键不一致 | `binding.session_mismatch`，退出 4 |
 | unbind 目标不存在 | 成功，`removed=false` |
+| bind/unbind 的 `--session` 含孤立代理码位（非严格 UTF-8） | `binding.invalid_session`，退出 2 |
 
-OSError 必须在最窄文件操作边界转换为稳定错误码并保留异常链，不向 Agent 泄漏 traceback。已有主错误时，清理失败只能附加诊断，不能覆盖主错误。Hook 日志和目录 fsync 是明确的尽力而为操作；binding/bridge 的创建、写入、替换、删除和锁操作是强制步骤。
+OSError 必须在最窄文件操作边界转换为稳定错误码并保留异常链，不向 Agent 泄漏 traceback。已有主错误时，清理失败以稳定明细码 `cleanup.unlock_failed`、`cleanup.close_failed`、`cleanup.unlink_failed` 追加到主错误 `details`（顺序与执行顺序一致），普通文本与 JSON 均可见，主错误码、路径、退出码与异常链不变；Hook 只显示净化后的诊断码，不暴露临时路径与底层系统错误。持久 JSON 文件的无效 UTF-8 按损坏处理：`load_context` 报 `plugin.context_invalid`、`load_binding` 报 `binding.invalid`，`publish_context` 对普通 bridge 文件的无效 UTF-8 按 JSON 损坏原子重写；bridge `data_dir`、binding 的 `session_id`/`root`/`last_page_hint` 以及插件入口路径含孤立代理码位时，按对应持久载荷或上下文无效处理（入口路径归 `plugin.context_invalid`）。Hook 标准输入超过 65,536 字节报 `hook.stdin_too_large`、非严格 UTF-8 或载荷非法报 `hook.stdin_invalid`，均输出诊断并返回 0。Hook 日志在打开前对 `logs/`（不存在或真实目录）与 `hook.jsonl`（不存在或普通文件）做 `lstat` 类型检查，遇到符号链接、目录替文件、FIFO 等异常类型不打开并报 `hook.log_unavailable`，保留主输出并返回 0。目录 fsync 是明确的尽力而为操作；binding/bridge 的创建、写入、替换、删除和锁操作是强制步骤。
 
 ## 故障恢复
 

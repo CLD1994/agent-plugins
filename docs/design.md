@@ -609,7 +609,7 @@ bridge JSON 严格只有两个字段：
 
 发布和消费在同一 `bridge_lock_path` 上取得操作系统级排他锁，并使用同目录临时文件、刷新到磁盘和原子替换发布 JSON。同一 `installation_key` 收到不同 `data_dir` 时原子创建不含路径信息的冲突哨兵，报告 `plugin.context_conflict`，并使后续普通插件命令停止使用冲突前的旧 JSON。用户先停止重复加载，再执行 `uv run <plugin_entry> plugin-context reset`；该维护动作在同一锁内删除本安装键的 JSON 和哨兵，不接受 `data_dir`。
 
-bridge 的必要文件与锁操作发生 `OSError` 时，一律在知道具体操作对象与路径的函数现场转换为 `plugin.context_invalid`（退出 4），保留异常链，不泄漏原始 traceback。锁内主错误在途时，解锁/关闭等清理失败只向主错误附加诊断，绝不覆盖主错误；无主错误时清理失败本身必须明确失败。目录 fsync 明确规定为尽力而为；其余文件写入、文件 fsync、替换、删除和锁操作均为强制步骤。
+bridge 的必要文件与锁操作发生 `OSError` 时，一律在知道具体操作对象与路径的函数现场转换为 `plugin.context_invalid`（退出 4），保留异常链，不泄漏原始 traceback。锁内主错误在途时，解锁/关闭等清理失败以稳定明细码 `cleanup.unlock_failed`、`cleanup.close_failed`、`cleanup.unlink_failed` 追加到主错误 `details`（顺序与执行顺序一致，普通文本与 JSON 均可见），绝不覆盖主错误；Hook 只显示净化后的诊断码；无主错误时清理失败本身必须明确失败。持久 JSON 文件的无效 UTF-8 按损坏处理（`load_context` 报 `plugin.context_invalid`、`load_binding` 报 `binding.invalid`、`publish_context` 原子重写）；含孤立代理码位的 `data_dir`、binding 字段或插件入口路径按对应持久载荷或上下文无效处理。目录 fsync 明确规定为尽力而为；其余文件写入、文件 fsync、替换、删除和锁操作均为强制步骤。
 
 bridge 是数据目录定位器，不是租约。插件禁用或钩子未信任时不再发布或恢复绑定，但已存在且仍合法的 bridge 可继续被当前进程消费。若未来要求禁用后立即撤销，必须单独设计租约协议，不得向当前两字段 JSON 暗中添加语义。
 
@@ -674,7 +674,7 @@ Codex 适配器只读取 `PLUGIN_ROOT`、`PLUGIN_DATA` 和 hook stdin；Claude �
 1. 根据 `HOST` 只读取对应宿主的 root/data 变量；不混用两个宿主的变量；
 2. 验证插件根、入口和 `skills/draft/SKILL.md` 均位于预期布局；
 3. 发布或验证 bridge；
-4. 最多读取 64 KiB 标准输入，解析并验证 `SessionStart` 载荷；
+4. 最多读取 65,536 字节标准输入（按字节而非字符计长，超限检查先于 UTF-8 解码），严格 UTF-8 解码并解析验证 `SessionStart` 载荷；
 5. 提取原始 `session_id` 和启动 `source`；
 6. 从宿主 `data_dir` 加载 binding；
 7. 记录尽力而为的宿主 Hook 日志；
