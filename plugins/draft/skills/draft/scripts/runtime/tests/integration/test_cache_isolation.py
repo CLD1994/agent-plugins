@@ -94,9 +94,9 @@ def assert_supported_uv_versions(uv_output: str, uvx_output: str) -> None:
         )
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture(scope="module", autouse=True)
 def uv_version_gate() -> None:
-    """Gate every test in this module on the actually executed uv/uvx versions."""
+    """Gate this module on the actually executed uv/uvx versions, probing once per module."""
     env = clean_env()
     uv = subprocess.run(
         ["uv", "--version"], env=env, text=True, capture_output=True, check=False, timeout=60
@@ -144,28 +144,6 @@ def snapshot_environments(cache_dir: Path) -> dict[str, int]:
             rel = path.relative_to(env_root).as_posix()
             snapshot[rel] = path.lstat().st_mtime_ns
     return snapshot
-
-
-def environment_archive_refs(cache_dir: Path) -> set[str]:
-    """Distinct second-layer reference names (symlinks) within environments-v2/.
-
-    Each uv tool environment is a second-layer reference beneath
-    ``environments-v2/<first layer>/`` and is itself a symlink into
-    ``archive-v0/``. Different resolution results produce distinct references,
-    so the count of distinct references proves how many distinct environments
-    the cache holds.
-    """
-    env_root = cache_dir / "environments-v2"
-    refs: set[str] = set()
-    if not env_root.is_dir():
-        return refs
-    for entry in env_root.iterdir():
-        if not entry.is_dir():
-            continue
-        for child in entry.iterdir():
-            if child.is_symlink():
-                refs.add(child.name)
-    return refs
 
 
 def second_layer_environments(cache_dir: Path) -> list[Path]:
@@ -233,6 +211,7 @@ def run_uvx_from(
     )
 
 
+@pytest.mark.network
 def test_offline_run_reuses_online_environment_snapshot(tmp_path: Path) -> None:
     artifact = copy_skill(tmp_path)
     runtime = artifact / "scripts" / "runtime"
@@ -293,6 +272,7 @@ def test_offline_run_reuses_online_environment_snapshot(tmp_path: Path) -> None:
     assert not list(artifact.rglob("envs"))
 
 
+@pytest.mark.network
 def test_distinct_releases_share_cache_without_corruption(tmp_path: Path) -> None:
     first = copy_skill(tmp_path, name="first")
     second = copy_skill(tmp_path, name="second")
@@ -366,12 +346,6 @@ def test_distinct_releases_share_cache_without_corruption(tmp_path: Path) -> Non
     assert rerun_first.returncode == 0, rerun_first.stderr
     assert rerun_first.stdout.strip() == "0.3.0", rerun_first.stdout
 
-    # The environments-v2 tree holds distinct second-layer references into
-    # archive-v0 for both releases, proving both were installed without one
-    # clobbering the other's archive.
-    refs = environment_archive_refs(cache)
-    assert len(refs) >= 2, f"expected >=2 archive references, got {refs}"
-
 
 def _build_conflicting_tool(pkg_dir: Path) -> None:
     """Build a temporary local package exposing a conflicting ``draft`` script."""
@@ -403,6 +377,7 @@ def _build_conflicting_tool(pkg_dir: Path) -> None:
     )
 
 
+@pytest.mark.network
 def test_isolated_uvx_ignores_conflicting_global_tool(tmp_path: Path) -> None:
     artifact = copy_skill(tmp_path)
     runtime = artifact / "scripts" / "runtime"

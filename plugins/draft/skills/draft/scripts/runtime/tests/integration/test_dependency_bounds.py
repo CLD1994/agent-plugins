@@ -18,9 +18,9 @@ For each bound, a ``python -c`` metadata probe (using
 first in the SAME cache, asserting the resolved versions; then the domain
 suite runs in that same cache. Sharing the cache means the probe verifies the
 exact wheel versions the domain suite will install. The domain suite runs via
-``uvx --isolated --from .`` with ``cwd=RUNTIME_ROOT``, ignoring the
-integration suites (bootstrap/distribution/bounds) so only domain tests
-execute under the constrained environment.
+``uvx --isolated --from .`` with ``cwd=RUNTIME_ROOT`` and targets only
+``tests/unit``, so the slow integration suites never recurse under the
+constrained environment.
 """
 
 from __future__ import annotations
@@ -30,18 +30,12 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from tests.support.paths import CONSTRAINTS_ROOT, RUNTIME_ROOT
 
 CONSTRAINTS_RUNTIME = CONSTRAINTS_ROOT / "minimum-runtime.txt"
 CONSTRAINTS_BUILD = CONSTRAINTS_ROOT / "minimum-build.txt"
-
-# Domain tests run under the constrained environment; the three integration
-# suites are ignored to avoid recursive subprocess invocation.
-IGNORED_INTEGRATION_TESTS = (
-    "--ignore=tests/integration/test_bootstrap.py",
-    "--ignore=tests/integration/test_dependency_bounds.py",
-    "--ignore=tests/integration/test_distribution.py",
-)
 
 # Metadata probe: uses importlib.metadata.version (stdlib) with the package
 # name as a string. Never imports markdown_it or send2trash.
@@ -101,6 +95,7 @@ def _major_minor(version: str) -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
+@pytest.mark.network
 def test_lowest_bound_probe_and_domain_suite_share_cache(tmp_path: Path) -> None:
     cache = tmp_path / "low-cache"
 
@@ -136,13 +131,13 @@ def test_lowest_bound_probe_and_domain_suite_share_cache(tmp_path: Path) -> None
         "--with",
         "pytest",
         "pytest",
-        "tests",
+        "tests/unit",
         "-q",
-        *IGNORED_INTEGRATION_TESTS,
     )
     assert suite.returncode == 0, suite.stderr + suite.stdout
 
 
+@pytest.mark.network
 def test_highest_available_probe_and_domain_suite_share_cache(tmp_path: Path) -> None:
     cache = tmp_path / "high-cache"
 
@@ -175,8 +170,7 @@ def test_highest_available_probe_and_domain_suite_share_cache(tmp_path: Path) ->
         "--with",
         "pytest",
         "pytest",
-        "tests",
+        "tests/unit",
         "-q",
-        *IGNORED_INTEGRATION_TESTS,
     )
     assert suite.returncode == 0, suite.stderr + suite.stdout

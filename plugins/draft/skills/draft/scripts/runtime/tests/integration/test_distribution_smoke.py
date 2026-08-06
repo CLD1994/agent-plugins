@@ -1,13 +1,15 @@
-"""Path-based uvx bootstrap tests.
+"""Path-based uvx install smoke tests (the network half of the distribution split).
 
-These tests replace the old fake-launcher suite. The only core invocation prefix
-is ``uvx --isolated --from "<skill_root>/scripts/runtime" draft``; uv owns
+The only core invocation prefix is
+``uvx --isolated --from "<skill_root>/scripts/runtime" draft``; uv owns
 environment selection and cache reuse, while uv startup failures retain uv's
 stderr and exit status.
 
 Each test copies only ``skills/draft`` beneath an unrelated parent directory
-(no ``.git``, no repository parent), computes the runtime path from that copy,
-and asserts the behavior contract from Task 6 Step 1.
+(no ``.git``, no repository parent) and computes the runtime path from that
+copy. The three successful-install cases need the external index, dependency
+resolution, download, or a cold uv cache and are marked ``network``; the
+missing-interpreter case fails before any index access and stays unmarked.
 """
 
 from __future__ import annotations
@@ -16,6 +18,8 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from tests.support.paths import RUNTIME_ROOT
 
@@ -143,6 +147,7 @@ def _assert_no_draft_managed_envs(artifact: Path, *roots: Path) -> None:
         assert not list(base.rglob("envs"))
 
 
+@pytest.mark.network
 def test_version_reports_runtime_version_from_copy(tmp_path: Path) -> None:
     artifact = copy_skill(tmp_path)
     env = clean_env()
@@ -157,6 +162,7 @@ def test_version_reports_runtime_version_from_copy(tmp_path: Path) -> None:
     _assert_no_draft_managed_envs(artifact)
 
 
+@pytest.mark.network
 def test_init_and_check_pass_without_plugin_files_or_repo_parents(
     tmp_path: Path,
 ) -> None:
@@ -217,6 +223,7 @@ def test_missing_interpreter_returns_uv_error_not_draft_json(
     assert '"result_type"' not in result.stdout
 
 
+@pytest.mark.network
 def test_uvx_resolves_from_pyproject_when_lock_absent(tmp_path: Path) -> None:
     artifact = copy_skill(tmp_path, drop_lock=True)
     assert not (artifact / "scripts" / "runtime" / "uv.lock").exists()
