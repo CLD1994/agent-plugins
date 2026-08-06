@@ -4,11 +4,14 @@ import pytest
 
 from draft.errors import DraftError
 from draft.markdown import (
+    append_parent_navigation,
+    locate_status_value_span,
     parse_page,
     remove_link_markup,
+    remove_parent_navigation,
     rewrite_link_destinations,
 )
-from draft.models import RelationLabel, StatusPrefix
+from draft.models import MarkdownLink, RelationLabel, SourceSpan, StatusPrefix
 
 VALID_PAGE = """# 请求身份
 
@@ -344,3 +347,65 @@ def test_machine_block_lazy_continuation_is_a_parse_error() -> None:
     assert caught.value.code == "page.parse_error"
     assert caught.value.details == ("lazy_continuation",)
     assert caught.value.line == 4
+
+
+# ---------------------------------------------------------------------------
+# 导航字符串转换：append / remove / locate_status_value_span
+# ---------------------------------------------------------------------------
+
+
+def test_append_parent_navigation_creates_section_when_absent() -> None:
+    text = "# 主题\n\n> 状态：`已确认`\n"
+    assert append_parent_navigation(text, "子", "pages/sub.md") == (
+        "# 主题\n\n> 状态：`已确认`\n\n## 子主题\n\n- [子](pages/sub.md)\n"
+    )
+
+
+def test_append_parent_navigation_appends_to_existing_section() -> None:
+    text = "# 主题\n\n> 状态：`已确认`\n\n## 子主题\n\n- [a](a.md)\n"
+    assert append_parent_navigation(text, "b", "b.md") == (
+        "# 主题\n\n> 状态：`已确认`\n\n## 子主题\n\n- [a](a.md)\n- [b](b.md)\n"
+    )
+
+
+def test_append_parent_navigation_escapes_brackets_in_title() -> None:
+    text = "# 主题\n\n> 状态：`已确认`\n"
+    result = append_parent_navigation(text, "a[b]c", "x.md")
+    assert "- [a\\[b\\]c](x.md)" in result
+
+
+def test_remove_parent_navigation_removes_whole_list_item_line() -> None:
+    text = "- [a](a.md)\n"
+    link = MarkdownLink(
+        label="a",
+        destination="a.md",
+        destination_span=SourceSpan(4, 9),
+        whole_span=SourceSpan(2, 11),
+        line=1,
+    )
+    assert remove_parent_navigation(text, link) == ""
+
+
+def test_remove_parent_navigation_keeps_visible_label_when_not_list_item() -> None:
+    text = "见 [a](a.md) 详情\n"
+    link = MarkdownLink(
+        label="a",
+        destination="a.md",
+        destination_span=SourceSpan(4, 9),
+        whole_span=SourceSpan(2, 11),
+        line=1,
+    )
+    assert remove_parent_navigation(text, link) == "见 a 详情\n"
+
+
+def test_locate_status_value_span_includes_backticks() -> None:
+    text = "# 标题\n\n> 状态：`已确认`\n"
+    span = locate_status_value_span(text)
+    assert text[span.start : span.end] == "`已确认`"
+
+
+def test_locate_status_value_span_missing_status_is_rejected() -> None:
+    text = "# 标题\n\n> 父主题：[根](../index.md)\n"
+    with pytest.raises(DraftError) as caught:
+        locate_status_value_span(text)
+    assert caught.value.code == "page.missing_status"
