@@ -23,14 +23,13 @@ import pytest
 from adapter.bindings import Binding, binding_path
 from adapter.bridge import bridge_paths, publish_context
 from adapter.errors import EXIT_RUNTIME, EXIT_USAGE
+from tests.support.paths import ENTRY_FILE
 
 # 以 importlib 导入入口模块，避免 `import draft` 语法与核心 draft 包同名冲突；
 # conftest 已将 plugins/draft/scripts/ 插入 sys.path[0]，运行时解析到入口模块。
 plugin_cli = importlib.import_module("draft")
 
 HOSTS = ("codex", "claude")
-# 真实入口路径，供 subprocess 测试使用。
-ENTRY_FILE = Path(__file__).resolve().parent.parent / "draft.py"
 
 
 # ---------------------------------------------------------------------------
@@ -823,3 +822,15 @@ def test_empty_session_with_valid_bridge_binds_and_unbinds(
     assert code == 0
     assert out == "解除成功 removed=true\n"
     assert not binding_path(setup.data_dir, "").exists()
+
+
+def test_plugin_entry_loader_does_not_reuse_core_draft_package() -> None:
+    import draft as core_package
+    from tests.support.entry import load_plugin_entry
+    from tests.support.paths import ENTRY_FILE
+
+    loaded = load_plugin_entry()
+
+    assert loaded is not core_package
+    assert loaded.__file__ == str(ENTRY_FILE)
+    assert callable(loaded.dispatch_plugin_command)
