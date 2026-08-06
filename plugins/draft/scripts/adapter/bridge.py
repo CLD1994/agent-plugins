@@ -33,11 +33,23 @@ class BridgePaths:
 
 
 def installation_key(entry_path: Path) -> str:
+    # 孤立代理码位无法安全编码为安装键：顶部可编码性检查与 _canonical_data_dir
+    # 同型。resolve 对含孤立代理的路径同样抛 UnicodeEncodeError（非 OSError），
+    # 必须先于 resolve 拦截。
+    try:
+        str(entry_path).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _invalid(entry_path) from exc
     try:
         canonical = entry_path.resolve(strict=True)
     except OSError as exc:
         raise _invalid(entry_path) from exc
-    return hashlib.sha256(str(canonical).encode("utf-8")).hexdigest()
+    # 解析结果可能经 readlink/getcwd 引入非 UTF-8 字节（surrogateescape 码位），
+    # 严格编码失败同样归一为 plugin.context_invalid
+    try:
+        return hashlib.sha256(str(canonical).encode("utf-8")).hexdigest()
+    except UnicodeEncodeError as exc:
+        raise _invalid(entry_path) from exc
 
 
 def per_user_runtime_dir(environ: Mapping[str, str] | None = None) -> Path:

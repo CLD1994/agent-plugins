@@ -15,9 +15,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import TextIO
+from typing import BinaryIO
 
-from adapter.bindings import Binding, binding_hint_is_current, binding_root_is_current, load_binding
+from adapter.bindings import (
+    Binding,
+    binding_hint_is_current,
+    binding_root_is_current,
+    load_binding,
+    session_id_is_valid,
+)
 from adapter.bridge import publish_context
 from adapter.errors import AdapterError
 
@@ -149,17 +155,23 @@ def resolve_host_context(host: str, entry_path: Path, environ: Mapping[str, str]
 # ---------------------------------------------------------------------------
 
 
-def read_hook_payload(stream: TextIO, host: str) -> HookPayload:
-    """读取至多 MAX_STDIN + 1 字节，校验对象/事件/session/宿主 source。
+def read_hook_payload(stream: BinaryIO, host: str) -> HookPayload:
+    """读取至多 MAX_STDIN + 1 个原始字节，校验对象/事件/session/宿主 source。
 
-    不修改字符串值：session_id 原样保留，不截断或规范化。
+    边界按字节而非字符计算；大小检查先于任何解码。解码使用严格 UTF-8，
+    不使用替换字符或忽略错误。不修改字符串值：session_id 原样保留，
+    不截断、不解释、不做 Unicode 规范化。
     """
     try:
-        text = stream.read(MAX_STDIN + 1)
+        raw = stream.read(MAX_STDIN + 1)
     except OSError as exc:
         raise AdapterError("hook.stdin_unavailable", exit_code=4) from exc
-    if len(text) > MAX_STDIN:
-        raise AdapterError("hook.stdin_oversized", exit_code=4)
+    if len(raw) > MAX_STDIN:
+        raise AdapterError("hook.stdin_too_large", exit_code=4)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AdapterError("hook.stdin_invalid", exit_code=4) from exc
     try:
         value = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -172,6 +184,10 @@ def read_hook_payload(stream: TextIO, host: str) -> HookPayload:
     session_id = payload.get("session_id")
     if not isinstance(session_id, str):
         raise AdapterError("binding.session_unavailable", exit_code=4)
+    # 孤立代理码位无法安全进入协议或文件系统操作：按载荷无效处理。
+    # 不截断、不解释、不规范化；禁止到达 binding_key 的 UTF-8 编码。
+    if not session_id_is_valid(session_id):
+        raise AdapterError("hook.stdin_invalid", exit_code=4)
     source = payload.get("source")
     if not isinstance(source, str):
         raise AdapterError("hook.unexpected_source", exit_code=4)
@@ -250,18 +266,37 @@ def render_diagnostic(error: AdapterError) -> str:
 
 
 def log_hook(data_dir: Path | None, host: str, **fields: object) -> AdapterError | None:
-    """尽力而为的宿主 Hook 日志。失败返回 hook.log_unavailable 而非抛出。"""
+    """尽力而为的宿主 Hook 日志。失败返回 hook.log_unavailable 而非抛出。
+
+    类型安全（lstat，不跟随符号链接）：logs/ 必须不存在或是真实目录；
+    hook.jsonl 必须不存在或是普通文件。符号链接、目录替代普通文件、FIFO 等
+    异常类型一律拒绝且不得打开。显式尽力而为语义不变：不引入目录句柄或
+    完整抗竞争架构。
+    """
     if data_dir is None:
         return None
+    logs = data_dir / "logs"
+    target = logs / "hook.jsonl"
     try:
-        logs = data_dir / "logs"
+        try:
+            logs_status = logs.lstat()
+        except FileNotFoundError:
+            logs_status = None
+        if logs_status is not None and not stat.S_ISDIR(logs_status.st_mode):
+            return AdapterError("hook.log_unavailable", data_dir, exit_code=4)
+        try:
+            target_status = target.lstat()
+        except FileNotFoundError:
+            target_status = None
+        if target_status is not None and not stat.S_ISREG(target_status.st_mode):
+            return AdapterError("hook.log_unavailable", data_dir, exit_code=4)
         logs.mkdir(parents=True, exist_ok=True)
         record = {
             "at": datetime.now(UTC).isoformat(),
             "host": host,
             **fields,
         }
-        with (logs / "hook.jsonl").open("a", encoding="utf-8") as handle:
+        with target.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         return None
     except OSError:
@@ -278,13 +313,14 @@ def run_session_start(
     *,
     entry_path: Path,
     environ: Mapping[str, str],
-    stdin: TextIO,
+    stdin: BinaryIO,
     runtime_dir: Path | None = None,
 ) -> int:
     """按八步顺序执行 SessionStart；所有失败归一为模型可见诊断并返回 0。
 
-    布局或宿主上下文失败先于 bridge 发布；载荷校验晚于 bridge 发布。stderr 保持
-    为空，所有诊断输出到 stdout。
+    布局或宿主上下文失败先于 bridge 发布；载荷校验晚于 bridge 发布。stdin 为
+    二进制流（宿主原始字节），字节边界与严格 UTF-8 校验见 read_hook_payload。
+    stderr 保持为空，所有诊断输出到 stdout。
     """
     primary: str
     log_data_dir: Path | None = None

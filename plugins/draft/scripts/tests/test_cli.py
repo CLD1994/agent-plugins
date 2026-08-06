@@ -114,7 +114,7 @@ def call_main(
         list(args),
         entry_path=setup_obj.entry,
         environ=dict(env) if env is not None else {},
-        stdin=io.StringIO(stdin),
+        stdin=io.BytesIO(stdin.encode("utf-8")),
         runtime_dir=setup_obj.runtime_dir if runtime_dir is None else runtime_dir,
     )
     captured = capsys.readouterr()
@@ -499,7 +499,7 @@ def test_hook_session_start_forwards_canonical_args_once(
         *,
         entry_path: Path,
         environ: Mapping[str, str],
-        stdin: io.StringIO,
+        stdin: io.BytesIO,
         runtime_dir: Path | None,
     ) -> int:
         calls.append((host_arg, entry_path, dict(environ), stdin.read(), runtime_dir))
@@ -524,7 +524,7 @@ def test_hook_session_start_forwards_canonical_args_once(
     assert forwarded_host == host
     assert forwarded_entry == setup.entry
     assert forwarded_env == env
-    assert forwarded_stdin == stdin_text
+    assert forwarded_stdin == stdin_text.encode("utf-8")
     assert forwarded_runtime == setup.runtime_dir
 
 

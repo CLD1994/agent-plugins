@@ -509,6 +509,14 @@ def test_installation_key_resolution_failure_is_invalid(tmp_path: Path) -> None:
         installation_key(missing)
 
 
+def test_installation_key_lone_surrogate_entry_is_context_invalid(tmp_path: Path) -> None:
+    # 含孤立代理的 entry_path（surrogateescape 来源的非 UTF-8 安装路径字节）
+    # 不得让 UnicodeEncodeError 逃逸：归一为 plugin.context_invalid
+    entry = tmp_path / "skill\ud800" / "scripts" / "draft.py"
+    with pytest.raises(AdapterError, match="plugin.context_invalid"):
+        installation_key(entry)
+
+
 def test_lock_open_failure_is_invalid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     entry, data_dir, runtime_dir = make_paths(tmp_path)
     publish_context(entry, data_dir, runtime_dir)

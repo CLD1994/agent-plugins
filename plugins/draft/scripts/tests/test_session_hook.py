@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shlex
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO, cast
+from typing import BinaryIO, cast
 
 import pytest
 from adapter.bindings import Binding, bind, binding_path
@@ -110,19 +112,24 @@ def run_hook(
     capsys: pytest.CaptureFixture[str],
     *,
     host: str = "codex",
-    stdin: str | None = None,
+    stdin: str | bytes | None = None,
     env: Mapping[str, str] | None = None,
     entry_path: Path | None = None,
 ) -> tuple[int, str]:
+    """stdin 按契约 A 为二进制流：str 视为 UTF-8 编码前的文本，bytes 原样传入。"""
     if env is None:
         env = default_env(setup, host)
     if stdin is None:
-        stdin = session_stdin("abc123", "startup")
+        raw = session_stdin("abc123", "startup").encode("utf-8")
+    elif isinstance(stdin, str):
+        raw = stdin.encode("utf-8")
+    else:
+        raw = stdin
     code = run_session_start(
         host,
         entry_path=entry_path if entry_path is not None else setup.entry,
         environ=dict(env),
-        stdin=io.StringIO(stdin),
+        stdin=io.BytesIO(raw),
         runtime_dir=setup.runtime_dir,
     )
     captured = capsys.readouterr()
@@ -356,24 +363,61 @@ def test_stdin_at_64kib_boundary_is_accepted(
     assert "Draft 会话未绑定" in output
 
 
-def test_oversized_stdin_renders_oversized(
+def test_multibyte_stdin_at_64kib_boundary_is_accepted(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 字节边界按字节而非字符计算：字符数少而字节数大的载荷恰好 65,536 字节必须被接受
+    fill = MAX_STDIN - len(session_stdin("").encode("utf-8"))
+    session = "中" * (fill // 3) + "x" * (fill % 3)
+    stdin = session_stdin(session).encode("utf-8")
+    assert len(stdin) == MAX_STDIN
+    code, output = run_hook(setup, capsys, host="codex", stdin=stdin)
+    assert code == 0
+    assert "Draft 会话未绑定" in output
+
+
+def test_stdin_one_byte_over_renders_too_large(
     setup: Setup, capsys: pytest.CaptureFixture[str]
 ) -> None:
     code, output = run_hook(setup, capsys, host="codex", stdin=" " * (MAX_STDIN + 1))
     assert code == 0
-    assert "hook.stdin_oversized" in output
+    assert "hook.stdin_too_large" in output
     assert output.count("Draft 插件诊断") == 1
     assert load_context(setup.entry, setup.runtime_dir) == PluginContext(setup.data_dir)
+
+
+def test_multibyte_stdin_one_byte_over_renders_too_large(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 同形多字节载荷 65,537 字节：旧实现按字符计长会错误接受，必须报 too_large
+    fill = MAX_STDIN + 1 - len(session_stdin("").encode("utf-8"))
+    session = "中" * (fill // 3) + "x" * (fill % 3)
+    stdin = session_stdin(session).encode("utf-8")
+    assert len(stdin) == MAX_STDIN + 1
+    code, output = run_hook(setup, capsys, host="codex", stdin=stdin)
+    assert code == 0
+    assert "hook.stdin_too_large" in output
+    assert output.count("Draft 插件诊断") == 1
+
+
+def test_oversized_and_invalid_utf8_prefers_too_large(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 大小检查先于任何解码：同时超限且无效 UTF-8 时报 too_large 而非 stdin_invalid
+    code, output = run_hook(setup, capsys, host="codex", stdin=b"\xff" * (MAX_STDIN + 1))
+    assert code == 0
+    assert "hook.stdin_too_large" in output
+    assert output.count("Draft 插件诊断") == 1
 
 
 def test_stream_read_oserror_renders_stdin_unavailable(
     setup: Setup, capsys: pytest.CaptureFixture[str]
 ) -> None:
     class _BadStream:
-        def read(self, size: int | None = -1) -> str:
+        def read(self, size: int | None = -1) -> bytes:
             raise OSError("stream broken")
 
-    bad_stream: TextIO = cast("TextIO", _BadStream())
+    bad_stream: BinaryIO = cast("BinaryIO", _BadStream())
     code = run_session_start(
         "codex",
         entry_path=setup.entry,
@@ -385,6 +429,38 @@ def test_stream_read_oserror_renders_stdin_unavailable(
     assert code == 0
     assert "hook.stdin_unavailable" in captured.out
     assert captured.err == ""
+
+
+def test_invalid_utf8_under_limit_renders_stdin_invalid(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 未超限的无效字节：严格 UTF-8 解码失败归一为 hook.stdin_invalid，不得逃逸 traceback
+    raw = b'{"hook_event_name": "SessionStart", "session_id": "s\xff", "source": "startup"}'
+    code = run_session_start(
+        "codex",
+        entry_path=setup.entry,
+        environ=default_env(setup, "codex"),
+        stdin=io.BytesIO(raw),
+        runtime_dir=setup.runtime_dir,
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "hook.stdin_invalid" in captured.out
+    assert captured.out.count("Draft 插件诊断") == 1
+    assert captured.err == ""
+
+
+def test_hook_lone_surrogate_session_renders_stdin_invalid(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # JSON 转义的孤立代理可解码为 str，但不得进入 binding 路径操作；
+    # ensure_ascii=True 将其转义为 \ud800，字节流本身是合法 UTF-8
+    payload = {"hook_event_name": "SessionStart", "session_id": "\ud800", "source": "startup"}
+    stdin = json.dumps(payload).encode("utf-8")
+    code, output = run_hook(setup, capsys, host="codex", stdin=stdin)
+    assert code == 0
+    assert "hook.stdin_invalid" in output
+    assert output.count("Draft 插件诊断") == 1
 
 
 def test_invalid_json_renders_stdin_invalid(
@@ -952,6 +1028,110 @@ def test_log_degradation_preserves_diagnostic_primary(
     assert "binding.root_missing" in output
     assert "hook.log_unavailable" in output
     assert output.count("Draft 插件诊断") == 2
+
+
+# ---------------------------------------------------------------------------
+# Step 5: 日志目标类型安全（lstat 拒绝符号链接/目录/FIFO 等异常类型，不打开）
+# ---------------------------------------------------------------------------
+
+LOG_TYPE_CASES = ("logs_symlink", "logs_file", "jsonl_symlink", "jsonl_fifo", "jsonl_dir")
+
+
+def prepare_log_type_case(setup: Setup, case: str) -> Path | None:
+    """布置异常日志目标状态；返回必须保持未被写入的哨兵目标（无则为 None）。"""
+    logs = setup.data_dir / "logs"
+    if case == "logs_symlink":
+        outside = setup.base / "outside-logs"
+        outside.mkdir()
+        logs.symlink_to(outside)
+        return outside
+    if case == "logs_file":
+        logs.write_text("", encoding="utf-8")
+        return logs
+    logs.mkdir()
+    target = logs / "hook.jsonl"
+    if case == "jsonl_symlink":
+        outside_file = setup.base / "outside-hook.jsonl"
+        outside_file.write_text("", encoding="utf-8")
+        target.symlink_to(outside_file)
+        return outside_file
+    if case == "jsonl_fifo":
+        os.mkfifo(target)
+        return None
+    # jsonl_dir
+    target.mkdir()
+    return None
+
+
+def assert_sentinel_not_written(sentinel: Path | None) -> None:
+    if sentinel is None:
+        return
+    status = sentinel.lstat()
+    if stat.S_ISDIR(status.st_mode):
+        assert list(sentinel.iterdir()) == []
+    else:
+        assert sentinel.read_text(encoding="utf-8") == ""
+
+
+@pytest.mark.parametrize("case", LOG_TYPE_CASES)
+def test_log_target_type_violation_renders_log_unavailable(
+    setup: Setup, case: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sentinel = prepare_log_type_case(setup, case)
+    code, output = run_hook(
+        setup, capsys, host="codex", stdin=session_stdin("unbound-session", "startup")
+    )
+    assert code == 0
+    # 无 binding 主分支保留 + 追加日志诊断
+    assert "Draft 会话未绑定" in output
+    assert "unbound-session" in output
+    assert "hook.log_unavailable" in output
+    assert output.count("Draft 插件诊断") == 1
+    # 异常目标不得被打开：数据目录外目标与哨兵均未被写入
+    assert_sentinel_not_written(sentinel)
+    if case == "jsonl_fifo":
+        # 仍然存在的 FIFO 证明没有在 append 模式打开（否则会阻塞或写入）
+        assert stat.S_ISFIFO((setup.data_dir / "logs" / "hook.jsonl").lstat().st_mode)
+    elif case == "jsonl_dir":
+        assert list((setup.data_dir / "logs" / "hook.jsonl").iterdir()) == []
+
+
+def test_log_target_symlink_preserves_rebind_branch(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 有效 binding 分支：主输出保留，外部目标未被写入
+    outside_file = setup.base / "outside-hook.jsonl"
+    outside_file.write_text("", encoding="utf-8")
+    logs = setup.data_dir / "logs"
+    logs.mkdir()
+    (logs / "hook.jsonl").symlink_to(outside_file)
+    bound = bind_session(setup)
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "resume"))
+    assert code == 0
+    assert "Draft 会话已绑定" in output
+    assert f"- 草稿根：{bound.root}" in output
+    assert "hook.log_unavailable" in output
+    assert output.count("Draft 插件诊断") == 1
+    assert outside_file.read_text(encoding="utf-8") == ""
+
+
+def test_log_target_symlink_preserves_diagnostic_primary(
+    setup: Setup, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 已有主要诊断分支：主诊断与日志诊断同时保留，外部目录未被写入
+    import shutil
+
+    outside = setup.base / "outside-logs"
+    outside.mkdir()
+    (setup.data_dir / "logs").symlink_to(outside)
+    bound = bind_session(setup)
+    shutil.rmtree(bound.root)
+    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "compact"))
+    assert code == 0
+    assert "binding.root_missing" in output
+    assert "hook.log_unavailable" in output
+    assert output.count("Draft 插件诊断") == 2
+    assert list(outside.iterdir()) == []
 
 
 def test_log_is_recorded_on_success(setup: Setup, capsys: pytest.CaptureFixture[str]) -> None:

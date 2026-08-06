@@ -17,7 +17,7 @@ import os
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import NoReturn, TextIO, cast
+from typing import BinaryIO, NoReturn, cast
 
 from adapter.bindings import Binding, bind, unbind
 from adapter.bridge import load_context, reset_context
@@ -32,13 +32,14 @@ def main(
     *,
     entry_path: Path | None = None,
     environ: Mapping[str, str] | None = None,
-    stdin: TextIO | None = None,
+    stdin: BinaryIO | None = None,
     runtime_dir: Path | None = None,
 ) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     active_entry = Path(__file__) if entry_path is None else entry_path
     active_environ = os.environ if environ is None else environ
-    active_stdin = sys.stdin if stdin is None else stdin
+    # Hook stdin 管道二进制化：宿主原始字节进入字节边界与严格 UTF-8 校验
+    active_stdin = sys.stdin.buffer if stdin is None else stdin
     return dispatch_plugin_command(
         arguments,
         entry_path=active_entry,
@@ -53,7 +54,7 @@ def dispatch_plugin_command(
     *,
     entry_path: Path,
     environ: Mapping[str, str],
-    stdin: TextIO,
+    stdin: BinaryIO,
     runtime_dir: Path | None,
 ) -> int:
     args = list(arguments)
@@ -246,7 +247,7 @@ def _dispatch_hook_session_start(
     rest: list[str],
     entry_path: Path,
     environ: Mapping[str, str],
-    stdin: TextIO,
+    stdin: BinaryIO,
     runtime_dir: Path | None,
 ) -> int:
     if len(rest) != 1:
