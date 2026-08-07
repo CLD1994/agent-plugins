@@ -8,11 +8,11 @@ installation_key 的真实路径解析与 publish/load/reset 路由保留在集�
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
+from pytest_mock import MockerFixture
 
 from adapter.bridge import (
     BridgePaths,
@@ -28,13 +28,13 @@ _BRIDGE_PATH = Path("/bridge.json")
 # ---------------------------------------------------------------------------
 
 
-def test_bridge_paths_explicit_runtime_dir_uses_installation_key() -> None:
+def test_bridge_paths_explicit_runtime_dir_uses_installation_key(mocker: MockerFixture) -> None:
     entry = Path("/entry/draft.py")
     runtime_dir = Path("/run")
     fixed_key = "abc123def456"
-    with patch("adapter.bridge.installation_key", autospec=True) as key_fn:
-        key_fn.return_value = fixed_key
-        paths = bridge_paths(entry, runtime_dir)
+    key_fn = mocker.patch("adapter.bridge.installation_key", autospec=True)
+    key_fn.return_value = fixed_key
+    paths = bridge_paths(entry, runtime_dir)
     base = runtime_dir / "draft" / "bridges"
     assert paths == BridgePaths(
         json=base / f"{fixed_key}.json",
@@ -44,13 +44,15 @@ def test_bridge_paths_explicit_runtime_dir_uses_installation_key() -> None:
     key_fn.assert_called_once_with(entry)
 
 
-def test_bridge_paths_explicit_runtime_dir_distinct_keys_distinct_files() -> None:
+def test_bridge_paths_explicit_runtime_dir_distinct_keys_distinct_files(
+    mocker: MockerFixture,
+) -> None:
     entry = Path("/entry/draft.py")
     runtime_dir = Path("/run")
-    with patch("adapter.bridge.installation_key", autospec=True) as key_fn:
-        key_fn.side_effect = ["key-one", "key-two"]
-        first = bridge_paths(entry, runtime_dir)
-        second = bridge_paths(entry, runtime_dir)
+    key_fn = mocker.patch("adapter.bridge.installation_key", autospec=True)
+    key_fn.side_effect = ["key-one", "key-two"]
+    first = bridge_paths(entry, runtime_dir)
+    second = bridge_paths(entry, runtime_dir)
     assert first.json != second.json
     assert first.conflict != second.conflict
     assert first.lock != second.lock
@@ -62,16 +64,17 @@ def test_bridge_paths_explicit_runtime_dir_distinct_keys_distinct_files() -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_bridge_paths_default_runtime_dir_uses_per_user_runtime_dir() -> None:
+def test_bridge_paths_default_runtime_dir_uses_per_user_runtime_dir(
+    mocker: MockerFixture,
+) -> None:
     entry = Path("/entry/draft.py")
     fixed_runtime = Path("/per-user-run")
     fixed_key = "def789ghi012"
-    with ExitStack() as stack:
-        key_fn = stack.enter_context(patch("adapter.bridge.installation_key", autospec=True))
-        key_fn.return_value = fixed_key
-        per_user = stack.enter_context(patch("adapter.bridge.per_user_runtime_dir", autospec=True))
-        per_user.return_value = fixed_runtime
-        paths = bridge_paths(entry)
+    key_fn = mocker.patch("adapter.bridge.installation_key", autospec=True)
+    key_fn.return_value = fixed_key
+    per_user = mocker.patch("adapter.bridge.per_user_runtime_dir", autospec=True)
+    per_user.return_value = fixed_runtime
+    paths = bridge_paths(entry)
     base = fixed_runtime / "draft" / "bridges"
     assert paths == BridgePaths(
         json=base / f"{fixed_key}.json",
@@ -82,14 +85,15 @@ def test_bridge_paths_default_runtime_dir_uses_per_user_runtime_dir() -> None:
     per_user.assert_called_once_with()
 
 
-def test_bridge_paths_default_branch_does_not_touch_installation_key_real_resolve() -> None:
+def test_bridge_paths_default_branch_does_not_touch_installation_key_real_resolve(
+    mocker: MockerFixture,
+) -> None:
     """缺省分支只通过替身获得 runtime_dir 与 key，不触发真实路径解析。"""
-    with ExitStack() as stack:
-        key_fn = stack.enter_context(patch("adapter.bridge.installation_key", autospec=True))
-        key_fn.return_value = "k"
-        per_user = stack.enter_context(patch("adapter.bridge.per_user_runtime_dir", autospec=True))
-        per_user.return_value = Path("/run")
-        paths = bridge_paths(Path("/entry/draft.py"))
+    key_fn = mocker.patch("adapter.bridge.installation_key", autospec=True)
+    key_fn.return_value = "k"
+    per_user = mocker.patch("adapter.bridge.per_user_runtime_dir", autospec=True)
+    per_user.return_value = Path("/run")
+    paths = bridge_paths(Path("/entry/draft.py"))
     assert paths.json.name == "k.json"
     assert paths.json.parent == Path("/run/draft/bridges")
 
@@ -100,9 +104,8 @@ def test_bridge_paths_default_branch_does_not_touch_installation_key_real_resolv
 
 
 @pytest.fixture
-def canonical_data_dir_stub() -> Iterator[MagicMock]:
-    with patch("adapter.bridge._canonical_data_dir", autospec=True) as mock:
-        yield mock
+def canonical_data_dir_stub(mocker: MockerFixture) -> Iterator[MagicMock]:
+    yield mocker.patch("adapter.bridge._canonical_data_dir", autospec=True)
 
 
 @pytest.mark.parametrize("raw", [[1, 2], 42, "string", None, True, 3.14])

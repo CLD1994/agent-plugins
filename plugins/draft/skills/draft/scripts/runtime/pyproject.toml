@@ -15,6 +15,7 @@ draft = "draft.cli:main"
 dev = [
     "hatchling>=1.31,<1.32",
     "pytest",
+    "pytest-mock",
     "pyright",
     "ruff",
 ]

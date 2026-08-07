@@ -5,9 +5,9 @@ import uuid as uuid_module
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
+from pytest_mock import MockerFixture
 
 from draft.errors import DraftError
 from draft.graph import (
@@ -314,7 +314,7 @@ def _trash_journal(
 # ===========================================================================
 
 
-def test_trash_plan_valid_leaf_produces_complete_plan() -> None:
+def test_trash_plan_valid_leaf_produces_complete_plan(mocker: MockerFixture) -> None:
     """合法叶页回收：生成完整删除包、父导航移除、页面删除，比较完整 OperationPlan。"""
     graph = _graph_from_texts(
         {
@@ -324,8 +324,8 @@ def test_trash_plan_valid_leaf_produces_complete_plan() -> None:
         }
     )
 
-    with patch("draft.trash.uuid.uuid4", autospec=True, return_value=FIXED_UUID):
-        plan, package_relative = trash_plan(graph, Path("pages/a.md"))
+    mocker.patch("draft.trash.uuid.uuid4", autospec=True, return_value=FIXED_UUID)
+    plan, package_relative = trash_plan(graph, Path("pages/a.md"))
 
     assert plan.kind == "trash"
     assert plan.root == ROOT
@@ -387,7 +387,7 @@ def test_trash_plan_valid_leaf_produces_complete_plan() -> None:
 # ===========================================================================
 
 
-def test_trash_plan_last_child_collapses_single_child_hub() -> None:
+def test_trash_plan_last_child_collapses_single_child_hub(mocker: MockerFixture) -> None:
     """回收最后一个子页时，单人枢纽折叠为叶页，其他页链接重定向。"""
     graph = _graph_from_texts(
         {
@@ -398,8 +398,8 @@ def test_trash_plan_last_child_collapses_single_child_hub() -> None:
         }
     )
 
-    with patch("draft.trash.uuid.uuid4", autospec=True, return_value=FIXED_UUID):
-        plan, _ = trash_plan(graph, Path("pages/solo/only.md"))
+    mocker.patch("draft.trash.uuid.uuid4", autospec=True, return_value=FIXED_UUID)
+    plan, _ = trash_plan(graph, Path("pages/solo/only.md"))
 
     mutation_paths = {m.path for m in plan.mutations}
     # 折叠后的叶页写入
@@ -429,7 +429,9 @@ def test_trash_plan_last_child_collapses_single_child_hub() -> None:
 # ===========================================================================
 
 
-def test_trash_plan_navigation_removal_removes_canonical_parent_link() -> None:
+def test_trash_plan_navigation_removal_removes_canonical_parent_link(
+    mocker: MockerFixture,
+) -> None:
     """回收移除父页中的规范导航项（整行独占则去整行）。"""
     graph = _graph_from_texts(
         {
@@ -439,8 +441,8 @@ def test_trash_plan_navigation_removal_removes_canonical_parent_link() -> None:
         }
     )
 
-    with patch("draft.trash.uuid.uuid4", autospec=True, return_value=FIXED_UUID):
-        plan, _ = trash_plan(graph, Path("pages/a.md"))
+    mocker.patch("draft.trash.uuid.uuid4", autospec=True, return_value=FIXED_UUID)
+    plan, _ = trash_plan(graph, Path("pages/a.md"))
 
     writes = [m for m in plan.mutations if m.kind is MutationKind.WRITE]
     index_mutation = next(m for m in writes if m.path == Path("index.md"))
@@ -456,7 +458,7 @@ def test_trash_plan_navigation_removal_removes_canonical_parent_link() -> None:
 # ===========================================================================
 
 
-def test_trash_plan_deterministic_mutation_ordering() -> None:
+def test_trash_plan_deterministic_mutation_ordering(mocker: MockerFixture) -> None:
     """变更项先写后删，各自按路径字典序排序。"""
     graph = _graph_from_texts(
         {
@@ -466,8 +468,8 @@ def test_trash_plan_deterministic_mutation_ordering() -> None:
         }
     )
 
-    with patch("draft.trash.uuid.uuid4", autospec=True, return_value=FIXED_UUID):
-        plan, _ = trash_plan(graph, Path("pages/a.md"))
+    mocker.patch("draft.trash.uuid.uuid4", autospec=True, return_value=FIXED_UUID)
+    plan, _ = trash_plan(graph, Path("pages/a.md"))
 
     kinds = [m.kind for m in plan.mutations]
     writes = [m for m in plan.mutations if m.kind is MutationKind.WRITE]

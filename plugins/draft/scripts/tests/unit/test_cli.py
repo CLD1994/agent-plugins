@@ -17,9 +17,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import BinaryIO, Protocol, cast
-from unittest.mock import MagicMock, create_autospec, patch
+from unittest.mock import MagicMock
 
 import pytest
+from pytest_mock import MockerFixture
 
 from adapter.bindings import Binding
 from adapter.bridge import PluginContext
@@ -94,28 +95,26 @@ class _EntryDoubles:
 
 
 @pytest.fixture
-def entry_doubles() -> Iterator[_EntryDoubles]:
+def entry_doubles(mocker: MockerFixture) -> Iterator[_EntryDoubles]:
     """全新加载入口模块，并把 bridge/bindings/hook 协作者替换为 autospec 替身。
 
     session_id_is_valid、error_payload、render_error、render_diagnostic 是纯函数，
     保留真实实现。
     """
     entry = load_plugin_entry()
-    with (
-        patch.object(entry, "run_session_start", autospec=True) as run_hook,
-        patch.object(entry, "reset_context", autospec=True) as reset_context,
-        patch.object(entry, "load_context", autospec=True) as load_context,
-        patch.object(entry, "bind", autospec=True) as bind_double,
-        patch.object(entry, "unbind", autospec=True) as unbind_double,
-    ):
-        yield _EntryDoubles(
-            module=entry,
-            run_session_start=run_hook,
-            reset_context=reset_context,
-            load_context=load_context,
-            bind=bind_double,
-            unbind=unbind_double,
-        )
+    run_hook = mocker.patch.object(entry, "run_session_start", autospec=True)
+    reset_context = mocker.patch.object(entry, "reset_context", autospec=True)
+    load_context = mocker.patch.object(entry, "load_context", autospec=True)
+    bind_double = mocker.patch.object(entry, "bind", autospec=True)
+    unbind_double = mocker.patch.object(entry, "unbind", autospec=True)
+    yield _EntryDoubles(
+        module=entry,
+        run_session_start=run_hook,
+        reset_context=reset_context,
+        load_context=load_context,
+        bind=bind_double,
+        unbind=unbind_double,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -571,15 +570,19 @@ def test_dispatch_ordinary_selects_error_stream_by_json_mode(
 
 
 def test_unknown_command_after_parse_is_defensive_usage_error(
-    entry_doubles: _EntryDoubles, capsys: pytest.CaptureFixture[str]
+    mocker: MockerFixture,
+    entry_doubles: _EntryDoubles,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     doubles = entry_doubles
-    parser = create_autospec(argparse.ArgumentParser, instance=True, spec_set=True)
+    parser = mocker.create_autospec(argparse.ArgumentParser, instance=True, spec_set=True)
     parser.parse_args.return_value = argparse.Namespace(command="bogus")
     doubles.load_context.return_value = PluginContext(data_dir=_DATA_DIR)
 
-    with patch.object(doubles.module, "_build_ordinary_parser", autospec=True, return_value=parser):
-        code, out, err = _run_cli(doubles.module, ["bind", str(_ROOT), "--session", "s"], capsys)
+    mocker.patch.object(
+        doubles.module, "_build_ordinary_parser", autospec=True, return_value=parser
+    )
+    code, out, err = _run_cli(doubles.module, ["bind", str(_ROOT), "--session", "s"], capsys)
 
     assert code == EXIT_USAGE
     assert out == ""

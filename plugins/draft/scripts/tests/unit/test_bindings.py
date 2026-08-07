@@ -9,12 +9,12 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterator
-from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
+from pytest_mock import MockerFixture
 
 from adapter.bindings import (
     Binding,
@@ -210,29 +210,18 @@ class _BindDoubles:
 
 
 @pytest.fixture
-def bind_doubles() -> Iterator[_BindDoubles]:
+def bind_doubles(mocker: MockerFixture) -> Iterator[_BindDoubles]:
     """精确替换 bind 的六个 FS 协作者；保留 binding_path/_lexical_hint/_binding_json 真实。"""
-    with ExitStack() as stack:
-        yield _BindDoubles(
-            require_data_dir=stack.enter_context(
-                patch("adapter.bindings._require_data_dir", autospec=True)
-            ),
-            canonical_root=stack.enter_context(
-                patch("adapter.bindings._canonical_root", autospec=True)
-            ),
-            require_hint_current=stack.enter_context(
-                patch("adapter.bindings._require_hint_current", autospec=True)
-            ),
-            ensure_container=stack.enter_context(
-                patch("adapter.bindings._ensure_container", autospec=True)
-            ),
-            require_safe_target=stack.enter_context(
-                patch("adapter.bindings._require_safe_target_for_overwrite", autospec=True)
-            ),
-            write_atomic=stack.enter_context(
-                patch("adapter.bindings._write_binding_atomic", autospec=True)
-            ),
-        )
+    yield _BindDoubles(
+        require_data_dir=mocker.patch("adapter.bindings._require_data_dir", autospec=True),
+        canonical_root=mocker.patch("adapter.bindings._canonical_root", autospec=True),
+        require_hint_current=mocker.patch("adapter.bindings._require_hint_current", autospec=True),
+        ensure_container=mocker.patch("adapter.bindings._ensure_container", autospec=True),
+        require_safe_target=mocker.patch(
+            "adapter.bindings._require_safe_target_for_overwrite", autospec=True
+        ),
+        write_atomic=mocker.patch("adapter.bindings._write_binding_atomic", autospec=True),
+    )
 
 
 def test_bind_orchestration_with_hint_writes_payload_once_and_returns_canonical(

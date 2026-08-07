@@ -11,13 +11,13 @@ import io
 import json
 import shlex
 from collections.abc import Iterator
-from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, cast
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, call
 
 import pytest
+from pytest_mock import MockerFixture
 
 from adapter.bindings import Binding
 from adapter.bridge import PluginContext
@@ -298,55 +298,42 @@ class _HookDoubles:
 
 
 @pytest.fixture
-def hook_doubles() -> Iterator[_HookDoubles]:
+def hook_doubles(mocker: MockerFixture) -> Iterator[_HookDoubles]:
     """按真实签名替换八步控制流的协作者；只有 run_session_start 自身编排保持真实。"""
-    with ExitStack() as stack:
-        resolve = stack.enter_context(
-            patch("adapter.session_hook.resolve_host_context", autospec=True)
-        )
-        resolve.return_value = _CTX
-        publish = stack.enter_context(patch("adapter.session_hook.publish_context", autospec=True))
-        publish.return_value = PluginContext(data_dir=_CTX.data_dir)
-        read_payload = stack.enter_context(
-            patch("adapter.session_hook.read_hook_payload", autospec=True)
-        )
-        read_payload.return_value = HookPayload(session_id="abc123", source="startup")
-        load = stack.enter_context(patch("adapter.session_hook.load_binding", autospec=True))
-        load.return_value = None
-        root_current = stack.enter_context(
-            patch("adapter.session_hook.binding_root_is_current", autospec=True)
-        )
-        root_current.return_value = True
-        hint_current = stack.enter_context(
-            patch("adapter.session_hook.binding_hint_is_current", autospec=True)
-        )
-        hint_current.return_value = True
-        session_fact = stack.enter_context(
-            patch("adapter.session_hook.render_session_fact", autospec=True)
-        )
-        session_fact.return_value = "SESSION-FACT"
-        rebind = stack.enter_context(patch("adapter.session_hook.render_rebind", autospec=True))
-        rebind.return_value = "REBIND"
-        diagnostic = stack.enter_context(
-            patch("adapter.session_hook.render_diagnostic", autospec=True)
-        )
-        diagnostic.return_value = "DIAGNOSTIC"
-        log = stack.enter_context(patch("adapter.session_hook.log_hook", autospec=True))
-        log.return_value = None
-        write = stack.enter_context(patch("adapter.session_hook._write_stdout", autospec=True))
-        yield _HookDoubles(
-            resolve_host_context=resolve,
-            publish_context=publish,
-            read_hook_payload=read_payload,
-            load_binding=load,
-            root_is_current=root_current,
-            hint_is_current=hint_current,
-            render_session_fact=session_fact,
-            render_rebind=rebind,
-            render_diagnostic=diagnostic,
-            log_hook=log,
-            write_stdout=write,
-        )
+    resolve = mocker.patch("adapter.session_hook.resolve_host_context", autospec=True)
+    resolve.return_value = _CTX
+    publish = mocker.patch("adapter.session_hook.publish_context", autospec=True)
+    publish.return_value = PluginContext(data_dir=_CTX.data_dir)
+    read_payload = mocker.patch("adapter.session_hook.read_hook_payload", autospec=True)
+    read_payload.return_value = HookPayload(session_id="abc123", source="startup")
+    load = mocker.patch("adapter.session_hook.load_binding", autospec=True)
+    load.return_value = None
+    root_current = mocker.patch("adapter.session_hook.binding_root_is_current", autospec=True)
+    root_current.return_value = True
+    hint_current = mocker.patch("adapter.session_hook.binding_hint_is_current", autospec=True)
+    hint_current.return_value = True
+    session_fact = mocker.patch("adapter.session_hook.render_session_fact", autospec=True)
+    session_fact.return_value = "SESSION-FACT"
+    rebind = mocker.patch("adapter.session_hook.render_rebind", autospec=True)
+    rebind.return_value = "REBIND"
+    diagnostic = mocker.patch("adapter.session_hook.render_diagnostic", autospec=True)
+    diagnostic.return_value = "DIAGNOSTIC"
+    log = mocker.patch("adapter.session_hook.log_hook", autospec=True)
+    log.return_value = None
+    write = mocker.patch("adapter.session_hook._write_stdout", autospec=True)
+    yield _HookDoubles(
+        resolve_host_context=resolve,
+        publish_context=publish,
+        read_hook_payload=read_payload,
+        load_binding=load,
+        root_is_current=root_current,
+        hint_is_current=hint_current,
+        render_session_fact=session_fact,
+        render_rebind=rebind,
+        render_diagnostic=diagnostic,
+        log_hook=log,
+        write_stdout=write,
+    )
 
 
 def _run_hook(*, host: str = "codex", runtime_dir: Path | None = None) -> int:
