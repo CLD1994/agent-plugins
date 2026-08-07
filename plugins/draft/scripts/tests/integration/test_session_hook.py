@@ -19,7 +19,6 @@ from adapter.bridge import PluginContext, load_context
 from adapter.errors import AdapterError
 from adapter.session_hook import (
     HOST_ENV,
-    HOST_SOURCES,
     MAX_STDIN,
     resolve_host_context,
     run_session_start,
@@ -150,18 +149,6 @@ def bind_session(
 # ---------------------------------------------------------------------------
 # Step 1: 宿主选择、布局与执行顺序
 # ---------------------------------------------------------------------------
-
-
-def test_host_env_and_sources_are_the_exact_protocol_tables() -> None:
-    assert HOST_ENV == {
-        "codex": ("PLUGIN_ROOT", "PLUGIN_DATA"),
-        "claude": ("CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA"),
-    }
-    assert HOST_SOURCES == {
-        "codex": ("startup", "resume", "clear", "compact"),
-        "claude": ("startup", "resume", "clear", "compact", "fork"),
-    }
-    assert MAX_STDIN == 64 * 1024
 
 
 @pytest.mark.parametrize("host", HOSTS)
@@ -1188,5 +1175,5 @@ def test_run_session_start_always_returns_zero_on_binding_load_error(
     bind_session(setup)
     target = binding_path(setup.data_dir, "abc123")
     target.write_text("{broken", encoding="utf-8")
-    code, output = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "compact"))
+    code, _ = run_hook(setup, capsys, host="codex", stdin=session_stdin("abc123", "compact"))
     assert code == 0

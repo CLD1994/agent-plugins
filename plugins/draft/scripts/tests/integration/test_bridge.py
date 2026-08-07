@@ -729,7 +729,8 @@ def test_fsync_directory_absorbs_close_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     patch_close_failure(monkeypatch, str(tmp_path))
-    bridge_mod._fsync_directory(tmp_path)
+    # 有意直接验证 _fsync_directory 吸收 close 失败的安全语义（集成安全矩阵）。
+    bridge_mod._fsync_directory(tmp_path)  # pyright: ignore[reportPrivateUsage]
 
 
 # 错误载荷与退出码

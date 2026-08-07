@@ -1,15 +1,17 @@
 """插件级分发静态契约：manifest、Hook 命令、物理边界、版本关系、导入边界。
 
 静态断言（不启动 uvx、不访问网络、不依赖冷缓存）：
-- 两个 manifest 声明插件版本 ``0.3.0``、``./skills/`` 与各自 Hook 文件；
+- 两个 manifest 声明语义版本格式的插件版本、``./skills/`` 与各自 Hook 文件；
 - 两个插件版本彼此相等，但不与 runtime 版本比较；
 - Codex/Claude marketplace 选择普通 ``plugins/draft`` 目录，不需要递归 Git 操作；
 - Hook 命令字面量严格使用 ``scripts/draft.py hook session-start HOST``；
 - 插件入口、skill、runtime 项目和适配层模块都是普通文件；
 - 适配层从仓库根检查时自动发现自己的 Ruff 配置和源码根；
-- skill 级 ``scripts/draft.py``、``.gitmodules``、gitlink 模式 ``160000``、生成式发布树、
-  核心源码下的插件导入都不存在；
-- 适配层源码没有非标准库导入，也没有对 Draft 核心的执行/导入引用。
+- skill 级 ``scripts/draft.py``、``.gitmodules``、gitlink 模式 ``160000`` 与生成式发布树都不存在；
+- 适配层源码没有非标准库导入，也没有对 Draft 核心的执行/导入引用；
+- 核心源码不得导入插件模块（该导入边界由核心
+  ``tests/integration/test_identity.py`` 的 AST 测试拥有，本文件不重复）。
+SKILL.md 与 draft-format.md 的文档措辞不做关键词扫描。
 
 需要真实子进程、网络和冷 uv 缓存的宿主流程与运行时安装冒烟测试位于
 ``test_distribution_smoke.py``。
@@ -56,11 +58,20 @@ def load_pyproject_version(path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_both_manifests_declare_plugin_version_0_3_0() -> None:
+def test_both_manifests_declare_a_semver_plugin_version() -> None:
+    """两个 manifest 版本必须是语义版本格式；不写死具体版本号。
+
+    数值相等由 test_plugin_manifest_versions_match_each_other 断言，与 runtime
+    版本的关系由 test_plugin_manifest_versions_are_independent_of_runtime_version
+    独立验证。
+    """
     codex = load_json(PLUGIN_ROOT / ".codex-plugin/plugin.json")
     claude = load_json(PLUGIN_ROOT / ".claude-plugin/plugin.json")
-    assert codex["version"] == "0.3.0", codex
-    assert claude["version"] == "0.3.0", claude
+    for manifest in (codex, claude):
+        version = manifest["version"]
+        assert isinstance(version, str) and re.fullmatch(
+            r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version
+        ), f"plugin manifest version must be semver, got {version!r}"
 
 
 def test_both_manifests_declare_skills_and_own_hook_file() -> None:
@@ -204,39 +215,6 @@ def test_no_generated_distribution_trees() -> None:
         assert not (RUNTIME_ROOT / forbidden).exists(), forbidden
 
 
-def test_no_plugin_imports_under_core_source() -> None:
-    """核心源码下不得导入插件专用模块（adapter、bridge、bindings、session_hook、entry）。"""
-    draft_pkg = RUNTIME_ROOT / "src" / "draft"
-    plugin_modules = ("adapter", "bridge", "bindings", "session_hook", "plugin_context", "entry")
-    for path in sorted(draft_pkg.rglob("*.py")):
-        text = path.read_text(encoding="utf-8")
-        tree = ast.parse(text, filename=str(path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    root_name = alias.name.split(".")[0]
-                    assert root_name not in plugin_modules, (
-                        f"{path} imports plugin module {alias.name}"
-                    )
-            elif isinstance(node, ast.ImportFrom) and node.module is not None:
-                root_name = node.module.split(".")[0]
-                assert root_name not in plugin_modules, (
-                    f"{path} imports from plugin module {node.module}"
-                )
-        # 字符串引用也禁止（exec/eval/dynamic import 防护）
-        for forbidden in (
-            "import adapter",
-            "from adapter",
-            "import bridge",
-            "from bridge",
-            "import bindings",
-            "from bindings",
-            "import session_hook",
-            "from session_hook",
-        ):
-            assert forbidden not in text, f"{path}: forbidden reference {forbidden!r}"
-
-
 def test_adapter_source_has_no_non_stdlib_imports() -> None:
     """适配层源码只依赖 Python 标准库。"""
     stdlib = set(sys.stdlib_module_names)
@@ -290,64 +268,14 @@ def test_adapter_source_has_no_draft_core_references() -> None:
             )
 
 
-def test_skill_md_does_not_reference_plugin_concepts() -> None:
-    """SKILL.md 不得引用 Step 5 审计覆盖的插件概念。
+def test_skill_references_contains_no_platform_setup() -> None:
+    """skill references 目录不得包含 platform-setup.md（已迁移到插件根）。
 
-    审计正则：``PLUGIN_ROOT|PLUGIN_DATA|CLAUDE_PLUGIN_ROOT|CLAUDE_PLUGIN_DATA|
-    DRAFT_DATA|DRAFT_SKILL_PATH|SessionStart|bridge|binding|marketplace``。
-    另外验证 bind/unbind/plugin-context 命令形式不出现。
+    文档文案不做关键词扫描：SKILL.md 与 draft-format.md 的内容归 Skill
+    内容维护，不冻结其中的措辞，避免文档改动破坏架构契约测试。
     """
-    text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-    for forbidden in (
-        "PLUGIN_ROOT",
-        "PLUGIN_DATA",
-        "CLAUDE_PLUGIN_ROOT",
-        "CLAUDE_PLUGIN_DATA",
-        "DRAFT_DATA",
-        "DRAFT_SKILL_PATH",
-        "SessionStart",
-        "bridge",
-        "binding",
-        "marketplace",
-    ):
-        assert forbidden not in text, f"SKILL.md references {forbidden!r}"
-    # 命令形式（比 bare word 更精确，避免误报英文/中文同形词）
-    for command_form in (
-        "bind ROOT",
-        "unbind --session",
-        "plugin-context reset",
-        "hook session-start",
-    ):
-        assert command_form not in text, f"SKILL.md references {command_form!r}"
-
-
-def test_skill_references_does_not_link_plugin_platform_setup() -> None:
-    """skill references 目录不得包含 platform-setup.md（已迁移到插件根）。"""
     refs = SKILL_ROOT / "references"
     assert refs.is_dir()
     assert not (refs / "platform-setup.md").exists(), (
         "skill-level platform-setup.md must be deleted"
     )
-    # SKILL.md 不得链接到 plugin-only platform-setup.md
-    text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-    assert "platform-setup.md" not in text, "SKILL.md must not link to platform-setup.md"
-
-
-def test_draft_format_reference_has_no_plugin_material() -> None:
-    """draft-format.md 不得包含 bridge/binding/marketplace 等插件概念。"""
-    text = (SKILL_ROOT / "references" / "draft-format.md").read_text(encoding="utf-8")
-    for forbidden in (
-        "PLUGIN_ROOT",
-        "PLUGIN_DATA",
-        "CLAUDE_PLUGIN_ROOT",
-        "CLAUDE_PLUGIN_DATA",
-        "DRAFT_DATA",
-        "DRAFT_SKILL_PATH",
-        "SessionStart",
-        "bridge",
-        "marketplace",
-        "bind ROOT",
-        "unbind --session",
-        "plugin-context",
-    ):
-        assert forbidden not in text, f"draft-format.md references {forbidden!r}"

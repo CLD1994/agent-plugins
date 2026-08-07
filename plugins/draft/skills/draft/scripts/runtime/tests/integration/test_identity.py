@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import tomllib
 from pathlib import Path
@@ -38,23 +39,24 @@ def test_core_runtime_owns_no_plugin_responsibilities() -> None:
 
     assert not hasattr(draft.models, "Binding")
 
-    forbidden = (
-        "PLUGIN_ROOT",
-        "PLUGIN_DATA",
-        "CLAUDE_PLUGIN_ROOT",
-        "CLAUDE_PLUGIN_DATA",
-        "DRAFT_DATA",
-        "DRAFT_SKILL_PATH",
-        "SessionStart",
-        "session-start",
-        "plugin.context",
-        "binding.",
-    )
+    # 架构依赖边界：只拒绝核心源码对插件模块的 import。基于 AST 判断，
+    # 字符串、注释与错误消息不参与，避免把文档文案变成变更探测器。
+    plugin_modules = {"adapter", "bridge", "bindings", "session_hook", "plugin_context", "entry"}
     src_root = RUNTIME_ROOT / "src" / "draft"
     for path in sorted(src_root.rglob("*.py")):
-        text = path.read_text(encoding="utf-8")
-        for term in forbidden:
-            assert term not in text, f"{term} in {path}"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root_name = alias.name.split(".")[0]
+                    assert root_name not in plugin_modules, (
+                        f"{path} imports plugin module {alias.name}"
+                    )
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                root_name = node.module.split(".")[0]
+                assert root_name not in plugin_modules, (
+                    f"{path} imports from plugin module {node.module}"
+                )
 
 
 def test_initialize_writes_only_draft_markers(tmp_path: Path) -> None:

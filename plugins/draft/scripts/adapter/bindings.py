@@ -10,6 +10,7 @@ import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import cast
 
 from adapter.errors import EXIT_RUNTIME, EXIT_USAGE, AdapterError
 
@@ -349,7 +350,7 @@ def _is_lexically_normalized_absolute(path_str: str) -> bool:
 def _parse_binding(raw: object, path: Path, session_id: str) -> Binding:
     if not isinstance(raw, dict):
         raise _invalid(path)
-    data = raw
+    data = cast("dict[object, object]", raw)
     if set(data) != _PAYLOAD_KEYS:
         raise _invalid(path)
 

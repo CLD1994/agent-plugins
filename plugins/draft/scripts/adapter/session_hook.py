@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO
+from typing import BinaryIO, cast
 
 from adapter.bindings import (
     Binding,
@@ -186,7 +186,7 @@ def read_hook_payload(stream: BinaryIO, host: str) -> HookPayload:
         raise AdapterError("hook.stdin_invalid", exit_code=4) from exc
     if not isinstance(value, dict):
         raise AdapterError("hook.stdin_not_object", exit_code=4)
-    payload: dict[str, object] = value
+    payload = cast("dict[str, object]", value)
     if payload.get("hook_event_name") != _SESSION_START_EVENT:
         raise AdapterError("hook.unexpected_event", exit_code=4)
     session_id = payload.get("session_id")
