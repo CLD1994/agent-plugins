@@ -20,11 +20,18 @@ from draft.models import (
     OperationResult,
     TrashResult,
 )
+from draft.paths import ResolvedPath
 from draft.trash_lifecycle import LifecycleAdvanceReport, LifecycleFailure
 
 # ---------------------------------------------------------------------------
 # 辅助构造器
 # ---------------------------------------------------------------------------
+
+
+def _resolved(relative: str) -> ResolvedPath:
+    """构造受真实接口约束的 ResolvedPath：_page_operand 真实执行后返回 .relative。"""
+    root = Path("/draft")
+    return ResolvedPath(root=root, relative=Path(relative), absolute=root / relative)
 
 
 def _operation_result(
@@ -137,10 +144,10 @@ def test_dispatch_adopt_calls_adopt_and_returns_success() -> None:
 def test_dispatch_move_calls_move_page_with_paged_operands() -> None:
     args = cli.build_parser().parse_args(["move", "/draft", "pages/a.md", "pages/b.md"])
     with (
-        patch("draft.cli._page_operand", autospec=True) as page_operand,
+        patch("draft.paths.resolve_page_operand", autospec=True) as resolve_page_operand,
         patch("draft.structure.move_page", autospec=True) as move_page,
     ):
-        page_operand.side_effect = [Path("pages/a.md"), Path("pages/b.md")]
+        resolve_page_operand.side_effect = [_resolved("pages/a.md"), _resolved("pages/b.md")]
         move_page.return_value = _operation_result(kind="move")
         payload, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 move 分派到 move_page 并组装操作载荷
     move_page.assert_called_once_with(Path("/draft"), Path("pages/a.md"), Path("pages/b.md"))
@@ -160,13 +167,13 @@ def test_dispatch_promote_calls_promote_page_with_paged_operands() -> None:
         ["promote", "/draft", "pages/a.md", "pages/b.md", "pages/c.md"]
     )
     with (
-        patch("draft.cli._page_operand", autospec=True) as page_operand,
+        patch("draft.paths.resolve_page_operand", autospec=True) as resolve_page_operand,
         patch("draft.structure.promote_page", autospec=True) as promote_page,
     ):
-        page_operand.side_effect = [
-            Path("pages/a.md"),
-            Path("pages/b.md"),
-            Path("pages/c.md"),
+        resolve_page_operand.side_effect = [
+            _resolved("pages/a.md"),
+            _resolved("pages/b.md"),
+            _resolved("pages/c.md"),
         ]
         promote_page.return_value = _operation_result(kind="promote")
         payload, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 promote 分派到 promote_page 并组装操作载荷
@@ -181,10 +188,10 @@ def test_dispatch_promote_calls_promote_page_with_paged_operands() -> None:
 def test_dispatch_collapse_calls_collapse_hub_with_paged_operand() -> None:
     args = cli.build_parser().parse_args(["collapse", "/draft", "pages/hub/index.md"])
     with (
-        patch("draft.cli._page_operand", autospec=True) as page_operand,
+        patch("draft.paths.resolve_page_operand", autospec=True) as resolve_page_operand,
         patch("draft.structure.collapse_hub", autospec=True) as collapse_hub,
     ):
-        page_operand.return_value = Path("pages/hub/index.md")
+        resolve_page_operand.return_value = _resolved("pages/hub/index.md")
         collapse_hub.return_value = _operation_result(kind="collapse")
         payload, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 collapse 分派到 collapse_hub 并组装操作载荷
     collapse_hub.assert_called_once_with(Path("/draft"), Path("pages/hub/index.md"))
@@ -196,10 +203,10 @@ def test_dispatch_collapse_calls_collapse_hub_with_paged_operand() -> None:
 def test_dispatch_trash_calls_trash_page_with_paged_operand() -> None:
     args = cli.build_parser().parse_args(["trash", "/draft", "pages/a.md"])
     with (
-        patch("draft.cli._page_operand", autospec=True) as page_operand,
+        patch("draft.paths.resolve_page_operand", autospec=True) as resolve_page_operand,
         patch("draft.trash.trash_page", autospec=True) as trash_page,
     ):
-        page_operand.return_value = Path("pages/a.md")
+        resolve_page_operand.return_value = _resolved("pages/a.md")
         trash_page.return_value = _trash_result()
         payload, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 trash 分派到 trash_page 并组装回收载荷
     trash_page.assert_called_once_with(Path("/draft"), Path("pages/a.md"))
@@ -217,10 +224,10 @@ def test_dispatch_trash_includes_first_warning_in_human_text() -> None:
         details=("OSError", "disk full"),
     )
     with (
-        patch("draft.cli._page_operand", autospec=True) as page_operand,
+        patch("draft.paths.resolve_page_operand", autospec=True) as resolve_page_operand,
         patch("draft.trash.trash_page", autospec=True) as trash_page,
     ):
-        page_operand.return_value = Path("pages/a.md")
+        resolve_page_operand.return_value = _resolved("pages/a.md")
         trash_page.return_value = _trash_result(warnings=(warning,))
         _, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 trash 载荷包含首个警告的人类可读文本
     assert "警告" in human

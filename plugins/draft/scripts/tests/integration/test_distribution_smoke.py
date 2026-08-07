@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -80,12 +81,28 @@ def _assert_no_git_ancestors(path: Path) -> None:
         cursor = cursor.parent
 
 
+def _snapshot_tree(root: Path) -> dict[str, str]:
+    """返回 {相对路径: 文件内容 SHA-256}，用于证明分发副本未被测试修改。"""
+    snapshot: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            snapshot[path.relative_to(root).as_posix()] = digest
+    return snapshot
+
+
 @pytest.fixture(scope="module")
-def distribution_copy(tmp_path_factory: pytest.TempPathFactory) -> Path:
+def distribution_copy(
+    tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
+) -> Path:
     """只复制一次普通插件目录；所有场景共享同一来源路径。
 
     不得为每个宿主分别复制核心运行时：来源路径不同会产生不同的 uv 工具环境，
     即使共享 ``UV_CACHE_DIR`` 也无法消除重复安装。
+
+    副本是只读契约：基线快照在夹具返回前记录，模块测试全部结束后由 finalizer
+    重新对比。配合 ``PYTHONDONTWRITEBYTECODE=1``，任何对副本的写入（含字节码）
+    都会在收尾时显式失败，而不是静默污染共享来源。
     """
     parent = tmp_path_factory.mktemp("distribution")
     _assert_no_git_ancestors(parent)
@@ -100,7 +117,16 @@ def distribution_copy(tmp_path_factory: pytest.TempPathFactory) -> Path:
             ".venv",
         ),
     )
-    return plugin_copy.resolve()
+    resolved = plugin_copy.resolve()
+    baseline = _snapshot_tree(resolved)
+
+    def _assert_copy_unchanged() -> None:
+        assert _snapshot_tree(resolved) == baseline, (
+            "distribution copy was modified by the test run"
+        )
+
+    request.addfinalizer(_assert_copy_unchanged)
+    return resolved
 
 
 @pytest.fixture(scope="module")
@@ -159,6 +185,8 @@ def _clean_smoke_env() -> dict[str, str]:
         "UV_RESOLUTION",
     ):
         env.pop(name, None)
+    # 分发副本是只读契约：禁止子进程向其写入 .pyc 字节码
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
 

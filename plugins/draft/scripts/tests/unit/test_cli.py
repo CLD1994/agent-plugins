@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import BinaryIO, Protocol, cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 
@@ -574,7 +574,7 @@ def test_unknown_command_after_parse_is_defensive_usage_error(
     entry_doubles: _EntryDoubles, capsys: pytest.CaptureFixture[str]
 ) -> None:
     doubles = entry_doubles
-    parser = MagicMock(spec=argparse.ArgumentParser)
+    parser = create_autospec(argparse.ArgumentParser, instance=True, spec_set=True)
     parser.parse_args.return_value = argparse.Namespace(command="bogus")
     doubles.load_context.return_value = PluginContext(data_dir=_DATA_DIR)
 

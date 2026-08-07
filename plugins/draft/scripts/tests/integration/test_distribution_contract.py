@@ -33,6 +33,13 @@ SKILL_ROOT = PLUGIN_ROOT / "skills" / "draft"
 REPO_ROOT = PLUGIN_ROOT.parents[1]
 ADAPTER_ROOT = SCRIPTS_ROOT / "adapter"
 
+# 严格语义版本：拒绝前导零（01.2.3），接受预发布与构建元数据（1.2.3-alpha+build）。
+_SEMVER = re.compile(
+    r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    r"(?:-(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*)?"
+    r"(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?"
+)
+
 
 # ---------------------------------------------------------------------------
 # 辅助
@@ -59,8 +66,9 @@ def load_pyproject_version(path: Path) -> str:
 
 
 def test_both_manifests_declare_a_semver_plugin_version() -> None:
-    """两个 manifest 版本必须是语义版本格式；不写死具体版本号。
+    """两个 manifest 版本必须是严格语义版本；不写死具体版本号。
 
+    拒绝前导零（01.2.3），接受预发布与构建元数据（1.2.3-alpha+build）。
     数值相等由 test_plugin_manifest_versions_match_each_other 断言，与 runtime
     版本的关系由 test_plugin_manifest_versions_are_independent_of_runtime_version
     独立验证。
@@ -69,9 +77,9 @@ def test_both_manifests_declare_a_semver_plugin_version() -> None:
     claude = load_json(PLUGIN_ROOT / ".claude-plugin/plugin.json")
     for manifest in (codex, claude):
         version = manifest["version"]
-        assert isinstance(version, str) and re.fullmatch(
-            r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version
-        ), f"plugin manifest version must be semver, got {version!r}"
+        assert isinstance(version, str) and _SEMVER.fullmatch(version) is not None, (
+            f"plugin manifest version must be strict semver, got {version!r}"
+        )
 
 
 def test_both_manifests_declare_skills_and_own_hook_file() -> None:
@@ -113,12 +121,9 @@ def test_marketplace_registries_select_ordinary_plugins_draft_dir() -> None:
     assert codex_source["path"] == "./plugins/draft"
     assert claude["plugins"][0]["name"] == "draft"
     assert claude["plugins"][0]["source"] == "./plugins/draft"
-    # 不要求递归 Git 操作：源是本地普通目录，不引用 submodule/递归初始化
-    codex_blob = json.dumps(codex, ensure_ascii=False)
-    claude_blob = json.dumps(claude, ensure_ascii=False)
-    for forbidden in ("submodule", "recursive", "gitmodules", "init"):
-        assert forbidden.lower() not in codex_blob.lower()
-        assert forbidden.lower() not in claude_blob.lower()
+    # 普通本地目录属性已由结构化字段证明：source == "local" + 普通路径，不要求递归
+    # Git 操作。.gitmodules 缺失与 gitlink 模式 160000 由
+    # test_no_gitmodules_or_gitlink_in_skill_or_plugin 独立断言，不做模糊字符串扫描。
 
 
 def test_hook_command_literals_match_specification() -> None:
@@ -239,33 +244,27 @@ def test_adapter_source_has_no_non_stdlib_imports() -> None:
                 )
 
 
-def test_adapter_source_has_no_draft_core_references() -> None:
-    """适配层源码不得有对 Draft 核心的执行或导入引用。"""
+def test_adapter_source_has_no_dynamic_import_of_core() -> None:
+    """适配层不得经 __import__ / import_module 动态导入 Draft 核心。
+
+    静态导入边界已由 test_adapter_source_has_no_non_stdlib_imports 保证：draft 核心
+    包既非标准库也非 adapter 内部模块，任何静态 import/from-import 都会失败。这里
+    只按 AST 调用节点禁止动态导入，不扫描源码文本，避免注释或错误消息成为变更探测器。
+    """
     for module_file in sorted(ADAPTER_ROOT.glob("*.py")):
-        text = module_file.read_text(encoding="utf-8")
-        for forbidden in (
-            "import draft",
-            "from draft",
-            "check_draft",
-            "load_graph",
-            "importlib.import_module",
-            "__import__",
-        ):
-            assert forbidden not in text, f"{module_file}: forbidden reference {forbidden!r}"
-        # 不得引用核心 CLI 模块路径
-        for forbidden_module in (
-            "draft.cli",
-            "draft.checker",
-            "draft.operations",
-            "draft.structure",
-            "draft.trash",
-            "draft.lifecycle",
-            "draft.markdown",
-            "draft.graph",
-        ):
-            assert forbidden_module not in text, (
-                f"{module_file}: forbidden core module reference {forbidden_module!r}"
-            )
+        tree = ast.parse(module_file.read_text(encoding="utf-8"), filename=str(module_file))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                assert func.id not in {"__import__", "import_module"}, (
+                    f"{module_file}: dynamic import call {func.id}"
+                )
+            elif isinstance(func, ast.Attribute):
+                assert func.attr not in {"__import__", "import_module"}, (
+                    f"{module_file}: dynamic import call {func.attr}"
+                )
 
 
 def test_skill_references_contains_no_platform_setup() -> None:

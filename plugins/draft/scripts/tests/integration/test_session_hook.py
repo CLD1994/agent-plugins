@@ -1153,20 +1153,28 @@ def test_log_is_recorded_on_success(setup: Setup, capsys: pytest.CaptureFixture[
     assert record["source"] == "startup"
 
 
-def test_never_imports_subprocess_draft_or_core() -> None:
+def test_session_hook_imports_no_subprocess() -> None:
+    """SessionStart 钩子是纯函数适配层：不得导入 subprocess。
+
+    draft 核心的静态导入边界已由 test_distribution_contract.py 的
+    test_adapter_source_has_no_non_stdlib_imports 保证（draft 非标准库也非 adapter
+    模块），这里只按 AST 断言本模块不引入 subprocess，不扫描源码文本。
+    """
+    import ast
+
     import adapter.session_hook as mod
 
-    source = Path(mod.__file__).read_text(encoding="utf-8")
-    for forbidden in [
-        "import subprocess",
-        "from subprocess",
-        "import draft",
-        "from draft",
-        "check_draft",
-        "load_graph",
-        ".draft/",
-    ]:
-        assert forbidden not in source, forbidden
+    tree = ast.parse(Path(mod.__file__).read_text(encoding="utf-8"), filename=str(mod.__file__))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert alias.name.split(".")[0] != "subprocess", (
+                    f"session_hook imports {alias.name}"
+                )
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            assert node.module.split(".")[0] != "subprocess", (
+                f"session_hook imports from {node.module}"
+            )
 
 
 def test_run_session_start_always_returns_zero_on_binding_load_error(
