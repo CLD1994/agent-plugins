@@ -7,25 +7,50 @@ description: Use when a design or protocol discussion is becoming long, recursiv
 
 把长期、递归、分叉的设计讨论维护成一个自包含的 Markdown 草稿。
 
-## 核心命令入口
+Draft 是 [LLM-WIKI](references/llm-wiki.md) 的一种具体实现, 如果上下文中没有该文章内容的记忆, 则必须进行阅读
 
-始终通过 `uvx` 从当前 skill 的 runtime 包源执行核心 `draft` 命令。`<skill_root>` 使用宿主在加载本 skill 时注入的当前 skill 根，不搜索或猜测其他副本。
+如果上下文中没有关于 Draft 目录布局、机器区域语法、状态与关系基数的认知，则必须阅读 [draft-format.md](references/draft-format.md)。
 
-```text
-uvx --isolated --from "<skill_root>/scripts/runtime" draft --version
-uvx --isolated --from "<skill_root>/scripts/runtime" draft init ROOT
-uvx --isolated --from "<skill_root>/scripts/runtime" draft check ROOT
-uvx --isolated --from "<skill_root>/scripts/runtime" draft move ROOT SOURCE TARGET
-uvx --isolated --from "<skill_root>/scripts/runtime" draft promote ROOT PAGE CHILD [CHILD ...]
-uvx --isolated --from "<skill_root>/scripts/runtime" draft collapse ROOT HUB
-uvx --isolated --from "<skill_root>/scripts/runtime" draft trash ROOT PAGE
-uvx --isolated --from "<skill_root>/scripts/runtime" draft restore ROOT OPERATION_ID
-uvx --isolated --from "<skill_root>/scripts/runtime" draft recover ROOT
+如果要把旧布局讨论迁移为 draft 格式，则必须阅读 [migration.md](references/migration.md)，它描述迁移流程、状态映射、枢纽升格和旧构造改写规则。
+
+## 前置条件
+
+要求当前环境需要安装有 [uv](https://docs.astral.sh/uv/)。
+
+如果没有安装 `uv`, 这执行下列命令进行安装:
+
+```sh
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-`--version`（即 `setup` 工作流）只验证 uvx 能从当前 skill 的 runtime 包源构建并运行 `draft`，不是其他命令的前置条件。每个普通命令都会在执行前完成同一套 uv 工具环境解析，因此不先跑 `setup` 也能工作。
+## 核心命令入口
 
-uv 启动失败（Python 发现、包索引访问、依赖解析、构建或缓存错误）直接保留 uv 的标准错误输出和退出码；外层没有启动器将其转换为 Draft 错误码。调用方不得把 uvx 启动失败解释为 Draft 检查失败、目标不存在或命令成功。首次依赖解析可能从配置的包索引下载第三方运行依赖和构建依赖；后续运行复用 uv 缓存中的工具环境。
+始终通过 `uvx` 从当前 skill 的 runtime 包源执行核心 `draft` 命令。命令如下:
+
+```bash
+uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
+```
+
+`<skill_root>` 会在加载本技能时自动注入到上下文，不需要进行猜测或搜索。 如果没有，直接报错即可。
+
+支持的 `COMMAND` 如下:
+
+- init 初始化新草稿
+- adopt 接管格式完整的未登记目录
+- check 检查草稿一致性
+- move 移动页面
+- promote 升格页面为枢纽
+- collapse 降级枢纽为普通页面
+- trash 回收页面为保留态
+- restore 恢复被回收的页面
+- recover 推进回收生命周期
+
+使用 `uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND --help` 来获得更多信息
+
+### CLI 注意事项
+
+- `ROOT` 永远显式给出；`SOURCE`、`TARGET`、`PAGE`、`CHILD`、`HUB` 是草稿根内规范相对页面路径（如 `pages/a.md`、`pages/hub/index.md`），不接受目录别名。
+- `check ROOT --candidate` 只读检查未登记候选布局，要求不存在任何 `.draft/` 内部状态。程序不提供来源格式迁移器，旧布局由 Agent 复制到新空候选根后重写。
 
 ## 第一性边界
 
@@ -36,19 +61,16 @@ uv 启动失败（Python 发现、包索引访问、依赖解析、构建或缓�
 
 ## 何时建立草稿
 
-出现以下任一情况时建立或继续一个草稿：
+出现以下任一情况时建立一个草稿：
 
-- 讨论明显变长、出现分支或递归子问题；
-- 上下文即将被压缩，或会话可能在多轮之间延续；
-- 需要让人类用 Obsidian 等工具直接阅读讨论记忆。
+- 讨论明显变长、出现分支或递归子问题
+- 用户明确表达希望将讨论过程记录下来
 
 入口选择：
 
-- 全新讨论 -> `draft init ROOT`；
-- 已经完全符合当前格式的未登记目录 -> `draft check ROOT --candidate`，然后 `draft adopt ROOT`；
-- 任意旧布局 -> 复制到新的空候选根，由 Agent 按当前格式和语义重写；程序不提供来源格式迁移器。
-- 三个入口绝不互相自动降级；失败就停止并询问用户，不要改试另一个入口。
-- 最终登记草稿只用普通 `check ROOT`；`check ROOT --candidate` 对最终登记根只读返回 `candidate.already_registered`（退出 1），对临时登记态返回 `adopt.recovery_required`（退出 3）。
+- 全新讨论 -> `draft init <ROOT>`
+- 已经完全符合当前格式的未登记目录 -> `draft check <ROOT> --candidate`，然后 `draft adopt ROOT`
+- 任意旧布局 -> 复制到新的空候选根，由 Agent 按当前格式和语义重写；具体规则见 [migration.md](references/migration.md)
 
 ## 即时维护循环
 
@@ -62,21 +84,6 @@ uv 启动失败（Python 发现、包索引访问、依赖解析、构建或缓�
 
 已确认的结论必须当日或当轮写入 `conclusions.md`；长条目在正式迁移到设计文档后可以压缩成紧凑条目（结论本身 + 草稿来源链接 + 正式文档链接），结论被正式取代时才移除。
 
-## 状态决策表
-
-每个页面恰好一个状态前缀，前缀后可加全角冒号和非空说明：
-
-| 前缀 | 何时使用 |
-| --- | --- |
-| `待讨论` | 问题已记录，尚无当前方案 |
-| `当前提案` | 方案正在评审，尚未确认 |
-| `已确认` | 已接受，属于当前有效结论；必须声明 `产出` 指向根级 `conclusions.md` |
-| `已取代` | 已被另一页面正式取代，只保留历史；必须声明 `被取代` |
-| `已关闭` | 讨论结束但没有当前有效结论；纯导航的根索引和枢纽页也用它（`已关闭：纯导航页，不表达独立结论`） |
-
-- 状态描述页面自身，不汇总后代；不要因为子页已确认就把导航页标为已确认。
-- `已确认` 与 `被质疑` 可以共存；若质疑使结论失效，把页面改回 `当前提案` 并移除 `产出`。
-
 ## 拆分时机
 
 - 语义触发为主：子问题获得独立状态生命周期（需要单独确认/否定/关闭）就拆成子页面；
@@ -87,7 +94,7 @@ uv 启动失败（Python 发现、包索引访问、依赖解析、构建或缓�
 
 - `trash` 把页面和权威删除包落地为 7 天保留态（`trash_retained`），不立即移交系统回收站；有其他入站引用时命令拒绝并列出阻碍，先人工解除或改指再回收。
 - `trash` 后 7 天内可 `draft restore ROOT OPERATION_ID` 恢复页面；到期后的系统回收站移交和最终清理由 `draft recover ROOT` 或普通结构写命令惰性推进，Agent 不需要维护计时器。最终清理（`trash_purge_committed`）只在到达清理期限后最后一次投递明确失败时发生，是永久删除授权。
-- `restore` 回滚不是成功：恢复未完成时退出 3、JSON `ok=false`、`phase=rolled_back`，权威删除包仍保留；遇到 exit 3 时不要报告"已恢复"。
+- `restore` 回滚不是成功：恢复未完成时 `exit 3`、JSON `ok=false`、`phase=rolled_back`，权威删除包仍保留；遇到 `exit 3` 时不要报告"已恢复"。
 - 移交明确失败只产生警告并继续原命令；状态损坏（`operation.inconsistent_state` 等）才停止写入。结构命令提示需要恢复时，先运行 `draft recover ROOT` 做机械恢复，不要删除锁或日志目录；恢复结果无法解释或需要取舍时再停止并询问用户（见硬停止条件）。
 - `.draft/` 下的操作日志、权威删除包和锁是工具内部状态，绝不手工编辑。
 
@@ -99,8 +106,23 @@ uv 启动失败（Python 发现、包索引访问、依赖解析、构建或缓�
 - `check` 报告你无法解释的客观错误；
 - `recover` 无法完成机械恢复，或其输出提示 `operation.journal_corrupt`、`operation.inconsistent_state`、`operation.external_change`；注意：结构命令首次提示 `operation.recovery_required` 时先按上一节运行 `recover` 做机械恢复，只有恢复本身失败或结果无法解释才到这里停止；
 - `trash` 列出你不确定能否解除的入站阻碍；
-- uvx 启动失败（uv 的 Python 发现、包索引访问、依赖解析、构建或缓存错误），且按 uv 自身的诊断处理后仍无法解决。
+- uvx 执行失败，且按 uv 自身的诊断处理后仍无法解决。
 
-## 参考资料
+## 检查器严重级别
 
-- 需要准确的目录布局、机器区域语法、状态与关系基数、CLI 命令和退出码时，读 [references/draft-format.md](references/draft-format.md)。
+检查器输出四档：
+
+- `errors`客观结构损坏
+- `warnings`合法但需注意的运行状态，如投递失败
+- `infos`合法未结束的生命周期事实，如 `trash_retained`
+- `reviews`待人类审查提醒。
+
+## 退出码
+
+| 码  | 含义                                                       |
+| --- | ---------------------------------------------------------- |
+| 0   | 成功；`check` 无客观错误；回收站移交可以处于待移交并带警告 |
+| 1   | `check` 完成并发现客观结构错误                             |
+| 2   | 参数、根、路径、版本或领域前置条件无效                     |
+| 3   | 需要恢复、锁/日志损坏、外部修改或不安全恢复冲突            |
+| 4   | 运行时 OSError（领域操作期间的文件系统错误）               |

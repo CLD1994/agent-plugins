@@ -32,48 +32,108 @@ def build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="以稳定 JSON 信封输出结果",
     )
-    parser = argparse.ArgumentParser(prog="draft", parents=[shared])
-    parser.add_argument("--version", action="store_true")
-    subparsers = parser.add_subparsers(dest="command")
+    parser = argparse.ArgumentParser(
+        prog="draft",
+        parents=[shared],
+        description="递归讨论草稿维护工具：以页面网络为单一事实源，提供登记、检查、结构维护与回收生命周期推进命令。",
+    )
+    parser.add_argument("--version", action="store_true", help="显示版本号后退出")
+    subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    init = subparsers.add_parser("init", parents=[shared])
-    init.add_argument("root", metavar="ROOT")
+    init = subparsers.add_parser(
+        "init",
+        parents=[shared],
+        help="初始化新草稿",
+        description="在 ROOT 创建草稿结构并登记，作为后续结构维护的入口。",
+    )
+    init.add_argument("root", metavar="ROOT", help="草稿根目录（将在此创建草稿结构）")
 
-    adopt = subparsers.add_parser("adopt", parents=[shared])
-    adopt.add_argument("root", metavar="ROOT")
+    adopt = subparsers.add_parser(
+        "adopt",
+        parents=[shared],
+        help="接管格式完整的未登记目录",
+        description="把已符合草稿格式的未登记目录登记为草稿（可先用 check --candidate 验证）。",
+    )
+    adopt.add_argument("root", metavar="ROOT", help="已符合草稿格式的目录")
 
-    check = subparsers.add_parser("check", parents=[shared])
-    check.add_argument("root", metavar="ROOT")
+    check = subparsers.add_parser(
+        "check",
+        parents=[shared],
+        help="检查草稿一致性",
+        description="按已登记布局检查草稿，报告错误、警告、信息与提醒；默认模式要求存在内部登记。",
+    )
+    check.add_argument("root", metavar="ROOT", help="草稿根目录")
     check.add_argument(
         "--candidate",
         action="store_true",
         help="按未登记候选布局检查（只读，要求不存在内部状态）",
     )
 
-    move = subparsers.add_parser("move", parents=[shared])
-    move.add_argument("root", metavar="ROOT")
-    move.add_argument("source", metavar="SOURCE")
-    move.add_argument("target", metavar="TARGET")
+    move = subparsers.add_parser(
+        "move",
+        parents=[shared],
+        help="移动页面",
+        description="把 SOURCE 页面连同其子页移动到 TARGET 位置，并更新网络链接。",
+    )
+    move.add_argument("root", metavar="ROOT", help="草稿根目录")
+    move.add_argument("source", metavar="SOURCE", help="源页面相对路径（如 pages/a.md）")
+    move.add_argument("target", metavar="TARGET", help="目标页面相对路径")
 
-    promote = subparsers.add_parser("promote", parents=[shared])
-    promote.add_argument("root", metavar="ROOT")
-    promote.add_argument("page", metavar="PAGE")
-    promote.add_argument("children", metavar="CHILD", nargs="*")
+    promote = subparsers.add_parser(
+        "promote",
+        parents=[shared],
+        help="升格页面为枢纽",
+        description="把 PAGE 升格为枢纽，将列出的 CHILD 降级为它的子页。",
+    )
+    promote.add_argument("root", metavar="ROOT", help="草稿根目录")
+    promote.add_argument("page", metavar="PAGE", help="要升格的页面相对路径")
+    promote.add_argument(
+        "children",
+        metavar="CHILD",
+        nargs="*",
+        help="要降级为子页的页面相对路径（可多个）",
+    )
 
-    collapse = subparsers.add_parser("collapse", parents=[shared])
-    collapse.add_argument("root", metavar="ROOT")
-    collapse.add_argument("hub", metavar="HUB")
+    collapse = subparsers.add_parser(
+        "collapse",
+        parents=[shared],
+        help="降级枢纽为普通页面",
+        description="把 HUB 枢纽降级为普通页面并合并回父级，不留空枢纽。",
+    )
+    collapse.add_argument("root", metavar="ROOT", help="草稿根目录")
+    collapse.add_argument("hub", metavar="HUB", help="枢纽页面相对路径")
 
-    trash = subparsers.add_parser("trash", parents=[shared])
-    trash.add_argument("root", metavar="ROOT")
-    trash.add_argument("page", metavar="PAGE")
+    trash = subparsers.add_parser(
+        "trash",
+        parents=[shared],
+        help="回收页面为保留态",
+        description=(
+            "把 PAGE 及子页回收为 7 天保留态，期间可 restore 恢复；存在未解除的入站引用时拒绝。"
+        ),
+    )
+    trash.add_argument("root", metavar="ROOT", help="草稿根目录")
+    trash.add_argument("page", metavar="PAGE", help="要回收的页面相对路径")
 
-    restore = subparsers.add_parser("restore", parents=[shared])
-    restore.add_argument("root", metavar="ROOT")
-    restore.add_argument("operation_id", metavar="OPERATION_ID")
+    restore = subparsers.add_parser(
+        "restore",
+        parents=[shared],
+        help="恢复被回收的页面",
+        description="按 OPERATION_ID 恢复保留期内被回收的操作对应的页面；恢复未完成时退出码为 3。",
+    )
+    restore.add_argument("root", metavar="ROOT", help="草稿根目录")
+    restore.add_argument(
+        "operation_id",
+        metavar="OPERATION_ID",
+        help="回收操作标识符（trash 返回）",
+    )
 
-    recover = subparsers.add_parser("recover", parents=[shared])
-    recover.add_argument("root", metavar="ROOT")
+    recover = subparsers.add_parser(
+        "recover",
+        parents=[shared],
+        help="推进回收生命周期",
+        description="推进回收生命周期：到期项移交系统回收站，已到清理期限的项完成最终清理。",
+    )
+    recover.add_argument("root", metavar="ROOT", help="草稿根目录")
 
     return parser
 
