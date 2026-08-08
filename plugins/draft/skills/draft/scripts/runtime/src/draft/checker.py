@@ -527,10 +527,10 @@ def check_draft(
     for required in (ROOT_PAGE, CONCLUSIONS_PAGE):
         candidate = resolved / required
         if not candidate.is_file() or candidate.is_symlink():
-            layout.append(_error("root.missing_file", required))
+            layout.append(_error("root.missing_file", None, None, "file", required.as_posix()))
     pages_dir = resolved / "pages"
     if not pages_dir.is_dir() or pages_dir.is_symlink():
-        layout.append(_error("root.missing_file", Path("pages")))
+        layout.append(_error("root.missing_file", None, None, "directory", "pages"))
 
     result = load_graph_tolerant(resolved, mode, allow_provisional_adopt=allow_provisional_adopt)
     format_issues = [issue for issue in result.issues if issue.code.startswith("format.")]

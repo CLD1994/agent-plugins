@@ -67,6 +67,13 @@ def _text(message: str) -> MessageRenderer:
     return lambda _details: message
 
 
+def _render_missing_file(details: tuple[str, ...]) -> str:
+    kind, name = details
+    if kind == "directory":
+        return f"缺少 {_safe(name)} 目录"
+    return f"缺少 {_safe(name)}"
+
+
 def _render_invalid_status(details: tuple[str, ...]) -> str:
     branch = details[0]
     if branch == "not_single_code_span":
@@ -130,6 +137,7 @@ def _render_cycle(prefix: str) -> MessageRenderer:
     return render
 
 
+_ROOT = frozenset({LocationKind.ROOT})
 _LINE = frozenset({LocationKind.LINE})
 _FILE = frozenset({LocationKind.FILE})
 _LINE_OR_FILE = frozenset({LocationKind.LINE, LocationKind.FILE})
@@ -144,7 +152,11 @@ _SPECS: dict[str, DiagnosticSpec] = {
     "format.missing": DiagnosticSpec(_FILE, _fixed(0), _text("登记文件不存在")),
     "format.invalid": DiagnosticSpec(_FILE, _fixed(0), _text("登记文件格式无效")),
     "format.unsupported": DiagnosticSpec(_FILE, _fixed(0), _text("登记文件版本不受支持")),
-    "root.missing_file": DiagnosticSpec(_FILE, _fixed(0), _text("必需文件或目录不存在")),
+    "root.missing_file": DiagnosticSpec(
+        _ROOT,
+        _variant({"file": 2, "directory": 2}),
+        _render_missing_file,
+    ),
     "page.unmanaged_path": DiagnosticSpec(_FILE, _fixed(0), _text("Markdown 文件不在受管理路径中")),
     "page.missing_title": DiagnosticSpec(_FILE, _fixed(0), _text("缺少一级标题")),
     "page.missing_machine_block": DiagnosticSpec(
@@ -295,6 +307,9 @@ def render_issue(issue: CheckIssue) -> str:
         if valid and spec is not None
         else _fallback(issue.details)
     )
+    if valid:
+        # 已登记错误码只展示人类可读事实，不重复错误码；未知/未登记码在兜底分支保留。
+        return f"{location}: {_SEVERITY_NAMES[issue.severity]}：{message}"
     # Escape the code too: every dynamic field must be single-line safe.
     return f"{location}: {_SEVERITY_NAMES[issue.severity]} {_safe(issue.code)}：{message}"
 

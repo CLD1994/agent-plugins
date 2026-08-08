@@ -128,7 +128,7 @@ def test_candidate_check_registered_root_human_hint(
     assert code == 1
     lines = output.splitlines()
     assert lines[0] == (
-        ".draft/draft.json: 错误 candidate.already_registered："
+        ".draft/draft.json: 错误："
         "目标已经登记，--candidate 仅适用于未登记候选"
     )
     assert lines[1] == "检查完成：1 个错误，0 个警告，0 个信息，0 个提醒。"
@@ -248,8 +248,8 @@ def test_check_human_reports_actionable_multiple_locations(
 
     assert main(["check", str(registered_draft)]) == 1
     assert capsys.readouterr().out.splitlines() == [
-        "conclusions.md:7: 错误 link.missing：链接目标不存在：pages/missing-a.md",
-        "conclusions.md:8: 错误 link.missing：链接目标不存在：pages/missing-b.md",
+        "conclusions.md:7: 错误：链接目标不存在：pages/missing-a.md",
+        "conclusions.md:8: 错误：链接目标不存在：pages/missing-b.md",
         "检查完成：2 个错误，0 个警告，0 个信息，0 个提醒。",
     ]
 
@@ -294,16 +294,16 @@ def test_check_human_orders_four_severities_and_summarizes(
     code = main(["check", str(registered_draft)])
     out = capsys.readouterr().out.splitlines()
     assert code == 1
-    assert out[0] == "pages/a.md: 错误 output.missing：已确认页面缺少“产出”声明"
+    assert out[0] == "pages/a.md: 错误：已确认页面缺少“产出”声明"
     assert out[1] == (
-        ".draft/operations/x/journal.json: 警告 trash.handoff_pending："
+        ".draft/operations/x/journal.json: 警告："
         "回收操作 op 的系统回收站移交等待重试"
     )
     assert out[2] == (
-        ".draft/operations/y/journal.json: 信息 trash.retained：回收操作 op 仍处于保留态"
+        ".draft/operations/y/journal.json: 信息：回收操作 op 仍处于保留态"
     )
     assert out[3] == (
-        "pages/big.md: 提醒 page.capacity：页面容量为 700 行 / 80000 字节，建议审查是否拆分"
+        "pages/big.md: 提醒：页面容量为 700 行 / 80000 字节，建议审查是否拆分"
     )
     assert out[4] == "检查完成：1 个错误，1 个警告，1 个信息，1 个提醒。"
 
@@ -326,7 +326,7 @@ def test_check_plain_and_json_agree_on_exit_code_and_raw_details(
 
     assert main(["check", str(root)]) == 1
     human = capsys.readouterr().out
-    assert "link.missing：missing.md 解析到 pages/missing.md 后不存在" in human
+    assert "missing.md 解析到 pages/missing.md 后不存在" in human
 
     code, payload = run_json(["check", str(root), "--json"], capsys)
     assert code == 1
