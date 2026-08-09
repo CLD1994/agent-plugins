@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from draft.checker import check_draft
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import (
     FORMAT_VERSION,
@@ -65,11 +66,11 @@ def provisional_marker_bytes(manifest: CandidateManifest) -> bytes:
 def read_provisional_adopt_manifest(marker: Path) -> CandidateManifest:
     """Resume evidence for adopt: final marker, provisional manifest or format error."""
     if marker.is_symlink():
-        raise DraftError("path.symlink_escape", marker)
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, marker)
     try:
         decoded = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise DraftError("format.invalid", marker) from exc
+        raise DraftError(CheckCode.FORMAT_INVALID.value, marker) from exc
     state = parse_marker_value(decoded, marker)
     if state.provisional_manifest is None:
         raise DraftError("adopt.already_registered", marker.parent.parent)

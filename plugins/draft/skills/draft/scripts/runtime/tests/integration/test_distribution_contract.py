@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import ast
 import subprocess
 import tomllib
+from pathlib import Path
 
+from draft.diagnostic_codes import CheckCode
 from tests.support.paths import RUNTIME_ROOT
 
 SKILL_ROOT = RUNTIME_ROOT.parents[1]
@@ -71,3 +74,32 @@ def test_runtime_src_contains_no_plugin_only_modules() -> None:
 # 插件清单、市场清单与 Hook JSON 的精确字段只由适配层契约测试
 # plugins/draft/scripts/tests/integration/test_distribution_contract.py 拥有；
 # 核心测试不复制这些产物字段，避免同一契约在两个测试树漂移。
+
+DIAGNOSTIC_CODE_LITERAL_CONSUMERS = (
+    RUNTIME_ROOT / "src/draft/diagnostics.py",
+    RUNTIME_ROOT / "src/draft/graph.py",
+    RUNTIME_ROOT / "src/draft/markdown.py",
+    RUNTIME_ROOT / "src/draft/lifecycle.py",
+    RUNTIME_ROOT / "src/draft/paths.py",
+)
+
+
+def _raw_registered_code_literals(path: Path) -> list[tuple[int, str]]:
+    registered = frozenset(code.value for code in CheckCode)
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return sorted(
+        (node.lineno, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value in registered
+    )
+
+
+def test_registered_diagnostic_codes_have_one_literal_owner() -> None:
+    offenders = {
+        path.relative_to(RUNTIME_ROOT).as_posix(): literals
+        for path in DIAGNOSTIC_CODE_LITERAL_CONSUMERS
+        if (literals := _raw_registered_code_literals(path))
+    }
+    assert offenders == {}

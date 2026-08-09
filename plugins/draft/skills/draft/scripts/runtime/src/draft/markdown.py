@@ -14,6 +14,12 @@ from markdown_it.token import Token
 if TYPE_CHECKING:
     from draft.graph import DraftGraph
 
+from draft.diagnostic_codes import (
+    CheckCode,
+    InvalidRelationReason,
+    InvalidStatusReason,
+    ParseErrorReason,
+)
 from draft.errors import DraftError
 from draft.models import (
     MarkdownLink,
@@ -396,7 +402,10 @@ def _token_links(tokens: Sequence[Token]) -> list[_TokenLink]:
             if child.type == "link_open":
                 href = child.attrGet("href")
                 if not isinstance(href, str):
-                    raise DraftError("page.parse_error", details=("link_destination_missing",))
+                    raise DraftError(
+                        CheckCode.PAGE_PARSE_ERROR.value,
+                        details=(ParseErrorReason.LINK_DESTINATION_MISSING.value,),
+                    )
                 depth = 1
                 label_parts: list[str] = []
                 index += 1
@@ -413,7 +422,10 @@ def _token_links(tokens: Sequence[Token]) -> list[_TokenLink]:
             elif child.type == "image":
                 source = child.attrGet("src")
                 if not isinstance(source, str):
-                    raise DraftError("page.parse_error", details=("image_destination_missing",))
+                    raise DraftError(
+                        CheckCode.PAGE_PARSE_ERROR.value,
+                        details=(ParseErrorReason.IMAGE_DESTINATION_MISSING.value,),
+                    )
                 label = "".join(
                     part.content
                     for part in (child.children or [])
@@ -456,8 +468,8 @@ def _align_candidates(
                 break
         if found == -1:
             raise DraftError(
-                "page.parse_error",
-                details=("source_alignment_failed", token_link.destination),
+                CheckCode.PAGE_PARSE_ERROR.value,
+                details=(ParseErrorReason.SOURCE_ALIGNMENT_FAILED.value, token_link.destination),
             )
         aligned.append((candidates[found], token_link))
         cursor = found + 1
@@ -475,8 +487,8 @@ def _machine_lines(
         if prefix is None:
             if raw.strip():
                 raise DraftError(
-                    "page.parse_error",
-                    details=("lazy_continuation",),
+                    CheckCode.PAGE_PARSE_ERROR.value,
+                    details=(ParseErrorReason.LAZY_CONTINUATION.value,),
                     line=line_index + 1,
                 )
             continue
@@ -493,7 +505,7 @@ def _machine_lines(
                 label = candidate_label
             else:
                 raise DraftError(
-                    "page.unknown_label",
+                    CheckCode.PAGE_UNKNOWN_LABEL.value,
                     details=(candidate_label,),
                     line=line_index + 1,
                 )
@@ -518,9 +530,9 @@ def _parse_status_value(value: str, path: Path, line: int) -> StatusValue:
         or "`" in stripped[1:-1]
     ):
         raise DraftError(
-            "page.invalid_status",
+            CheckCode.PAGE_INVALID_STATUS.value,
             path,
-            details=("not_single_code_span",),
+            details=(InvalidStatusReason.NOT_SINGLE_CODE_SPAN.value,),
             line=line,
         )
     inner = stripped[1:-1]
@@ -528,9 +540,9 @@ def _parse_status_value(value: str, path: Path, line: int) -> StatusValue:
         prefix_text, explanation = inner.split("：", 1)
         if not explanation.strip():
             raise DraftError(
-                "page.invalid_status",
+                CheckCode.PAGE_INVALID_STATUS.value,
                 path,
-                details=("empty_explanation",),
+                details=(InvalidStatusReason.EMPTY_EXPLANATION.value,),
                 line=line,
             )
     else:
@@ -539,9 +551,9 @@ def _parse_status_value(value: str, path: Path, line: int) -> StatusValue:
         prefix = StatusPrefix(prefix_text)
     except ValueError as exc:
         raise DraftError(
-            "page.invalid_status",
+            CheckCode.PAGE_INVALID_STATUS.value,
             path,
-            details=("unknown_prefix", prefix_text),
+            details=(InvalidStatusReason.UNKNOWN_PREFIX.value, prefix_text),
             line=line,
         ) from exc
     return StatusValue(prefix=prefix, explanation=explanation)
@@ -552,15 +564,19 @@ def parse_page(path: Path, text: str) -> PageDocument:
     starts = _line_starts(text)
 
     if not tokens or tokens[0].type != "heading_open" or tokens[0].tag != "h1" or len(tokens) < 3:
-        raise DraftError("page.missing_title", path)
+        raise DraftError(CheckCode.PAGE_MISSING_TITLE.value, path)
     title_token = tokens[1]
     title = title_token.content.strip()
     machine_open_index = 3
     if len(tokens) <= machine_open_index or tokens[machine_open_index].type != "blockquote_open":
-        raise DraftError("page.missing_machine_block", path)
+        raise DraftError(CheckCode.PAGE_MISSING_MACHINE_BLOCK.value, path)
     blockquote_map = tokens[machine_open_index].map
     if blockquote_map is None:
-        raise DraftError("page.parse_error", path, details=("machine_block_map_missing",))
+        raise DraftError(
+            CheckCode.PAGE_PARSE_ERROR.value,
+            path,
+            details=(ParseErrorReason.MACHINE_BLOCK_MAP_MISSING.value,),
+        )
 
     lines = text.split("\n")
     definitions = _scan_definitions(lines, starts, _fenced_line_ranges(lines))
@@ -596,7 +612,7 @@ def parse_page(path: Path, text: str) -> PageDocument:
         if machine_line.label == _STATUS_LABEL:
             if status is not None:
                 raise DraftError(
-                    "page.duplicate_status",
+                    CheckCode.PAGE_DUPLICATE_STATUS.value,
                     path,
                     details=(),
                     line=machine_line.line,
@@ -613,9 +629,9 @@ def parse_page(path: Path, text: str) -> PageDocument:
         value_start = machine_line.content_start + len(machine_line.label) + 1 + leading
         if len(contained) != 1 or contained[0].is_image:
             raise DraftError(
-                "page.invalid_relation",
+                CheckCode.PAGE_INVALID_RELATION.value,
                 path,
-                details=("link_cardinality_or_image", machine_line.label),
+                details=(InvalidRelationReason.LINK_CARDINALITY_OR_IMAGE.value, machine_line.label),
                 line=machine_line.line,
             )
         link = contained[0]
@@ -623,15 +639,15 @@ def parse_page(path: Path, text: str) -> PageDocument:
         after = text[link.whole_span.end : machine_line.content_end]
         if before.strip() or after.strip():
             raise DraftError(
-                "page.invalid_relation",
+                CheckCode.PAGE_INVALID_RELATION.value,
                 path,
-                details=("extra_content", machine_line.label),
+                details=(InvalidRelationReason.EXTRA_CONTENT.value, machine_line.label),
                 line=machine_line.line,
             )
         relations.append(Relation(label=relation_label, link=link))
 
     if status is None:
-        raise DraftError("page.missing_status", path)
+        raise DraftError(CheckCode.PAGE_MISSING_STATUS.value, path)
 
     return PageDocument(
         path=path,
@@ -647,9 +663,9 @@ def locate_status_value_span(text: str) -> SourceSpan:
     """Return the span of the backticked status value, including backticks."""
     tokens = COMMONMARK.parse(text, {})
     if len(tokens) < 4 or tokens[0].type != "heading_open":
-        raise DraftError("page.missing_title")
+        raise DraftError(CheckCode.PAGE_MISSING_TITLE.value)
     if tokens[3].type != "blockquote_open" or tokens[3].map is None:
-        raise DraftError("page.missing_machine_block")
+        raise DraftError(CheckCode.PAGE_MISSING_MACHINE_BLOCK.value)
     starts = _line_starts(text)
     machine = _machine_lines(text, starts, (tokens[3].map[0], tokens[3].map[1]))
     for machine_line in machine:
@@ -657,12 +673,12 @@ def locate_status_value_span(text: str) -> SourceSpan:
             continue
         value_offset = machine_line.value.find("`")
         if value_offset == -1:
-            raise DraftError("page.invalid_status")
+            raise DraftError(CheckCode.PAGE_INVALID_STATUS.value)
         label_width = len(_STATUS_LABEL) + 1
         begin = machine_line.content_start + label_width + value_offset
         end = machine_line.content_start + label_width + machine_line.value.rfind("`") + 1
         return SourceSpan(begin, end)
-    raise DraftError("page.missing_status")
+    raise DraftError(CheckCode.PAGE_MISSING_STATUS.value)
 
 
 def _apply_edits(text: str, edits: Mapping[SourceSpan, str]) -> str:

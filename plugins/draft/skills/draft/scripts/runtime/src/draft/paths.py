@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 
 
@@ -42,7 +43,7 @@ def resolve_page_operand(root: Path, value: str) -> ResolvedPath:
     for part in normalized.parts:
         cursor /= part
         if cursor.is_symlink():
-            raise DraftError("path.symlink_escape", cursor)
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, cursor)
     canonical = candidate.resolve(strict=False)
     try:
         relative = canonical.relative_to(canonical_root)

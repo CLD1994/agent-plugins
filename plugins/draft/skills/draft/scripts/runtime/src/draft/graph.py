@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 from typing import cast
 from urllib.parse import unquote
 
+from draft.diagnostic_codes import CheckCode, LinkEscapeKind
 from draft.errors import DraftError
 from draft.markdown import parse_page
 from draft.models import (
@@ -51,13 +52,17 @@ class LoadResult:
 
 
 def error_issue(
-    code: str,
+    code: CheckCode,
     path: Path | None,
     line: int | None = None,
     *details: str,
 ) -> CheckIssue:
     return CheckIssue(
-        code=code, severity=IssueSeverity.ERROR, path=path, line=line, details=details
+        code=code.value,
+        severity=IssueSeverity.ERROR,
+        path=path,
+        line=line,
+        details=details,
     )
 
 
@@ -69,58 +74,58 @@ class MarkerState:
 
 def _parse_manifest_entries(value: object, marker: Path) -> tuple[tuple[str, str], ...]:
     if not isinstance(value, list):
-        raise DraftError("format.invalid", marker)
+        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
     entries: list[tuple[str, str]] = []
     for item in cast("list[object]", value):
         if not isinstance(item, list):
-            raise DraftError("format.invalid", marker)
+            raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
         pair = cast("list[object]", item)
         if len(pair) != 2:
-            raise DraftError("format.invalid", marker)
+            raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
         path_text, digest = pair
         if not isinstance(path_text, str) or not isinstance(digest, str):
-            raise DraftError("format.invalid", marker)
+            raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
         posix = PurePosixPath(path_text)
         if posix.is_absolute() or ".." in posix.parts:
-            raise DraftError("format.invalid", marker)
+            raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
         entries.append((path_text, digest))
     return tuple(entries)
 
 
 def parse_marker_value(decoded: object, marker: Path) -> MarkerState:
     if not isinstance(decoded, dict):
-        raise DraftError("format.invalid", marker)
+        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
     data = cast("dict[str, object]", decoded)
     version = data.get("format_version")
     if not isinstance(version, int) or isinstance(version, bool):
-        raise DraftError("format.invalid", marker)
+        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
     if version != FORMAT_VERSION:
-        raise DraftError("format.unsupported", marker)
+        raise DraftError(CheckCode.FORMAT_UNSUPPORTED.value, marker)
     keys = set(data)
     if keys == {"format_version"}:
         return MarkerState(version=version, provisional_manifest=None)
     if keys == {"format_version", "adopt_state", "candidate_manifest"}:
         if data.get("adopt_state") != "provisional":
-            raise DraftError("format.invalid", marker)
+            raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
         return MarkerState(
             version=version,
             provisional_manifest=_parse_manifest_entries(data.get("candidate_manifest"), marker),
         )
-    raise DraftError("format.invalid", marker)
+    raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
 
 
 def _read_marker_file(path: Path) -> MarkerState:
     if path.is_symlink():
-        raise DraftError("path.symlink_escape", path)
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, path)
     if not path.exists():
-        raise DraftError("format.missing", path)
+        raise DraftError(CheckCode.FORMAT_MISSING.value, path)
     if not path.is_file():
         # 已存在但不是普通文件（目录等）：异常内部状态，不是"缺失"。
-        raise DraftError("format.invalid", path)
+        raise DraftError(CheckCode.FORMAT_INVALID.value, path)
     try:
         decoded = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise DraftError("format.invalid", path) from exc
+        raise DraftError(CheckCode.FORMAT_INVALID.value, path) from exc
     return parse_marker_value(decoded, path)
 
 
@@ -150,15 +155,15 @@ def provisional_marker_path(root: Path) -> Path | None:
     """
     marker = root / PROVISIONAL_MARKER_PATH
     if marker.is_symlink():
-        raise DraftError("path.symlink_escape", marker)
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, marker)
     if not marker.exists():
         return None
     if not marker.is_file():
         # 已存在但不是普通文件（目录/FIFO 等）：异常内部状态，必须报错而非折叠为不存在。
-        raise DraftError("format.invalid", marker)
+        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
     state = read_provisional_marker(root)
     if state.provisional_manifest is None:
-        raise DraftError("format.invalid", marker)
+        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
     return marker
 
 
@@ -194,14 +199,14 @@ def resolve_local_destination(
     path_part, separator, anchor = destination.partition("#")
     decoded = unquote(path_part)
     if PurePosixPath(decoded).is_absolute():
-        raise DraftError("link.escape", source)
+        raise DraftError(CheckCode.LINK_ESCAPE.value, source)
     if decoded == "":
         target = source
     else:
         joined = source.parent / PurePosixPath(decoded)
         normalized = _normalize_relative(str(joined))
         if normalized is None or normalized == PurePosixPath("."):
-            raise DraftError("link.escape", source)
+            raise DraftError(CheckCode.LINK_ESCAPE.value, source)
         target = Path(str(normalized))
     return target, (anchor if separator else None)
 
@@ -214,7 +219,13 @@ def _discover(root: Path) -> tuple[list[Path], list[CheckIssue]]:
             continue
         if entry.is_symlink():
             issues.append(
-                error_issue("link.escape", Path(entry.name), None, "managed_path", entry.name)
+                error_issue(
+                    CheckCode.LINK_ESCAPE,
+                    Path(entry.name),
+                    None,
+                    LinkEscapeKind.MANAGED_PATH.value,
+                    entry.name,
+                )
             )
             continue
         if entry.is_dir():
@@ -223,7 +234,11 @@ def _discover(root: Path) -> tuple[list[Path], list[CheckIssue]]:
                 if descendant.is_symlink():
                     issues.append(
                         error_issue(
-                            "link.escape", relative, None, "managed_path", relative.as_posix()
+                            CheckCode.LINK_ESCAPE,
+                            relative,
+                            None,
+                            LinkEscapeKind.MANAGED_PATH.value,
+                            relative.as_posix(),
                         )
                     )
                     continue
@@ -232,14 +247,14 @@ def _discover(root: Path) -> tuple[list[Path], list[CheckIssue]]:
                 if relative.parts[0] == PAGES_DIR.name:
                     managed.append(relative)
                 else:
-                    issues.append(error_issue("page.unmanaged_path", relative))
+                    issues.append(error_issue(CheckCode.PAGE_UNMANAGED_PATH, relative))
             continue
         if entry.suffix != ".md":
             continue
         if entry.name in (ROOT_PAGE.name, CONCLUSIONS_PAGE.name):
             managed.append(Path(entry.name))
         else:
-            issues.append(error_issue("page.unmanaged_path", Path(entry.name)))
+            issues.append(error_issue(CheckCode.PAGE_UNMANAGED_PATH, Path(entry.name)))
     return managed, issues
 
 
@@ -278,7 +293,13 @@ def _load(root: Path) -> LoadResult:
             if error.code == "link.external":
                 return None
             link_issues.append(
-                error_issue("link.escape", source, link.line, "destination", link.destination)
+                error_issue(
+                    CheckCode.LINK_ESCAPE,
+                    source,
+                    link.line,
+                    LinkEscapeKind.DESTINATION.value,
+                    link.destination,
+                )
             )
             return None
         return target
@@ -296,7 +317,7 @@ def _load(root: Path) -> LoadResult:
                 if target not in managed_set:
                     link_issues.append(
                         error_issue(
-                            "link.missing",
+                            CheckCode.LINK_MISSING,
                             source,
                             link.line,
                             link.destination,
@@ -307,7 +328,7 @@ def _load(root: Path) -> LoadResult:
             elif not (root / target).exists():
                 link_issues.append(
                     error_issue(
-                        "link.missing",
+                        CheckCode.LINK_MISSING,
                         source,
                         link.line,
                         link.destination,
@@ -388,22 +409,29 @@ def _candidate_internal_issues(
     issues: list[CheckIssue] = []
     internal = resolved / INTERNAL_DIR
     if internal.is_symlink() or (internal.exists() and not internal.is_dir()):
-        return [error_issue("candidate.internal_state", Path(INTERNAL_DIR))]
+        return [error_issue(CheckCode.CANDIDATE_INTERNAL_STATE, Path(INTERNAL_DIR))]
     if not internal.is_dir():
         return issues
     entries = sorted(internal.iterdir())
     if not entries:
-        issues.append(error_issue("candidate.internal_state", Path(INTERNAL_DIR)))
+        issues.append(error_issue(CheckCode.CANDIDATE_INTERNAL_STATE, Path(INTERNAL_DIR)))
     final = resolved / MARKER_PATH
     if final.is_file() and not final.is_symlink():
         try:
             final_state = read_marker(resolved, allow_provisional_adopt=True)
         except DraftError as error:
-            issues.append(error_issue(error.code, MARKER_PATH))
+            issues.append(
+                CheckIssue(
+                    code=error.code,
+                    severity=IssueSeverity.ERROR,
+                    path=MARKER_PATH,
+                    line=None,
+                )
+            )
         else:
             if final_state.provisional_manifest is None:
                 # 已登记是终态事实：其余内部条目都是合法登记状态，不再逐条报告。
-                return [error_issue("candidate.already_registered", MARKER_PATH)]
+                return [error_issue(CheckCode.CANDIDATE_ALREADY_REGISTERED, MARKER_PATH)]
             if not allow_provisional_adopt:
                 raise DraftError("adopt.recovery_required", final)
     provisional = resolved / PROVISIONAL_MARKER_PATH
@@ -411,17 +439,26 @@ def _candidate_internal_issues(
         try:
             provisional_state = read_provisional_marker(resolved)
         except DraftError as error:
-            issues.append(error_issue(error.code, PROVISIONAL_MARKER_PATH))
+            issues.append(
+                CheckIssue(
+                    code=error.code,
+                    severity=IssueSeverity.ERROR,
+                    path=PROVISIONAL_MARKER_PATH,
+                    line=None,
+                )
+            )
         else:
             if provisional_state.provisional_manifest is None:
-                issues.append(error_issue("format.invalid", PROVISIONAL_MARKER_PATH))
+                issues.append(
+                    error_issue(CheckCode.FORMAT_INVALID, PROVISIONAL_MARKER_PATH)
+                )
             elif not allow_provisional_adopt:
                 raise DraftError("adopt.recovery_required", provisional)
     allowed = {MARKER_PATH, PROVISIONAL_MARKER_PATH}
     for entry in entries:
         relative = entry.relative_to(resolved)
         if relative not in allowed or entry.is_symlink() or not entry.is_file():
-            issues.append(error_issue("candidate.internal_state", relative))
+            issues.append(error_issue(CheckCode.CANDIDATE_INTERNAL_STATE, relative))
     return issues
 
 
