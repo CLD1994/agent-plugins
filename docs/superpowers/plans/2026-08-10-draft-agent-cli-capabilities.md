@@ -1,32 +1,41 @@
-# Draft Agent CLI Capabilities Implementation Plan
+# Draft 面向代理的命令行能力实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **给实施代理（Agent）：** 按任务执行本计划时，使用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans`。使用复选框（`- [ ]`）记录进度。
 
-**Goal:** 为 Draft runtime 增加低 token 的结构查询、安全创建、状态与关系修改、按需结论生成、统一 dry-run 和静默回收生命周期，同时让所有命令共享类型化状态、关系与正文资源规则。
+**目标：** 为 Draft 运行时增加低令牌消耗的结构查询、安全创建、状态与关系修改、按需结论生成、统一预演（`dry-run`）和静默回收生命周期，同时让所有命令共享类型化状态、关系与正文资源规则。
 
-**Architecture:** Markdown 继续是唯一事实来源；每次命令按需建立一次内存页面或完整图，不保存跨命令缓存。新增聚焦模块分别拥有稳定词汇、正文资源解析、查询、公开计划影响、结论生成和页面元数据修改；现有 graph/checker/structure/trash/CLI 通过这些边界协作，所有正式写入继续走 `OperationPlan` 与崩溃恢复日志。
+**架构：** Markdown 继续是唯一事实来源；每次命令按需建立一次内存页面或完整图，不保存跨命令缓存。建议将稳定词汇、正文资源解析、查询、公开计划影响、结论生成和页面元数据修改分别放在职责集中的模块中；现有图构建、检查、结构修改、回收和命令行入口通过这些边界协作，所有正式写入继续使用 `OperationPlan` 与崩溃恢复日志。
 
-**Tech Stack:** Python `>=3.12,<3.15`、标准库 `pathlib`/`urllib.parse`/`enum.StrEnum`/`dataclasses`、markdown-it-py `>=4.2,<4.3`、Send2Trash `>=2.1,<2.2`、pytest、pytest-mock、Pyright strict、Ruff、uv。
+**技术栈：** Python `>=3.12,<3.15`、标准库 `pathlib`/`urllib.parse`/`enum.StrEnum`/`dataclasses`、markdown-it-py `>=4.2,<4.3`、Send2Trash `>=2.1,<2.2`、pytest、pytest-mock、Pyright 严格模式、Ruff、uv。
 
-**Approved Spec:** `docs/superpowers/specs/2026-08-10-draft-agent-cli-capabilities-design.md`
+**已批准规格：** `docs/superpowers/specs/2026-08-10-draft-agent-cli-capabilities-design.md`
 
-## Global Constraints
+## 必须遵守的全局约束
 
 - 开始每个任务前依次读取根 `AGENTS.md`、`plugins/draft/AGENTS.md` 和批准规格；若实施过程中这些文件变化，重新读取后再继续。
 - 不引入 Obsidian、数据库、后台索引、文件监视器、跨命令缓存或新第三方依赖；不得修改 `pyproject.toml` 依赖窗口与 `uv.lock`。
 - 保持 `FORMAT_VERSION = 1`；项目仍在开发，不实现旧 `output`/`产出` 格式兼容、迁移命令或双读双写。
-- CLI/JSON 使用稳定 `StatusCode`、`RelationCode`、资源类型、范围和目标状态；中文标签只存在于生产本地化映射、Markdown 与人类渲染边界。
+- CLI 和 JSON 使用稳定的 `StatusCode`、`RelationCode`、资源类型、范围和目标状态；中文标签只存在于生产本地化映射、Markdown 与人类输出边界。
 - 正文资源链接允许 Draft 外路径、Linux/Windows 相对路径及两种绝对路径；正式关系和受管理页面参数仍只能指向同一 Draft 内页面。
-- `conclusions.md` 不实时维护；只有 `generate-conclusions` 完整重建，普通结构命令不得逐条改写结论列表，也不得让旧结论链接阻止 move/trash。
+- `conclusions.md` 不实时维护；只有 `generate-conclusions` 完整重建，普通结构命令不得逐条改写结论列表，也不得让旧结论链接阻止 `move` 或 `trash`。
 - 所有已登记 Draft 命令，包括查询和 `--dry-run`，在业务逻辑前静默推进回收生命周期；临时移交失败隐藏并保留重试，损坏状态明确失败。
 - 查询无法证明结果完整时整体失败；目标的 `missing`、`invalid`、`unavailable`、`unchecked` 是成功查询到的事实。
-- 人类输出测试只验证动态事实、顺序、计数、单行和转义；不得复制完整中文文案。稳定 JSON 字段与 wire value 必须精确断言。
-- 单元测试同进程、无真实文件系统、无子进程；用注入的 existence probe、时间和受真实接口约束的 stub/fake。真实文件、符号链接、操作日志、恢复和 CLI 组合属于 integration。
-- 结构和依赖边界使用 AST、真实导入或运行行为验证，不以源码普通文本包含/排除代替语义检查。
-- 每个任务按红—绿—重构执行并单独提交。门禁失败先定位根因，不删除测试、不放宽 Pyright/Ruff、不吞错误。
-- 工作区可能包含用户或其他 Agent 的修改；任务开始记录 `git status --short`，只暂存本任务列出的文件，不清理或覆盖其他改动。
+- 人类输出测试只验证动态事实、顺序、计数、单行和转义；不得复制完整中文文案。稳定 JSON 字段与机器协议值必须精确断言。
+- 单元测试同进程、无真实文件系统、无子进程；使用注入的存在性探针、时间以及受真实接口约束的桩件或伪实现。真实文件、符号链接、操作日志、恢复和 CLI 组合属于集成测试。
+- 结构和依赖边界使用抽象语法树（AST）、真实导入或运行行为验证，不以源码普通文本包含或排除代替语义检查。
+- 每个任务按红—绿—重构执行。任务是可独立验证和审查的行为边界，不强制对应一个固定提交。门禁失败时先定位根因，不删除测试、不放宽 Pyright 或 Ruff、不吞错误。
+- 工作区可能包含用户或其他代理的修改；开始任务前记录 `git status --short`，提交前根据实际差异确认归属，不清理、覆盖或误提交其他人的改动。
 
-## File Structure
+## 计划内容的约束层级
+
+- 上一节和批准规格中的行为契约是硬性要求。
+- 下文列出的模块、内部函数名、签名、预计修改文件和检查点是帮助实施的当前建议，不是封闭清单。实施者在追踪真实数据流后可以调整，但必须保持行为契约，并在交付时说明重要偏差及原因。
+- 明确属于公开机器协议的命令、字段、枚举值和退出码不得自行改变；仅为组织实现而建议的内部接口可以在不改变行为的前提下调整。
+- 不要求恰好形成 11 个提交。应按可独立验证、可独立审查的行为组织提交，避免为了符合计划制造无意义的中间状态。
+
+## 预计的文件组织
+
+以下路径用于说明建议的职责归属，并帮助实施者定位代码。实际实施可能增加、减少或调整文件；不要为了匹配清单而修改无关文件。
 
 ### 新建的生产模块
 
@@ -35,9 +44,9 @@
 - `plugins/draft/skills/draft/scripts/runtime/src/draft/resources.py`
   - 区分正式关系目标与正文资源，解析 Linux/Windows 路径、资源身份、范围、可用状态和移动后重写。
 - `plugins/draft/skills/draft/scripts/runtime/src/draft/query.py`
-  - 定义紧凑查询结果并从单页或完整 `DraftGraph` 计算 page/links/backlinks/relations/status。
+  - 定义紧凑查询结果，并从单页或完整 `DraftGraph` 计算 `page`、`links`、`backlinks`、`relations`、`status`。
 - `plugins/draft/skills/draft/scripts/runtime/src/draft/plan_effects.py`
-  - 定义 `PlanEffect`、公开 changed paths、统一分页和 JSON 影响序列化所需的纯逻辑。
+  - 定义 `PlanEffect`、公开 `changed_paths`、统一分页和 JSON 影响序列化所需的纯逻辑。
 - `plugins/draft/skills/draft/scripts/runtime/src/draft/conclusions.py`
   - 规划和执行按需结论生成，拥有固定文件形状、导航顺序和 `generated` 所有权收敛。
 - `plugins/draft/skills/draft/scripts/runtime/src/draft/page_create.py`
@@ -52,13 +61,13 @@
 - `src/draft/models.py`：页面模型改用稳定代码；`OperationPlan` 携带公开 `effects`。
 - `src/draft/markdown.py`：中文标签边界、机器区域编辑、普通文本转义、结论导航插入。
 - `src/draft/graph.py`：构建页面图与正文资源反向索引，提供单页/完整快照加载边界，读取结论所有权状态。
-- `src/draft/checker.py`：删除 output 规则，复用资源状态，检查懒生成结论结构并容忍结论列表过时。
-- `src/draft/structure.py`、`src/draft/trash.py`：使用资源重写和公开 effects，跳过机器结论列表。
+- `src/draft/checker.py`：删除 `output` 规则，复用资源状态，检查懒生成结论结构并容忍结论列表过时。
+- `src/draft/structure.py`、`src/draft/trash.py`：使用资源重写和公开 `effects`，跳过机器结论列表。
 - `src/draft/lifecycle.py`：初始化/接管写入 `conclusions_state=not_generated`，不预建结论页。
 - `src/draft/trash_lifecycle.py`：通用静默前置推进、只恢复中断操作、可恢复项查询。
-- `src/draft/operations.py`：允许结论生成计划原子写指定 marker，验证公开 effects 与低层 mutation 一致。
-- `src/draft/cli.py`：只保留 argparse、命令编排、前置推进、退出码和错误边界。
-- `src/draft/diagnostic_codes.py`、`src/draft/diagnostics.py`：删除 output 诊断，增加资源与结论结构诊断。
+- `src/draft/operations.py`：允许结论生成计划原子写指定登记标记，验证公开 `effects` 与底层文件变更一致。
+- `src/draft/cli.py`：只保留命令参数解析、命令编排、前置推进、退出码和错误边界。
+- `src/draft/diagnostic_codes.py`、`src/draft/diagnostics.py`：删除 `output` 诊断，增加资源与结论结构诊断。
 
 ### 新建测试文件
 
@@ -77,40 +86,23 @@
 
 ---
 
-### Task 1: 建立稳定状态/关系词汇并删除 output 协议
+### 任务 1：建立稳定状态和关系词汇，并删除 `output` 协议
 
-**Files:**
-- Create: `plugins/draft/skills/draft/scripts/runtime/src/draft/vocabulary.py`
-- Create: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_vocabulary.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/models.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/markdown.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/checker.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/structure.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/diagnostic_codes.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/diagnostics.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_markdown.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_graph.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_checker.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_diagnostics.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_structure.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_trash.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_checker.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_cli.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_lifecycle.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_structure.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_distribution_contract.py`
+**预计影响范围（非穷尽）：**
+- 建议新建：`plugins/draft/skills/draft/scripts/runtime/src/draft/vocabulary.py`
+- 建议新建：`plugins/draft/skills/draft/scripts/runtime/tests/unit/test_vocabulary.py`
+- 预计修改：模型、Markdown 解析、图构建、检查、结构操作和诊断模块
+- 预计修改：相关词汇、解析、检查、诊断和结构操作的单元测试与集成测试
 
-**Interfaces:**
-- Produces: `StatusCode`, `RelationCode`, `EditableRelationCode`.
-- Produces: `status_label(code) -> str`, `status_code(label) -> StatusCode`, `relation_label(code) -> str`, `relation_code(label) -> RelationCode`.
-- Changes: `StatusValue.prefix` becomes `StatusValue.code`; `Relation.label` becomes `Relation.code`; `DraftGraph.relations` keys become `RelationCode`.
-- Removes: `StatusPrefix`, `RelationLabel`, `RelationCode.OUTPUT` and four `CheckCode.OUTPUT_*` members.
+**建议的任务间接口：**
+- 建议提供：`StatusCode`、`RelationCode`、`EditableRelationCode`。
+- 建议提供：`status_label(code) -> str`、`status_code(label) -> StatusCode`、`relation_label(code) -> str`、`relation_code(label) -> RelationCode`。
+- 预计调整：将 `StatusValue.prefix` 改为 `StatusValue.code`，将 `Relation.label` 改为 `Relation.code`，并让 `DraftGraph.relations` 使用 `RelationCode` 作为键。
+- 预计淘汰内部的 `StatusPrefix` 和 `RelationLabel`；公开关系类型不得再包含 `RelationCode.OUTPUT`，诊断类型不得再包含四个 `CheckCode.OUTPUT_*` 成员。
 
-- [ ] **Step 1: Write failing vocabulary and output-removal tests**
+- [ ] **步骤 1：编写词汇边界和删除旧协议的失败测试**
 
-Create `test_vocabulary.py` with type-driven round trips and update checker tests so a confirmed page without `产出` is valid:
+新建 `test_vocabulary.py`，用生产类型驱动往返测试；同时更新检查器测试，证明已确认页面不声明“产出”也合法：
 
 ```python
 from draft.vocabulary import (
@@ -146,11 +138,11 @@ def test_removed_relation_is_not_published() -> None:
     assert "OUTPUT" not in RelationCode.__members__
 ```
 
-Replace output-specific checker expectations with a case proving `confirmed` alone is sufficient. Delete tests whose only contract is `output.missing`, `output.forbidden`, `output.wrong_target` or output backlink maintenance.
+将只验证旧 `output` 规则的检查器预期替换为“`confirmed` 状态本身已经足够”的行为用例。删除仅验证 `output.missing`、`output.forbidden`、`output.wrong_target` 或旧反向维护规则的测试。
 
-- [ ] **Step 2: Run the narrow tests and verify the intended red state**
+- [ ] **步骤 2：运行最窄测试并确认预期的失败状态**
 
-Run:
+运行：
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -160,11 +152,11 @@ uv run --project "$RUNTIME" --locked pytest \
   "$RUNTIME/tests/unit/test_checker.py" -q
 ```
 
-Expected: collection fails because `draft.vocabulary` and `StatusCode` do not exist; existing output tests may also fail until their obsolete fixtures are removed.
+预期：测试收集因 `draft.vocabulary` 和 `StatusCode` 尚不存在而失败；清理旧夹具前，已有 `output` 测试也可能失败。
 
-- [ ] **Step 3: Implement the single vocabulary owner**
+- [ ] **步骤 3：实现唯一的词汇权威来源**
 
-Create `vocabulary.py` with these exact public types and mappings:
+建议在 `vocabulary.py` 中提供以下公开类型和映射。内部函数组织可以调整，但合法值集合和往返行为必须一致：
 
 ```python
 from __future__ import annotations
@@ -240,17 +232,17 @@ def relation_code(label: str) -> RelationCode:
         raise ValueError(label) from exc
 ```
 
-In `markdown.py`, convert vocabulary `ValueError` to the existing stable parse error instead of leaking it. Use the mapping functions in parser and every Markdown renderer; do not duplicate Chinese labels in checker/structure/trash.
+在 `markdown.py` 中，把词汇转换产生的 `ValueError` 转换为现有稳定解析错误，不要直接泄漏该异常。解析器和所有 Markdown 渲染器都使用词汇映射函数；不得在检查、结构操作或回收模块中重复维护中文标签。
 
-Change all consumers and tests to `.code` and enum identity. Remove `_check_outputs`, output-specific diagnostics and fixtures. Keep the existing always-present conclusions page only as a temporary valid page; Task 7 changes its lifecycle.
+将所有消费者和测试改为使用 `.code` 与枚举身份比较。删除 `_check_outputs`、旧 `output` 诊断和夹具。现有常驻结论页暂时仍可作为合法页面；任务 7 再调整它的生命周期。
 
-- [ ] **Step 4: Add an AST ownership contract for stable wire values**
+- [ ] **步骤 4：增加稳定机器协议值的抽象语法树所有权测试**
 
-Extend `tests/integration/test_distribution_contract.py` so raw stable status/relation wire values appear only in `vocabulary.py`. Parse Python AST constants; do not search source text. Exclude JSON examples in documentation because this contract covers production/test Python only.
+扩展 `tests/integration/test_distribution_contract.py`：解析 Python 抽象语法树中的常量，证明原始状态和关系协议值只由 `vocabulary.py` 拥有。不要搜索源码文本；文档中的 JSON 示例不属于这个生产代码和测试代码的所有权契约。
 
-- [ ] **Step 5: Run focused and full core unit gates**
+- [ ] **步骤 5：运行定向测试和完整核心单元门禁**
 
-Run:
+运行：
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -260,91 +252,66 @@ uv run --project "$RUNTIME" --locked ruff check "$RUNTIME/src" "$RUNTIME/tests"
 uv run --project "$RUNTIME" --locked ruff format --check "$RUNTIME/src" "$RUNTIME/tests"
 ```
 
-Expected: all commands exit `0`; no output diagnostic code remains in `CheckCode` or `KNOWN_CHECK_CODES`.
+预期：所有命令退出码均为 `0`；`CheckCode` 和 `KNOWN_CHECK_CODES` 中不再存在旧 `output` 诊断码。
 
-- [ ] **Step 6: Commit the vocabulary boundary**
+- [ ] **步骤 6：形成可审查检查点**
 
 ```bash
-git add -- \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/vocabulary.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/models.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/markdown.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/checker.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/structure.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/diagnostic_codes.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/diagnostics.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_vocabulary.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_markdown.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_graph.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_checker.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_diagnostics.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_structure.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_trash.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_checker.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_cli.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_lifecycle.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_structure.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_distribution_contract.py
-git commit -m "refactor(draft): stabilize status and relation codes"
+git status --short
+git diff --stat
 ```
+
+确认实际差异只服务于本任务的行为契约。如果这一阶段适合独立提交，建议提交说明为 `refactor(draft): stabilize status and relation codes`；否则与紧密耦合的下一阶段一起提交，不为匹配计划强行拆分。
 
 ---
 
-### Task 2: 统一正文资源解析与检查状态
+### 任务 2：统一正文资源解析与检查状态
 
-**Files:**
-- Create: `plugins/draft/skills/draft/scripts/runtime/src/draft/resources.py`
-- Create: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_resources.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/checker.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/diagnostic_codes.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/diagnostics.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_graph.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_checker.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_diagnostics.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_checker.py`
+**预计影响范围（非穷尽）：**
+- 建议新建：`plugins/draft/skills/draft/scripts/runtime/src/draft/resources.py`
+- 建议新建：`plugins/draft/skills/draft/scripts/runtime/tests/unit/test_resources.py`
+- 预计修改：图构建、检查器、诊断码和诊断渲染模块
+- 预计修改：相关图、检查器、诊断单元测试以及检查器集成测试
 
-**Interfaces:**
-- Produces: `ResourceKind`, `ResourceScope`, `TargetState`, `HostOS`, `ResourceIdentity`, `ResolvedResource`, `ResourceReference`.
-- Produces: `resolve_managed_destination(source, destination) -> tuple[Path, str | None]` for formal relations.
-- Produces: `resolve_body_resource(root: Path, source: Path, destination: str, *, host_os: HostOS | None = None, exists: Callable[[str], bool] | None = None) -> ResolvedResource` for ordinary body links.
-- Produces: `resolve_page_resources(root: Path, page: PageDocument, *, host_os: HostOS | None = None, exists: Callable[[str], bool] | None = None) -> tuple[ResourceReference, ...]`, excluding parsed relation spans.
-- Produces: `resource_identity_from_operand(root: Path, value: str, *, host_os: HostOS | None = None) -> ResourceIdentity` for root-based backlinks operands.
-- Changes: `DraftGraph` adds `body_resources` and `inbound_resources`; existing `inbound_links` remains the managed-page-only index used by structure/trash.
+**建议的任务间接口：**
+- 建议提供：`ResourceKind`、`ResourceScope`、`TargetState`、`HostOS`、`ResourceIdentity`、`ResolvedResource`、`ResourceReference`。
+- 建议提供：正式关系使用 `resolve_managed_destination(source, destination) -> tuple[Path, str | None]`。
+- 建议提供：正文链接使用 `resolve_body_resource(root: Path, source: Path, destination: str, *, host_os: HostOS | None = None, exists: Callable[[str], bool] | None = None) -> ResolvedResource`。
+- 建议提供：`resolve_page_resources(root: Path, page: PageDocument, *, host_os: HostOS | None = None, exists: Callable[[str], bool] | None = None) -> tuple[ResourceReference, ...]`，并排除已经解析为正式关系的链接位置。
+- 建议提供：命令行反向链接目标使用 `resource_identity_from_operand(root: Path, value: str, *, host_os: HostOS | None = None) -> ResourceIdentity`。
+- 预计调整：`DraftGraph` 增加 `body_resources` 和 `inbound_resources`；现有 `inbound_links` 继续作为结构修改和回收使用的受管理页面索引。
 
-- [ ] **Step 1: Write a pure resource-state matrix**
+- [ ] **步骤 1：编写纯内存资源状态矩阵**
 
-Create parameterized unit cases covering these exact classes:
+使用参数化单元测试覆盖以下分类：
 
-| Destination | Host | Expected kind | scope | state |
+| 目标写法 | 当前系统 | 预期类型 | 范围 | 状态 |
 |---|---|---|---|---|
-| `b.md#one` from `pages/a.md` | linux | page（规范目标符合受管理页面路径） | draft | present |
-| `../asset.png` | linux | local | draft | present |
-| `../../shared.png` | linux | local | outside | missing |
-| `..\\asset.png` | linux | local | draft | present |
-| `C:\\docs\\a.pdf` | linux | local | unknown | unavailable |
-| `C:docs\\a.pdf` | linux | local | unknown | unavailable |
-| `\\\\server\\share\\a.pdf` | linux | local | unknown | unavailable |
-| `/opt/shared/a.pdf` | linux | local | outside | present |
-| `https://example.test/a#part` | linux | external | unknown | unchecked |
-| malformed percent escape | linux | local | unknown | invalid |
+| `pages/a.md` 中的 `b.md#one` | `linux` | `page`（规范目标符合受管理页面路径） | `draft` | `present` |
+| `../asset.png` | `linux` | `local` | `draft` | `present` |
+| `../../shared.png` | `linux` | `local` | `outside` | `missing` |
+| `..\\asset.png` | `linux` | `local` | `draft` | `present` |
+| `C:\\docs\\a.pdf` | `linux` | `local` | `unknown` | `unavailable` |
+| `C:docs\\a.pdf` | `linux` | `local` | `unknown` | `unavailable` |
+| `\\\\server\\share\\a.pdf` | `linux` | `local` | `unknown` | `unavailable` |
+| `/opt/shared/a.pdf` | `linux` | `local` | `outside` | `present` |
+| `https://example.test/a#part` | `linux` | `external` | `unknown` | `unchecked` |
+| 非法百分号转义 | `linux` | `local` | `unknown` | `invalid` |
 
-Use an injected `exists: Callable[[str], bool]` fake keyed by normalized absolute strings; unit tests must not create files. Add a test proving image and plain links to the same identity deduplicate, and anchors do not affect identity.
+使用按规范化绝对路径返回结果的 `exists: Callable[[str], bool]` 伪实现；单元测试不得创建真实文件。另加用例证明：图片和普通链接指向同一资源时会去重，锚点不参与资源身份比较。
 
-- [ ] **Step 2: Run the matrix and verify missing module failure**
+- [ ] **步骤 2：运行矩阵并确认缺少模块时失败**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
 uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit/test_resources.py" -q
 ```
 
-Expected: collection ERROR naming `draft.resources`.
+预期：测试收集报错，并明确指出缺少 `draft.resources`。
 
-- [ ] **Step 3: Implement the resource types and two resolvers**
+- [ ] **步骤 3：实现资源类型和两类解析边界**
 
-Use these public shapes:
+建议采用以下公开形状；只要类型表达的状态和调用契约不变，内部命名可以在实现时调整：
 
 ```python
 class ResourceKind(StrEnum):
@@ -397,28 +364,28 @@ class ResourceReference:
     resource: ResolvedResource
 ```
 
-Parse URI schemes before Windows drive paths, but treat a one-letter drive followed by `:` as Windows syntax. Reject malformed percent escapes as `invalid`; do not call `Path.resolve()` or `realpath()` for identity because symlink identity and missing targets must remain lexical.
+先识别 URI 方案名，再识别 Windows 盘符路径；单字母后跟 `:` 时按 Windows 路径处理。非法百分号转义标记为 `invalid`。资源身份不得调用 `Path.resolve()` 或 `realpath()`，因为符号链接和缺失目标都必须保留词法身份。
 
-`resolve_managed_destination` accepts only relative POSIX Markdown destinations that stay under the Draft root and returns root-relative `Path`; absolute, URI, Windows drive/UNC and root escape raise the existing stable formal-link error.
+`resolve_managed_destination` 只接受保持在 Draft 根目录内的相对 POSIX Markdown 目标，并返回相对根目录的 `Path`。绝对路径、URI、Windows 盘符、UNC 路径和越过根目录的路径都产生现有稳定正式链接错误。
 
-- [ ] **Step 4: Refactor graph/checker to keep body links and formal relations disjoint**
+- [ ] **步骤 4：分开处理正文资源和正式关系**
 
-Implement relation-span exclusion once in `resolve_page_resources`. Graph loading calls that function for `body_resources`; formal relation targets separately use `resolve_managed_destination`. Query code in Task 5 reuses the same page-resource function instead of duplicating the distinction.
+在 `resolve_page_resources` 中统一排除正式关系链接位置。图加载用它生成 `body_resources`；正式关系目标单独使用 `resolve_managed_destination`。任务 5 的查询代码复用同一个页面资源函数，不再重复判断。
 
-Add `CheckCode.LINK_UNAVAILABLE = "link.unavailable"`. Emit:
+增加 `CheckCode.LINK_UNAVAILABLE = "link.unavailable"`，并按以下规则报告：
 
-- ERROR `link.missing` for `missing`;
-- ERROR `link.invalid` for `invalid` using a new `CheckCode.LINK_INVALID`;
-- WARNING `link.unavailable` for `unavailable`;
-- no issue for `present` or external `unchecked`.
+- `missing` 产生错误 `link.missing`；
+- `invalid` 通过新增的 `CheckCode.LINK_INVALID` 产生错误 `link.invalid`；
+- `unavailable` 产生警告 `link.unavailable`；
+- `present` 和外部资源的 `unchecked` 不产生问题。
 
-Keep every `ResourceReference` even when state is not present. Build `inbound_resources` by `ResourceIdentity` and preserve `(source path, link position)` order.
+无论目标状态如何，都保留对应的 `ResourceReference`。按照 `ResourceIdentity` 建立 `inbound_resources`，并保持“来源路径、声明位置”的确定顺序。
 
-- [ ] **Step 5: Prove real files, images, directories and non-native paths**
+- [ ] **步骤 5：验证真实文件、图片、目录和非本机路径**
 
-Add integration cases that create a Draft plus a file, directory and image outside the Draft; assert present/missing diagnostics and Linux handling of Windows absolute paths. Assert external URI causes no warning and a missing image is an error with the image source line.
+增加集成测试：创建 Draft 以及位于 Draft 外的文件、目录和图片，验证存在或缺失诊断，以及 Linux 对 Windows 绝对路径的处理。外部 URI 不产生警告；缺失图片产生错误，并包含图片所在行。
 
-- [ ] **Step 6: Run focused gates and commit**
+- [ ] **步骤 6：运行定向门禁并形成检查点**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -430,52 +397,39 @@ uv run --project "$RUNTIME" --locked pytest \
   "$RUNTIME/tests/integration/test_checker.py" -q
 (cd "$RUNTIME" && uv run --locked pyright)
 uv run --project "$RUNTIME" --locked ruff check "$RUNTIME/src" "$RUNTIME/tests"
-git add -- \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/resources.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/checker.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/diagnostic_codes.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/diagnostics.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_resources.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_graph.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_checker.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_diagnostics.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_checker.py
-git commit -m "feat(draft): model body resource targets"
+git status --short
+git diff --stat
 ```
+
+核对实际修改与资源解析契约一致。若适合独立提交，可使用 `feat(draft): model body resource targets` 作为提交说明建议。
 
 ---
 
-### Task 3: 在结构变化中保持 Draft 内外正文资源目标
+### 任务 3：在结构变化中保持 Draft 内外正文资源目标
 
-**Files:**
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/resources.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/structure.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/trash.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_resources.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_structure.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_structure.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash.py`
+**预计影响范围（非穷尽）：**
+- 预计修改：`resources.py`、`structure.py` 和 `trash.py`
+- 预计修改：资源与结构单元测试、结构与回收集成测试
 
-**Interfaces:**
-- Produces: `rebase_body_destination(resource: ResolvedResource, *, new_source: Path, moved_targets: Mapping[ResourceIdentity, ResourceIdentity]) -> str`.
-- Preserves: absolute local and external destinations byte-for-byte; only relative local destinations are rewritten.
-- Consumes: `DraftGraph.body_resources` from Task 2.
+**建议的任务间接口：**
+- 建议提供：`rebase_body_destination(resource: ResolvedResource, *, new_source: Path, moved_targets: Mapping[ResourceIdentity, ResourceIdentity]) -> str`。
+- 必须保持：本地绝对路径和外部 URI 原文不变，只重写可解释的本地相对路径。
+- 依赖任务 2 提供的 `DraftGraph.body_resources` 或具有同等语义的资源索引。
 
-- [ ] **Step 1: Write failing rebase tests independent of implementation math**
+- [ ] **步骤 1：编写不复制实现公式的链接重算失败测试**
 
-Add tests proving:
+增加测试证明：
 
-1. moving `pages/a.md` to `pages/sub/a.md` changes `../shared.png` to `../../shared.png` while preserving identity;
-2. Windows relative `..\\shared.png` remains backslash-primary after the same move;
-3. mixed separators preserve the first separator occurring in the original path;
-4. Linux absolute, Windows absolute, UNC, drive-relative and external URI remain exactly unchanged;
-5. a relative link to another moved page follows the target mapping rather than its old absolute location;
-6. anchors are reattached unchanged after path recomputation.
+1. 将 `pages/a.md` 移到 `pages/sub/a.md` 时，`../shared.png` 变为 `../../shared.png`，资源身份保持不变；
+2. Windows 相对路径 `..\\shared.png` 在同样移动后仍以反斜杠为主要分隔符；
+3. 混合分隔符保留原路径中最先出现的分隔符风格；
+4. Linux 绝对路径、Windows 绝对路径、UNC 路径、盘符相对路径和外部 URI 保持原文不变；
+5. 相对链接指向另一个同时移动的页面时，跟随最终目标映射，而不是继续指向旧绝对位置；
+6. 重新计算路径后，原锚点按原样重新附加。
 
-The test oracle must resolve both old and new destinations independently and compare `ResourceIdentity`; it must not copy the production rebasing formula.
+测试应分别解析移动前后的目标并比较 `ResourceIdentity`，不得复制生产代码的相对路径计算公式作为预期值来源。
 
-- [ ] **Step 2: Verify structure tests fail on outside-root and Windows-relative links**
+- [ ] **步骤 2：确认现有结构代码不能正确处理越过根目录和 Windows 相对路径**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -484,17 +438,17 @@ uv run --project "$RUNTIME" --locked pytest \
   "$RUNTIME/tests/unit/test_structure.py" -q
 ```
 
-Expected: new tests fail because current structure code skips or rejects root-external/Windows links.
+预期：新增测试失败，显示现有结构代码会跳过或拒绝 Draft 根目录外链接与 Windows 风格链接。
 
-- [ ] **Step 3: Implement resource-based rebasing**
+- [ ] **步骤 3：按资源身份实现链接重算**
 
-`rebase_body_destination` accepts a mapping from old absolute resource identity values to final values for moved managed pages. For a relative native local target, compute a new relative path from `new_source.parent`, percent-encode with `safe="/-._~"`, convert `/` to the recorded primary `separator` when it is `\\`, then append the original anchor. Return the original destination for every absolute, unavailable or external target.
+`rebase_body_destination` 接收受管理页面移动前后资源身份的映射。对于当前系统可解释的本地相对目标，从 `new_source.parent` 计算新相对路径，使用 `safe="/-._~"` 做百分号编码；记录的主要分隔符为 `\\` 时，再把 `/` 转为反斜杠，最后附加原锚点。绝对路径、不可用路径和外部目标直接返回原链接。
 
-In `structure._render_pages`, handle formal relation links with `resolve_managed_destination`; handle non-relation body links by looking up the existing `ResourceReference`. Do not route both through one heuristic resolver.
+在 `structure._render_pages` 中，正式关系链接使用 `resolve_managed_destination`；普通正文链接查找现有 `ResourceReference`。两类链接不得经过同一个启发式解析器。
 
-Apply the same resource helper in trash restore/rebase paths. Keep protected root/conclusions rules unchanged until Task 7 adds the explicit stale-conclusions exception.
+回收恢复和路径重算也使用同一资源辅助逻辑。任务 7 明确加入允许结论列表过时的例外前，保持根页面和结论页的现有保护规则。
 
-- [ ] **Step 4: Run unit and real move/trash gates**
+- [ ] **步骤 4：运行单元测试以及真实移动和回收门禁**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -507,54 +461,44 @@ uv run --project "$RUNTIME" --locked pytest \
 uv run --project "$RUNTIME" --locked ruff check "$RUNTIME/src" "$RUNTIME/tests"
 ```
 
-Expected: exit `0`; every rewritten relative link resolves to the pre-move identity.
+预期：退出码为 `0`；每个被改写的相对链接仍解析到移动前的资源身份。
 
-- [ ] **Step 5: Commit resource-preserving structure changes**
+- [ ] **步骤 5：形成可审查检查点**
 
 ```bash
-git add -- plugins/draft/skills/draft/scripts/runtime/src/draft/resources.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/structure.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/trash.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_resources.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_structure.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_structure.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash.py
-git commit -m "feat(draft): preserve resource targets across moves"
+git status --short
+git diff --stat
 ```
+
+核对实际修改只改变链接重算行为。若适合独立提交，可使用 `feat(draft): preserve resource targets across moves` 作为提交说明建议。
 
 ---
 
-### Task 4: 统一静默生命周期前置推进与可恢复项清单
+### 任务 4：统一静默生命周期前置推进与可恢复项清单
 
-**Files:**
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/trash_lifecycle.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/structure.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/trash.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/models.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash_lifecycle.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_cli.py`
+**预计影响范围（非穷尽）：**
+- 预计修改：`trash_lifecycle.py`、命令编排、结构操作、回收和相关模型
+- 预计修改：生命周期、命令行单元测试与集成测试
 
-**Interfaces:**
-- Produces: `prepare_registered_command(root: Path, *, now: datetime | None = None, handoff: Handoff | None = None) -> None`.
-- Produces: `recover_interrupted_operations(root: Path, *, now: datetime | None = None, handoff: Handoff | None = None) -> tuple[OperationResult | TrashResult, ...]`.
-- Produces: `RecoverableItem(operation_id: str, page: Path, restore_expires_at: datetime)` and `list_recoverable(root: Path, *, as_of: datetime | None = None) -> tuple[RecoverableItem, ...]`.
-- Removes from public results: collected lifecycle warnings and lifecycle results from ordinary commands/recover.
+**建议的任务间接口：**
+- 建议提供：`prepare_registered_command(root: Path, *, now: datetime | None = None, handoff: Handoff | None = None) -> None`。
+- 建议提供：`recover_interrupted_operations(root: Path, *, now: datetime | None = None, handoff: Handoff | None = None) -> tuple[OperationResult | TrashResult, ...]`。
+- 建议提供：`RecoverableItem(operation_id: str, page: Path, restore_expires_at: datetime)` 和 `list_recoverable(root: Path, *, as_of: datetime | None = None) -> tuple[RecoverableItem, ...]`。
+- 必须从普通命令和 `recover` 的公开结果中移除生命周期警告与生命周期推进结果。
 
-- [ ] **Step 1: Write lifecycle boundary tests**
+- [ ] **步骤 1：编写生命周期边界测试**
 
-Add integration tests for these existing commands against an expired retained item: registered `check`, `move`, `restore`, `recover`. Use an injected handoff spy at the lifecycle function boundary and assert each command calls it exactly once before its own collaborator. Task 5 adds the same proof for query commands; Task 6 adds it for `--dry-run`.
+针对已过期但仍保留的回收项，为已登记 Draft 的 `check`、`move`、`restore`、`recover` 增加集成测试。在生命周期函数边界注入移交监视替身，断言每个命令在调用自身协作者前恰好推进一次。任务 5 为查询补充同样证明；任务 6 为 `--dry-run` 补充证明。
 
-Add tests that:
+增加以下测试：
 
-- temporary `OSError` handoff failure leaves `trash_handoff_pending`, returns the main command result and emits no warning field/text;
-- corrupt journal stops the main command with exit 3;
-- `check --candidate`, `init`, pre-registration `adopt`, help and version do not call preflight;
-- `as_of == restore_expires_at` excludes the item;
-- one corrupt candidate journal makes `list_recoverable` fail instead of returning earlier valid items.
+- 临时 `OSError` 移交失败保留 `trash_handoff_pending`，主命令继续返回自身结果，且不输出警告字段或文案；
+- 损坏日志以退出码 3 阻止主命令；
+- `check --candidate`、`init`、登记前的 `adopt`、帮助和版本不执行前置推进；
+- `as_of == restore_expires_at` 时不再返回该项目；
+- 任一候选日志损坏时，`list_recoverable` 整体失败，不返回此前读到的部分项目。
 
-- [ ] **Step 2: Run focused lifecycle/CLI tests and confirm failures**
+- [ ] **步骤 2：运行定向生命周期和 CLI 测试并确认失败**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -563,11 +507,11 @@ uv run --project "$RUNTIME" --locked pytest \
   "$RUNTIME/tests/unit/test_cli.py" -q
 ```
 
-Expected: failures show preflight currently exists only in structural write wrappers, warnings remain public, and recover combines recovery with lifecycle results.
+预期：失败表明当前前置推进只存在于结构写包装器中，警告仍公开，并且 `recover` 混合了操作恢复与生命周期结果。
 
-- [ ] **Step 3: Split the three lifecycle responsibilities**
+- [ ] **步骤 3：拆分三项生命周期职责**
 
-Implement:
+建议采用以下接口形状：
 
 ```python
 @dataclass(frozen=True)
@@ -588,22 +532,22 @@ def prepare_registered_command(
         raise LifecycleAdvanceError(report)
 ```
 
-`recover_interrupted_operations` contains the lock/orphan-operation recovery part currently in `recover_draft`, but does not enumerate retained/handoff-pending items after recovery. `list_recoverable` validates every trash journal and verified package, filters strictly with `as_of < restore_expires_at`, and sorts `(restore_expires_at, operation_id)`.
+`recover_interrupted_operations` 承担当前 `recover_draft` 中锁和孤立操作的恢复部分，但恢复后不枚举仍保留或等待移交的项目。`list_recoverable` 验证每个回收日志和权威回收包，严格按 `as_of < restore_expires_at` 过滤，并按 `(restore_expires_at, operation_id)` 排序。
 
-Remove `collect_lifecycle_warnings` and `_with_preflight_warnings`. Main command orchestration owns a single call to `prepare_registered_command`; domain planners and execution wrappers no longer call it a second time.
+删除 `collect_lifecycle_warnings` 和 `_with_preflight_warnings`。主命令编排只调用一次 `prepare_registered_command`；领域计划器和执行包装器不再重复调用。
 
-- [ ] **Step 4: Refactor CLI preflight selection**
+- [ ] **步骤 4：统一选择哪些 CLI 命令执行前置推进**
 
-Add a pure predicate `_registered_root_for(args) -> Path | None` with these results:
+建议增加纯函数 `_registered_root_for(args) -> Path | None`，语义如下：
 
-- `None`: version/help, init, adopt, `check --candidate`;
-- `Path(args.root)`: registered check, query, all registered writes including dry-run, restore, generate-conclusions and recover.
+- 返回 `None`：版本、帮助、`init`、`adopt`、`check --candidate`；
+- 返回 `Path(args.root)`：已登记 Draft 的检查、查询、所有写命令及其预演、恢复回收项、生成结论和故障恢复。
 
-Call preflight once after argparse succeeds and before check/dispatch. Discard successful report details. Render only a stable error on `LifecycleAdvanceError`.
+参数解析成功后，在检查或分派业务命令前执行一次前置推进。成功时丢弃推进细节；遇到 `LifecycleAdvanceError` 时只渲染稳定错误。
 
-Public `recover` calls `recover_interrupted_operations` and reports only repaired operation count/paths; lifecycle handoff activity remains hidden.
+公开 `recover` 调用 `recover_interrupted_operations`，只报告已修复操作的数量和路径；生命周期移交活动保持隐藏。
 
-- [ ] **Step 5: Run lifecycle and CLI gates and commit**
+- [ ] **步骤 5：运行生命周期和 CLI 门禁并形成检查点**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -613,50 +557,38 @@ uv run --project "$RUNTIME" --locked pytest \
   "$RUNTIME/tests/integration/test_trash_lifecycle.py" -q
 (cd "$RUNTIME" && uv run --locked pyright)
 uv run --project "$RUNTIME" --locked ruff check "$RUNTIME/src" "$RUNTIME/tests"
-git add -- \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/trash_lifecycle.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/structure.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/trash.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/models.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash_lifecycle.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_cli.py
-git commit -m "refactor(draft): centralize silent lifecycle preflight"
+git status --short
+git diff --stat
 ```
+
+核对生命周期活动没有进入任何普通成功输出。若适合独立提交，可使用 `refactor(draft): centralize silent lifecycle preflight` 作为提交说明建议。
 
 ---
 
-### Task 5: 实现紧凑查询服务与 CLI 命令
+### 任务 5：实现紧凑查询服务与 CLI 命令
 
-**Files:**
-- Create: `plugins/draft/skills/draft/scripts/runtime/src/draft/query.py`
-- Create: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli_results.py`
-- Create: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_query.py`
-- Create: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_queries.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_cli.py`
+**预计影响范围（非穷尽）：**
+- 建议新建：查询服务、CLI 结果渲染、查询单元测试和查询集成测试模块
+- 预计修改：图加载、CLI 编排及其现有测试
 
-**Interfaces:**
-- Produces: `LocalPageSnapshot(document: PageDocument, body_resources: tuple[ResourceReference, ...])`, `load_registered_page(root: Path, page: Path) -> LocalPageSnapshot` and `load_complete_snapshot(root: Path) -> DraftGraph`.
-- Produces query functions: `page_summary(graph: DraftGraph, page: Path) -> PageSummary`, `page_links(resources: tuple[ResourceReference, ...]) -> tuple[LinkItem, ...]`, `backlinks(graph: DraftGraph, target: ResourceIdentity) -> tuple[Path, ...]`, `outgoing_relations(page: PageDocument) -> tuple[RelationItem, ...]`, `incoming_relations(graph: DraftGraph, page: Path) -> tuple[RelationItem, ...]`, `pages_with_status(graph: DraftGraph, status: StatusCode) -> tuple[Path, ...]`.
-- Produces result types: `LocalPageSnapshot`, `PageSummary`, `LinkItem`, `RelationItem`.
-- Consumes: `list_recoverable` from Task 4.
+**建议的任务间接口：**
+- 建议提供：`LocalPageSnapshot(document: PageDocument, body_resources: tuple[ResourceReference, ...])`、`load_registered_page(root: Path, page: Path) -> LocalPageSnapshot` 和 `load_complete_snapshot(root: Path) -> DraftGraph`。
+- 建议提供查询函数：`page_summary`、`page_links`、`backlinks`、`outgoing_relations`、`incoming_relations`、`pages_with_status`。具体签名可以随实现调整，但局部查询和完整图查询必须保持明确边界。
+- 建议提供结果类型：`LocalPageSnapshot`、`PageSummary`、`LinkItem`、`RelationItem`。
+- 依赖任务 4 的 `list_recoverable` 或同等语义边界。
 
-- [ ] **Step 1: Write pure query behavior tests**
+- [ ] **步骤 1：编写纯内存查询行为测试**
 
-Use in-memory parsed pages, injected resource probes and `DraftGraph` fakes to prove:
+使用内存解析页面、注入的资源探针和 `DraftGraph` 伪实现证明：
 
-- `page_links` removes relation spans, deduplicates by identity, preserves first declaration order and strips anchors from `target`;
-- backlinks deduplicate source paths and sort by source path/position;
-- outgoing relations preserve declaration order and include `parent`, `superseded_by`, `challenged_by` when present;
-- incoming relations sort by source path/line and preserve the source declaration code;
-- status returns only paths sorted by canonical POSIX value;
-- `PageSummary.link_count` equals the unpaginated deduplicated link total and relation counts equal the two relation query totals.
+- `page_links` 排除关系链接位置，按身份去重，保持首次声明顺序，并从 `target` 去掉锚点；
+- 反向链接按来源页面去重，再按来源路径和声明位置排序；
+- 出站关系保持声明顺序，并在存在时包含 `parent`、`superseded_by`、`challenged_by`；
+- 入站关系按来源路径和行号排序，保留来源声明的关系代码；
+- 状态查询只返回按规范 POSIX 路径排序的页面；
+- `PageSummary.link_count` 等于未分页去重链接总数，两个关系计数分别等于对应方向的关系查询总数。
 
-Use the exact result shapes:
+建议采用以下结果形状；字段及语义来自批准规格，承载它们的内部类型名可以调整：
 
 ```python
 @dataclass(frozen=True)
@@ -686,26 +618,26 @@ class PageSummary:
     incoming_relation_count: int
 ```
 
-- [ ] **Step 2: Verify query module is absent**
+- [ ] **步骤 2：确认查询模块尚不存在**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
 uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit/test_query.py" -q
 ```
 
-Expected: collection ERROR naming `draft.query`.
+预期：测试收集报错，并明确指出缺少 `draft.query`。
 
-- [ ] **Step 3: Implement local and complete loading boundaries**
+- [ ] **步骤 3：实现局部加载与完整加载边界**
 
-`load_registered_page` validates the registered marker and one strict page operand, reads/parses only that file, and calls Task 2's `resolve_page_resources` for the returned snapshot. It must allow `query links` and outgoing relations to succeed when another page is malformed. The pure `page_links` function consumes the snapshot's already resolved resources, so unit tests never touch the filesystem.
+`load_registered_page` 验证登记标记和一个严格页面参数，只读取并解析该文件，再通过任务 2 的 `resolve_page_resources` 生成快照。其他页面损坏时，`query links` 和出站关系仍应成功。纯函数 `page_links` 消费快照中已经解析的资源，使单元测试不访问文件系统。
 
-`load_complete_snapshot` discovers and parses every managed page. It fails if a managed page is unreadable/unparseable or marker ownership is invalid, but does not fail merely because a parsed body resource is `missing`, `invalid`, `unavailable` or `unchecked`. Keep checker diagnostics separate from parse completeness.
+`load_complete_snapshot` 发现并解析所有受管理页面。任一页面不可读、不可解析或登记所有权无效时整体失败；正文资源为 `missing`、`invalid`、`unavailable` 或 `unchecked` 本身不使加载失败。解析完整性与检查器诊断保持分离。
 
-Do not hide partial graph construction behind `load_graph()`; name the two public boundaries explicitly and test that local loading does not call global discovery.
+不要在 `load_graph()` 后隐藏部分图构建行为；明确命名局部和完整两类边界，并测试局部加载不会调用全局发现。
 
-- [ ] **Step 4: Implement nested argparse and result rendering**
+- [ ] **步骤 4：实现分层命令解析和结果渲染**
 
-Add:
+增加以下命令：
 
 ```text
 draft query page ROOT PAGE
@@ -716,9 +648,9 @@ draft query status ROOT CODE
 draft query recoverable ROOT
 ```
 
-All collection commands accept `--limit` default 20, maximum 100, non-negative `--offset`, and `--count-only`; no parser exposes `--all`. `query page` has no pagination.
+所有集合查询接受默认值为 20、最大值为 100 的 `--limit`、非负 `--offset` 和 `--count-only`；不得提供 `--all`。`query page` 不分页。
 
-In `cli_results.py`, define a generic pure paginator:
+建议在 `cli_results.py` 中定义通用纯分页器：
 
 ```python
 @dataclass(frozen=True)
@@ -745,21 +677,21 @@ def paginate[T](items: tuple[T, ...], *, offset: int, limit: int) -> PageSlice[T
     )
 ```
 
-`--count-only` renders `items: []` but retains the full `total`. JSON page summary uses exactly the fields in the approved spec. Human output contains only item facts plus one count/pagination summary; tests must use dynamic facts rather than full sentences.
+`--count-only` 输出 `items: []`，但保留完整 `total`。页面摘要 JSON 必须使用批准规格中的字段。人类输出只包含条目事实和一行计数或分页摘要；测试验证动态事实，不逐字复制完整句子。
 
-- [ ] **Step 5: Add real CLI scope/failure tests**
+- [ ] **步骤 5：增加真实 CLI 范围和失败测试**
 
-Integration cases must prove:
+集成测试必须证明：
 
-- malformed unrelated page does not block links/outgoing for a valid target;
-- the same malformed page blocks page summary, backlinks, incoming relations and status with no partial JSON;
-- link problem states appear in successful JSON with exit 0;
-- empty results return exit 0;
-- `limit=101`, negative offset, missing direction and `status_label(StatusCode.PROPOSED)` used as a localized status argument fail with exit 2;
-- `query backlinks` resolves CLI relative target from Draft root and source relative links from each page;
-- recoverable output includes `as_of` and strict expiration ordering.
+- 无关页面损坏时，合法目标的链接查询和出站关系查询不受阻；
+- 同一个损坏页面会阻止页面摘要、反向链接、入站关系和状态查询，并且不得返回部分 JSON；
+- 链接问题状态出现在退出码为 0 的成功 JSON 中；
+- 空结果退出码为 0；
+- `limit=101`、负偏移、缺少方向，以及把 `status_label(StatusCode.PROPOSED)` 的本地化标签作为状态参数时，均以退出码 2 失败；
+- `query backlinks` 从 Draft 根目录解析 CLI 相对目标，从各来源页面解析正文相对链接；
+- 可恢复项结果包含 `as_of`，并严格按到期规则排序。
 
-- [ ] **Step 6: Run query/CLI gates and commit**
+- [ ] **步骤 6：运行查询和 CLI 门禁并形成检查点**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -770,46 +702,28 @@ uv run --project "$RUNTIME" --locked pytest \
   "$RUNTIME/tests/integration/test_cli.py" -q
 (cd "$RUNTIME" && uv run --locked pyright)
 uv run --project "$RUNTIME" --locked ruff check "$RUNTIME/src" "$RUNTIME/tests"
-git add -- \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/query.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/cli_results.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_query.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_queries.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_cli.py
-git commit -m "feat(draft): add compact query commands"
+git status --short
+git diff --stat
 ```
+
+核对局部查询和全局查询的失败范围与批准规格一致。若适合独立提交，可使用 `feat(draft): add compact query commands` 作为提交说明建议。
 
 ---
 
-### Task 6: 为现有写命令增加语义 PlanEffect 与 dry-run
+### 任务 6：为现有写命令增加语义化 `PlanEffect` 与预演
 
-**Files:**
-- Create: `plugins/draft/skills/draft/scripts/runtime/src/draft/plan_effects.py`
-- Create: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_plan_effects.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/models.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/operations.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/structure.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/trash.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli_results.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_structure.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_trash.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_structure.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_cli.py`
+**预计影响范围（非穷尽）：**
+- 建议新建：公开计划影响模型及其单元测试
+- 预计修改：操作计划、结构修改、回收、CLI 结果渲染及相关测试
 
-**Interfaces:**
-- Produces: `PlanAction`, `PlanEffect`, `public_changed_paths(effects) -> tuple[Path, ...]`.
-- Changes: `OperationPlan.effects: tuple[PlanEffect, ...]` is required for every user-facing write plan.
-- Produces: `prepare_move(root: Path, source: Path, target: Path) -> OperationPlan`, `prepare_promote(root: Path, page: Path, children: tuple[Path, ...]) -> OperationPlan`, `prepare_collapse(root: Path, hub: Path) -> OperationPlan`, `prepare_trash(root: Path, page: Path) -> OperationPlan`; formal execution wrappers call the same prepare function then execute.
+**建议的任务间接口：**
+- 建议提供：`PlanAction`、`PlanEffect`、`public_changed_paths(effects) -> tuple[Path, ...]`。
+- 必须保证：每个面向用户的写计划都能提供 `OperationPlan.effects: tuple[PlanEffect, ...]` 或同等语义数据。
+- 建议为 `move`、`promote`、`collapse`、`trash` 分离准备计划和正式执行；正式执行必须复用预演使用的同一个计划构造边界。
 
-- [ ] **Step 1: Write PlanEffect invariant and serialization tests**
+- [ ] **步骤 1：编写 `PlanEffect` 不变量和序列化测试**
 
-Use this exact type:
+建议采用以下类型形状；四种公开动作及字段语义属于批准规格：
 
 ```python
 class PlanAction(StrEnum):
@@ -827,11 +741,11 @@ class PlanEffect:
     to_path: Path | None = None
 ```
 
-`__post_init__` must require exactly `from_path/to_path` for MOVE and exactly `path` for all other actions. Tests assert invalid combinations raise `ValueError`, move JSON uses `from`/`to`, and no serialized path begins with `.draft/`.
+`__post_init__` 必须要求 `MOVE` 只使用 `from_path/to_path`，其他动作只使用 `path`。测试断言非法组合抛出 `ValueError`，移动 JSON 使用 `from`/`to`，并且任何序列化路径都不以 `.draft/` 开头。
 
-Add structure tests proving one moved file is one MOVE effect rather than CREATE+REMOVE, while rewritten non-moved pages are MODIFY effects. Add trash tests proving public removal and parent navigation modification but no package path.
+增加结构测试，证明一个移动文件表现为一个 `MOVE`，而不是 `CREATE` 加 `REMOVE`；路径不变但内容被重写的页面表现为 `MODIFY`。增加回收测试，证明公开效果包含页面删除和父导航修改，但不包含回收包路径。
 
-- [ ] **Step 2: Run tests and observe absent effects**
+- [ ] **步骤 2：运行测试并确认当前缺少公开影响**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -841,27 +755,27 @@ uv run --project "$RUNTIME" --locked pytest \
   "$RUNTIME/tests/unit/test_trash.py" -q
 ```
 
-Expected: collection or assertion failures because `PlanEffect` and `OperationPlan.effects` do not exist.
+预期：由于 `PlanEffect` 和 `OperationPlan.effects` 尚不存在，测试收集或断言失败。
 
-- [ ] **Step 3: Populate effects in planners, never infer them from mutations**
+- [ ] **步骤 3：由计划器直接生成效果，不从底层变更猜测**
 
-`structure.plan_path_remap` already knows the old→new mapping, so it must emit MOVE effects there. Pages whose path is unchanged but bytes change emit MODIFY. Trash planner emits REMOVE for every publicly removed page and MODIFY for surviving navigation owners.
+`structure.plan_path_remap` 已经知道旧路径到新路径的映射，应在该处生成 `MOVE`。路径不变但字节变化的页面生成 `MODIFY`。回收计划为每个公开删除页面生成 `REMOVE`，为仍存在但导航被改写的页面生成 `MODIFY`。
 
-`public_changed_paths` preserves effect order while deduplicating: CREATE/MODIFY/REMOVE contribute `path`; MOVE contributes `from_path` then `to_path`. It excludes all internal mutations by construction.
+`public_changed_paths` 在去重时保持效果顺序：`CREATE`、`MODIFY`、`REMOVE` 提供 `path`，`MOVE` 依次提供 `from_path` 和 `to_path`。该函数从类型结构上排除所有内部变更。
 
-Do not write a generic matcher that guesses moves by pairing low-level write/delete hashes; such guessing loses the semantic operation.
+不要通过配对底层写入、删除或哈希来猜测移动；这种做法会丢失计划器已经知道的业务语义。
 
-- [ ] **Step 4: Add dry-run parser and dispatch for existing commands**
+- [ ] **步骤 4：为现有命令增加预演参数和分派**
 
-Add `--dry-run`, `--limit`, `--offset` to move/promote/collapse/trash. Dry-run calls the same `prepare_*` as execution, paginates `plan.effects`, and never calls `execute_plan`, allocates a journal, creates a package or acquires a lock. The central lifecycle preflight from Task 4 still runs.
+为 `move`、`promote`、`collapse`、`trash` 增加 `--dry-run`、`--limit`、`--offset`。预演调用与正式执行相同的 `prepare_*` 边界并分页输出 `plan.effects`，但不得调用 `execute_plan`、分配日志、创建回收包或获取业务写锁。任务 4 的集中生命周期推进仍然执行。
 
-Formal success JSON for non-trash writes becomes `result_type` plus `changed_paths`; remove `phase`, ordinary `operation_id`, `warnings` and implicit `ok: true`. Trash retains `operation_id`, `restore_expires_at`, `changed_paths`; remove `package`, `purge_eligible_at`, `phase`, `warnings`.
+非回收写命令的正式成功 JSON 只保留 `result_type`、必要业务事实和 `changed_paths`，移除 `phase`、普通 `operation_id`、`warnings` 和隐式 `ok: true`。`trash` 保留 `operation_id`、`restore_expires_at`、`changed_paths`，移除 `package`、`purge_eligible_at`、`phase`、`warnings`。
 
-- [ ] **Step 5: Prove dry-run/execute parity and non-mutation**
+- [ ] **步骤 5：证明预演与正式执行一致且预演不执行业务写入**
 
-For each existing write command, integration tests snapshot public files and `.draft` after lifecycle preflight, run dry-run, assert business files/journals/packages unchanged, then run the real command from an equivalent fixture and assert its `changed_paths` equal paths derived from the dry-run effects. Test pagination at 20/100 and reject `--all`.
+对每个现有写命令，集成测试在生命周期推进后记录公开文件和 `.draft` 状态，执行预演并断言业务文件、日志和回收包没有变化；再从等价夹具执行正式命令，断言 `changed_paths` 与预演效果推导出的路径一致。测试 20 和 100 的分页边界，并拒绝 `--all`。
 
-- [ ] **Step 6: Run gates and commit**
+- [ ] **步骤 6：运行门禁并形成检查点**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -875,84 +789,52 @@ uv run --project "$RUNTIME" --locked pytest \
   "$RUNTIME/tests/integration/test_cli.py" -q
 (cd "$RUNTIME" && uv run --locked pyright)
 uv run --project "$RUNTIME" --locked ruff check "$RUNTIME/src" "$RUNTIME/tests"
-git add -- \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/plan_effects.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/models.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/operations.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/structure.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/trash.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/cli_results.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_plan_effects.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_structure.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_trash.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_structure.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_cli.py
-git commit -m "feat(draft): expose semantic dry-run plans"
+git status --short
+git diff --stat
 ```
+
+核对预演效果和正式结果都只包含公开语义。若适合独立提交，可使用 `feat(draft): expose semantic dry-run plans` 作为提交说明建议。
 
 ---
 
-### Task 7: 将结论页改为确定、按需、显式生成
+### 任务 7：将结论页改为确定、按需、显式生成
 
-**Files:**
-- Create: `plugins/draft/skills/draft/scripts/runtime/src/draft/conclusions.py`
-- Create: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_conclusions.py`
-- Create: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_conclusions.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/vocabulary.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/lifecycle.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/checker.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/operations.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/structure.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/trash.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli_results.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/support.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_lifecycle.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_graph.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_checker.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_lifecycle.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_checker.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_structure.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_cli.py`
+**预计影响范围（非穷尽）：**
+- 建议新建：结论生成模块及其单元测试和集成测试
+- 预计修改：词汇、图加载、生命周期、检查、操作计划、结构、回收、CLI 及相关测试夹具
 
-**Interfaces:**
-- Produces: `ConclusionsState.NOT_GENERATED`, `ConclusionsState.GENERATED`.
-- Changes: `MarkerState` includes `conclusions_state`; final/provisional markers require it while `FORMAT_VERSION` stays 1.
-- Produces: `GenerationReason.NO_CONFIRMED_PAGES`, `GenerationPlan`, `plan_generate_conclusions(root: Path) -> GenerationPlan`, `generate_conclusions(root: Path) -> tuple[bool, GenerationReason | None, tuple[Path, ...]]`.
-- Allows: `OperationPlan(kind="generate-conclusions")` to mutate only `.draft/draft.json` among internal paths.
+**建议的任务间接口：**
+- 建议提供：`ConclusionsState.NOT_GENERATED`、`ConclusionsState.GENERATED`。
+- 正式和临时登记标记都必须携带 `conclusions_state`，同时保持 `FORMAT_VERSION = 1`；如果继续使用 `MarkerState`，应由它表达该状态。
+- 建议提供：`GenerationReason.NO_CONFIRMED_PAGES`、`GenerationPlan`、结论生成计划器和正式执行入口。
+- 必须只允许结论生成操作修改内部路径 `.draft/draft.json`，其他操作仍不得修改内部路径。
 
-- [ ] **Step 1: Write marker/init/adopt red tests**
+- [ ] **步骤 1：编写登记标记、初始化和接管的失败测试**
 
-Change lifecycle expectations so init creates only `index.md`, `pages/`, and a marker containing:
+修改生命周期预期：`init` 只创建 `index.md`、`pages/` 和以下登记标记：
 
 ```json
 {"format_version":1,"conclusions_state":"not_generated"}
 ```
 
-Root index must not contain a conclusion link. Candidate fixtures must not contain `conclusions.md`; candidate check/adopt reject an unexpected file. Marker tests reject missing, unknown or extra conclusions state without accepting the old marker shape. Build expected ownership values from `ConclusionsState.NOT_GENERATED.value` rather than duplicating its wire string in test constants. Provisional adopt markers contain all four exact keys `format_version`, `conclusions_state`, `adopt_state`, `candidate_manifest`, and their conclusions state is always `ConclusionsState.NOT_GENERATED`.
+根索引不得包含结论链接。候选夹具不得包含 `conclusions.md`；候选检查和接管必须拒绝意外文件。登记标记测试拒绝缺失、未知或多余的结论所有权状态，不接受旧标记形状。测试预期从 `ConclusionsState.NOT_GENERATED.value` 读取所有权值，不在测试常量中复制机器字符串。临时接管标记精确包含 `format_version`、`conclusions_state`、`adopt_state`、`candidate_manifest` 四个键，结论状态始终为 `ConclusionsState.NOT_GENERATED`。
 
-- [ ] **Step 2: Write generator behavior tests**
+- [ ] **步骤 2：编写生成器状态转换测试**
 
-Cover all state transitions:
+覆盖以下状态转换：
 
-- NOT_GENERATED + zero confirmed → `generated=False`, reason `no_confirmed_pages`, no plan/effects;
-- NOT_GENERATED + confirmed pages → create conclusions, modify root, update marker, public effects hide marker;
-- GENERATED + unchanged proposed content → empty effects;
-- GENERATED + conclusions status confirmed → regenerate to proposed;
-- GENERATED + zero confirmed → retain file/root link with empty list;
-- GENERATED + missing/malformed file or root link drift → rebuild canonical output;
-- NOT_GENERATED + unexpected file → fail without overwrite;
-- invalid navigation graph → fail instead of path-sort fallback.
+- `NOT_GENERATED` 且没有已确认页面：`generated=False`、原因为 `no_confirmed_pages`，没有计划或效果；
+- `NOT_GENERATED` 且存在已确认页面：创建结论页、修改根页面、更新标记，公开效果隐藏标记文件；
+- `GENERATED` 且提案内容不变：效果为空；
+- `GENERATED` 且结论页状态为 `confirmed`：重新生成并改为 `proposed`；
+- `GENERATED` 且没有已确认页面：保留文件和根链接，列表为空；
+- `GENERATED` 且文件缺失、格式损坏或根链接漂移：重建规范结果；
+- `NOT_GENERATED` 但文件意外存在：失败且不覆盖；
+- 导航图无效：失败，不退化为路径排序。
 
-Build an in-memory navigation order whose path order differs from index declaration order, and assert the flat conclusion list follows depth-first navigation order.
+构造路径顺序与索引声明顺序不同的内存导航，断言扁平结论列表按导航深度优先顺序生成。
 
-- [ ] **Step 3: Run focused tests and verify current eager behavior fails**
+- [ ] **步骤 3：运行定向测试并确认当前预建行为失败**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -962,11 +844,11 @@ uv run --project "$RUNTIME" --locked pytest \
   "$RUNTIME/tests/unit/test_conclusions.py" -q
 ```
 
-Expected: failures show init still creates conclusions, marker lacks ownership state and generator module is absent.
+预期：失败表明 `init` 仍会创建结论页、标记缺少所有权状态、生成器模块尚不存在。
 
-- [ ] **Step 4: Implement ownership state and canonical generation plan**
+- [ ] **步骤 4：实现所有权状态和规范生成计划**
 
-Use:
+建议采用以下类型形状：
 
 ```python
 class ConclusionsState(StrEnum):
@@ -985,28 +867,28 @@ class GenerationPlan:
     operation: OperationPlan | None
 ```
 
-The generator filters `confirmed` pages excluding root and conclusions. Render exactly one H1, proposed status, parent relation, `## 已确认结论`, then one title/link item per page. Derive order from parent navigation link positions, not `Path` order or `DraftGraph.children` sorting.
+生成器筛选状态为 `confirmed` 的页面，并排除根页面和结论页。输出恰好一个一级标题、`proposed` 状态、父主题关系、`## 已确认结论`，然后为每个页面输出一个标题和链接条目。顺序来自父页面导航链接位置，不得使用 `Path` 顺序或 `DraftGraph.children` 的排序结果代替。
 
-Use a generator-specific tolerant load boundary: it must strictly parse marker, root and all discussion pages, but when ownership is GENERATED it may ignore a missing or malformed existing `conclusions.md` because that file is the replaceable target. It may repair root-link absence/duplication only when root Markdown itself still parses; an unparseable root remains a hard failure.
+生成器使用专用的容错加载边界：严格解析登记标记、根页面和所有讨论页面；当所有权为 `GENERATED` 时，可以忽略缺失或格式损坏的现有 `conclusions.md`，因为该文件正是可替换目标。只有根 Markdown 本身仍可解析时，才可以修复根链接缺失或重复；根页面不可解析仍是硬失败。
 
-First successful generation atomically writes conclusion file, root navigation and marker through one `OperationPlan`. Extend `_validate_plan_paths` only for `plan.kind == "generate-conclusions"` and exact path `.draft/draft.json`; every other internal target remains rejected.
+首次成功生成通过一个 `OperationPlan` 原子写入结论页、根导航和登记标记。只为 `plan.kind == "generate-conclusions"` 且目标恰好为 `.draft/draft.json` 的情况扩展 `_validate_plan_paths`；继续拒绝其他内部目标。
 
-- [ ] **Step 5: Implement stale-content tolerance without weakening normal pages**
+- [ ] **步骤 5：允许结论内容过时，但不削弱普通页面检查**
 
-When marker is GENERATED:
+当登记状态为 `GENERATED` 时：
 
-- graph discovery requires `conclusions.md` but treats list item targets as queryable resource facts, not checker missing-link errors;
-- checker validates fixed H1/status/parent/section/list shape and unique last root navigation link, but does not compare list membership/title/path with current confirmed pages;
-- structure renderer skips body-link rewrites owned by the conclusion list;
-- trash blocker calculation ignores inbound links from the generated conclusion list.
+- 图发现要求 `conclusions.md` 存在，但列表目标只是可查询的资源事实，不产生普通断链错误；
+- 检查器验证固定的一级标题、状态、父主题、章节、列表形状以及根导航中唯一且位于最后的结论链接，但不把列表成员、标题和路径与当前已确认页面比较；
+- 结构渲染跳过机器结论列表拥有的正文链接；
+- 回收阻碍计算忽略机器结论列表产生的入站链接。
 
-Do not globally ignore missing links from `conclusions.md` before ownership is GENERATED, and do not weaken missing-link checks for any other page.
+所有权进入 `GENERATED` 前，不得全局忽略 `conclusions.md` 的缺失链接；任何其他页面的断链检查也不得削弱。
 
-- [ ] **Step 6: Add CLI and dry-run**
+- [ ] **步骤 6：增加 CLI 和预演**
 
-Add `generate-conclusions ROOT [--dry-run] [--limit N] [--offset N]`. Normal JSON returns `generated`, optional `reason`, and public `changed_paths`. Dry-run uses the Task 6 plan envelope. The command always writes proposed status when it generates; it never auto-confirms.
+增加 `generate-conclusions ROOT [--dry-run] [--limit N] [--offset N]`。正式 JSON 返回 `generated`、可选的 `reason` 和公开 `changed_paths`。预演使用任务 6 的计划信封。命令每次实际生成时都写入 `proposed` 状态，绝不自动确认。
 
-- [ ] **Step 7: Run conclusion/lifecycle/structure gates and commit**
+- [ ] **步骤 7：运行结论、生命周期和结构门禁并形成检查点**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -1022,92 +904,66 @@ uv run --project "$RUNTIME" --locked pytest \
   "$RUNTIME/tests/integration/test_trash.py" -q
 (cd "$RUNTIME" && uv run --locked pyright)
 uv run --project "$RUNTIME" --locked ruff check "$RUNTIME/src" "$RUNTIME/tests"
-git add -- \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/conclusions.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/vocabulary.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/lifecycle.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/checker.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/operations.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/structure.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/trash.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/cli_results.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_conclusions.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_lifecycle.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_graph.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_checker.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/support.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_conclusions.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_lifecycle.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_checker.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_structure.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_cli.py
-git commit -m "feat(draft): generate conclusions on demand"
+git status --short
+git diff --stat
 ```
+
+核对首次生成、重复生成和修复损坏产物三条路径均符合所有权规则。若适合独立提交，可使用 `feat(draft): generate conclusions on demand` 作为提交说明建议。
 
 ---
 
-### Task 8: 增加原子叶子页面创建
+### 任务 8：增加原子叶子页面创建
 
-**Files:**
-- Create: `plugins/draft/skills/draft/scripts/runtime/src/draft/page_create.py`
-- Create: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_page_create.py`
-- Create: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_page_commands.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/paths.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/markdown.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli_results.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py`
+**预计影响范围（非穷尽）：**
+- 建议新建：页面创建模块以及页面命令的单元测试和集成测试
+- 预计修改：路径校验、Markdown 渲染、CLI 编排和结果渲染
 
-**Interfaces:**
-- Produces: `resolve_new_leaf_operand(root: Path, value: str) -> ResolvedPath`.
-- Produces: `plan_create_page(root: Path, page: Path, *, title: str, status: StatusCode) -> OperationPlan` and `create_page(root: Path, page: Path, *, title: str, status: StatusCode) -> tuple[Path, ...]`.
-- Consumes: `StatusCode.PENDING|PROPOSED`, `physical_parent`, Task 6 effects, Task 7 ownership state.
+**建议的任务间接口：**
+- 建议提供：`resolve_new_leaf_operand(root: Path, value: str) -> ResolvedPath`。
+- 建议提供：页面创建计划器和正式执行入口；二者共享相同计划构造逻辑。
+- 依赖 `StatusCode.PENDING|PROPOSED`、`physical_parent`、任务 6 的公开效果以及任务 7 的结论所有权状态。
 
-- [ ] **Step 1: Write path/title/status/navigation tests**
+- [ ] **步骤 1：编写路径、标题、状态和导航测试**
 
-Reject exact categories: absolute path, backslash machine operand, non-`pages/`, non-`.md`, `.`/`..`, empty segment, any `index.md`, existing target, missing physical parent, `confirmed`/`superseded`/`closed`, empty title, newline and control characters.
+明确拒绝：绝对路径、使用反斜杠的机器页面参数、不在 `pages/` 下的路径、非 `.md` 路径、`.` 或 `..`、空路径段、任何 `index.md`、已经存在的目标、缺失的物理父页面、`confirmed`/`superseded`/`closed` 初始状态、空标题、换行和控制字符。
 
-Accept Unicode and Markdown punctuation in a single-line title. Parse the created page back through `parse_page` and assert `PageDocument.title` equals the input, proving escaping rather than asserting raw Markdown.
+接受单行标题中的 Unicode 和 Markdown 标点。通过 `parse_page` 重新解析创建结果，并断言 `PageDocument.title` 等于输入，证明转义正确，而不是断言原始 Markdown 字符串。
 
-Test navigation insertion:
+测试导航插入：
 
-- append at end of ordinary parent `## 子主题`;
-- insert immediately before the unique generated conclusions link at root;
-- page and parent mutations form one OperationPlan with CREATE then MODIFY effects;
-- failure leaves both page and parent unchanged.
+- 追加到普通父页面 `## 子主题` 末尾；
+- 根页面已有机器结论链接时，插入到该唯一链接之前；
+- 页面创建和父页面修改位于同一个 `OperationPlan` 中，公开效果依次为 `CREATE`、`MODIFY`；
+- 失败时页面和父页面都保持不变。
 
-- [ ] **Step 2: Run the new unit file and verify missing API**
+- [ ] **步骤 2：运行新单元测试并确认接口尚不存在**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
 uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit/test_page_create.py" -q
 ```
 
-Expected: collection ERROR for `draft.page_create` or missing `resolve_new_leaf_operand`.
+预期：测试收集因缺少 `draft.page_create` 或 `resolve_new_leaf_operand` 而失败。
 
-- [ ] **Step 3: Implement leaf validation and plain-text Markdown escaping**
+- [ ] **步骤 3：实现叶子路径校验和普通文本 Markdown 转义**
 
-Add `escape_markdown_text(value: str) -> str` to `markdown.py`; escape backslash and CommonMark punctuation so the parsed inline text remains the requested title. Reject Unicode control categories and any `\r`/`\n`.
+建议在 `markdown.py` 增加 `escape_markdown_text(value: str) -> str`；转义反斜杠和 CommonMark 标点，使解析后的行内文本仍等于请求标题。拒绝 Unicode 控制类别以及任何 `\r` 或 `\n`。
 
-Render the skeleton with current localized labels obtained through `status_label`/`relation_label`; do not repeat a Chinese status lookup table in `page_create.py`.
+通过 `status_label` 和 `relation_label` 获取当前本地化标签并渲染页面骨架；不要在页面创建模块中重复中文状态映射。
 
-Use `append_parent_navigation` for ordinary parents and a new `insert_navigation_before_conclusions` helper for generated root. The latter identifies the canonical root link semantically through parsed destination, not by searching the text `conclusions.md`.
+普通父页面复用 `append_parent_navigation`；生成过结论页的根页面可以使用新的 `insert_navigation_before_conclusions` 辅助函数。后者必须通过解析后的目标识别规范结论链接，不得搜索文本 `conclusions.md`。
 
-- [ ] **Step 4: Add CLI execution/dry-run integration**
+- [ ] **步骤 4：增加 CLI 正式执行和预演集成测试**
 
-Add:
+增加：
 
 ```text
 draft create ROOT PAGE --title TITLE --status pending|proposed
 ```
 
-Support Task 6 dry-run/pagination fields. Test actual JSON `result_type=create`, created path/status and public changed paths; dry-run must not create directories or a journal after the shared lifecycle preflight.
+支持任务 6 的预演和分页字段。测试正式 JSON 中的 `result_type=create`、创建路径、状态和公开变化路径；共享生命周期推进完成后，预演不得创建目录或业务日志。
 
-- [ ] **Step 5: Run gates and commit**
+- [ ] **步骤 5：运行门禁并形成检查点**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -1117,78 +973,66 @@ uv run --project "$RUNTIME" --locked pytest \
   "$RUNTIME/tests/integration/test_page_commands.py" -q
 (cd "$RUNTIME" && uv run --locked pyright)
 uv run --project "$RUNTIME" --locked ruff check "$RUNTIME/src" "$RUNTIME/tests"
-git add -- \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/page_create.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/paths.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/markdown.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/cli_results.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_page_create.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_page_commands.py
-git commit -m "feat(draft): add atomic page creation"
+git status --short
+git diff --stat
 ```
+
+核对失败路径没有留下半个页面或孤立导航。若适合独立提交，可使用 `feat(draft): add atomic page creation` 作为提交说明建议。
 
 ---
 
-### Task 9: 增加带最终状态验证的状态修改
+### 任务 9：增加带最终状态验证的状态修改
 
-**Files:**
-- Create: `plugins/draft/skills/draft/scripts/runtime/src/draft/page_metadata.py`
-- Create: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_page_metadata.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/markdown.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli_results.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_page_commands.py`
+**预计影响范围（非穷尽）：**
+- 建议新建：页面元数据修改模块及其单元测试
+- 预计修改：Markdown 编辑、图替换、CLI 编排、结果渲染和页面命令集成测试
 
-**Interfaces:**
-- Produces: `plan_set_status(root: Path, page: Path, code: StatusCode, *, note: str | None = None, clear_note: bool = False) -> OperationPlan`.
-- Produces: `replace_status(text: str, code: StatusCode, explanation: str | None) -> str` using the existing located status span.
-- Produces: `replace_graph_page(graph: DraftGraph, page: PageDocument) -> DraftGraph`, keyed by `page.path`, for Tasks 9–10.
+**建议的任务间接口：**
+- 建议提供：`plan_set_status(root: Path, page: Path, code: StatusCode, *, note: str | None = None, clear_note: bool = False) -> OperationPlan`。
+- 建议提供：基于已定位状态范围的 `replace_status(text: str, code: StatusCode, explanation: str | None) -> str`。
+- 建议提供：按 `page.path` 替换内存图页面的辅助边界，供本任务和任务 10 复用。
 
-- [ ] **Step 1: Write status transition matrix tests**
+- [ ] **步骤 1：编写状态转换矩阵测试**
 
-Cover every ordered pair of `StatusCode`; a pair succeeds whenever the final graph satisfies existing invariants. Add focused cases:
+覆盖 `StatusCode` 的所有有序组合；只要最终图满足既有不变量，该转换就应成功。重点包括：
 
-- confirmed → proposed and closed → pending succeed;
-- proposed → superseded fails without `superseded_by`;
-- superseded → proposed fails while `superseded_by` remains;
-- same code with no note option is a no-op;
-- omitted note preserves the current explanation;
-- `--note` replaces it; `--clear-note` removes it; both together fail;
-- note rejects newline/control characters but accepts any language;
-- changing generated conclusions to confirmed changes only its status and never refreshes entries.
+- `confirmed` → `proposed` 和 `closed` → `pending` 成功；
+- 缺少 `superseded_by` 时，`proposed` → `superseded` 失败；
+- 仍有 `superseded_by` 时，`superseded` → `proposed` 失败；
+- 状态相同且没有说明选项时无变化；
+- 未提供说明选项时保留当前说明；
+- `--note` 替换说明，`--clear-note` 删除说明，两者同时出现时失败；
+- 说明拒绝换行和控制字符，但接受任何语言；
+- 把机器生成的结论页改为 `confirmed` 时只改变状态，不刷新条目。
 
-Tests assert parsed `StatusValue`, final check report and PlanEffect, not full Markdown strings.
+测试断言解析后的 `StatusValue`、最终检查报告和 `PlanEffect`，不逐字比较完整 Markdown。
 
-- [ ] **Step 2: Verify missing status planner**
+- [ ] **步骤 2：确认状态计划器尚不存在**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
 uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit/test_page_metadata.py" -q
 ```
 
-Expected: collection ERROR for `draft.page_metadata`.
+预期：测试收集因缺少 `draft.page_metadata` 而失败。
 
-- [ ] **Step 3: Implement status planning through a final in-memory graph**
+- [ ] **步骤 3：通过最终内存图规划状态修改**
 
-Load a graph whose existing non-derived structure is clean, rewrite exactly the status span, parse the new page, replace it in a rebuilt graph, and run `check_graph` on the final graph. On any final error raise a stable domain error with the blocking codes; never commit an intermediate invalid page.
+加载非派生结构没有既有错误的图，只重写状态范围，解析新页面并替换到重建图中，再对最终图运行 `check_graph`。最终图有错误时，抛出包含阻碍码的稳定领域错误；不得写入无效中间页面。
 
-Build a single MODIFY mutation/effect only when bytes change. `plan_set_status` does not add/remove relations and does not call the conclusions generator.
+只有字节实际变化时才构造一个 `MODIFY` 变更和效果。状态计划器不增加或删除关系，也不调用结论生成器。
 
-- [ ] **Step 4: Add nested status CLI and dry-run**
+- [ ] **步骤 4：增加分层状态命令和预演**
 
-Add:
+增加：
 
 ```text
 draft status set ROOT PAGE CODE [--note TEXT | --clear-note]
 ```
 
-Argparse accepts only stable codes. JSON returns `result_type=status.set`, path, final status and public changed paths; human output includes dynamic path/code. Use Task 6 dry-run.
+命令参数只接受稳定代码。JSON 返回 `result_type=status.set`、路径、最终状态和公开变化路径；人类输出包含动态路径和代码。预演复用任务 6 的机制。
 
-- [ ] **Step 5: Run status gates and commit**
+- [ ] **步骤 5：运行状态门禁并形成检查点**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -1198,85 +1042,73 @@ uv run --project "$RUNTIME" --locked pytest \
   "$RUNTIME/tests/integration/test_page_commands.py" -q
 (cd "$RUNTIME" && uv run --locked pyright)
 uv run --project "$RUNTIME" --locked ruff check "$RUNTIME/src" "$RUNTIME/tests"
-git add -- \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/page_metadata.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/markdown.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/cli_results.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_page_metadata.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_page_commands.py
-git commit -m "feat(draft): add validated status mutation"
+git status --short
+git diff --stat
 ```
+
+核对所有成功转换都满足最终图不变量，失败转换没有产生文件变化。若适合独立提交，可使用 `feat(draft): add validated status mutation` 作为提交说明建议。
 
 ---
 
-### Task 10: 增加幂等的依赖、取代与质疑修改
+### 任务 10：增加幂等的依赖、取代与质疑修改
 
-**Files:**
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/page_metadata.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/markdown.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_page_metadata.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli_results.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_page_commands.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py`
+**预计影响范围（非穷尽）：**
+- 预计修改：页面元数据、Markdown 机器区域编辑、CLI 编排和结果渲染
+- 预计修改：关系单元测试、页面命令集成测试和多文件回滚集成测试
 
-**Interfaces:**
-- Produces: `plan_add_relation(root: Path, source: Path, code: EditableRelationCode, target: Path) -> OperationPlan`.
-- Produces: `plan_remove_relation(root: Path, source: Path, code: EditableRelationCode, target: Path, *, restored_status: StatusCode | None = None) -> OperationPlan`.
-- Produces Markdown helpers: `append_machine_relation`, `remove_machine_relation` that edit complete quoted machine lines and preserve unrelated text.
-- Consumes only `EditableRelationCode`; inverse codes and parent are rejected at CLI/domain boundary.
+**建议的任务间接口：**
+- 建议提供：`plan_add_relation(root: Path, source: Path, code: EditableRelationCode, target: Path) -> OperationPlan`。
+- 建议提供：`plan_remove_relation(root: Path, source: Path, code: EditableRelationCode, target: Path, *, restored_status: StatusCode | None = None) -> OperationPlan`。
+- 建议提供编辑完整引用机器行且保留无关正文的 `append_machine_relation`、`remove_machine_relation` 辅助边界。
+- 只接受 `EditableRelationCode`；反向关系代码和 `parent` 在 CLI 与领域边界都必须拒绝。
 
-- [ ] **Step 1: Extend unit tests with relation matrices**
+- [ ] **步骤 1：扩展关系矩阵单元测试**
 
-Required cases:
+必须覆盖：
 
-- depends_on adds/removes only the source line and rejects self/cycle;
-- challenges adds/removes `challenges` + `challenged_by` atomically;
-- supersedes adds both directions, sets target `superseded`, preserves status explanation and rejects replacement cycle;
-- adding a complete existing pair is no-op;
-- adding a half pair repairs the missing side;
-- removing an absent pair is no-op;
-- removing a half pair clears the remaining side;
-- removing one of several replacement pairs keeps target superseded and rejects unnecessary `--status`;
-- removing the last replacement requires non-superseded `--status` and updates both relations/status in one plan;
-- parent, superseded_by and challenged_by are rejected as mutation parameters; the removed relation is already proved absent from the published type in Task 1 and receives no compatibility test;
-- any unrelated graph error that could invalidate final proof blocks the command.
+- `depends_on` 只修改来源页面，并拒绝自引用和依赖环；
+- `challenges` 原子增加或删除 `challenges` 与 `challenged_by`；
+- `supersedes` 增加两个方向、把目标状态设为 `superseded`、保留状态说明，并拒绝取代环；
+- 增加已经完整存在的双向关系时无变化；
+- 增加只存在一边的关系时补齐缺失一边；
+- 删除不存在的关系时无变化；
+- 删除只存在一边的关系时清理残留；
+- 删除多条取代关系中的一条时，目标仍为 `superseded`，并拒绝多余 `--status`；
+- 删除最后一条取代关系时要求提供非 `superseded` 的 `--status`，并在同一计划中更新关系和状态；
+- `parent`、`superseded_by`、`challenged_by` 不能作为修改参数；任务 1 已证明删除的旧关系不在公开类型中，不再增加兼容性测试；
+- 任何会妨碍证明最终结果有效的无关图错误都阻止命令。
 
-Create half-pair graphs directly from parsed Markdown so the planner proves it can repair the targeted inconsistency without treating every dirty graph as writable.
+直接从解析后的 Markdown 构造只存在半对关系的图，证明计划器只能修复本次目标不一致，不能把任意脏图视为可写。
 
-- [ ] **Step 2: Run tests and verify missing planners**
+- [ ] **步骤 2：运行测试并确认关系计划器尚不存在**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
 uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit/test_page_metadata.py" -q
 ```
 
-Expected: new tests fail because relation planners/helpers do not exist.
+预期：新增测试因关系计划器或辅助函数尚不存在而失败。
 
-- [ ] **Step 3: Implement exact machine-line edits and targeted dirty repair**
+- [ ] **步骤 3：精确编辑机器行并定向修复半对关系**
 
-`append_machine_relation` inserts a new quoted relation line at the end of the initial machine block using `relation_label(code)` and a canonical relative managed-page destination. `remove_machine_relation` removes the full quote line identified by the parsed relation link span; it must not remove matching prose links.
+`append_machine_relation` 使用 `relation_label(code)` 和规范的受管理页面相对目标，在开头机器区域末尾插入新的引用关系行。`remove_machine_relation` 根据解析后的关系链接范围删除完整引用行，不得删除正文中目标相同的普通链接。
 
-For paired relations, compute desired final membership for both pages, apply all text changes in memory, parse both pages and validate the final graph. Initial loading may tolerate only the exact missing counterpart issue for the requested source/code/target pair; every other checker error remains blocking.
+对双向关系，先计算两个页面的最终成员关系，在内存中应用全部文本修改，解析两个页面并验证最终图。初始加载只可以容忍本次来源、代码、目标所对应的缺失反向问题；其他检查错误仍然阻止命令。
 
-When add supersedes changes target status, reuse the status renderer from Task 9. When removing the final supersedes pair, require `restored_status` in the type-derived set `set(StatusCode) - {StatusCode.SUPERSEDED}`. Never infer the previous state or store hidden restoration history.
+增加 `supersedes` 并改变目标状态时，复用任务 9 的状态渲染器。删除最后一对取代关系时，要求 `restored_status` 属于从类型推导的集合 `set(StatusCode) - {StatusCode.SUPERSEDED}`。不得猜测先前状态，也不保存隐藏恢复历史。
 
-- [ ] **Step 4: Add relation CLI and dry-run**
+- [ ] **步骤 4：增加关系 CLI 和预演**
 
-Add:
+增加：
 
 ```text
 draft relation add ROOT SOURCE depends_on|supersedes|challenges TARGET
 draft relation remove ROOT SOURCE depends_on|supersedes|challenges TARGET [--status CODE]
 ```
 
-`--status` is accepted only by remove and only when the final replacement pair disappears. JSON returns `result_type=relation.add|relation.remove`, source/code/target and public changed paths. Add integration tests for rollback after injected second-page write failure.
+只有 `remove` 且最终取代关系消失时才接受 `--status`。JSON 返回 `result_type=relation.add|relation.remove`、来源、代码、目标和公开变化路径。增加集成测试，注入第二个页面写入失败并验证整体回滚。
 
-- [ ] **Step 5: Run relation gates and commit**
+- [ ] **步骤 5：运行关系门禁并形成检查点**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -1287,53 +1119,44 @@ uv run --project "$RUNTIME" --locked pytest \
   "$RUNTIME/tests/integration/test_operations.py" -q
 (cd "$RUNTIME" && uv run --locked pyright)
 uv run --project "$RUNTIME" --locked ruff check "$RUNTIME/src" "$RUNTIME/tests"
-git add -- \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/page_metadata.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/markdown.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py \
-  plugins/draft/skills/draft/scripts/runtime/src/draft/cli_results.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_page_metadata.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_page_commands.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py
-git commit -m "feat(draft): add idempotent relation mutation"
+git status --short
+git diff --stat
 ```
+
+核对双向关系和必要状态始终原子变化。若适合独立提交，可使用 `feat(draft): add idempotent relation mutation` 作为提交说明建议。
 
 ---
 
-### Task 11: 更新公开文档并运行全部分发门禁
+### 任务 11：更新公开文档并运行全部分发门禁
 
-**Files:**
-- Modify: `plugins/draft/skills/draft/SKILL.md`
-- Modify: `plugins/draft/skills/draft/references/draft-format.md`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/support.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_distribution_contract.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_distribution_smoke.py`
+**预计影响范围（非穷尽）：**
+- 预计修改：`plugins/draft/skills/draft/SKILL.md` 和 `references/draft-format.md`
+- 预计修改：分发契约、分发冒烟测试及其共享集成夹具
 
-**Interfaces:**
-- Documents every command, stable code, path rule, lazy conclusion workflow, dry-run envelope, pagination and lifecycle boundary implemented in Tasks 1–10.
-- Preserves core/adapter dependency direction and self-contained runtime distribution.
+**必须交付：**
+- 文档覆盖任务 1 至 10 实际实现的每个命令、稳定代码、路径规则、按需结论流程、预演信封、分页和生命周期边界。
+- 保持核心与适配层的依赖方向，并保持运行时分发物自包含。
 
-- [ ] **Step 1: Rewrite format and skill workflow from implemented behavior**
+- [ ] **步骤 1：根据实际行为重写格式和技能工作流**
 
-`draft-format.md` must show an initial tree without `conclusions.md`, list stable machine codes separately from current Chinese Markdown labels, remove every output rule/example, document Draft-external body resources, and state that generated conclusion entries may be stale until explicit generation.
+`draft-format.md` 必须展示不含 `conclusions.md` 的初始目录树，将稳定机器代码与当前中文 Markdown 标签分开说明，删除所有旧 `output` 规则和示例，记录 Draft 外正文资源，并说明机器生成的结论条目可以过时，直到下一次显式生成。
 
-`SKILL.md` must include this mandatory final sequence:
+`SKILL.md` 必须包含以下最终流程：
 
 1. 与用户确认讨论结束；
 2. 执行 `draft generate-conclusions ROOT`；
-3. 从生成后的 proposed 结论页产出设计文档；
+3. 从生成后的 `proposed` 结论页产出设计文档；
 4. 产出完成后执行 `draft status set ROOT conclusions.md confirmed`。
 
-Also document query selection so Agent uses `query page` for routing, narrow collection commands with JSON/pagination for facts, and `rg` for body search. Do not tell Agent to maintain conclusions during ordinary edits.
+同时说明查询选择：代理使用 `query page` 做路由，使用带 JSON 和分页的窄集合命令获取事实，使用 `rg` 搜索正文。不得要求代理在普通编辑过程中维护结论页。
 
-- [ ] **Step 2: Add semantic distribution/help contracts**
+- [ ] **步骤 2：增加语义化分发和帮助契约测试**
 
-Use argparse parser objects or run `draft --help`/subcommand help to verify command availability and option structure. Do not test help by searching production source text. Extend AST contracts so stable status/relation wire values have one production owner and core never imports plugin adapter modules.
+使用 `argparse` 命令参数解析器对象，或运行 `draft --help` 及子命令帮助，验证命令存在和选项结构。不得通过搜索生产源码文本来测试帮助。扩展抽象语法树契约，证明稳定状态和关系协议值只有一个生产代码权威来源，并且核心从不导入插件适配层模块。
 
-Update shared integration fixtures to produce both NOT_GENERATED and GENERATED roots explicitly; fixture names must reveal which lifecycle state they create.
+更新共享集成夹具，明确生成 `NOT_GENERATED` 和 `GENERATED` 两种根目录；夹具名称必须直接说明其创建的生命周期状态。
 
-- [ ] **Step 3: Run all non-network quality gates**
+- [ ] **步骤 3：运行全部非联网质量门禁**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -1353,9 +1176,9 @@ uv run --project "$RUNTIME" --locked ruff format --check plugins/draft/scripts
 uv lock --project "$RUNTIME" --check
 ```
 
-Expected: every command exits `0`; core and adapter suites are collected separately.
+预期：每条命令退出码均为 `0`；核心测试树和适配层测试树分别收集。
 
-- [ ] **Step 4: Run both network dependency-window gates**
+- [ ] **步骤 4：运行两个联网依赖窗口门禁**
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -1365,11 +1188,11 @@ uv run --project "$RUNTIME" --locked \
   pytest plugins/draft/scripts/tests/integration -q -m network
 ```
 
-Expected: every command exits `0`. If external resolution fails, record the exact network/index failure and retry only after establishing it is environmental; do not alter dependency bounds or skip tests.
+预期：每条命令退出码均为 `0`。如果外部解析失败，记录准确的网络或索引错误；只有证明它属于环境问题后才重试，不得修改依赖范围或跳过测试。
 
-- [ ] **Step 5: Audit approved-spec coverage and dirty-worktree boundaries**
+- [ ] **步骤 5：审计批准规格覆盖和脏工作区边界**
 
-Run:
+运行：
 
 ```bash
 RUNTIME=plugins/draft/skills/draft/scripts/runtime
@@ -1387,34 +1210,32 @@ git status --short
 git diff --check
 ```
 
-Expected: the semantic contracts and runtime enum inspection pass, so neither the removed relation nor its diagnostics remain published. This deliberately does not search source text: unrelated variable names, comments and prose are not protocol evidence. Status contains only implementation changes plus the pre-recorded user baseline. `git diff --check` exits `0`.
+预期：语义契约和运行时枚举检查通过，删除的关系及其诊断都不再公开。这里有意不搜索源码文本，因为无关变量名、注释和说明文字不能证明协议是否存在。工作区状态只包含本次实现改动以及实施前已经记录的用户基线；`git diff --check` 退出码为 `0`。
 
-Manually map every approved spec section 5–18 to at least one passing test file named in this plan. This is a requirements audit, not a substitute for test gates.
+人工把批准规格第 5 至 18 节分别映射到至少一个通过的测试文件。这是需求覆盖审计，不能代替测试门禁。
 
-- [ ] **Step 6: Commit documentation and final contracts**
+- [ ] **步骤 6：形成最终可审查检查点**
 
 ```bash
-git add -- plugins/draft/skills/draft/SKILL.md \
-  plugins/draft/skills/draft/references/draft-format.md \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/support.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_distribution_contract.py \
-  plugins/draft/skills/draft/scripts/runtime/tests/integration/test_distribution_smoke.py
-git commit -m "docs(draft): publish agent cli workflow"
+git status --short
+git diff --stat
 ```
 
-No `AGENTS.md` change is planned because Tasks 1–10 implement existing constraints. If implementation changes a long-lived constraint, stop, revise this task's file list, and then update and stage the affected `AGENTS.md` explicitly as required by the repository rules.
+本计划预计不需要修改 `AGENTS.md`，因为任务 1 至 10 实现的是现有约束。如果实施实际改变了长期规则，应按仓库要求更新受影响的 `AGENTS.md`，不要因为它未列在预计文件中而跳过。
+
+若文档与最终行为一致且适合独立提交，可使用 `docs(draft): publish agent cli workflow` 作为提交说明建议。
 
 ---
 
-## Final Review Checklist
+## 最终审查清单
 
-The implementing Agent must provide the reviewing Agent with:
+实施代理必须向审查代理提供：
 
-- the 11 task commit hashes in order;
-- the final `git status --short` compared with the recorded baseline;
-- unit, non-network integration, network, Pyright, Ruff and lock outputs from Task 11;
-- a command/result matrix for every new query and write command in human and JSON modes;
-- proof that dry-run effects and actual public changed paths agree;
-- proof that generated conclusions may be stale without blocking move/trash and converge after regeneration;
-- proof that all stable status/relation code sets derive from production types rather than duplicated test strings;
-- any remaining assumption or external failure, stated without claiming the full gate is green.
+- 按可独立审查行为组织的提交或变更清单，以及任何偏离建议任务边界的原因；
+- 最终 `git status --short` 与实施前基线的比较；
+- 任务 11 中单元测试、非联网集成测试、联网测试、Pyright、Ruff 和锁文件检查结果；
+- 每个新增查询和写命令在人类输出与 JSON 模式下的命令和结果矩阵；
+- 预演效果与正式执行公开变化路径一致的证据；
+- 机器结论允许过时而不阻止 `move` 或 `trash`，并在重新生成后收敛的证据；
+- 所有稳定状态和关系代码集合都从生产类型派生，而不是在测试中复制字符串清单的证据；
+- 仍存在的假设或外部失败；只要门禁没有全部通过，就不得声称整体全绿。
