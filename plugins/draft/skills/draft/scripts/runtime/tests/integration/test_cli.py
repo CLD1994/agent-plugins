@@ -214,7 +214,7 @@ def test_check_clean_and_errors(tmp_path: Path, capsys: pytest.CaptureFixture[st
 
     question = root / "pages/question.md"
     question.write_text(
-        "# 问题\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](../index.md)\n\n无产出。\n",
+        "# 问题\n\n> 状态：`已确认`\n\n无父主题声明。\n",
         encoding="utf-8",
     )
     code, payload = run_json(["check", str(root), "--json"], capsys)
@@ -222,7 +222,7 @@ def test_check_clean_and_errors(tmp_path: Path, capsys: pytest.CaptureFixture[st
     assert payload["ok"] is False
     error_dicts = as_dicts(payload["errors"])
     codes = {str(issue["code"]) for issue in error_dicts}
-    assert CheckCode.OUTPUT_MISSING.value in codes
+    assert CheckCode.PARENT_MISSING.value in codes
     first = error_dicts[0]
     assert "path" in first
     assert "line" in first
@@ -687,8 +687,7 @@ def _trashable_cli_root(tmp_path: Path) -> Path:
     root = tmp_path / "topic"
     assert main(["init", str(root)]) == 0
     (root / "pages/a.md").write_text(
-        "# A\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](../index.md)\n>\n"
-        "> 产出：[结论汇总](../conclusions.md)\n\nA。\n",
+        "# A\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](../index.md)\n\nA。\n",
         encoding="utf-8",
     )
     (root / "pages/b.md").write_text(
@@ -713,10 +712,10 @@ def test_check_json_separates_errors_warnings_infos_and_reviews(
 ) -> None:
     root = _trashable_cli_root(tmp_path)
     capsys.readouterr()
-    # 制造一个 info（trash_retained）与一个 error（已确认页缺产出）。
+    # 制造一个 info（trash_retained）与一个 error（a.md 缺少父主题声明）。
     run_json(["trash", str(root), "pages/b.md", "--json"], capsys)
     (root / "pages/a.md").write_text(
-        "# A\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](../index.md)\n\nA。\n",
+        "# A\n\n> 状态：`已确认`\n\nA。\n",
         encoding="utf-8",
     )
     capsys.readouterr()

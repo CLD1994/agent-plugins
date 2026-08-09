@@ -16,11 +16,11 @@ from draft.models import (
     IssueSeverity,
     MarkdownLink,
     PageDocument,
-    RelationLabel,
     SourceSpan,
     ValidationMode,
 )
 from draft.paths import resolve_draft_root
+from draft.vocabulary import RelationCode
 
 LoadMode = ValidationMode
 
@@ -42,7 +42,7 @@ class DraftGraph:
     parents: Mapping[Path, Path]
     children: Mapping[Path, tuple[Path, ...]]
     inbound_links: Mapping[Path, tuple[tuple[Path, MarkdownLink], ...]]
-    relations: Mapping[RelationLabel, tuple[tuple[Path, Path, int], ...]]
+    relations: Mapping[RelationCode, tuple[tuple[Path, Path, int], ...]]
 
 
 @dataclass(frozen=True)
@@ -281,8 +281,8 @@ def _load(root: Path) -> LoadResult:
             )
 
     inbound: dict[Path, list[tuple[Path, MarkdownLink]]] = {}
-    relation_edges: dict[RelationLabel, list[tuple[Path, Path, int]]] = {
-        label: [] for label in RelationLabel
+    relation_edges: dict[RelationCode, list[tuple[Path, Path, int]]] = {
+        label: [] for label in RelationCode
     }
     link_issues: list[CheckIssue] = []
 
@@ -341,19 +341,17 @@ def _load(root: Path) -> LoadResult:
             target = resolved_links.get(relation.link.whole_span)
             if target is None or target not in managed_set:
                 continue
-            relation_edges[relation.label].append((source, target, relation.link.line))
+            relation_edges[relation.code].append((source, target, relation.link.line))
     issues.extend(link_issues)
 
     parents: dict[Path, Path] = {}
     for source, page in pages.items():
-        declared = [
-            relation for relation in page.relations if relation.label is RelationLabel.PARENT
-        ]
+        declared = [relation for relation in page.relations if relation.code is RelationCode.PARENT]
         if len(declared) != 1:
             continue
         matches = [
             target
-            for edge_source, target, _line in relation_edges[RelationLabel.PARENT]
+            for edge_source, target, _line in relation_edges[RelationCode.PARENT]
             if edge_source == source
         ]
         if len(matches) == 1:

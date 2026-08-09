@@ -8,7 +8,6 @@ from draft.diagnostic_codes import (
     CheckCode,
     LinkEscapeKind,
     ReplacementStatusReason,
-    WrongOutputReason,
 )
 from draft.errors import DraftError
 from draft.models import CheckReport, IssueSeverity
@@ -40,8 +39,6 @@ QUESTION = """# 问题
 > 状态：`已确认`
 >
 > 父主题：[根索引](../index.md)
->
-> 产出：[结论汇总](../conclusions.md)
 
 使用显式状态前缀。
 """
@@ -86,15 +83,13 @@ def test_journal_operation_id_mismatch_is_corrupt_without_mutation(
     assert journal_path.read_bytes() == before
 
 
-def test_confirmed_page_without_output_is_an_error(draft_factory: DraftFactory) -> None:
-    files = healthy()
-    files["pages/question.md"] = QUESTION.replace("> 产出：[结论汇总](../conclusions.md)\n", "")
-    root = draft_factory(files)
+def test_confirmed_page_without_output_is_valid(draft_factory: DraftFactory) -> None:
+    """已确认页面不再要求产出声明；确认状态本身决定结论归属。"""
+    root = draft_factory(healthy())
 
     report = check_draft(root)
 
-    assert [issue.code for issue in report.errors] == [CheckCode.OUTPUT_MISSING.value]
-    assert report.errors[0].path == Path("pages/question.md")
+    assert report.errors == ()
 
 
 def test_missing_marker(draft_factory: DraftFactory) -> None:
@@ -237,7 +232,10 @@ def test_unmanaged_markdown_below_root(draft_factory: DraftFactory) -> None:
 
 def test_parse_error_keeps_specific_code_and_line(draft_factory: DraftFactory) -> None:
     files = healthy()
-    files["pages/question.md"] = QUESTION.replace("> 产出：", "> 状态依据：")
+    files["pages/question.md"] = QUESTION.replace(
+        "> 父主题：[根索引](../index.md)",
+        "> 父主题：[根索引](../index.md)\n>\n> 状态依据：",
+    )
     root = draft_factory(files)
 
     report = check_draft(root)
@@ -268,7 +266,7 @@ def test_missing_link_reports_source_line_literal_and_normalized_target(
     report = check_draft(draft_factory(files))
     issue = next(issue for issue in report.errors if issue.code == CheckCode.LINK_MISSING.value)
     assert issue.path == Path("pages/question.md")
-    assert issue.line == 9
+    assert issue.line == 7
     assert issue.details == ("missing.md", "pages/missing.md")
 
 
@@ -302,7 +300,8 @@ def test_missing_relation_target_reports_link_missing_once(
 ) -> None:
     files = healthy()
     files["pages/question.md"] = QUESTION.replace(
-        "> 产出：", "> 依赖：[缺失](missing.md)\n>\n> 产出："
+        "> 父主题：[根索引](../index.md)",
+        "> 父主题：[根索引](../index.md)\n>\n> 依赖：[缺失](missing.md)",
     )
     report = check_draft(draft_factory(files))
     missing = [i for i in report.errors if i.code == CheckCode.LINK_MISSING.value]
@@ -331,7 +330,7 @@ def test_link_escape_preserves_literal_destination(draft_factory: DraftFactory) 
     report = check_draft(draft_factory(files))
     issue = next(issue for issue in report.errors if issue.code == CheckCode.LINK_ESCAPE.value)
     assert issue.path == Path("pages/question.md")
-    assert issue.line == 9
+    assert issue.line == 7
     assert issue.details == (LinkEscapeKind.DESTINATION.value, "../../outside.md")
 
 
@@ -363,7 +362,7 @@ def test_managed_path_symlink_escape_preserves_relative_path(
 
 def test_non_root_page_without_parent(draft_factory: DraftFactory) -> None:
     files = healthy()
-    files["pages/question.md"] = QUESTION.replace("> 父主题：[根索引](../index.md)\n>\n", "")
+    files["pages/question.md"] = QUESTION.replace("> 父主题：[根索引](../index.md)\n", "")
     root = draft_factory(files)
 
     report = check_draft(root)
@@ -374,7 +373,8 @@ def test_non_root_page_without_parent(draft_factory: DraftFactory) -> None:
 def test_multiple_parent_declarations(draft_factory: DraftFactory) -> None:
     files = healthy()
     files["pages/question.md"] = QUESTION.replace(
-        "> 产出：", "> 父主题：[结论](../conclusions.md)\n>\n> 产出："
+        "> 父主题：[根索引](../index.md)",
+        "> 父主题：[根索引](../index.md)\n>\n> 父主题：[结论](../conclusions.md)",
     )
     root = draft_factory(files)
 
@@ -465,7 +465,8 @@ def test_non_root_empty_hub(draft_factory: DraftFactory) -> None:
 def test_dependency_self_loop(draft_factory: DraftFactory) -> None:
     files = healthy()
     files["pages/question.md"] = QUESTION.replace(
-        "> 产出：", "> 依赖：[自己](question.md)\n>\n> 产出："
+        "> 父主题：[根索引](../index.md)",
+        "> 父主题：[根索引](../index.md)\n>\n> 依赖：[自己](question.md)",
     )
     root = draft_factory(files)
 
@@ -517,7 +518,7 @@ def test_replacement_pair_missing(draft_factory: DraftFactory) -> None:
     assert len(pair) == 1
     assert pair[0].path == Path("pages/new.md")
     assert pair[0].line == 7
-    assert pair[0].details == ("pages/question.md", "被取代")
+    assert pair[0].details == ("pages/question.md", "superseded_by")
 
 
 def test_replacement_pair_missing_reverse_branch_uses_forward_label(
@@ -543,7 +544,7 @@ def test_replacement_pair_missing_reverse_branch_uses_forward_label(
     assert len(pair) == 1
     assert pair[0].path == Path("pages/old.md")
     assert pair[0].line == 7
-    assert pair[0].details == ("pages/new.md", "取代")
+    assert pair[0].details == ("pages/new.md", "supersedes")
 
 
 def test_superseded_status_mismatch(draft_factory: DraftFactory) -> None:
@@ -552,10 +553,9 @@ def test_superseded_status_mismatch(draft_factory: DraftFactory) -> None:
         "# 新\n\n> 状态：`待讨论`\n>\n> 父主题：[根](../index.md)\n>\n"
         "> 取代：[旧](question.md)\n\n正文。\n"
     )
-    files["pages/question.md"] = (
-        QUESTION.replace("> 状态：`已确认`", "> 状态：`待讨论`")
-        .replace("> 产出：", "> 被取代：[新](new.md)\n>\n> 产出：")
-        .replace("> 产出：[结论汇总](../conclusions.md)\n", "")
+    files["pages/question.md"] = QUESTION.replace("> 状态：`已确认`", "> 状态：`待讨论`").replace(
+        "> 父主题：[根索引](../index.md)",
+        "> 父主题：[根索引](../index.md)\n>\n> 被取代：[新](new.md)",
     )
     root = draft_factory(files)
 
@@ -664,7 +664,7 @@ def test_challenge_pair_missing(draft_factory: DraftFactory) -> None:
     assert len(pair) == 1
     assert pair[0].path == Path("pages/challenger.md")
     assert pair[0].line == 7
-    assert pair[0].details == ("pages/question.md", "被质疑")
+    assert pair[0].details == ("pages/question.md", "challenged_by")
 
 
 def test_challenge_pair_missing_reverse_branch_uses_forward_label(
@@ -690,7 +690,7 @@ def test_challenge_pair_missing_reverse_branch_uses_forward_label(
     assert len(pair) == 1
     assert pair[0].path == Path("pages/old.md")
     assert pair[0].line == 7
-    assert pair[0].details == ("pages/new.md", "质疑")
+    assert pair[0].details == ("pages/new.md", "challenges")
 
 
 def test_confirmed_page_with_open_challenge_is_accepted(draft_factory: DraftFactory) -> None:
@@ -700,7 +700,8 @@ def test_confirmed_page_with_open_challenge_is_accepted(draft_factory: DraftFact
         "> 质疑：[问题](question.md)\n\n- [问题](question.md)。\n"
     )
     files["pages/question.md"] = QUESTION.replace(
-        "> 产出：", "> 被质疑：[质疑者](challenger.md)\n>\n> 产出："
+        "> 父主题：[根索引](../index.md)",
+        "> 父主题：[根索引](../index.md)\n>\n> 被质疑：[质疑者](challenger.md)",
     )
     files["index.md"] = ROOT_PAGE.replace(
         "- [问题](pages/question.md)",
@@ -711,111 +712,6 @@ def test_confirmed_page_with_open_challenge_is_accepted(draft_factory: DraftFact
     report = check_draft(root)
 
     assert report.errors == ()
-
-
-def test_output_to_wrong_target(draft_factory: DraftFactory) -> None:
-    files = healthy()
-    files["pages/question.md"] = QUESTION.replace(
-        "> 产出：[结论汇总](../conclusions.md)", "> 产出：[根索引](../index.md)"
-    )
-    root = draft_factory(files)
-
-    report = check_draft(root)
-
-    wrong = [issue for issue in report.errors if issue.code == CheckCode.OUTPUT_WRONG_TARGET.value]
-    assert len(wrong) == 1
-    assert wrong[0].path == Path("pages/question.md")
-    assert wrong[0].line == 7
-    assert wrong[0].details == (WrongOutputReason.NOT_CONCLUSIONS.value, "../index.md")
-
-
-def test_output_duplicate_declaration_is_wrong_target(draft_factory: DraftFactory) -> None:
-    files = healthy()
-    files["pages/question.md"] = QUESTION.replace(
-        "> 产出：[结论汇总](../conclusions.md)",
-        "> 产出：[结论汇总](../conclusions.md)\n>\n> 产出：[结论汇总](../conclusions.md)",
-    )
-    root = draft_factory(files)
-
-    report = check_draft(root)
-
-    wrong = [issue for issue in report.errors if issue.code == CheckCode.OUTPUT_WRONG_TARGET.value]
-    assert len(wrong) == 1
-    assert wrong[0].path == Path("pages/question.md")
-    assert wrong[0].line == 9
-    assert wrong[0].details == (WrongOutputReason.DUPLICATE.value,)
-
-
-def test_output_correct_then_wrong_locates_the_wrong_declaration(
-    draft_factory: DraftFactory,
-) -> None:
-    files = healthy()
-    files["pages/question.md"] = QUESTION.replace(
-        "> 产出：[结论汇总](../conclusions.md)",
-        "> 产出：[结论汇总](../conclusions.md)\n>\n> 产出：[根索引](../index.md)",
-    )
-    root = draft_factory(files)
-
-    report = check_draft(root)
-
-    wrong = [issue for issue in report.errors if issue.code == CheckCode.OUTPUT_WRONG_TARGET.value]
-    duplicate = [i for i in wrong if i.details == (WrongOutputReason.DUPLICATE.value,)]
-    not_conclusions = [
-        i for i in wrong if i.details and i.details[0] == WrongOutputReason.NOT_CONCLUSIONS.value
-    ]
-    assert len(duplicate) == 1
-    assert duplicate[0].line == 9
-    assert len(not_conclusions) == 1
-    assert not_conclusions[0].line == 9
-    assert not_conclusions[0].details == (WrongOutputReason.NOT_CONCLUSIONS.value, "../index.md")
-
-
-def test_output_wrong_then_correct_locates_the_wrong_declaration(
-    draft_factory: DraftFactory,
-) -> None:
-    files = healthy()
-    files["pages/question.md"] = QUESTION.replace(
-        "> 产出：[结论汇总](../conclusions.md)",
-        "> 产出：[根索引](../index.md)\n>\n> 产出：[结论汇总](../conclusions.md)",
-    )
-    root = draft_factory(files)
-
-    report = check_draft(root)
-
-    wrong = [issue for issue in report.errors if issue.code == CheckCode.OUTPUT_WRONG_TARGET.value]
-    duplicate = [i for i in wrong if i.details == (WrongOutputReason.DUPLICATE.value,)]
-    not_conclusions = [
-        i for i in wrong if i.details and i.details[0] == WrongOutputReason.NOT_CONCLUSIONS.value
-    ]
-    assert len(duplicate) == 1
-    assert duplicate[0].line == 9
-    assert len(not_conclusions) == 1
-    assert not_conclusions[0].line == 7
-    assert not_conclusions[0].details == (WrongOutputReason.NOT_CONCLUSIONS.value, "../index.md")
-
-
-def test_non_confirmed_page_declaring_output(draft_factory: DraftFactory) -> None:
-    files = healthy()
-    files["pages/question.md"] = QUESTION.replace("> 状态：`已确认`", "> 状态：`待讨论`")
-    root = draft_factory(files)
-
-    report = check_draft(root)
-
-    assert CheckCode.OUTPUT_FORBIDDEN.value in codes(report)
-
-
-def test_conclusions_missing_backlink(draft_factory: DraftFactory) -> None:
-    files = healthy()
-    files["conclusions.md"] = CONCLUSIONS.replace(
-        "- [已确认的问题](pages/question.md)：使用显式状态前缀。\n", ""
-    )
-    root = draft_factory(files)
-
-    report = check_draft(root)
-
-    assert codes(report) == [CheckCode.OUTPUT_BACKLINK_MISSING.value]
-    assert report.errors[0].path == Path("conclusions.md")
-    assert report.errors[0].details == ("pages/question.md",)
 
 
 def test_oversized_ordinary_page_is_review_only(draft_factory: DraftFactory) -> None:
@@ -830,7 +726,7 @@ def test_oversized_ordinary_page_is_review_only(draft_factory: DraftFactory) -> 
     assert [issue.code for issue in report.reviews] == [CheckCode.PAGE_CAPACITY.value]
     assert report.reviews[0].severity is IssueSeverity.REVIEW
     assert report.reviews[0].details == (
-        "620",
+        "618",
         str(len(files["pages/question.md"].encode("utf-8"))),
     )
 
@@ -883,8 +779,9 @@ def test_duplicate_normalized_relation_target_is_an_error(
 ) -> None:
     files = healthy()
     files["pages/question.md"] = QUESTION.replace(
-        "> 产出：",
-        "> 依赖：[其他](other.md)\n>\n> 依赖：[其他副本](./other.md)\n>\n> 产出：",
+        "> 父主题：[根索引](../index.md)",
+        "> 父主题：[根索引](../index.md)\n>\n> 依赖：[其他](other.md)\n>\n"
+        "> 依赖：[其他副本](./other.md)",
     )
     files["pages/other.md"] = (
         "# 其他\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n\n其他。\n"
@@ -901,7 +798,7 @@ def test_duplicate_normalized_relation_target_is_an_error(
     issue = report.errors[0]
     assert issue.path == Path("pages/question.md")
     assert issue.line == 9
-    assert issue.details == ("依赖", "pages/other.md")
+    assert issue.details == ("depends_on", "pages/other.md")
 
 
 def test_same_label_with_distinct_targets_is_allowed(
@@ -909,8 +806,8 @@ def test_same_label_with_distinct_targets_is_allowed(
 ) -> None:
     files = healthy()
     files["pages/question.md"] = QUESTION.replace(
-        "> 产出：",
-        "> 依赖：[甲](other.md)\n>\n> 依赖：[乙](second.md)\n>\n> 产出：",
+        "> 父主题：[根索引](../index.md)",
+        "> 父主题：[根索引](../index.md)\n>\n> 依赖：[甲](other.md)\n>\n> 依赖：[乙](second.md)",
     )
     files["pages/other.md"] = (
         "# 其他\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n\n其他。\n"
@@ -959,8 +856,6 @@ CHECKER_QUESTION = """# 问题
 > 状态：`已确认`
 >
 > 父主题：[根索引](../index.md)
->
-> 产出：[结论汇总](../conclusions.md)
 
 问题。
 """

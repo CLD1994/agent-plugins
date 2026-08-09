@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from draft.checker import check_graph
-from draft.diagnostic_codes import CheckCode, ReplacementStatusReason, WrongOutputReason
+from draft.diagnostic_codes import CheckCode, ReplacementStatusReason
 from draft.graph import ROOT_PAGE, DraftGraph
 from draft.models import (
     CheckIssue,
@@ -12,18 +12,17 @@ from draft.models import (
     MarkdownLink,
     PageDocument,
     Relation,
-    RelationLabel,
     SourceSpan,
-    StatusPrefix,
     StatusValue,
 )
+from draft.vocabulary import RelationCode, StatusCode
 
 ROOT = Path("/draft")
 CONCLUSIONS = Path("conclusions.md")
 A = Path("pages/a.md")
 B = Path("pages/b.md")
 SUB_INDEX = Path("pages/sub/index.md")
-_PENDING = StatusValue(StatusPrefix.PENDING, None)
+_PENDING = StatusValue(StatusCode.PENDING, None)
 
 
 def _link(destination: str, *, line: int = 1, label: str = "x") -> MarkdownLink:
@@ -38,8 +37,8 @@ def _link(destination: str, *, line: int = 1, label: str = "x") -> MarkdownLink:
     )
 
 
-def _relation(label: RelationLabel, destination: str, *, line: int = 1) -> Relation:
-    return Relation(label=label, link=_link(destination, line=line))
+def _relation(label: RelationCode, destination: str, *, line: int = 1) -> Relation:
+    return Relation(code=label, link=_link(destination, line=line))
 
 
 def _page(
@@ -61,7 +60,7 @@ def _graph(
     parents: Mapping[Path, Path] | None = None,
     children: Mapping[Path, tuple[Path, ...]] | None = None,
     inbound_links: Mapping[Path, tuple[tuple[Path, MarkdownLink], ...]] | None = None,
-    relations: Mapping[RelationLabel, tuple[tuple[Path, Path, int], ...]] | None = None,
+    relations: Mapping[RelationCode, tuple[tuple[Path, Path, int], ...]] | None = None,
     root: Path = ROOT,
 ) -> DraftGraph:
     return DraftGraph(
@@ -70,7 +69,7 @@ def _graph(
         parents=dict(parents or {}),
         children=dict(children or {}),
         inbound_links=dict(inbound_links or {}),
-        relations={label: () for label in RelationLabel} | dict(relations or {}),
+        relations={label: () for label in RelationCode} | dict(relations or {}),
     )
 
 
@@ -90,26 +89,26 @@ def test_clean_parent_child_graph_has_no_issues() -> None:
         pages={
             ROOT_PAGE: _page(
                 ROOT_PAGE,
-                status=StatusValue(StatusPrefix.CLOSED, "导航"),
+                status=StatusValue(StatusCode.CLOSED, "导航"),
                 links=(_link("pages/a.md"), _link("conclusions.md")),
             ),
             A: _page(
                 A,
-                status=StatusValue(StatusPrefix.PENDING, None),
-                relations=(_relation(RelationLabel.PARENT, "../index.md"),),
+                status=StatusValue(StatusCode.PENDING, None),
+                relations=(_relation(RelationCode.PARENT, "../index.md"),),
                 links=(_link("../index.md"),),
             ),
             CONCLUSIONS: _page(
                 CONCLUSIONS,
-                status=StatusValue(StatusPrefix.CONFIRMED, "汇总"),
-                relations=(_relation(RelationLabel.PARENT, "../index.md"),),
+                status=StatusValue(StatusCode.CONFIRMED, "汇总"),
+                relations=(_relation(RelationCode.PARENT, "../index.md"),),
                 links=(_link("../index.md"),),
             ),
         },
         parents={A: ROOT_PAGE, CONCLUSIONS: ROOT_PAGE},
         children={ROOT_PAGE: (A, CONCLUSIONS)},
         relations={
-            RelationLabel.PARENT: (
+            RelationCode.PARENT: (
                 (A, ROOT_PAGE, 1),
                 (CONCLUSIONS, ROOT_PAGE, 1),
             ),
@@ -128,10 +127,10 @@ def test_root_page_declaring_parent_is_rejected() -> None:
         pages={
             ROOT_PAGE: _page(
                 ROOT_PAGE,
-                relations=(_relation(RelationLabel.PARENT, "pages/a.md"),),
+                relations=(_relation(RelationCode.PARENT, "pages/a.md"),),
             ),
         },
-        relations={RelationLabel.PARENT: ((ROOT_PAGE, A, 1),)},
+        relations={RelationCode.PARENT: ((ROOT_PAGE, A, 1),)},
     )
     assert _issue(CheckCode.PARENT_ROOT_DECLARED.value, ROOT_PAGE, 1) in check_graph(graph).issues
 
@@ -148,12 +147,12 @@ def test_non_root_page_with_multiple_parents_is_rejected() -> None:
             A: _page(
                 A,
                 relations=(
-                    _relation(RelationLabel.PARENT, "../index.md", line=1),
-                    _relation(RelationLabel.PARENT, "b.md", line=2),
+                    _relation(RelationCode.PARENT, "../index.md", line=1),
+                    _relation(RelationCode.PARENT, "b.md", line=2),
                 ),
             ),
         },
-        relations={RelationLabel.PARENT: ((A, ROOT_PAGE, 1), (A, B, 2))},
+        relations={RelationCode.PARENT: ((A, ROOT_PAGE, 1), (A, B, 2))},
     )
     assert _issue(CheckCode.PARENT_MULTIPLE.value, A, 2) in check_graph(graph).issues
 
@@ -165,14 +164,14 @@ def test_declared_parent_mismatching_physical_parent_is_rejected() -> None:
             ROOT_PAGE: _page(ROOT_PAGE),
             A: _page(
                 A,
-                relations=(_relation(RelationLabel.PARENT, "b.md", line=3),),
+                relations=(_relation(RelationCode.PARENT, "b.md", line=3),),
                 links=(_link("b.md"),),
             ),
             B: _page(B),
         },
         parents={A: B},
         children={B: (A,)},
-        relations={RelationLabel.PARENT: ((A, B, 3),)},
+        relations={RelationCode.PARENT: ((A, B, 3),)},
     )
     assert (
         _issue(CheckCode.LAYOUT_PARENT_MISMATCH.value, A, 3, str(B), str(ROOT_PAGE))
@@ -185,11 +184,11 @@ def test_parent_cycle_is_reported_with_canonical_rotation() -> None:
     graph = _graph(
         pages={
             ROOT_PAGE: _page(ROOT_PAGE),
-            A: _page(A, relations=(_relation(RelationLabel.PARENT, "b.md", line=1),)),
-            B: _page(B, relations=(_relation(RelationLabel.PARENT, "a.md", line=1),)),
+            A: _page(A, relations=(_relation(RelationCode.PARENT, "b.md", line=1),)),
+            B: _page(B, relations=(_relation(RelationCode.PARENT, "a.md", line=1),)),
         },
         relations={
-            RelationLabel.PARENT: ((A, B, 1), (B, A, 1)),
+            RelationCode.PARENT: ((A, B, 1), (B, A, 1)),
         },
     )
     issues = check_graph(graph).issues
@@ -203,13 +202,13 @@ def test_unreachable_page_is_reported() -> None:
     graph = _graph(
         pages={
             ROOT_PAGE: _page(ROOT_PAGE),
-            A: _page(A, relations=(_relation(RelationLabel.PARENT, "../index.md"),)),
-            B: _page(B, relations=(_relation(RelationLabel.PARENT, "../index.md"),)),
+            A: _page(A, relations=(_relation(RelationCode.PARENT, "../index.md"),)),
+            B: _page(B, relations=(_relation(RelationCode.PARENT, "../index.md"),)),
         },
         parents={A: ROOT_PAGE, B: ROOT_PAGE},
         children={ROOT_PAGE: (A,)},  # B 不可达
         relations={
-            RelationLabel.PARENT: ((A, ROOT_PAGE, 1), (B, ROOT_PAGE, 1)),
+            RelationCode.PARENT: ((A, ROOT_PAGE, 1), (B, ROOT_PAGE, 1)),
         },
     )
     assert _issue(CheckCode.PARENT_UNREACHABLE.value, B) in check_graph(graph).issues
@@ -219,11 +218,11 @@ def test_parent_navigation_missing_when_parent_does_not_link_child() -> None:
     graph = _graph(
         pages={
             ROOT_PAGE: _page(ROOT_PAGE),  # 没有指向 a.md 的正文链接
-            A: _page(A, relations=(_relation(RelationLabel.PARENT, "../index.md"),)),
+            A: _page(A, relations=(_relation(RelationCode.PARENT, "../index.md"),)),
         },
         parents={A: ROOT_PAGE},
         children={ROOT_PAGE: (A,)},
-        relations={RelationLabel.PARENT: ((A, ROOT_PAGE, 1),)},
+        relations={RelationCode.PARENT: ((A, ROOT_PAGE, 1),)},
     )
     assert (
         _issue(CheckCode.PARENT_NAVIGATION_MISSING.value, ROOT_PAGE, None, str(A))
@@ -237,12 +236,12 @@ def test_empty_hub_index_is_reported() -> None:
         pages={
             ROOT_PAGE: _page(ROOT_PAGE, links=(_link("pages/sub/index.md"),)),
             SUB_INDEX: _page(
-                SUB_INDEX, relations=(_relation(RelationLabel.PARENT, "../../index.md"),)
+                SUB_INDEX, relations=(_relation(RelationCode.PARENT, "../../index.md"),)
             ),
         },
         parents={SUB_INDEX: ROOT_PAGE},
         children={ROOT_PAGE: (SUB_INDEX,)},
-        relations={RelationLabel.PARENT: ((SUB_INDEX, ROOT_PAGE, 1),)},
+        relations={RelationCode.PARENT: ((SUB_INDEX, ROOT_PAGE, 1),)},
     )
     assert _issue(CheckCode.HUB_EMPTY.value, SUB_INDEX) in check_graph(graph).issues
 
@@ -258,10 +257,10 @@ def test_duplicate_non_parent_relation_is_reported() -> None:
             ROOT_PAGE: _page(ROOT_PAGE),
             A: _page(
                 A,
-                relations=(_relation(RelationLabel.PARENT, "../index.md"),),
+                relations=(_relation(RelationCode.PARENT, "../index.md"),),
                 links=(
-                    _relation(RelationLabel.DEPENDS_ON, "b.md", line=2).link,
-                    _relation(RelationLabel.DEPENDS_ON, "b.md", line=3).link,
+                    _relation(RelationCode.DEPENDS_ON, "b.md", line=2).link,
+                    _relation(RelationCode.DEPENDS_ON, "b.md", line=3).link,
                 ),
             ),
             B: _page(B),
@@ -269,12 +268,12 @@ def test_duplicate_non_parent_relation_is_reported() -> None:
         parents={A: ROOT_PAGE},
         children={ROOT_PAGE: (A,)},
         relations={
-            RelationLabel.PARENT: ((A, ROOT_PAGE, 1),),
-            RelationLabel.DEPENDS_ON: ((A, B, 2), (A, B, 3)),
+            RelationCode.PARENT: ((A, ROOT_PAGE, 1),),
+            RelationCode.DEPENDS_ON: ((A, B, 2), (A, B, 3)),
         },
     )
     assert (
-        _issue(CheckCode.RELATION_DUPLICATE.value, A, 3, RelationLabel.DEPENDS_ON.value, str(B))
+        _issue(CheckCode.RELATION_DUPLICATE.value, A, 3, RelationCode.DEPENDS_ON.value, str(B))
         in check_graph(graph).issues
     )
 
@@ -288,13 +287,13 @@ def test_dependency_self_is_rejected() -> None:
     graph = _graph(
         pages={
             ROOT_PAGE: _page(ROOT_PAGE),
-            A: _page(A, relations=(_relation(RelationLabel.PARENT, "../index.md"),)),
+            A: _page(A, relations=(_relation(RelationCode.PARENT, "../index.md"),)),
         },
         parents={A: ROOT_PAGE},
         children={ROOT_PAGE: (A,)},
         relations={
-            RelationLabel.PARENT: ((A, ROOT_PAGE, 1),),
-            RelationLabel.DEPENDS_ON: ((A, A, 4),),
+            RelationCode.PARENT: ((A, ROOT_PAGE, 1),),
+            RelationCode.DEPENDS_ON: ((A, A, 4),),
         },
     )
     assert _issue(CheckCode.DEPENDENCY_SELF.value, A, 4) in check_graph(graph).issues
@@ -304,14 +303,14 @@ def test_dependency_cycle_is_reported() -> None:
     graph = _graph(
         pages={
             ROOT_PAGE: _page(ROOT_PAGE),
-            A: _page(A, relations=(_relation(RelationLabel.PARENT, "../index.md"),)),
-            B: _page(B, relations=(_relation(RelationLabel.PARENT, "../index.md"),)),
+            A: _page(A, relations=(_relation(RelationCode.PARENT, "../index.md"),)),
+            B: _page(B, relations=(_relation(RelationCode.PARENT, "../index.md"),)),
         },
         parents={A: ROOT_PAGE, B: ROOT_PAGE},
         children={ROOT_PAGE: (A, B)},
         relations={
-            RelationLabel.PARENT: ((A, ROOT_PAGE, 1), (B, ROOT_PAGE, 1)),
-            RelationLabel.DEPENDS_ON: ((A, B, 1), (B, A, 1)),
+            RelationCode.PARENT: ((A, ROOT_PAGE, 1), (B, ROOT_PAGE, 1)),
+            RelationCode.DEPENDS_ON: ((A, B, 1), (B, A, 1)),
         },
     )
     issues = check_graph(graph).issues
@@ -329,14 +328,14 @@ def test_replacement_pair_missing_when_reverse_absent() -> None:
     graph = _graph(
         pages={
             ROOT_PAGE: _page(ROOT_PAGE),
-            A: _page(A, relations=(_relation(RelationLabel.PARENT, "../index.md"),)),
-            B: _page(B, relations=(_relation(RelationLabel.PARENT, "../index.md"),)),
+            A: _page(A, relations=(_relation(RelationCode.PARENT, "../index.md"),)),
+            B: _page(B, relations=(_relation(RelationCode.PARENT, "../index.md"),)),
         },
         parents={A: ROOT_PAGE, B: ROOT_PAGE},
         children={ROOT_PAGE: (A, B)},
         relations={
-            RelationLabel.PARENT: ((A, ROOT_PAGE, 1), (B, ROOT_PAGE, 1)),
-            RelationLabel.SUPERSEDES: ((A, B, 2),),
+            RelationCode.PARENT: ((A, ROOT_PAGE, 1), (B, ROOT_PAGE, 1)),
+            RelationCode.SUPERSEDES: ((A, B, 2),),
         },
     )
     assert (
@@ -345,7 +344,7 @@ def test_replacement_pair_missing_when_reverse_absent() -> None:
             A,
             2,
             str(B),
-            RelationLabel.SUPERSEDED_BY.value,
+            RelationCode.SUPERSEDED_BY.value,
         )
         in check_graph(graph).issues
     )
@@ -357,20 +356,20 @@ def test_replacement_status_mismatch_relation_without_status() -> None:
             ROOT_PAGE: _page(ROOT_PAGE),
             A: _page(
                 A,
-                status=StatusValue(StatusPrefix.PENDING, None),
+                status=StatusValue(StatusCode.PENDING, None),
                 relations=(
-                    _relation(RelationLabel.PARENT, "../index.md"),
-                    _relation(RelationLabel.SUPERSEDED_BY, "b.md", line=5),
+                    _relation(RelationCode.PARENT, "../index.md"),
+                    _relation(RelationCode.SUPERSEDED_BY, "b.md", line=5),
                 ),
             ),
-            B: _page(B, relations=(_relation(RelationLabel.PARENT, "../index.md"),)),
+            B: _page(B, relations=(_relation(RelationCode.PARENT, "../index.md"),)),
         },
         parents={A: ROOT_PAGE, B: ROOT_PAGE},
         children={ROOT_PAGE: (A, B)},
         relations={
-            RelationLabel.PARENT: ((A, ROOT_PAGE, 1), (B, ROOT_PAGE, 1)),
-            RelationLabel.SUPERSEDES: ((B, A, 5),),
-            RelationLabel.SUPERSEDED_BY: ((A, B, 5),),
+            RelationCode.PARENT: ((A, ROOT_PAGE, 1), (B, ROOT_PAGE, 1)),
+            RelationCode.SUPERSEDES: ((B, A, 5),),
+            RelationCode.SUPERSEDED_BY: ((A, B, 5),),
         },
     )
     assert (
@@ -390,13 +389,13 @@ def test_replacement_status_mismatch_status_without_relation() -> None:
             ROOT_PAGE: _page(ROOT_PAGE),
             A: _page(
                 A,
-                status=StatusValue(StatusPrefix.SUPERSEDED, "旧"),
-                relations=(_relation(RelationLabel.PARENT, "../index.md"),),
+                status=StatusValue(StatusCode.SUPERSEDED, "旧"),
+                relations=(_relation(RelationCode.PARENT, "../index.md"),),
             ),
         },
         parents={A: ROOT_PAGE},
         children={ROOT_PAGE: (A,)},
-        relations={RelationLabel.PARENT: ((A, ROOT_PAGE, 1),)},
+        relations={RelationCode.PARENT: ((A, ROOT_PAGE, 1),)},
     )
     assert (
         _issue(
@@ -418,137 +417,45 @@ def test_challenge_pair_missing_when_reverse_absent() -> None:
     graph = _graph(
         pages={
             ROOT_PAGE: _page(ROOT_PAGE),
-            A: _page(A, relations=(_relation(RelationLabel.PARENT, "../index.md"),)),
-            B: _page(B, relations=(_relation(RelationLabel.PARENT, "../index.md"),)),
+            A: _page(A, relations=(_relation(RelationCode.PARENT, "../index.md"),)),
+            B: _page(B, relations=(_relation(RelationCode.PARENT, "../index.md"),)),
         },
         parents={A: ROOT_PAGE, B: ROOT_PAGE},
         children={ROOT_PAGE: (A, B)},
         relations={
-            RelationLabel.PARENT: ((A, ROOT_PAGE, 1), (B, ROOT_PAGE, 1)),
-            RelationLabel.CHALLENGES: ((A, B, 2),),
+            RelationCode.PARENT: ((A, ROOT_PAGE, 1), (B, ROOT_PAGE, 1)),
+            RelationCode.CHALLENGES: ((A, B, 2),),
         },
     )
     assert (
         _issue(
-            CheckCode.CHALLENGE_PAIR_MISSING.value, A, 2, str(B), RelationLabel.CHALLENGED_BY.value
+            CheckCode.CHALLENGE_PAIR_MISSING.value, A, 2, str(B), RelationCode.CHALLENGED_BY.value
         )
         in check_graph(graph).issues
     )
 
 
 # ---------------------------------------------------------------------------
-# _check_outputs
+# output 协议删除：confirmed 状态本身已经足够，无需产出声明
 # ---------------------------------------------------------------------------
 
 
-def test_confirmed_page_without_output_is_missing() -> None:
+def test_confirmed_page_without_output_is_valid() -> None:
+    """已确认页面不再要求产出声明：`confirmed` 状态本身决定结论归属。"""
     graph = _graph(
         pages={
             ROOT_PAGE: _page(ROOT_PAGE, links=(_link("pages/a.md"),)),
             A: _page(
                 A,
-                status=StatusValue(StatusPrefix.CONFIRMED, "ok"),
-                relations=(_relation(RelationLabel.PARENT, "../index.md"),),
+                status=StatusValue(StatusCode.CONFIRMED, "ok"),
+                relations=(_relation(RelationCode.PARENT, "../index.md"),),
             ),
         },
         parents={A: ROOT_PAGE},
         children={ROOT_PAGE: (A,)},
-        relations={RelationLabel.PARENT: ((A, ROOT_PAGE, 1),)},
+        relations={RelationCode.PARENT: ((A, ROOT_PAGE, 1),)},
     )
-    assert _issue(CheckCode.OUTPUT_MISSING.value, A) in check_graph(graph).issues
-
-
-def test_non_confirmed_page_with_output_relation_is_forbidden() -> None:
-    graph = _graph(
-        pages={
-            ROOT_PAGE: _page(ROOT_PAGE),
-            A: _page(
-                A,
-                status=StatusValue(StatusPrefix.PENDING, None),
-                relations=(
-                    _relation(RelationLabel.PARENT, "../index.md"),
-                    _relation(RelationLabel.OUTPUT, "../conclusions.md", line=6),
-                ),
-            ),
-            CONCLUSIONS: _page(
-                CONCLUSIONS,
-                status=StatusValue(StatusPrefix.CONFIRMED, "汇总"),
-                relations=(_relation(RelationLabel.PARENT, "../index.md"),),
-            ),
-        },
-        parents={A: ROOT_PAGE, CONCLUSIONS: ROOT_PAGE},
-        children={ROOT_PAGE: (A, CONCLUSIONS)},
-        relations={
-            RelationLabel.PARENT: ((A, ROOT_PAGE, 1), (CONCLUSIONS, ROOT_PAGE, 1)),
-            RelationLabel.OUTPUT: ((A, CONCLUSIONS, 6),),
-        },
-    )
-    assert _issue(CheckCode.OUTPUT_FORBIDDEN.value, A, 6) in check_graph(graph).issues
-
-
-def test_confirmed_page_with_wrong_output_target_is_rejected() -> None:
-    graph = _graph(
-        pages={
-            ROOT_PAGE: _page(ROOT_PAGE),
-            A: _page(
-                A,
-                status=StatusValue(StatusPrefix.CONFIRMED, "ok"),
-                relations=(
-                    _relation(RelationLabel.PARENT, "../index.md"),
-                    _relation(RelationLabel.OUTPUT, "b.md", line=7),
-                ),
-            ),
-            B: _page(B, relations=(_relation(RelationLabel.PARENT, "../index.md"),)),
-        },
-        parents={A: ROOT_PAGE, B: ROOT_PAGE},
-        children={ROOT_PAGE: (A, B)},
-        relations={
-            RelationLabel.PARENT: ((A, ROOT_PAGE, 1), (B, ROOT_PAGE, 1)),
-            RelationLabel.OUTPUT: ((A, B, 7),),
-        },
-    )
-    assert (
-        _issue(
-            CheckCode.OUTPUT_WRONG_TARGET.value,
-            A,
-            7,
-            WrongOutputReason.NOT_CONCLUSIONS.value,
-            "b.md",
-        )
-        in check_graph(graph).issues
-    )
-
-
-def test_confirmed_output_without_backlink_is_rejected() -> None:
-    graph = _graph(
-        pages={
-            ROOT_PAGE: _page(ROOT_PAGE),
-            A: _page(
-                A,
-                status=StatusValue(StatusPrefix.CONFIRMED, "ok"),
-                relations=(
-                    _relation(RelationLabel.PARENT, "../index.md"),
-                    _relation(RelationLabel.OUTPUT, "../conclusions.md", line=6),
-                ),
-            ),
-            CONCLUSIONS: _page(
-                CONCLUSIONS,
-                status=StatusValue(StatusPrefix.CONFIRMED, "汇总"),
-                relations=(_relation(RelationLabel.PARENT, "../index.md"),),
-                # 没有指向 a.md 的正文链接
-            ),
-        },
-        parents={A: ROOT_PAGE, CONCLUSIONS: ROOT_PAGE},
-        children={ROOT_PAGE: (A, CONCLUSIONS)},
-        relations={
-            RelationLabel.PARENT: ((A, ROOT_PAGE, 1), (CONCLUSIONS, ROOT_PAGE, 1)),
-            RelationLabel.OUTPUT: ((A, CONCLUSIONS, 6),),
-        },
-    )
-    assert (
-        _issue(CheckCode.OUTPUT_BACKLINK_MISSING.value, CONCLUSIONS, None, str(A))
-        in check_graph(graph).issues
-    )
+    assert check_graph(graph).issues == ()
 
 
 # ---------------------------------------------------------------------------
@@ -564,14 +471,14 @@ def test_oversized_page_is_a_review_not_an_error() -> None:
             ROOT_PAGE: _page(ROOT_PAGE),
             A: _page(
                 A,
-                status=StatusValue(StatusPrefix.PENDING, None),
-                relations=(_relation(RelationLabel.PARENT, "../index.md"),),
+                status=StatusValue(StatusCode.PENDING, None),
+                relations=(_relation(RelationCode.PARENT, "../index.md"),),
                 text=big_text,
             ),
         },
         parents={A: ROOT_PAGE},
         children={ROOT_PAGE: (A,)},
-        relations={RelationLabel.PARENT: ((A, ROOT_PAGE, 1),)},
+        relations={RelationCode.PARENT: ((A, ROOT_PAGE, 1),)},
     )
     report = check_graph(graph)
     review = next(i for i in report.issues if i.code == CheckCode.PAGE_CAPACITY.value)
@@ -589,32 +496,28 @@ def test_two_independent_errors_preserve_pass_order_and_sort() -> None:
         pages={
             ROOT_PAGE: _page(
                 ROOT_PAGE,
-                status=StatusValue(StatusPrefix.CLOSED, "导航"),
+                status=StatusValue(StatusCode.CLOSED, "导航"),
                 links=(_link("pages/a.md"), _link("conclusions.md")),
             ),
             A: _page(
                 A,
-                status=StatusValue(StatusPrefix.CONFIRMED, "ok"),
-                relations=(_relation(RelationLabel.PARENT, "../index.md"),),
+                status=StatusValue(StatusCode.CONFIRMED, "ok"),
+                relations=(_relation(RelationCode.PARENT, "../index.md"),),
                 links=(_link("../index.md"),),
             ),
             CONCLUSIONS: _page(
                 CONCLUSIONS,
-                status=StatusValue(StatusPrefix.CONFIRMED, "汇总"),
-                relations=(_relation(RelationLabel.PARENT, "../index.md"),),
+                status=StatusValue(StatusCode.CONFIRMED, "汇总"),
+                relations=(_relation(RelationCode.PARENT, "../index.md"),),
                 links=(_link("../index.md"),),
             ),
         },
         parents={A: ROOT_PAGE, CONCLUSIONS: ROOT_PAGE},
         children={ROOT_PAGE: (A, CONCLUSIONS)},
         relations={
-            RelationLabel.PARENT: ((A, ROOT_PAGE, 1), (CONCLUSIONS, ROOT_PAGE, 1)),
+            RelationCode.PARENT: ((A, ROOT_PAGE, 1), (CONCLUSIONS, ROOT_PAGE, 1)),
             # 依赖自环：来自依赖检查 pass
-            RelationLabel.DEPENDS_ON: ((A, A, 5),),
+            RelationCode.DEPENDS_ON: ((A, A, 5),),
         },
     )
-    # a.md 已确认但无产出声明 -> output.missing（产出 pass 在依赖 pass 之后）
-    assert check_graph(graph).issues == (
-        _issue(CheckCode.DEPENDENCY_SELF.value, A, 5),
-        _issue(CheckCode.OUTPUT_MISSING.value, A),
-    )
+    assert check_graph(graph).issues == (_issue(CheckCode.DEPENDENCY_SELF.value, A, 5),)

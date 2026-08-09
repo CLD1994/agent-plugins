@@ -25,16 +25,15 @@ from draft.models import (
     MarkdownLink,
     PageDocument,
     Relation,
-    RelationLabel,
     SourceSpan,
-    StatusPrefix,
     StatusValue,
 )
+from draft.vocabulary import RelationCode, relation_code, relation_label, status_code
 
 COMMONMARK = MarkdownIt("commonmark")
 
 _STATUS_LABEL = "状态"
-_KNOWN_LABELS = frozenset(label.value for label in RelationLabel) | {_STATUS_LABEL}
+_KNOWN_LABELS = frozenset(relation_label(code) for code in RelationCode) | {_STATUS_LABEL}
 
 _ESCAPED_PUNCT = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
 _FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})")
@@ -548,7 +547,7 @@ def _parse_status_value(value: str, path: Path, line: int) -> StatusValue:
     else:
         prefix_text, explanation = inner, None
     try:
-        prefix = StatusPrefix(prefix_text)
+        code = status_code(prefix_text)
     except ValueError as exc:
         raise DraftError(
             CheckCode.PAGE_INVALID_STATUS.value,
@@ -556,7 +555,7 @@ def _parse_status_value(value: str, path: Path, line: int) -> StatusValue:
             details=(InvalidStatusReason.UNKNOWN_PREFIX.value, prefix_text),
             line=line,
         ) from exc
-    return StatusValue(prefix=prefix, explanation=explanation)
+    return StatusValue(code=code, explanation=explanation)
 
 
 def parse_page(path: Path, text: str) -> PageDocument:
@@ -619,7 +618,15 @@ def parse_page(path: Path, text: str) -> PageDocument:
                 )
             status = _parse_status_value(machine_line.value, path, machine_line.line)
             continue
-        relation_label = RelationLabel(machine_line.label)
+        try:
+            code = relation_code(machine_line.label)
+        except ValueError as exc:
+            raise DraftError(
+                CheckCode.PAGE_INVALID_RELATION.value,
+                path,
+                details=(InvalidRelationReason.EXTRA_CONTENT.value, machine_line.label),
+                line=machine_line.line,
+            ) from exc
         contained = [
             link
             for link in links
@@ -644,7 +651,7 @@ def parse_page(path: Path, text: str) -> PageDocument:
                 details=(InvalidRelationReason.EXTRA_CONTENT.value, machine_line.label),
                 line=machine_line.line,
             )
-        relations.append(Relation(label=relation_label, link=link))
+        relations.append(Relation(code=code, link=link))
 
     if status is None:
         raise DraftError(CheckCode.PAGE_MISSING_STATUS.value, path)

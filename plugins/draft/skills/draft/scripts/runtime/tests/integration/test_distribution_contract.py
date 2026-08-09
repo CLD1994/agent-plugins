@@ -13,8 +13,8 @@ from draft.diagnostic_codes import (
     ParseErrorReason,
     ReplacementStatusReason,
     RootMissingKind,
-    WrongOutputReason,
 )
+from draft.vocabulary import RelationCode, StatusCode
 from tests.support.paths import RUNTIME_ROOT
 
 SKILL_ROOT = RUNTIME_ROOT.parents[1]
@@ -113,13 +113,13 @@ def test_registered_diagnostic_codes_have_one_literal_owner() -> None:
     assert offenders == {}
 
 
-# 分支判别值（如 "not_single_code_span"、"duplicate"）与普通业务字符串（如
+# 分支判别值（如 "not_single_code_span"、"relation_requires_status"）与普通业务字符串（如
 # LocationKind 的 "file"、parametrize 参数名 "destination"）共享字符串空间，不能像
 # 检查码一样做全局字面量扫描。这里只报告与诊断 details 有可证关联的裸字符串：
 # 诊断构造调用（_issue / CheckIssue / DraftError / error_issue）实参、以及和
 # details 派生表达式（直接 .details、下标、list()/tuple() 保元素转换、按作用域
 # 解析的简单别名）比较的另一侧容器。其余出现位置不属于分支值，允许保留裸字符串
-# ——例如 `return ("duplicate",)` 这样的普通元组必须不报告。
+# ——例如 `return ("relation_requires_status",)` 这样的普通元组必须不报告。
 _BRANCH_VALUE_ENUMS = (
     RootMissingKind,
     InvalidStatusReason,
@@ -127,7 +127,6 @@ _BRANCH_VALUE_ENUMS = (
     ParseErrorReason,
     LinkEscapeKind,
     ReplacementStatusReason,
-    WrongOutputReason,
 )
 _BRANCH_VALUES: frozenset[str] = frozenset(
     member.value for enum in _BRANCH_VALUE_ENUMS for member in enum
@@ -260,32 +259,67 @@ def test_branch_discriminators_have_no_bare_literals_in_detail_positions() -> No
 
 def test_branch_check_ignores_plain_tuples() -> None:
     """普通元组中的分支值（与 details 无关联）必须不报告。"""
-    assert _branch_literals_in_source('def f():\n    return ("duplicate",)\n') == []
+    assert _branch_literals_in_source('def f():\n    return ("relation_requires_status",)\n') == []
 
 
 def test_branch_check_reports_direct_details_compare() -> None:
     """直接与 `.details` 比较的元组或标量必须报告。"""
-    assert _branch_literals_in_source('assert issue.details == ("duplicate",)\n') == [
-        (1, "duplicate")
+    assert _branch_literals_in_source(
+        'assert issue.details == ("relation_requires_status",)\n'
+    ) == [(1, "relation_requires_status")]
+    assert _branch_literals_in_source('assert "relation_requires_status" in issue.details\n') == [
+        (1, "relation_requires_status")
     ]
-    assert _branch_literals_in_source('assert "duplicate" in issue.details\n') == [(1, "duplicate")]
 
 
 def test_branch_check_reports_details_alias_access() -> None:
     """通过局部变量别名访问 details 必须报告；非 details 别名的同名下标不报告。"""
     assert _branch_literals_in_source(
-        'details = issue.details\nassert details[0] == "duplicate"\n'
-    ) == [(2, "duplicate")]
+        'details = issue.details\nassert details[0] == "relation_requires_status"\n'
+    ) == [(2, "relation_requires_status")]
     assert (
-        _branch_literals_in_source('details = ["a", "b"]\nassert details[0] == "duplicate"\n') == []
+        _branch_literals_in_source(
+            'details = ["a", "b"]\nassert details[0] == "relation_requires_status"\n'
+        )
+        == []
     )
 
 
 def test_branch_check_reports_details_conversions() -> None:
     """list()/tuple() 等保元素转换形式必须报告。"""
-    assert _branch_literals_in_source('assert list(issue.details) == ["duplicate"]\n') == [
-        (1, "duplicate")
-    ]
-    assert _branch_literals_in_source('assert tuple(issue.details) == ("duplicate",)\n') == [
-        (1, "duplicate")
-    ]
+    assert _branch_literals_in_source(
+        'assert list(issue.details) == ["relation_requires_status"]\n'
+    ) == [(1, "relation_requires_status")]
+    assert _branch_literals_in_source(
+        'assert tuple(issue.details) == ("relation_requires_status",)\n'
+    ) == [(1, "relation_requires_status")]
+
+
+# 稳定状态/关系协议值只由 vocabulary.py 拥有。这里扫描生产源码中的原始字面量，
+# 而不是测试或文档：语义所有权检查不能用普通文本包含/排除代替（见 AGENTS.md）。
+VOCABULARY_OWNER = RUNTIME_ROOT / "src/draft/vocabulary.py"
+_VOCABULARY_VALUES: frozenset[str] = frozenset(
+    member.value for enum in (StatusCode, RelationCode) for member in enum
+)
+
+
+def _vocabulary_literal_offenders() -> dict[str, list[tuple[int, str]]]:
+    offenders: dict[str, list[tuple[int, str]]] = {}
+    for path in sorted((RUNTIME_ROOT / "src/draft").rglob("*.py")):
+        if path == VOCABULARY_OWNER:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        hits = sorted(
+            (node.lineno, node.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in _VOCABULARY_VALUES
+        )
+        if hits:
+            offenders[path.relative_to(RUNTIME_ROOT).as_posix()] = hits
+    return offenders
+
+
+def test_status_and_relation_values_have_one_literal_owner() -> None:
+    assert _vocabulary_literal_offenders() == {}

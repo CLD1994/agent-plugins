@@ -6,25 +6,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
+from draft.vocabulary import RelationCode, StatusCode
+
 ValidationMode = Literal["registered", "candidate"]
-
-
-class StatusPrefix(StrEnum):
-    PENDING = "待讨论"
-    PROPOSAL = "当前提案"
-    CONFIRMED = "已确认"
-    SUPERSEDED = "已取代"
-    CLOSED = "已关闭"
-
-
-class RelationLabel(StrEnum):
-    PARENT = "父主题"
-    DEPENDS_ON = "依赖"
-    SUPERSEDES = "取代"
-    SUPERSEDED_BY = "被取代"
-    CHALLENGES = "质疑"
-    CHALLENGED_BY = "被质疑"
-    OUTPUT = "产出"
 
 
 class IssueSeverity(StrEnum):
@@ -54,7 +38,7 @@ class OperationPhase(StrEnum):
 
 @dataclass(frozen=True)
 class StatusValue:
-    prefix: StatusPrefix
+    code: StatusCode
     explanation: str | None
 
 
@@ -77,7 +61,7 @@ class MarkdownLink:
 
 @dataclass(frozen=True)
 class Relation:
-    label: RelationLabel
+    code: RelationCode
     link: MarkdownLink
 
 

@@ -12,7 +12,6 @@ from draft.diagnostic_codes import (
     ParseErrorReason,
     ReplacementStatusReason,
     RootMissingKind,
-    WrongOutputReason,
 )
 from draft.diagnostics import KNOWN_CHECK_CODES, issue_payload, render_issue
 from draft.models import CheckIssue, IssueSeverity
@@ -329,9 +328,9 @@ VALID_RENDER_CASES = [
             IssueSeverity.ERROR,
             Path("pages/question.md"),
             9,
-            ("依赖", "pages/question.md"),
+            ("depends_on", "pages/question.md"),
         ),
-        (0, 1),
+        (1,),
     ),
     RenderCase(
         CheckIssue(
@@ -447,9 +446,9 @@ VALID_RENDER_CASES = [
             IssueSeverity.ERROR,
             Path("pages/new.md"),
             7,
-            ("pages/question.md", "被取代"),
+            ("pages/question.md", "superseded_by"),
         ),
-        (0, 1),
+        (0,),
     ),
     RenderCase(
         CheckIssue(
@@ -495,52 +494,7 @@ VALID_RENDER_CASES = [
             IssueSeverity.ERROR,
             Path("pages/challenger.md"),
             7,
-            ("pages/question.md", "被质疑"),
-        ),
-        (0, 1),
-    ),
-    RenderCase(
-        CheckIssue(
-            CheckCode.OUTPUT_FORBIDDEN.value,
-            IssueSeverity.ERROR,
-            Path("pages/a.md"),
-            7,
-        ),
-    ),
-    RenderCase(
-        CheckIssue(
-            CheckCode.OUTPUT_MISSING.value,
-            IssueSeverity.ERROR,
-            Path("pages/a.md"),
-            None,
-        ),
-    ),
-    RenderCase(
-        CheckIssue(
-            CheckCode.OUTPUT_WRONG_TARGET.value,
-            IssueSeverity.ERROR,
-            Path("pages/a.md"),
-            7,
-            (WrongOutputReason.DUPLICATE.value,),
-        ),
-    ),
-    RenderCase(
-        CheckIssue(
-            CheckCode.OUTPUT_WRONG_TARGET.value,
-            IssueSeverity.ERROR,
-            Path("pages/a.md"),
-            7,
-            (WrongOutputReason.NOT_CONCLUSIONS.value, "../index.md"),
-        ),
-        (1,),
-    ),
-    RenderCase(
-        CheckIssue(
-            CheckCode.OUTPUT_BACKLINK_MISSING.value,
-            IssueSeverity.ERROR,
-            Path("conclusions.md"),
-            None,
-            ("pages/a.md",),
+            ("pages/question.md", "challenged_by"),
         ),
         (0,),
     ),
@@ -664,7 +618,6 @@ VARIANT_CODES: tuple[CheckCode, ...] = (
     CheckCode.LINK_MISSING,
     CheckCode.LINK_ESCAPE,
     CheckCode.REPLACEMENT_STATUS_MISMATCH,
-    CheckCode.OUTPUT_WRONG_TARGET,
 )
 
 VARIANT_GROUPS = [
@@ -703,6 +656,21 @@ def test_known_code_with_invalid_location_exposes_code_and_raw_details() -> None
     _assert_single_line(rendered)
     assert issue.code in rendered
     assert json.dumps(list(issue.details), ensure_ascii=False) in rendered
+
+
+def test_relation_detail_renders_current_chinese_label() -> None:
+    """details 携带稳定关系码，人类输出渲染为当前中文标签。"""
+    issue = CheckIssue(
+        CheckCode.REPLACEMENT_PAIR_MISSING.value,
+        IssueSeverity.ERROR,
+        Path("pages/new.md"),
+        7,
+        ("pages/old.md", "superseded_by"),
+    )
+    rendered = render_issue(issue)
+    _assert_single_line(rendered)
+    assert "被取代" in rendered
+    assert "superseded_by" not in rendered
 
 
 def test_known_code_with_non_positive_line_does_not_render_fake_line() -> None:

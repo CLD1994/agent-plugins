@@ -38,10 +38,6 @@ class CheckCode(StrEnum):
     REPLACEMENT_STATUS_MISMATCH = "replacement.status_mismatch"
     REPLACEMENT_CYCLE = "replacement.cycle"
     CHALLENGE_PAIR_MISSING = "challenge.pair_missing"
-    OUTPUT_FORBIDDEN = "output.forbidden"
-    OUTPUT_MISSING = "output.missing"
-    OUTPUT_WRONG_TARGET = "output.wrong_target"
-    OUTPUT_BACKLINK_MISSING = "output.backlink_missing"
     OPERATION_JOURNAL_CORRUPT = "operation.journal_corrupt"
     OPERATION_RECOVERY_REQUIRED = "operation.recovery_required"
     OPERATION_ORPHAN_ALLOCATING = "operation.orphan_allocating"
@@ -86,8 +82,3 @@ class LinkEscapeKind(StrEnum):
 class ReplacementStatusReason(StrEnum):
     RELATION_REQUIRES_STATUS = "relation_requires_status"
     STATUS_REQUIRES_RELATION = "status_requires_relation"
-
-
-class WrongOutputReason(StrEnum):
-    DUPLICATE = "duplicate"
-    NOT_CONCLUSIONS = "not_conclusions"

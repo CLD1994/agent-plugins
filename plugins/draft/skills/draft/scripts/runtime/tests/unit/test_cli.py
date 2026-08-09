@@ -400,7 +400,7 @@ def test_render_check_json_uses_structured_payload_without_human_renderer(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     issue = CheckIssue(
-        CheckCode.OUTPUT_MISSING.value, IssueSeverity.ERROR, Path("pages/a.md"), None
+        CheckCode.PARENT_MISSING.value, IssueSeverity.ERROR, Path("pages/a.md"), None
     )
     render_issue = mocker.patch.object(cli, "render_issue", autospec=True)
     exit_code = cli._render_check(  # pyright: ignore[reportPrivateUsage]
@@ -413,7 +413,7 @@ def test_render_check_json_uses_structured_payload_without_human_renderer(
         "result_type": "check",
         "errors": [
             {
-                "code": CheckCode.OUTPUT_MISSING.value,
+                "code": CheckCode.PARENT_MISSING.value,
                 "severity": "error",
                 "path": "pages/a.md",
                 "line": None,
@@ -528,7 +528,7 @@ def test_main_check_with_errors_returns_one(
     report = CheckReport(
         issues=(
             CheckIssue(
-                CheckCode.OUTPUT_MISSING.value, IssueSeverity.ERROR, Path("pages/a.md"), None
+                CheckCode.PARENT_MISSING.value, IssueSeverity.ERROR, Path("pages/a.md"), None
             ),
         )
     )

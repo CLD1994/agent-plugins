@@ -7,7 +7,6 @@ from draft.diagnostic_codes import (
     CheckCode,
     ReplacementStatusReason,
     RootMissingKind,
-    WrongOutputReason,
 )
 from draft.errors import DraftError
 from draft.graph import (
@@ -24,8 +23,6 @@ from draft.models import (
     CheckReport,
     IssueSeverity,
     OperationPhase,
-    RelationLabel,
-    StatusPrefix,
 )
 from draft.operations import (
     Journal,
@@ -36,6 +33,7 @@ from draft.operations import (
 )
 from draft.paths import physical_parent, resolve_draft_root
 from draft.trash_package import OUTGOING_RELATIVE, load_verified_package
+from draft.vocabulary import RelationCode, StatusCode
 
 CAPACITY_LINES = 600
 CAPACITY_BYTES = 60 * 1024
@@ -155,7 +153,7 @@ def _find_cycles(edges: Mapping[Path, tuple[Path, ...]]) -> list[tuple[Path, ...
     return sorted(cycles)
 
 
-def _multi_edges(graph: DraftGraph, label: RelationLabel) -> dict[Path, tuple[Path, ...]]:
+def _multi_edges(graph: DraftGraph, label: RelationCode) -> dict[Path, tuple[Path, ...]]:
     edges: dict[Path, set[Path]] = {}
     for source, target, _line in graph.relations.get(label, ()):
         edges.setdefault(source, set()).add(target)
@@ -163,7 +161,7 @@ def _multi_edges(graph: DraftGraph, label: RelationLabel) -> dict[Path, tuple[Pa
 
 
 def _relation_lines(
-    graph: DraftGraph, label: RelationLabel
+    graph: DraftGraph, label: RelationCode
 ) -> dict[tuple[Path, Path], tuple[int, ...]]:
     """Group relation edges by (source, target) and retain each declaration line.
 
@@ -184,8 +182,8 @@ def _cycle_details(cycle: tuple[Path, ...]) -> tuple[str, ...]:
 def _check_relation_duplicates(graph: DraftGraph) -> list[CheckIssue]:
     """同一来源页的同一标签重复指向同一规范化目标（父主题由基数检查覆盖）。"""
     issues: list[CheckIssue] = []
-    for label in RelationLabel:
-        if label is RelationLabel.PARENT:
+    for label in RelationCode:
+        if label is RelationCode.PARENT:
             continue
         seen = _relation_lines(graph, label)
         for (source, target), lines in sorted(seen.items()):
@@ -222,13 +220,11 @@ def _body_links_to(graph: DraftGraph, source: Path) -> set[Path]:
 
 def _check_parents(graph: DraftGraph) -> list[CheckIssue]:
     issues: list[CheckIssue] = []
-    parent_edges = _multi_edges(graph, RelationLabel.PARENT)
+    parent_edges = _multi_edges(graph, RelationCode.PARENT)
     single_edges = {source: targets for source, targets in parent_edges.items()}
 
     for path, page in graph.pages.items():
-        declared = [
-            relation for relation in page.relations if relation.label is RelationLabel.PARENT
-        ]
+        declared = [relation for relation in page.relations if relation.code is RelationCode.PARENT]
         if path == ROOT_PAGE:
             if declared:
                 issues.append(_error(CheckCode.PARENT_ROOT_DECLARED, path, declared[0].link.line))
@@ -285,8 +281,8 @@ def _check_parents(graph: DraftGraph) -> list[CheckIssue]:
 
 def _check_dependencies(graph: DraftGraph) -> list[CheckIssue]:
     issues: list[CheckIssue] = []
-    edges = _multi_edges(graph, RelationLabel.DEPENDS_ON)
-    depends_lines = _relation_lines(graph, RelationLabel.DEPENDS_ON)
+    edges = _multi_edges(graph, RelationCode.DEPENDS_ON)
+    depends_lines = _relation_lines(graph, RelationCode.DEPENDS_ON)
     for (source, target), lines in sorted(depends_lines.items()):
         if source == target:
             issues.append(_error(CheckCode.DEPENDENCY_SELF, source, min(lines)))
@@ -301,8 +297,8 @@ def _check_dependencies(graph: DraftGraph) -> list[CheckIssue]:
 
 def _check_replacements(graph: DraftGraph) -> list[CheckIssue]:
     issues: list[CheckIssue] = []
-    supersedes = _relation_lines(graph, RelationLabel.SUPERSEDES)
-    superseded_by = _relation_lines(graph, RelationLabel.SUPERSEDED_BY)
+    supersedes = _relation_lines(graph, RelationCode.SUPERSEDES)
+    superseded_by = _relation_lines(graph, RelationCode.SUPERSEDED_BY)
     for (source, target), lines in sorted(supersedes.items()):
         if (target, source) not in superseded_by:
             issues.append(
@@ -311,7 +307,7 @@ def _check_replacements(graph: DraftGraph) -> list[CheckIssue]:
                     source,
                     min(lines),
                     target.as_posix(),
-                    RelationLabel.SUPERSEDED_BY.value,
+                    RelationCode.SUPERSEDED_BY.value,
                 )
             )
     for (source, target), lines in sorted(superseded_by.items()):
@@ -322,15 +318,15 @@ def _check_replacements(graph: DraftGraph) -> list[CheckIssue]:
                     source,
                     min(lines),
                     target.as_posix(),
-                    RelationLabel.SUPERSEDES.value,
+                    RelationCode.SUPERSEDES.value,
                 )
             )
     for path, page in graph.pages.items():
         superseded_by_relations = [
-            relation for relation in page.relations if relation.label is RelationLabel.SUPERSEDED_BY
+            relation for relation in page.relations if relation.code is RelationCode.SUPERSEDED_BY
         ]
         declares_superseded_by = bool(superseded_by_relations)
-        is_superseded = page.status.prefix is StatusPrefix.SUPERSEDED
+        is_superseded = page.status.code is StatusCode.SUPERSEDED
         if declares_superseded_by and not is_superseded:
             line = min(relation.link.line for relation in superseded_by_relations)
             issues.append(
@@ -350,7 +346,7 @@ def _check_replacements(graph: DraftGraph) -> list[CheckIssue]:
                     ReplacementStatusReason.STATUS_REQUIRES_RELATION.value,
                 )
             )
-    edges = _multi_edges(graph, RelationLabel.SUPERSEDES)
+    edges = _multi_edges(graph, RelationCode.SUPERSEDES)
     for cycle in _find_cycles(edges):
         issues.append(_error(CheckCode.REPLACEMENT_CYCLE, cycle[0], None, *_cycle_details(cycle)))
     return issues
@@ -358,8 +354,8 @@ def _check_replacements(graph: DraftGraph) -> list[CheckIssue]:
 
 def _check_challenges(graph: DraftGraph) -> list[CheckIssue]:
     issues: list[CheckIssue] = []
-    challenges = _relation_lines(graph, RelationLabel.CHALLENGES)
-    challenged_by = _relation_lines(graph, RelationLabel.CHALLENGED_BY)
+    challenges = _relation_lines(graph, RelationCode.CHALLENGES)
+    challenged_by = _relation_lines(graph, RelationCode.CHALLENGED_BY)
     for (source, target), lines in sorted(challenges.items()):
         if (target, source) not in challenged_by:
             issues.append(
@@ -368,7 +364,7 @@ def _check_challenges(graph: DraftGraph) -> list[CheckIssue]:
                     source,
                     min(lines),
                     target.as_posix(),
-                    RelationLabel.CHALLENGED_BY.value,
+                    RelationCode.CHALLENGED_BY.value,
                 )
             )
     for (source, target), lines in sorted(challenged_by.items()):
@@ -379,70 +375,8 @@ def _check_challenges(graph: DraftGraph) -> list[CheckIssue]:
                     source,
                     min(lines),
                     target.as_posix(),
-                    RelationLabel.CHALLENGES.value,
+                    RelationCode.CHALLENGES.value,
                 )
-            )
-    return issues
-
-
-def _resolved_target(source: Path, destination: str, root: Path) -> Path | None:
-    """Normalized target of a declaration, or None if it escapes the draft root."""
-    try:
-        target, _anchor = resolve_local_destination(source, destination, root)
-    except DraftError:
-        return None
-    return target
-
-
-def _check_outputs(graph: DraftGraph) -> list[CheckIssue]:
-    issues: list[CheckIssue] = []
-    for path, page in graph.pages.items():
-        declared = [
-            relation for relation in page.relations if relation.label is RelationLabel.OUTPUT
-        ]
-        if path == CONCLUSIONS_PAGE:
-            if declared:
-                issues.append(_error(CheckCode.OUTPUT_FORBIDDEN, path, declared[0].link.line))
-            continue
-        is_confirmed = page.status.prefix is StatusPrefix.CONFIRMED
-        if not is_confirmed:
-            if declared:
-                issues.append(_error(CheckCode.OUTPUT_FORBIDDEN, path, declared[0].link.line))
-            continue
-        if not declared:
-            issues.append(_error(CheckCode.OUTPUT_MISSING, path))
-            continue
-        if len(declared) > 1:
-            issues.append(
-                _error(
-                    CheckCode.OUTPUT_WRONG_TARGET,
-                    path,
-                    declared[1].link.line,
-                    WrongOutputReason.DUPLICATE.value,
-                )
-            )
-        # 关联每条声明与其规范化目标，定位实际未指向 conclusions.md 的声明；
-        # 不能用 declared[0]，否则会把正确声明报成错误事实。
-        wrong_targets = [
-            relation
-            for relation in declared
-            if _resolved_target(path, relation.link.destination, graph.root) != CONCLUSIONS_PAGE
-        ]
-        for relation in wrong_targets:
-            issues.append(
-                _error(
-                    CheckCode.OUTPUT_WRONG_TARGET,
-                    path,
-                    relation.link.line,
-                    WrongOutputReason.NOT_CONCLUSIONS.value,
-                    relation.link.destination,
-                )
-            )
-        if wrong_targets:
-            continue
-        if path not in _body_links_to(graph, CONCLUSIONS_PAGE):
-            issues.append(
-                _error(CheckCode.OUTPUT_BACKLINK_MISSING, CONCLUSIONS_PAGE, None, path.as_posix())
             )
     return issues
 
@@ -467,7 +401,6 @@ def check_graph(graph: DraftGraph) -> CheckReport:
         _check_dependencies(graph),
         _check_replacements(graph),
         _check_challenges(graph),
-        _check_outputs(graph),
         _check_capacity(graph),
     ):
         issues.extend(sorted(pass_issues, key=_sort_key))

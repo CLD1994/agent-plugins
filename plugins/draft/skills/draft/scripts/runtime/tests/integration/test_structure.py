@@ -50,8 +50,6 @@ A_PAGE = """# A
 > 状态：`已确认`
 >
 > 父主题：[旧枢纽](../old/index.md)
->
-> 产出：[结论汇总](../../conclusions.md)
 
 关联 [留存](keep.md#细节) 与 [外部](https://example.com/a)。
 
@@ -539,8 +537,6 @@ LAZY_A = """# 甲
 > 状态：`已确认`
 >
 > 父主题：[根索引](../index.md)
->
-> 产出：[结论汇总](../conclusions.md)
 
 甲。
 """

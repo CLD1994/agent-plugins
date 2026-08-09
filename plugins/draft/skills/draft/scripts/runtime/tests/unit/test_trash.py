@@ -22,7 +22,6 @@ from draft.models import (
     MutationKind,
     OperationPhase,
     PageDocument,
-    RelationLabel,
     SourceSpan,
 )
 from draft.operations import (
@@ -32,6 +31,7 @@ from draft.operations import (
 )
 from draft.trash import require_retained_restore_window, trash_plan
 from draft.trash_package import OUTGOING_RELATIVE, PACKAGE_VERSION
+from draft.vocabulary import RelationCode
 
 ROOT = Path("/draft")
 FIXED_OPERATION_ID = "12345678123456781234567812345678"
@@ -59,8 +59,8 @@ def _graph_from_texts(
 
     managed_set = set(pages)
     inbound: dict[Path, list[tuple[Path, MarkdownLink]]] = {}
-    relation_edges: dict[RelationLabel, list[tuple[Path, Path, int]]] = {
-        label: [] for label in RelationLabel
+    relation_edges: dict[RelationCode, list[tuple[Path, Path, int]]] = {
+        label: [] for label in RelationCode
     }
 
     for source in sorted(pages):
@@ -79,15 +79,15 @@ def _graph_from_texts(
             target = resolved_links.get(relation.link.whole_span)
             if target is None or target not in managed_set:
                 continue
-            relation_edges[relation.label].append((source, target, relation.link.line))
+            relation_edges[relation.code].append((source, target, relation.link.line))
 
     parents: dict[Path, Path] = {}
     for source in sorted(pages):
-        declared = [r for r in pages[source].relations if r.label is RelationLabel.PARENT]
+        declared = [r for r in pages[source].relations if r.code is RelationCode.PARENT]
         if len(declared) != 1:
             continue
         matches = [
-            target for src, target, _line in relation_edges[RelationLabel.PARENT] if src == source
+            target for src, target, _line in relation_edges[RelationCode.PARENT] if src == source
         ]
         if len(matches) == 1:
             parents[source] = matches[0]
@@ -205,18 +205,6 @@ _B_CHALLENGES_A = """# 乙
 > 父主题：[根](../index.md)
 >
 > 质疑：[甲](a.md)
-
-乙的正文。
-"""
-
-# 产出阻碍图（非法指向非结论页，但 trash_plan 不校验图合法性）
-_B_OUTPUT_A = """# 乙
-
-> 状态：`待讨论`
->
-> 父主题：[根](../index.md)
->
-> 产出：[甲](a.md)
 
 乙的正文。
 """
@@ -624,23 +612,6 @@ def test_trash_plan_challenge_relation_blocks() -> None:
             Path("conclusions.md"): _CONCLUSIONS,
             Path("pages/a.md"): _A,
             Path("pages/b.md"): _B_CHALLENGES_A,
-        }
-    )
-    with pytest.raises(DraftError) as caught:
-        trash_plan(graph, Path("pages/a.md"))
-    assert caught.value.code == "trash.inbound_reference"
-    details = " ".join(caught.value.details)
-    assert "pages/b.md" in details
-
-
-def test_trash_plan_output_relation_blocks() -> None:
-    """其他页有产出关系指向被回收页时，关系阻碍回收。"""
-    graph = _graph_from_texts(
-        {
-            Path("index.md"): _INDEX_WITH_B,
-            Path("conclusions.md"): _CONCLUSIONS,
-            Path("pages/a.md"): _A,
-            Path("pages/b.md"): _B_OUTPUT_A,
         }
     )
     with pytest.raises(DraftError) as caught:

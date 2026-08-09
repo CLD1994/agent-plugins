@@ -43,8 +43,6 @@ def operation_draft(tmp_path: Path) -> Path:
 > 状态：`已确认`
 >
 > 父主题：[根索引](../index.md)
->
-> 产出：[结论汇总](../conclusions.md)
 
 A。
 """,
@@ -53,8 +51,6 @@ A。
 > 状态：`已确认`
 >
 > 父主题：[根索引](../index.md)
->
-> 产出：[结论汇总](../conclusions.md)
 
 B。
 """,
@@ -619,7 +615,7 @@ def test_rolled_back_journal_with_matching_lock_releases_lock(
     root = operation_draft
     _plan, old_a, _old_b, _new_a, _new_b = two_write_plan(root)
     # 让验证失败：计划把 a.md 改坏，使检查后存在结构错误。
-    broken = (root / "pages/a.md").read_bytes().replace(b"(../conclusions.md)", b"(../missing.md)")
+    broken = (root / "pages/a.md").read_bytes().replace(b"(../index.md)", b"(../missing.md)")
     plan = OperationPlan(
         kind="test",
         root=root,

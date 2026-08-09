@@ -13,9 +13,9 @@ from draft.diagnostic_codes import (
     ParseErrorReason,
     ReplacementStatusReason,
     RootMissingKind,
-    WrongOutputReason,
 )
 from draft.models import CheckIssue, IssueSeverity
+from draft.vocabulary import RelationCode, relation_label
 
 
 class LocationKind(StrEnum):
@@ -46,6 +46,14 @@ _SEVERITY_NAMES = {
 def _safe(value: str) -> str:
     """Escape control characters so a parameter never breaks the single-line boundary."""
     return json.dumps(value, ensure_ascii=False)[1:-1]
+
+
+def _relation_text(value: str) -> str:
+    """稳定关系码渲染为当前中文标签；未知值原样保留（仍经转义）。"""
+    try:
+        return relation_label(RelationCode(value))
+    except ValueError:
+        return value
 
 
 def _location(issue: CheckIssue) -> tuple[LocationKind, str]:
@@ -125,12 +133,6 @@ def _render_status_mismatch(details: tuple[str, ...]) -> str:
     if details[0] == ReplacementStatusReason.RELATION_REQUIRES_STATUS.value:
         return "被取代关系要求已取代状态"
     return "已取代状态要求被取代关系"
-
-
-def _render_wrong_target(details: tuple[str, ...]) -> str:
-    if details[0] == WrongOutputReason.DUPLICATE.value:
-        return "重复产出"
-    return f"产出必须指向根级 conclusions.md，当前目标：{_safe(details[1])}"
 
 
 def _render_link_missing(details: tuple[str, ...]) -> str:
@@ -230,7 +232,9 @@ _SPECS: dict[CheckCode, DiagnosticSpec] = {
         _FILE, _fixed(0), _text("路径包含越出受管理树的符号链接")
     ),
     CheckCode.RELATION_DUPLICATE: DiagnosticSpec(
-        _LINE, _fixed(2), lambda details: f"{_safe(details[0])} 重复指向 {_safe(details[1])}"
+        _LINE,
+        _fixed(2),
+        lambda details: f"{_safe(_relation_text(details[0]))} 重复指向 {_safe(details[1])}",
     ),
     CheckCode.PARENT_ROOT_DECLARED: DiagnosticSpec(
         _LINE, _fixed(0), _text("根页面不得声明“父主题”")
@@ -253,7 +257,7 @@ _SPECS: dict[CheckCode, DiagnosticSpec] = {
     CheckCode.REPLACEMENT_PAIR_MISSING: DiagnosticSpec(
         _LINE,
         _fixed(2),
-        lambda details: f"{_safe(details[0])} 缺少对应的“{_safe(details[1])}”关系",
+        lambda details: f"{_safe(details[0])} 缺少对应的“{_safe(_relation_text(details[1]))}”关系",
     ),
     CheckCode.REPLACEMENT_STATUS_MISMATCH: DiagnosticSpec(
         _LINE_OR_FILE,
@@ -269,21 +273,7 @@ _SPECS: dict[CheckCode, DiagnosticSpec] = {
     CheckCode.CHALLENGE_PAIR_MISSING: DiagnosticSpec(
         _LINE,
         _fixed(2),
-        lambda details: f"{_safe(details[0])} 缺少对应的“{_safe(details[1])}”关系",
-    ),
-    CheckCode.OUTPUT_FORBIDDEN: DiagnosticSpec(
-        _LINE, _fixed(0), _text("当前页面或状态不允许声明“产出”")
-    ),
-    CheckCode.OUTPUT_MISSING: DiagnosticSpec(_FILE, _fixed(0), _text("已确认页面缺少“产出”声明")),
-    CheckCode.OUTPUT_WRONG_TARGET: DiagnosticSpec(
-        _LINE,
-        _variant(
-            {WrongOutputReason.DUPLICATE.value: 1, WrongOutputReason.NOT_CONCLUSIONS.value: 2}
-        ),
-        _render_wrong_target,
-    ),
-    CheckCode.OUTPUT_BACKLINK_MISSING: DiagnosticSpec(
-        _FILE, _fixed(1), lambda details: f"缺少对已确认页面 {_safe(details[0])} 的正文反向链接"
+        lambda details: f"{_safe(details[0])} 缺少对应的“{_safe(_relation_text(details[1]))}”关系",
     ),
     CheckCode.OPERATION_JOURNAL_CORRUPT: DiagnosticSpec(
         _FILE, _fixed(0), _text("操作锁或日志损坏")

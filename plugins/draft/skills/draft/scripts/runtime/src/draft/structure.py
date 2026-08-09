@@ -28,12 +28,12 @@ from draft.models import (
     MutationKind,
     OperationPlan,
     OperationResult,
-    RelationLabel,
     SourceSpan,
 )
 from draft.operations import execute_plan, read_lock, sha256_bytes
 from draft.paths import physical_parent, resolve_draft_root
 from draft.trash_lifecycle import collect_lifecycle_warnings, prepare_structural_write
+from draft.vocabulary import RelationCode
 
 
 def _with_preflight_warnings(result: OperationResult, report: object) -> OperationResult:
@@ -170,7 +170,7 @@ def _render_pages(
         final_path = expanded.get(path, path)
         edits: dict[SourceSpan, str] = {}
         parent_relation = next(
-            (relation for relation in page.relations if relation.label is RelationLabel.PARENT),
+            (relation for relation in page.relations if relation.code is RelationCode.PARENT),
             None,
         )
         if path in parent_changes and parent_relation is not None:

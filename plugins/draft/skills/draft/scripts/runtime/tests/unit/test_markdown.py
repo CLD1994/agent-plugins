@@ -17,7 +17,8 @@ from draft.markdown import (
     remove_parent_navigation,
     rewrite_link_destinations,
 )
-from draft.models import MarkdownLink, RelationLabel, SourceSpan, StatusPrefix
+from draft.models import MarkdownLink, SourceSpan
+from draft.vocabulary import RelationCode, StatusCode, status_code
 
 VALID_PAGE = """# 请求身份
 
@@ -40,11 +41,11 @@ def test_parse_page_reads_only_the_top_machine_block() -> None:
     page = parse_page(Path("pages/request.md"), VALID_PAGE)
 
     assert page.title == "请求身份"
-    assert page.status.prefix is StatusPrefix.CLOSED
+    assert page.status.code is StatusCode.CLOSED
     assert page.status.explanation == "旧方案，仅保留历史"
-    assert [relation.label for relation in page.relations] == [
-        RelationLabel.PARENT,
-        RelationLabel.DEPENDS_ON,
+    assert [relation.code for relation in page.relations] == [
+        RelationCode.PARENT,
+        RelationCode.DEPENDS_ON,
     ]
     assert {link.destination for link in page.links} == {
         "../index.md",
@@ -63,7 +64,7 @@ def test_parse_page_rejects_unknown_machine_label() -> None:
 def test_status_value_colon_is_not_confused_with_label_colon() -> None:
     page = parse_page(Path("pages/request.md"), VALID_PAGE)
 
-    assert page.status.prefix is StatusPrefix.CLOSED
+    assert page.status.code is StatusCode.CLOSED
     assert page.status.explanation == "旧方案，仅保留历史"
 
 
@@ -82,11 +83,11 @@ def make_page(status_value: str) -> str:
     return "# 标题\n\n> 状态：" + status_value + "\n>\n> 父主题：[根](../index.md)\n\n正文。\n"
 
 
-@pytest.mark.parametrize("prefix", ["待讨论", "当前提案", "已确认", "已取代", "已关闭"])
-def test_exact_five_status_prefixes(prefix: str) -> None:
-    page = parse_page(Path("pages/x.md"), make_page(f"`{prefix}`"))
+@pytest.mark.parametrize("label", ["待讨论", "当前提案", "已确认", "已取代", "已关闭"])
+def test_exact_five_status_labels(label: str) -> None:
+    page = parse_page(Path("pages/x.md"), make_page(f"`{label}`"))
 
-    assert page.status.prefix is StatusPrefix(prefix)
+    assert page.status.code is status_code(label)
     assert page.status.explanation is None
 
 
@@ -164,10 +165,10 @@ def test_repeated_relation_lines_are_preserved() -> None:
 
     page = parse_page(Path("pages/x.md"), text)
 
-    assert [relation.label for relation in page.relations] == [
-        RelationLabel.PARENT,
-        RelationLabel.DEPENDS_ON,
-        RelationLabel.DEPENDS_ON,
+    assert [relation.code for relation in page.relations] == [
+        RelationCode.PARENT,
+        RelationCode.DEPENDS_ON,
+        RelationCode.DEPENDS_ON,
     ]
     assert [relation.link.destination for relation in page.relations] == [
         "../index.md",
@@ -300,6 +301,17 @@ def test_unknown_label_preserves_only_the_label_operand() -> None:
     assert caught.value.code == CheckCode.PAGE_UNKNOWN_LABEL.value
     assert caught.value.line == 7
     assert caught.value.details == ("状态依据",)
+
+
+def test_removed_output_label_is_reported_as_unknown() -> None:
+    """旧 `产出：` 不再被识别为关系，而是按未知机器标签报错；这不是兼容路径。"""
+    text = VALID_PAGE.replace(
+        "> 依赖：[页面模型](page-model.md#边界)", "> 产出：[结论汇总](../conclusions.md)"
+    )
+    with pytest.raises(DraftError) as caught:
+        parse_page(Path("pages/request.md"), text)
+    assert caught.value.code == CheckCode.PAGE_UNKNOWN_LABEL.value
+    assert caught.value.details == ("产出",)
 
 
 @pytest.mark.parametrize(
