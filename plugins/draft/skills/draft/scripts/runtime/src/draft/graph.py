@@ -26,7 +26,7 @@ from draft.resources import (
     TargetState,
     resolve_page_resources,
 )
-from draft.vocabulary import RelationCode
+from draft.vocabulary import ConclusionsState, RelationCode
 
 LoadMode = ValidationMode
 
@@ -82,6 +82,7 @@ def error_issue(
 class MarkerState:
     version: int
     provisional_manifest: tuple[tuple[str, str], ...] | None
+    conclusions_state: ConclusionsState = ConclusionsState.NOT_GENERATED
 
 
 def _parse_manifest_entries(value: object, marker: Path) -> tuple[tuple[str, str], ...]:
@@ -104,6 +105,15 @@ def _parse_manifest_entries(value: object, marker: Path) -> tuple[tuple[str, str
     return tuple(entries)
 
 
+def _parse_conclusions_state(value: object, marker: Path) -> ConclusionsState:
+    if not isinstance(value, str):
+        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
+    try:
+        return ConclusionsState(value)
+    except ValueError as exc:
+        raise DraftError(CheckCode.FORMAT_INVALID.value, marker) from exc
+
+
 def parse_marker_value(decoded: object, marker: Path) -> MarkerState:
     if not isinstance(decoded, dict):
         raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
@@ -114,14 +124,25 @@ def parse_marker_value(decoded: object, marker: Path) -> MarkerState:
     if version != FORMAT_VERSION:
         raise DraftError(CheckCode.FORMAT_UNSUPPORTED.value, marker)
     keys = set(data)
+    # 旧 {"format_version":1} 标记有意以 format.invalid 拒绝；不提供迁移或双读。
     if keys == {"format_version"}:
-        return MarkerState(version=version, provisional_manifest=None)
-    if keys == {"format_version", "adopt_state", "candidate_manifest"}:
+        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
+    if keys == {"format_version", "conclusions_state"}:
+        return MarkerState(
+            version=version,
+            provisional_manifest=None,
+            conclusions_state=_parse_conclusions_state(data.get("conclusions_state"), marker),
+        )
+    if keys == {"format_version", "conclusions_state", "adopt_state", "candidate_manifest"}:
         if data.get("adopt_state") != "provisional":
+            raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
+        state = _parse_conclusions_state(data.get("conclusions_state"), marker)
+        if state is not ConclusionsState.NOT_GENERATED:
             raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
         return MarkerState(
             version=version,
             provisional_manifest=_parse_manifest_entries(data.get("candidate_manifest"), marker),
+            conclusions_state=state,
         )
     raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
 

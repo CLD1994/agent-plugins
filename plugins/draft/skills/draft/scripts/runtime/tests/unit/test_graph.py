@@ -13,6 +13,7 @@ from draft.graph import (
     parse_marker_value,
     resolve_local_destination,
 )
+from draft.vocabulary import ConclusionsState
 
 MARKER = Path(".draft/draft.json")
 
@@ -23,14 +24,21 @@ MARKER = Path(".draft/draft.json")
 
 
 def test_parse_marker_value_accepts_final_marker() -> None:
-    state = parse_marker_value({"format_version": FORMAT_VERSION}, MARKER)
-    assert state == MarkerState(version=FORMAT_VERSION, provisional_manifest=None)
+    state = parse_marker_value(
+        {"format_version": FORMAT_VERSION, "conclusions_state": "not_generated"}, MARKER
+    )
+    assert state == MarkerState(
+        version=FORMAT_VERSION,
+        provisional_manifest=None,
+        conclusions_state=ConclusionsState.NOT_GENERATED,
+    )
 
 
 def test_parse_marker_value_accepts_provisional_adopt_marker() -> None:
     state = parse_marker_value(
         {
             "format_version": FORMAT_VERSION,
+            "conclusions_state": "not_generated",
             "adopt_state": "provisional",
             "candidate_manifest": [["pages/a.md", "sha256:abc"]],
         },
@@ -66,9 +74,19 @@ def test_parse_marker_value_rejects_unsupported_version() -> None:
     assert caught.value.code == CheckCode.FORMAT_UNSUPPORTED.value
 
 
+def test_parse_marker_value_rejects_old_final_marker_without_conclusions_state() -> None:
+    """旧 {"format_version":1} 标记有意以 format.invalid 拒绝，无迁移。"""
+    with pytest.raises(DraftError) as caught:
+        parse_marker_value({"format_version": FORMAT_VERSION}, MARKER)
+    assert caught.value.code == CheckCode.FORMAT_INVALID.value
+
+
 def test_parse_marker_value_rejects_extra_fields_on_final_marker() -> None:
     with pytest.raises(DraftError) as caught:
-        parse_marker_value({"format_version": FORMAT_VERSION, "extra": 1}, MARKER)
+        parse_marker_value(
+            {"format_version": FORMAT_VERSION, "conclusions_state": "not_generated", "extra": 1},
+            MARKER,
+        )
     assert caught.value.code == CheckCode.FORMAT_INVALID.value
 
 
@@ -77,6 +95,7 @@ def test_parse_marker_value_rejects_wrong_adopt_state() -> None:
         parse_marker_value(
             {
                 "format_version": FORMAT_VERSION,
+                "conclusions_state": "not_generated",
                 "adopt_state": "final",
                 "candidate_manifest": [],
             },
@@ -88,7 +107,11 @@ def test_parse_marker_value_rejects_wrong_adopt_state() -> None:
 def test_parse_marker_value_rejects_provisional_with_missing_manifest_field() -> None:
     with pytest.raises(DraftError) as caught:
         parse_marker_value(
-            {"format_version": FORMAT_VERSION, "adopt_state": "provisional"},
+            {
+                "format_version": FORMAT_VERSION,
+                "conclusions_state": "not_generated",
+                "adopt_state": "provisional",
+            },
             MARKER,
         )
     assert caught.value.code == CheckCode.FORMAT_INVALID.value
@@ -111,6 +134,7 @@ def test_parse_marker_value_rejects_malformed_manifest(manifest: object) -> None
         parse_marker_value(
             {
                 "format_version": FORMAT_VERSION,
+                "conclusions_state": "not_generated",
                 "adopt_state": "provisional",
                 "candidate_manifest": manifest,
             },
@@ -123,6 +147,7 @@ def test_parse_marker_value_manifest_preserves_entry_order() -> None:
     state = parse_marker_value(
         {
             "format_version": FORMAT_VERSION,
+            "conclusions_state": "not_generated",
             "adopt_state": "provisional",
             "candidate_manifest": [["pages/b.md", "d2"], ["pages/a.md", "d1"]],
         },

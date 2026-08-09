@@ -65,5 +65,7 @@ def test_initialize_writes_only_draft_markers(tmp_path: Path) -> None:
     root = tmp_path / "draft"
     initialize(root)
 
-    assert (root / ".draft/draft.json").read_text(encoding="utf-8") == ('{"format_version":1}\n')
+    assert (root / ".draft/draft.json").read_text(encoding="utf-8") == (
+        '{"format_version":1,"conclusions_state":"not_generated"}\n'
+    )
     assert not (root / ".draft/draft.provisional.json").exists()

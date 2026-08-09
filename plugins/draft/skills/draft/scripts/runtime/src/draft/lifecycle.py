@@ -25,8 +25,9 @@ from draft.operations import (
     sha256_file,
 )
 from draft.paths import resolve_draft_root
+from draft.vocabulary import ConclusionsState
 
-FINAL_MARKER_BYTES = b'{"format_version":1}\n'
+FINAL_MARKER_BYTES = b'{"format_version":1,"conclusions_state":"not_generated"}\n'
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,7 @@ def draft_manifest(
 def provisional_marker_bytes(manifest: CandidateManifest) -> bytes:
     payload = {
         "format_version": FORMAT_VERSION,
+        "conclusions_state": ConclusionsState.NOT_GENERATED.value,
         "adopt_state": "provisional",
         "candidate_manifest": [[path.as_posix(), digest] for path, digest in manifest.entries],
     }
@@ -103,15 +105,7 @@ def rollback_provisional_marker_durably(root: Path, expected_bytes: bytes) -> No
 
 
 def _index_template(title: str) -> str:
-    return (
-        f"# {title}\n\n"
-        "> 状态：`已关闭：纯导航页，不表达独立结论`\n\n"
-        "## 子主题\n\n"
-        "- [结论汇总](conclusions.md)\n"
-    )
-
-
-CONCLUSIONS_TEMPLATE = "# 结论汇总\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](index.md)\n"
+    return f"# {title}\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n## 子主题\n"
 
 
 def initialize(root: Path) -> None:
@@ -130,9 +124,6 @@ def initialize(root: Path) -> None:
         index = target / "index.md"
         index.write_text(_index_template(target.name), encoding="utf-8")
         created.append(index)
-        conclusions = target / "conclusions.md"
-        conclusions.write_text(CONCLUSIONS_TEMPLATE, encoding="utf-8")
-        created.append(conclusions)
         pages = target / "pages"
         pages.mkdir()
         created.append(pages)

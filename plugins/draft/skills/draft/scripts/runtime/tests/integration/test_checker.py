@@ -176,7 +176,7 @@ def test_candidate_mode_provisional_marker_boundary(draft_factory: DraftFactory)
     internal = root / ".draft"
     internal.mkdir()
     (internal / "draft.json").write_text(
-        '{"format_version":1,"adopt_state":"provisional","candidate_manifest":[]}\n',
+        '{"format_version":1,"conclusions_state":"not_generated","adopt_state":"provisional","candidate_manifest":[]}\n',
         encoding="utf-8",
     )
 
@@ -213,10 +213,27 @@ def test_missing_required_files(draft_factory: DraftFactory) -> None:
     files = healthy()
     del files["conclusions.md"]
     root = draft_factory(files)
+    # 所有权为 generated 时 conclusions.md 必须存在。
+    (root / ".draft/draft.json").write_text(
+        '{"format_version":1,"conclusions_state":"generated"}\n', encoding="utf-8"
+    )
 
     report = check_draft(root)
 
     assert CheckCode.ROOT_MISSING_FILE.value in codes(report)
+
+
+def test_not_generated_absent_conclusions_is_not_missing_file(
+    draft_factory: DraftFactory,
+) -> None:
+    files = healthy()
+    del files["conclusions.md"]
+    files["index.md"] = ROOT_PAGE.replace("- [结论汇总](conclusions.md)\n", "")
+    root = draft_factory(files)
+
+    report = check_draft(root)
+
+    assert CheckCode.ROOT_MISSING_FILE.value not in codes(report)
 
 
 def test_unmanaged_markdown_below_root(draft_factory: DraftFactory) -> None:

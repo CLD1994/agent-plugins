@@ -54,7 +54,7 @@ A。
 
 B。
 """,
-        ".draft/draft.json": '{"format_version":1}\n',
+        ".draft/draft.json": '{"format_version":1,"conclusions_state":"not_generated"}\n',
     }
     for relative, text in files.items():
         path = root / relative

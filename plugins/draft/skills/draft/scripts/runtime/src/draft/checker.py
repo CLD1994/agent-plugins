@@ -33,7 +33,7 @@ from draft.operations import (
 )
 from draft.paths import physical_parent, resolve_draft_root
 from draft.trash_package import OUTGOING_RELATIVE, load_verified_package
-from draft.vocabulary import RelationCode, StatusCode
+from draft.vocabulary import ConclusionsState, RelationCode, StatusCode
 
 CAPACITY_LINES = 600
 CAPACITY_BYTES = 60 * 1024
@@ -540,6 +540,24 @@ def _check_trash_handoff_pending(
     return [_error(CheckCode.TRASH_PENDING_UNEXPLAINED, relative, None, journal.operation_id)]
 
 
+def _conclusions_required(resolved: Path, mode: LoadMode, allow_provisional_adopt: bool) -> bool:
+    """conclusions.md 是否必须存在：registered 且标记有效时由所有权状态决定。
+
+    标记缺失/无效/候选模式下不在此处要求；对应诊断由加载期 marker issue 报告。
+    """
+    if mode != "registered":
+        return False
+    from draft.graph import read_marker
+
+    try:
+        state = read_marker(resolved, allow_provisional_adopt=allow_provisional_adopt)
+    except DraftError:
+        return False
+    if state.provisional_manifest is not None:
+        return False
+    return state.conclusions_state is ConclusionsState.GENERATED
+
+
 def check_draft(
     root: Path,
     mode: LoadMode = "registered",
@@ -549,7 +567,7 @@ def check_draft(
 ) -> CheckReport:
     resolved = resolve_draft_root(root)
     layout: list[CheckIssue] = []
-    for required in (ROOT_PAGE, CONCLUSIONS_PAGE):
+    for required in (ROOT_PAGE,):
         candidate = resolved / required
         if not candidate.is_file() or candidate.is_symlink():
             layout.append(
@@ -559,6 +577,20 @@ def check_draft(
                     None,
                     RootMissingKind.FILE.value,
                     required.as_posix(),
+                )
+            )
+    # conclusions.md 只在所有权为 generated 时要求存在；not_generated 允许缺失。
+    conclusions_required = _conclusions_required(resolved, mode, allow_provisional_adopt)
+    if conclusions_required:
+        candidate = resolved / CONCLUSIONS_PAGE
+        if not candidate.is_file() or candidate.is_symlink():
+            layout.append(
+                _error(
+                    CheckCode.ROOT_MISSING_FILE,
+                    None,
+                    None,
+                    RootMissingKind.FILE.value,
+                    CONCLUSIONS_PAGE.as_posix(),
                 )
             )
     pages_dir = resolved / "pages"

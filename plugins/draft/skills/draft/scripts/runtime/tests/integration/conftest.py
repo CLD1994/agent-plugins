@@ -21,7 +21,9 @@ def draft_factory(tmp_path: Path) -> DraftFactory:
             internal.mkdir()
             (internal / "operations").mkdir()
             (internal / "trash" / "outgoing").mkdir(parents=True)
-            (internal / "draft.json").write_text('{"format_version":1}\n', encoding="utf-8")
+            (internal / "draft.json").write_text(
+                '{"format_version":1,"conclusions_state":"not_generated"}\n', encoding="utf-8"
+            )
         return root
 
     return create

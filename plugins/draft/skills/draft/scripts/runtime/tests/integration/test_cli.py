@@ -157,7 +157,7 @@ def test_candidate_check_provisional_marker_is_recovery_required(
     internal = root / ".draft"
     internal.mkdir()
     (internal / "draft.json").write_text(
-        '{"format_version":1,"adopt_state":"provisional","candidate_manifest":[]}\n',
+        '{"format_version":1,"conclusions_state":"not_generated","adopt_state":"provisional","candidate_manifest":[]}\n',
         encoding="utf-8",
     )
     before = snapshot_tree(root)
@@ -696,13 +696,19 @@ def _trashable_cli_root(tmp_path: Path) -> Path:
     )
     index = root / "index.md"
     index.write_text(
-        index.read_text(encoding="utf-8") + "- [A](pages/a.md)\n- [B](pages/b.md)\n",
+        index.read_text(encoding="utf-8")
+        + "- [结论汇总](conclusions.md)\n- [A](pages/a.md)\n- [B](pages/b.md)\n",
         encoding="utf-8",
     )
     conclusions = root / "conclusions.md"
     conclusions.write_text(
-        conclusions.read_text(encoding="utf-8") + "- [A](pages/a.md)：A。\n",
+        "# 结论汇总\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](index.md)\n\n"
+        "- [A](pages/a.md)：A。\n",
         encoding="utf-8",
+    )
+    # conclusions.md 已存在：所有权推进为 generated，使检查器认为它必须存在。
+    (root / ".draft/draft.json").write_text(
+        '{"format_version":1,"conclusions_state":"generated"}\n', encoding="utf-8"
     )
     return root
 

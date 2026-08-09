@@ -22,6 +22,7 @@ def test_provisional_marker_bytes_serializes_valid_manifest() -> None:
     decoded = json.loads(result)
     assert decoded == {
         "format_version": FORMAT_VERSION,
+        "conclusions_state": "not_generated",
         "adopt_state": "provisional",
         "candidate_manifest": [
             ["conclusions.md", "sha256:bbb"],
@@ -36,6 +37,7 @@ def test_provisional_marker_bytes_serializes_empty_manifest() -> None:
     decoded = json.loads(result)
     assert decoded == {
         "format_version": FORMAT_VERSION,
+        "conclusions_state": "not_generated",
         "adopt_state": "provisional",
         "candidate_manifest": [],
     }

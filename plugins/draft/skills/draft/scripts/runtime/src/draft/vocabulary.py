@@ -20,6 +20,13 @@ class StatusCode(StrEnum):
     CLOSED = "closed"
 
 
+class ConclusionsState(StrEnum):
+    """结论页所有权状态；只从 not_generated 前进到 generated，不回退。"""
+
+    NOT_GENERATED = "not_generated"
+    GENERATED = "generated"
+
+
 class RelationCode(StrEnum):
     PARENT = "parent"
     DEPENDS_ON = "depends_on"

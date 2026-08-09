@@ -11,7 +11,7 @@ from draft.errors import DraftError
 from draft.lifecycle import adopt, initialize
 from tests.integration.support import add_valid_child, build_valid_candidate
 
-FINAL_MARKER_BYTES = b'{"format_version":1}\n'
+FINAL_MARKER_BYTES = b'{"format_version":1,"conclusions_state":"not_generated"}\n'
 
 
 class SimulatedCrash(BaseException):
@@ -58,7 +58,7 @@ def test_initialize_creates_a_clean_self_contained_draft(tmp_path: Path) -> None
     initialize(root)
 
     assert (root / "index.md").is_file()
-    assert (root / "conclusions.md").is_file()
+    assert not (root / "conclusions.md").exists()  # 结论页改为按需生成
     assert (root / "pages").is_dir()
     assert (root / ".draft/draft.json").read_bytes() == FINAL_MARKER_BYTES
     assert not (root / ".draft/operations").exists()
@@ -113,11 +113,8 @@ def test_initialize_accepts_empty_directory_and_keeps_it_on_later_use(
     index_text = (root / "index.md").read_text(encoding="utf-8")
     assert "# empty" in index_text
     assert "已关闭：纯导航页，不表达独立结论" in index_text
-    assert "- [结论汇总](conclusions.md)" in index_text
-    conclusions_text = (root / "conclusions.md").read_text(encoding="utf-8")
-    assert "状态：`已确认`" in conclusions_text
-    assert "父主题：[根索引](index.md)" in conclusions_text
-    assert "产出" not in conclusions_text
+    assert "- [结论汇总](conclusions.md)" not in index_text
+    assert not (root / "conclusions.md").exists()
 
 
 def test_adopt_registers_a_complete_candidate(tmp_path: Path) -> None:
