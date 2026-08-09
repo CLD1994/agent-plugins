@@ -22,7 +22,7 @@ from draft.models import (
     TrashResult,
 )
 from draft.query import LocalPageSnapshot, SnapshotView
-from draft.vocabulary import StatusCode
+from draft.vocabulary import EditableRelationCode, StatusCode
 
 _EXIT_DOMAIN = 2
 
@@ -182,6 +182,30 @@ def build_parser() -> argparse.ArgumentParser:
     status_set.add_argument("--note", help="替换状态说明")
     status_set.add_argument("--clear-note", action="store_true", help="删除状态说明")
     _add_dry_run_args(status_set)
+
+    relation_cmd = subparsers.add_parser(
+        "relation",
+        parents=[shared],
+        help="修改正式关系",
+        description="幂等添加或删除依赖/取代/质疑关系，必要时维护反向与状态。",
+    )
+    relation_sub = relation_cmd.add_subparsers(dest="relation_command", metavar="SUB")
+    relation_choices = tuple(member.value for member in EditableRelationCode)
+    for sub_name, sub_help in (("add", "添加关系"), ("remove", "删除关系")):
+        sub = relation_sub.add_parser(sub_name, parents=[shared], help=sub_help)
+        sub.add_argument("root", metavar="ROOT", help="草稿根目录")
+        sub.add_argument("source", metavar="SOURCE", help="来源页面相对路径")
+        sub.add_argument("code", metavar="CODE", choices=relation_choices, help="主动关系代码")
+        sub.add_argument("target", metavar="TARGET", help="目标页面相对路径")
+        if sub_name == "remove":
+            sub.add_argument(
+                "--status",
+                choices=tuple(
+                    member.value for member in StatusCode if member not in (StatusCode.SUPERSEDED,)
+                ),
+                help="删除最后一条取代关系后恢复目标状态",
+            )
+        _add_dry_run_args(sub)
 
     generate_conclusions = subparsers.add_parser(
         "generate-conclusions",
@@ -658,6 +682,53 @@ def _dispatch(
         if result.warnings:
             human = f"{human}；警告：{_warning_text(result.warnings[0])}"
         return payload, human, 0
+    if command == "relation":
+        from draft.page_metadata import (
+            add_relation,
+            plan_add_relation,
+            plan_remove_relation,
+            remove_relation,
+        )
+        from draft.vocabulary import StatusCode
+
+        root = Path(cast(str, args.root))
+        source = _page_operand(root, cast(str, args.source))
+        target = _page_operand(root, cast(str, args.target))
+        code = EditableRelationCode(cast(str, args.code))
+        sub = cast(str, args.relation_command)
+        restored = getattr(args, "status", None)
+        restored_status = StatusCode(cast(str, restored)) if restored is not None else None
+        if _is_dry_run(args):
+            if sub == "add":
+
+                def build(graph: DraftGraph) -> OperationPlan:
+                    return plan_add_relation(graph.root, source, code, target)
+
+                operation = DryRunOperation.RELATION_ADD
+            else:
+
+                def build(graph: DraftGraph) -> OperationPlan:
+                    return plan_remove_relation(
+                        graph.root, source, code, target, restored_status=restored_status
+                    )
+
+                operation = DryRunOperation.RELATION_REMOVE
+            return _dry_run_write(args, root=root, operation=operation, build=build)
+        _reject_pagination_without_dry_run(args)
+        if sub == "add":
+            result = add_relation(root, source, code, target)
+            result_type = ResultType.RELATION_ADD.value
+        else:
+            result = remove_relation(root, source, code, target, restored_status=restored_status)
+            result_type = ResultType.RELATION_REMOVE.value
+        payload: dict[str, object] = {
+            "result_type": result_type,
+            "source": source.as_posix(),
+            "code": code.value,
+            "target": target.as_posix(),
+            "changed_paths": [path.as_posix() for path in result.changed_paths],
+        }
+        return payload, f"已{sub} {code.value} {source} → {target}", 0
     if command == "status":
         from draft.page_metadata import plan_set_status, set_status
         from draft.vocabulary import StatusCode
