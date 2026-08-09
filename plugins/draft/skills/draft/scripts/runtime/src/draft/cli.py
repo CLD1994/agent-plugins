@@ -163,6 +163,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_dry_run_args(create)
 
+    status_cmd = subparsers.add_parser(
+        "status",
+        parents=[shared],
+        help="修改页面状态",
+        description="修改页面讨论状态，只要求最终结构满足不变量。",
+    )
+    status_sub = status_cmd.add_subparsers(dest="status_command", metavar="SUB")
+    status_set = status_sub.add_parser("set", parents=[shared], help="设置页面状态")
+    status_set.add_argument("root", metavar="ROOT", help="草稿根目录")
+    status_set.add_argument("page", metavar="PAGE", help="严格受管理页面路径")
+    status_set.add_argument(
+        "code",
+        metavar="CODE",
+        choices=tuple(member.value for member in StatusCode),
+        help="稳定状态代码",
+    )
+    status_set.add_argument("--note", help="替换状态说明")
+    status_set.add_argument("--clear-note", action="store_true", help="删除状态说明")
+    _add_dry_run_args(status_set)
+
     generate_conclusions = subparsers.add_parser(
         "generate-conclusions",
         parents=[shared],
@@ -638,6 +658,35 @@ def _dispatch(
         if result.warnings:
             human = f"{human}；警告：{_warning_text(result.warnings[0])}"
         return payload, human, 0
+    if command == "status":
+        from draft.page_metadata import plan_set_status, set_status
+        from draft.vocabulary import StatusCode
+
+        root = Path(cast(str, args.root))
+        page = _page_operand(root, cast(str, args.page))
+        code = StatusCode(cast(str, args.code))
+        note = getattr(args, "note", None)
+        clear_note = bool(getattr(args, "clear_note", False))
+        if _is_dry_run(args):
+
+            def build(graph: DraftGraph) -> OperationPlan:
+                return plan_set_status(graph.root, page, code, note=note, clear_note=clear_note)
+
+            return _dry_run_write(
+                args,
+                root=root,
+                operation=DryRunOperation.STATUS_SET,
+                build=build,
+            )
+        _reject_pagination_without_dry_run(args)
+        result = set_status(root, page, code, note=note, clear_note=clear_note)
+        payload: dict[str, object] = {
+            "result_type": ResultType.STATUS_SET.value,
+            "path": page.as_posix(),
+            "status": code.value,
+            "changed_paths": [path.as_posix() for path in result.changed_paths],
+        }
+        return payload, f"已将 {page} 状态设为 {code.value}", 0
     if command == "create":
         from draft.page_create import create_page, plan_create_page
         from draft.vocabulary import StatusCode

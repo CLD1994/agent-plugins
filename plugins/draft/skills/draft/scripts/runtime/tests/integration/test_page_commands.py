@@ -141,3 +141,104 @@ def test_create_inserts_before_conclusions_link(
     assert code == 0
     index = (root / "index.md").read_text(encoding="utf-8")
     assert index.index("- [乙](pages/b.md)") < index.index("- [结论汇总](conclusions.md)")
+
+
+def test_status_set_changes_and_validates_final_state(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = build_page_draft(draft_factory)
+    (root / "pages/a.md").write_text(PAGE_A.replace("待讨论", "已确认"), encoding="utf-8")
+    capsys.readouterr()
+
+    code, payload = run_json(
+        ["status", "set", str(root), "pages/a.md", "proposed", "--json"], capsys
+    )
+
+    assert code == 0
+    assert payload["result_type"] == "status.set"
+    assert payload["status"] == "proposed"
+    assert "pages/a.md" in cast("list[str]", payload["changed_paths"])
+    assert "当前提案" in (root / "pages/a.md").read_text(encoding="utf-8")
+    assert check_draft(root).errors == ()
+
+
+def test_status_set_rejects_invalid_final_state(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = build_page_draft(draft_factory)
+    capsys.readouterr()
+
+    code, payload = run_json(
+        ["status", "set", str(root), "pages/a.md", "superseded", "--json"], capsys
+    )
+
+    assert code == 2
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "status.invalid_final_state"
+    # 未写入：状态保持待讨论。
+    assert "待讨论" in (root / "pages/a.md").read_text(encoding="utf-8")
+
+
+def test_status_set_note_and_clear_note(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = build_page_draft(draft_factory)
+    capsys.readouterr()
+
+    code, _payload = run_json(
+        ["status", "set", str(root), "pages/a.md", "proposed", "--note", "新方案", "--json"],
+        capsys,
+    )
+    assert code == 0
+    assert "当前提案：新方案" in (root / "pages/a.md").read_text(encoding="utf-8")
+
+    code, _payload = run_json(
+        ["status", "set", str(root), "pages/a.md", "pending", "--clear-note", "--json"],
+        capsys,
+    )
+    assert code == 0
+    assert "待讨论" in (root / "pages/a.md").read_text(encoding="utf-8")
+    assert "新方案" not in (root / "pages/a.md").read_text(encoding="utf-8")
+    assert check_draft(root).errors == ()
+
+
+def test_status_set_missing_page_is_page_not_found(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = build_page_draft(draft_factory)
+    capsys.readouterr()
+
+    code, payload = run_json(
+        ["status", "set", str(root), "pages/missing.md", "pending", "--json"], capsys
+    )
+
+    assert code == 2
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "page.not_found"
+
+
+def test_status_set_dry_run_does_not_write(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = build_page_draft(draft_factory)
+    capsys.readouterr()
+
+    code, payload = run_json(
+        [
+            "status",
+            "set",
+            str(root),
+            "pages/a.md",
+            "proposed",
+            "--dry-run",
+            "--json",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    assert payload["result_type"] == "plan"
+    assert payload["operation"] == "status.set"
+    assert "待讨论" in (root / "pages/a.md").read_text(encoding="utf-8")
