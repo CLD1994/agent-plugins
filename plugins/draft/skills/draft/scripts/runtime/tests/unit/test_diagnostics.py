@@ -4,59 +4,9 @@ from pathlib import Path
 
 import pytest
 
+from draft.diagnostic_codes import CheckCode
 from draft.diagnostics import KNOWN_CHECK_CODES, issue_payload, render_issue
 from draft.models import CheckIssue, IssueSeverity
-
-EXPECTED_CODES = {
-    "candidate.already_registered",
-    "candidate.internal_state",
-    "format.missing",
-    "format.invalid",
-    "format.unsupported",
-    "root.missing_file",
-    "page.unmanaged_path",
-    "page.missing_title",
-    "page.missing_machine_block",
-    "page.missing_status",
-    "page.duplicate_status",
-    "page.unknown_label",
-    "page.invalid_status",
-    "page.invalid_relation",
-    "page.parse_error",
-    "page.capacity",
-    "link.missing",
-    "link.escape",
-    "path.symlink_escape",
-    "relation.duplicate",
-    "parent.root_declared",
-    "parent.missing",
-    "parent.multiple",
-    "layout.parent_mismatch",
-    "parent.cycle",
-    "parent.unreachable",
-    "parent.navigation_missing",
-    "hub.empty",
-    "dependency.self",
-    "dependency.cycle",
-    "replacement.pair_missing",
-    "replacement.status_mismatch",
-    "replacement.cycle",
-    "challenge.pair_missing",
-    "output.forbidden",
-    "output.missing",
-    "output.wrong_target",
-    "output.backlink_missing",
-    "operation.journal_corrupt",
-    "operation.recovery_required",
-    "operation.orphan_allocating",
-    "operation.inconsistent_state",
-    "trash.deadlines_invalid",
-    "trash.package_missing",
-    "trash.package_corrupt",
-    "trash.retained",
-    "trash.handoff_pending",
-    "trash.pending_unexplained",
-}
 
 # 操作诊断用例的稳定路径与操作标识；仅用于缩短测试输入，不参与被测逻辑。
 _JOURNAL = ".draft/operations/abc/journal.json"
@@ -96,8 +46,8 @@ def _assert_valid_render(case: RenderCase) -> str:
     return rendered
 
 
-def test_catalog_covers_the_published_check_codes() -> None:
-    assert KNOWN_CHECK_CODES == EXPECTED_CODES
+def test_catalog_covers_every_typed_check_code() -> None:
+    assert frozenset(code.value for code in CheckCode) == KNOWN_CHECK_CODES
 
 
 # 每条用例手写合法 CheckIssue 与需要展示的动态详情索引；期望全部来自结构化输入，
@@ -580,7 +530,7 @@ VALID_RENDER_CASES = [
 
 
 def test_valid_render_cases_cover_every_published_code() -> None:
-    assert {case.issue.code for case in VALID_RENDER_CASES} == EXPECTED_CODES
+    assert {case.issue.code for case in VALID_RENDER_CASES} == KNOWN_CHECK_CODES
 
 
 @pytest.mark.parametrize(
