@@ -74,6 +74,15 @@ def _default_handoff(path: str) -> None:
 
 
 @dataclass(frozen=True)
+class RecoverableItem:
+    """一个仍处于恢复窗口内的回收项，供 `query recoverable` 返回。"""
+
+    operation_id: str
+    page: Path
+    restore_expires_at: datetime
+
+
+@dataclass(frozen=True)
 class LifecycleFailure:
     operation_id: str
     code: str
@@ -332,26 +341,6 @@ def _iter_trash_journals(root: Path) -> list[Path]:
     return paths
 
 
-def collect_lifecycle_warnings(
-    report: LifecycleAdvanceReport,
-) -> tuple[LifecycleWarning, ...]:
-    """汇聚批量推进中各结果携带的结构化警告，供结构写命令合并进自身结果。"""
-    return tuple(warning for result in report.results for warning in result.warnings)
-
-
-def prepare_structural_write(
-    root: Path,
-    *,
-    now: datetime | None = None,
-    handoff: Handoff | None = None,
-) -> LifecycleAdvanceReport:
-    """普通结构写命令的前置推进：到期包先推进，损坏即抛 LifecycleAdvanceError 中止结构写。"""
-    report = advance_trash_lifecycle(root, now=now, handoff=handoff)
-    if report.error is not None:
-        raise LifecycleAdvanceError(report)
-    return report
-
-
 def advance_trash_lifecycle(
     root: Path,
     *,
@@ -574,3 +563,111 @@ def recover_draft(
             results.append(result)
 
     return LifecycleAdvanceReport(results=tuple(results), error=None)
+
+
+def prepare_registered_command(
+    root: Path,
+    *,
+    now: datetime | None = None,
+    handoff: Handoff | None = None,
+) -> None:
+    """已登记命令的业务逻辑前置推进：成功时丢弃推进细节，损坏时以稳定错误阻止命令。
+
+    调用方必须先确认正式登记标记有效；本边界不重新判定登记状态。
+    """
+    report = advance_trash_lifecycle(root, now=now, handoff=handoff)
+    if report.error is not None:
+        raise LifecycleAdvanceError(report)
+
+
+def list_recoverable(
+    root: Path,
+    *,
+    as_of: datetime | None = None,
+) -> tuple[RecoverableItem, ...]:
+    """只读返回仍可恢复的回收项，严格按 ``as_of < restore_expires_at`` 过滤。
+
+    任一候选日志或权威删除包损坏时整体失败，不返回部分项目。
+    """
+    resolved = resolve_draft_root(root)
+    normalized = normalize_utc(as_of)
+    items: list[RecoverableItem] = []
+    for journal_path in _iter_trash_journals(resolved):
+        journal = read_journal(journal_path)
+        if journal.kind != "trash":
+            continue
+        if journal.phase is not OperationPhase.TRASH_RETAINED:
+            continue
+        deadlines = TrashDeadlines.parse(journal.metadata)
+        if normalized >= deadlines.restore_expires_at:
+            continue
+        package = load_verified_package(resolved, journal)
+        items.append(
+            RecoverableItem(
+                operation_id=journal.operation_id,
+                page=package.page_path,
+                restore_expires_at=deadlines.restore_expires_at,
+            )
+        )
+    return tuple(sorted(items, key=lambda item: (item.restore_expires_at, item.operation_id)))
+
+
+def recover_interrupted_operations(
+    root: Path,
+    *,
+    now: datetime | None = None,
+    handoff: Handoff | None = None,
+) -> tuple[LifecycleResult, ...]:
+    """只修复崩溃或中断留下的未完成写操作；不枚举仍保留或等待移交的回收项。
+
+    当前 ``recover_draft`` 中锁内恢复与无锁操作目录分类属于这里；批量到期推进
+    由 ``prepare_registered_command`` 在命令前置统一完成。
+    """
+    resolved = resolve_draft_root(root)
+    provisional = provisional_marker_path(resolved)
+    if provisional is not None:
+        raise DraftError("adopt.recovery_required", provisional)
+    normalized_now = normalize_utc(now)
+    active_handoff = handoff if handoff is not None else _default_handoff
+    results: list[LifecycleResult] = []
+
+    locked = read_lock(resolved)
+    if locked is not None:
+        journal = read_journal(operation_journal_path(resolved, locked))
+        if journal.operation_id != locked:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+        if journal.kind == "restore":
+            trash_journal = validate_restore_link(resolved, journal)
+            package = load_verified_package(resolved, trash_journal)
+            results.append(
+                resolve_restore_execution(
+                    resolved,
+                    trash_id=trash_journal.operation_id,
+                    restore_id=locked,
+                    package=package,
+                    execution_result=None,
+                    execution_error=None,
+                )
+            )
+        elif journal.kind == "trash":
+            result = _recover_locked_trash(
+                resolved, journal, now=normalized_now, handoff=active_handoff
+            )
+            if result is not None:
+                results.append(result)
+        else:
+            results.append(recover(resolved))
+
+    reject_symlink_components(resolved, OPERATIONS_RELATIVE)
+    operations = resolved / OPERATIONS_RELATIVE
+    if operations.is_dir():
+        for entry in sorted(operations.iterdir()):
+            if not entry.is_dir() or entry.name == locked:
+                continue
+            result = _handle_no_lock_dir(
+                resolved, entry, now=normalized_now, handoff=active_handoff
+            )
+            if result is not None:
+                results.append(result)
+
+    return tuple(results)

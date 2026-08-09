@@ -642,13 +642,7 @@ def _prove_parent_restore(
 
 def trash_page(root: Path, page: Path, *, now: datetime | None = None) -> TrashResult:
     """回收页面：创建权威删除包并落地为 7 天保留态，不立即移交系统回收站。"""
-    from draft.trash_lifecycle import (
-        collect_lifecycle_warnings,
-        prepare_structural_write,
-    )
-
     resolved = resolve_draft_root(root)
-    preflight = prepare_structural_write(resolved, now=now)
     normalized_now = normalize_utc(now)
     deadlines = TrashDeadlines.from_created_at(normalized_now)
     if read_lock(resolved) is not None:
@@ -669,7 +663,6 @@ def trash_page(root: Path, page: Path, *, now: datetime | None = None) -> TrashR
         package=verified.directory,
         restore_expires_at=deadlines.restore_expires_at,
         purge_eligible_at=deadlines.purge_eligible_at,
-        warnings=collect_lifecycle_warnings(preflight),
     )
 
 

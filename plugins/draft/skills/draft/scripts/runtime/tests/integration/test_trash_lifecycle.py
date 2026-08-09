@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from draft.diagnostic_codes import CheckCode
+from draft.errors import DraftError
 from draft.models import OperationPhase
 from draft.operations import TrashDeadlines
 from draft.trash import trash_page
@@ -562,3 +563,109 @@ def test_orphan_restore_scan_stops_on_unreadable_sibling_journal(
     assert report.error.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
     assert (r_dir / "journal.json").read_bytes() == r_bytes_before
     assert _phase(root, pending.operation_id) == "trash_retained"
+
+
+# ---------------------------------------------------------------------------
+# Task 4：统一静默前置推进与可恢复项清单
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_registered_command_advances_but_hides_results(
+    draft_factory: DraftFactory, tmp_path: Path
+) -> None:
+    """普通命令的前置推进推进到期项，但成功时返回值不暴露推进细节。"""
+    from draft.trash_lifecycle import prepare_registered_command
+
+    root = build_trashable_draft(draft_factory)
+    trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    accepted: list[str] = []
+
+    result = prepare_registered_command(root, now=EXPIRY, handoff=_accept_into(bin_dir, accepted))
+
+    assert result is None
+    assert len(accepted) == 1
+
+
+def test_prepare_registered_command_corruption_raises_lifecycle_advance_error(
+    draft_factory: DraftFactory,
+) -> None:
+    """损坏日志以可诊断错误阻止命令，不返回部分推进结果。"""
+    import json
+
+    from draft.trash_lifecycle import LifecycleAdvanceError, prepare_registered_command
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    broken_path = _journal_path(root, pending.operation_id)
+    data = json.loads(broken_path.read_text(encoding="utf-8"))
+    data["phase"] = "unknown_phase"
+    broken_path.write_text(json.dumps(data), encoding="utf-8")
+
+    try:
+        prepare_registered_command(root, now=EXPIRY)
+    except LifecycleAdvanceError as error:
+        assert error.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
+        assert error.report.results == ()
+    else:
+        raise AssertionError("expected LifecycleAdvanceError")
+
+
+def test_list_recoverable_filters_by_expiry_and_sorts(
+    draft_factory: DraftFactory,
+) -> None:
+    """list_recoverable 只返回仍未到期项目，按到期时间再按 operation_id 排序。"""
+    from draft.trash_lifecycle import list_recoverable
+
+    root = build_trashable_draft(draft_factory)
+    first = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    (root / "pages/obsolete.md").write_text(OBSOLETE, encoding="utf-8")
+    idx = root / "index.md"
+    idx.write_text(
+        idx.read_text(encoding="utf-8") + "- [旧页](pages/obsolete.md)\n", encoding="utf-8"
+    )
+    second = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+
+    items = list_recoverable(root, as_of=EXPIRY - timedelta(days=1))
+
+    assert [item.operation_id for item in items] == sorted(
+        [first.operation_id, second.operation_id]
+    )
+    assert all(item.restore_expires_at == EXPIRY for item in items)
+    assert all(item.page == Path("pages/obsolete.md") for item in items)
+
+
+def test_list_recoverable_excludes_at_exact_expiry(
+    draft_factory: DraftFactory,
+) -> None:
+    """as_of == restore_expires_at 时项目已不可恢复，不进入结果。"""
+    from draft.trash_lifecycle import list_recoverable
+
+    root = build_trashable_draft(draft_factory)
+    trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+
+    items = list_recoverable(root, as_of=EXPIRY)
+
+    assert items == ()
+
+
+def test_list_recoverable_corruption_fails_whole(
+    draft_factory: DraftFactory,
+) -> None:
+    """任一候选日志损坏时整体失败，不返回此前读到的部分项目。"""
+    import json
+
+    from draft.trash_lifecycle import list_recoverable
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    broken_path = _journal_path(root, pending.operation_id)
+    data = json.loads(broken_path.read_text(encoding="utf-8"))
+    data["metadata"]["created_at"] = "not-a-date"
+    broken_path.write_text(json.dumps(data), encoding="utf-8")
+
+    import pytest
+
+    with pytest.raises(DraftError):
+        list_recoverable(root, as_of=EXPIRY)

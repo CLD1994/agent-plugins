@@ -22,7 +22,6 @@ from draft.models import (
     TrashResult,
 )
 from draft.paths import ResolvedPath
-from draft.trash_lifecycle import LifecycleAdvanceReport, LifecycleFailure
 
 # ---------------------------------------------------------------------------
 # 辅助构造器
@@ -270,40 +269,37 @@ def test_dispatch_restore_rolled_back_returns_exit_three(mocker: MockerFixture) 
     _assert_human_result(human)
 
 
-def test_dispatch_recover_success_returns_results_payload(mocker: MockerFixture) -> None:
+def test_dispatch_recover_success_returns_fixed_payload(mocker: MockerFixture) -> None:
     args = cli.build_parser().parse_args(["recover", "/draft"])
-    report = LifecycleAdvanceReport(results=(), error=None)
-    recover_draft = mocker.patch("draft.trash_lifecycle.recover_draft", autospec=True)
-    recover_draft.return_value = report
-    payload, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 recover 成功路径返回结果载荷与退出码 0
-    assert payload == {"result_type": "recover", "results": []}
-    _assert_human_result(human, len(report.results))
+    result = _operation_result(
+        operation_id="a" * 32,
+        kind="restore",
+        phase=OperationPhase.COMPLETED,
+        changed_paths=(Path("pages/a.md"),),
+    )
+    recover = mocker.patch("draft.trash_lifecycle.recover_interrupted_operations", autospec=True)
+    recover.return_value = (result,)
+    payload, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 recover 只报告已修复操作的数量与公开路径
+    assert payload == {
+        "result_type": "recover",
+        "fixed_count": 1,
+        "paths": ["pages/a.md"],
+    }
+    _assert_human_result(human, 1)
     assert exit_code == 0
 
 
-def test_dispatch_recover_error_returns_failure_payload_and_exit_code(
-    mocker: MockerFixture,
-) -> None:
+def test_dispatch_recover_error_raises_standard_envelope(mocker: MockerFixture) -> None:
     args = cli.build_parser().parse_args(["recover", "/draft"])
-    failure = LifecycleFailure(
-        operation_id="c" * 32,
-        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
-        paths=(Path(".draft/operations/cccccccccccccccccccccccccccccccc/journal.json"),),
+    recover = mocker.patch("draft.trash_lifecycle.recover_interrupted_operations", autospec=True)
+    recover.side_effect = DraftError(
+        CheckCode.OPERATION_INCONSISTENT_STATE.value,
+        Path(".draft/operations/cccccccccccccccccccccccccccccccc/journal.json"),
         details=("inconsistent",),
     )
-    report = LifecycleAdvanceReport(results=(), error=failure)
-    recover_draft = mocker.patch("draft.trash_lifecycle.recover_draft", autospec=True)
-    recover_draft.return_value = report
-    payload, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 recover 失败路径保留停止位置并返回操作类退出码
-    assert payload["result_type"] == "recover"
-    assert payload["ok"] is False
-    error = payload["error"]
-    assert isinstance(error, dict)
-    assert error["operation_id"] == "c" * 32
-    assert error["code"] == CheckCode.OPERATION_INCONSISTENT_STATE.value
-    assert payload["stopped_at_operation_id"] == "c" * 32
-    assert exit_code == 3
-    _assert_human_result(human, failure.code, failure.operation_id)
+    with pytest.raises(DraftError) as caught:
+        cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 恢复损坏直接抛稳定错误，由 main 映射为退出码 3
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
 
 
 # ---------------------------------------------------------------------------

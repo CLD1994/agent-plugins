@@ -741,12 +741,12 @@ def test_check_json_separates_errors_warnings_infos_and_reviews(
             assert set(issue) == {"code", "severity", "path", "line", "details"}
 
 
-def test_recover_json_preserves_partial_results_on_later_corruption(
+def test_recover_preflight_corruption_is_standard_error_envelope(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = _trashable_cli_root(tmp_path)
     capsys.readouterr()
-    # 造两个到期包：第一个可推进，第二个破坏证据。
+    # 造两个到期包：第二个破坏证据，使前置推进整体失败。
     import json as json_module
 
     from draft.operations import TrashDeadlines
@@ -779,17 +779,18 @@ def test_recover_json_preserves_partial_results_on_later_corruption(
 
     code, payload = run_json(["recover", str(root), "--json"], capsys)
 
+    # 前置推进损坏：recover 不进入自身逻辑，只返回标准错误信封，退出码 3。
     assert code == 3
     assert payload["ok"] is False
-    assert payload["result_type"] == "recover"
-    assert [r["operation_id"] for r in as_dicts(payload["results"])] == [ordered[0]]
+    assert payload["result_type"] == "error"
     error = payload["error"]
     assert isinstance(error, dict)
-    assert error["operation_id"] == ordered[1]
-    assert payload["stopped_at_operation_id"] == ordered[1]
+    assert error["code"] == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    assert "results" not in payload
+    assert "stopped_at_operation_id" not in payload
 
 
-def test_structure_preflight_partial_failure_reports_progress_and_never_starts_write(
+def test_structure_preflight_corruption_never_starts_write(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _trashable_cli_root(tmp_path)
@@ -831,13 +832,149 @@ def test_structure_preflight_partial_failure_reports_progress_and_never_starts_w
 
     code, payload = run_json(["move", str(root), "pages/a.md", "pages/a2.md", "--json"], capsys)
 
+    # 前置推进损坏：只返回标准错误信封，不暴露推进明细，退出码 3。
     assert code == 3
     assert payload["result_type"] == "error"
-    assert [r["operation_id"] for r in as_dicts(payload["lifecycle_results"])] == [ordered[0]]
+    assert payload["ok"] is False
     error = payload["error"]
     assert isinstance(error, dict)
-    assert error["operation_id"] == ordered[1]
-    assert payload["stopped_at_operation_id"] == ordered[1]
+    assert error["code"] == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    assert "lifecycle_results" not in payload
+    assert "stopped_at_operation_id" not in payload
     # 结构写未开始：源页字节不变，目标不存在。
     assert (root / "pages/a.md").read_bytes() == before_a
     assert not (root / "pages/a2.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# Task 4：统一静默前置推进——每个已登记命令恰好推进一次
+# ---------------------------------------------------------------------------
+
+
+def _due_package_root(tmp_path: Path) -> Path:
+    root = _trashable_cli_root(tmp_path)
+    import json as json_module
+
+    from draft.operations import TrashDeadlines
+    from draft.trash import trash_page
+
+    pending = trash_page(root, Path("pages/b.md"), now=datetime(2026, 7, 21, tzinfo=UTC))
+    path = root / ".draft/operations" / pending.operation_id / "journal.json"
+    data = json_module.loads(path.read_text(encoding="utf-8"))
+    data["metadata"].update(
+        TrashDeadlines.from_created_at(datetime(2026, 7, 10, tzinfo=UTC)).to_metadata()
+    )
+    path.write_text(json_module.dumps(data), encoding="utf-8")
+    return root
+
+
+def test_check_advances_due_package_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _due_package_root(tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr("draft.trash_lifecycle._default_handoff", calls.append)
+    capsys.readouterr()
+
+    code, payload = run_json(["check", str(root), "--json"], capsys)
+
+    assert len(calls) == 1
+    assert code == 0
+    assert payload["ok"] is True
+    assert "lifecycle_results" not in payload
+
+
+def test_move_advances_due_package_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _due_package_root(tmp_path)
+    capsys.readouterr()
+    calls: list[str] = []
+    monkeypatch.setattr("draft.trash_lifecycle._default_handoff", calls.append)
+
+    code, _payload = run_json(["move", str(root), "pages/a.md", "pages/a2.md", "--json"], capsys)
+
+    assert len(calls) == 1
+    assert code == 0
+
+
+def test_restore_advances_due_package_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 一个已到期包（会触发推进）与一个保留窗口内的包（用于 restore）。
+    root = _trashable_cli_root(tmp_path)
+    import json as json_module
+
+    from draft.operations import TrashDeadlines
+    from draft.trash import trash_page
+
+    due = trash_page(root, Path("pages/b.md"), now=datetime(2026, 7, 21, tzinfo=UTC))
+    due_path = root / ".draft/operations" / due.operation_id / "journal.json"
+    due_data = json_module.loads(due_path.read_text(encoding="utf-8"))
+    due_data["metadata"].update(
+        TrashDeadlines.from_created_at(datetime(2026, 7, 10, tzinfo=UTC)).to_metadata()
+    )
+    due_path.write_text(json_module.dumps(due_data), encoding="utf-8")
+    # 重建 b.md 再回收一次，得到保留窗口内的第二个包。
+    (root / "pages/b.md").write_text(
+        "# B\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n\nB。\n",
+        encoding="utf-8",
+    )
+    index = root / "index.md"
+    index.write_text(index.read_text(encoding="utf-8") + "- [B](pages/b.md)\n", encoding="utf-8")
+    retained = trash_page(root, Path("pages/b.md"), now=datetime(2026, 8, 20, tzinfo=UTC))
+    capsys.readouterr()
+    calls: list[str] = []
+    monkeypatch.setattr("draft.trash_lifecycle._default_handoff", calls.append)
+
+    code, _payload = run_json(["restore", str(root), retained.operation_id, "--json"], capsys)
+
+    assert len(calls) == 1
+    assert code == 0
+
+
+def test_init_and_candidate_check_do_not_preflight(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr("draft.trash_lifecycle._default_handoff", calls.append)
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    capsys.readouterr()
+
+    code, _payload = run_json(["check", str(root), "--candidate", "--json"], capsys)
+
+    assert code == 0
+    assert calls == []
+
+
+def test_check_preflight_corruption_returns_standard_error_envelope(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _trashable_cli_root(tmp_path)
+    capsys.readouterr()
+    # 已登记根 + 损坏日志：check 的前置推进失败，只返回标准错误信封。
+    import json as json_module
+
+    from draft.operations import TrashDeadlines
+    from draft.trash import trash_page
+
+    pending = trash_page(root, Path("pages/b.md"), now=datetime(2026, 7, 21, tzinfo=UTC))
+    path = root / ".draft/operations" / pending.operation_id / "journal.json"
+    data = json_module.loads(path.read_text(encoding="utf-8"))
+    data["metadata"].update(
+        TrashDeadlines.from_created_at(datetime(2026, 7, 10, tzinfo=UTC)).to_metadata()
+    )
+    path.write_text(json_module.dumps(data), encoding="utf-8")
+    broken = json_module.loads(path.read_text(encoding="utf-8"))
+    broken["metadata"]["restore_operation_id"] = "0" * 32
+    path.write_text(json_module.dumps(broken), encoding="utf-8")
+    capsys.readouterr()
+
+    code, payload = run_json(["check", str(root), "--json"], capsys)
+
+    assert code == 3
+    assert payload["ok"] is False
+    assert payload["result_type"] == "error"
+    assert "errors" not in payload
+    assert "lifecycle_results" not in payload

@@ -4,7 +4,6 @@ from pathlib import Path
 import pytest
 
 from draft.checker import check_draft
-from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.operations import recover
 from draft.structure import collapse_hub, move_page, promote_page
@@ -565,30 +564,25 @@ def _lazy_root(draft_factory: DraftFactory) -> Path:
 DUE_NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 
 
-def test_move_advances_due_package_but_continues_after_handoff_failure(
+def test_domain_move_does_not_preflight_due_package(
     draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """领域 move_page 不再推进生命周期：前置推进由 CLI 编排统一完成。"""
     root = _lazy_root(draft_factory)
     trash_page(root, Path("pages/b.md"), now=DUE_NOW)
 
     calls: list[str] = []
-
-    def fail_handoff(path: str) -> None:
-        calls.append(path)
-        raise OSError("recycle bin unavailable")
-
-    monkeypatch.setattr("draft.trash_lifecycle._default_handoff", fail_handoff)
-    # 推进时间在恢复期限之后、清理期限之前：普通失败产生警告，不触发最终清理。
+    monkeypatch.setattr("draft.trash_lifecycle._default_handoff", calls.append)
     result = move_page(
         root, Path("pages/a.md"), Path("pages/a2.md"), now=datetime(2026, 6, 10, tzinfo=UTC)
     )
 
-    assert len(calls) == 1
+    assert calls == []
     assert (root / "pages/a2.md").is_file()
-    assert any(warning.code == "trash.handoff_failed" for warning in result.warnings)
+    assert result.warnings == ()
 
 
-def test_corrupt_due_package_blocks_new_structure_write(
+def test_domain_move_corrupt_package_blocks_via_clean_graph(
     draft_factory: DraftFactory,
 ) -> None:
     root = _lazy_root(draft_factory)
@@ -598,7 +592,7 @@ def test_corrupt_due_package_blocks_new_structure_write(
     )
     before = (root / "pages/a.md").read_bytes()
 
-    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+    with pytest.raises(DraftError, match="structure.dirty"):
         move_page(root, Path("pages/a.md"), Path("pages/a2.md"))
 
     assert (root / "pages/a.md").read_bytes() == before

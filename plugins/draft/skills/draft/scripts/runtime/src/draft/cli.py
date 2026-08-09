@@ -17,7 +17,6 @@ from draft.models import (
     OperationResult,
     TrashResult,
 )
-from draft.trash_lifecycle import LifecycleAdvanceReport, LifecycleFailure
 
 _EXIT_DOMAIN = 2
 _EXIT_OPERATION = 3
@@ -295,81 +294,70 @@ def _dispatch(args: argparse.Namespace) -> tuple[dict[str, object], str, int]:
         payload = {"result_type": "restore", **_operation_payload(result)}
         return payload, f"已恢复操作 {operation_id} 的页面", 0
     if command == "recover":
-        from draft.trash_lifecycle import recover_draft
+        from draft.trash_lifecycle import recover_interrupted_operations
 
         root = Path(cast(str, args.root))
-        report = recover_draft(root)
-        results_payload = [
-            _trash_payload(result)
-            if isinstance(result, TrashResult)
-            else _operation_payload(result)
-            for result in report.results
-        ]
-        if report.error is not None:
-            failure = report.error
-            payload: dict[str, object] = {
-                "result_type": "recover",
-                "results": results_payload,
-                "error": {
-                    "code": failure.code,
-                    "operation_id": failure.operation_id,
-                    "paths": [path.as_posix() for path in failure.paths],
-                    "details": list(failure.details),
-                },
-                "stopped_at_operation_id": failure.operation_id,
-                "ok": False,
+        results = recover_interrupted_operations(root)
+        paths = sorted(
+            {
+                path
+                for result in results
+                for path in (
+                    result.changed_paths
+                    if isinstance(result, OperationResult)
+                    else (result.package,)
+                )
             }
-            return (
-                payload,
-                f"恢复停止在 {failure.operation_id}（{failure.code}）",
-                _exit_for_error(DraftError(failure.code, *failure.paths, details=failure.details)),
-            )
+        )
         payload = {
             "result_type": "recover",
-            "results": results_payload,
+            "fixed_count": len(results),
+            "paths": [path.as_posix() for path in paths],
         }
-        return payload, f"恢复完成：{len(report.results)} 项结果", 0
+        return payload, f"恢复完成：{len(results)} 项结果", 0
     raise DraftError("cli.unknown_command")
-
-
-def _render_lifecycle_result(result: OperationResult | TrashResult) -> dict[str, object]:
-    if isinstance(result, TrashResult):
-        return _trash_payload(result)
-    return _operation_payload(result)
-
-
-def _render_failure(failure: LifecycleFailure) -> dict[str, object]:
-    return {
-        "code": failure.code,
-        "operation_id": failure.operation_id,
-        "paths": [path.as_posix() for path in failure.paths],
-        "details": list(failure.details),
-    }
-
-
-def _structure_preflight_payload(report: LifecycleAdvanceReport) -> dict[str, object]:
-    failure = report.error
-    assert failure is not None
-    return {
-        "ok": False,
-        "result_type": "error",
-        "lifecycle_results": [_render_lifecycle_result(result) for result in report.results],
-        "error": _render_failure(failure),
-        "stopped_at_operation_id": failure.operation_id,
-    }
-
-
-def _structure_preflight_human(report: LifecycleAdvanceReport) -> str:
-    failure = report.error
-    assert failure is not None
-    completed = len(report.results)
-    return f"结构写前置推进停止在 {failure.operation_id}（{failure.code}），已完成 {completed} 项"
 
 
 def _exit_for_error(error: DraftError) -> int:
     if error.code.startswith("operation.") or error.code == "adopt.recovery_required":
         return _EXIT_OPERATION
     return _EXIT_DOMAIN
+
+
+def _preflight_candidate_root_for(args: argparse.Namespace) -> Path | None:
+    """从命令参数中找出可能需要前置推进的根；不声称该根已经登记。"""
+    command = cast(str, args.command)
+    if command in ("init", "adopt"):
+        return None
+    if command == "check" and bool(getattr(args, "candidate", False)):
+        return None
+    return Path(cast(str, args.root))
+
+
+def _registered_root_for(candidate: Path) -> Path | None:
+    """只读资格判定：只有正式登记标记精确有效才返回解析后的根，否则返回 None。
+
+    根或标记缺失、无效、不支持或为临时接管形状时不推进，交由命令自身验证。
+    本边界复用共享标记解析语义，不在这里复制登记键集合。
+    """
+    from draft.graph import read_marker
+    from draft.paths import resolve_draft_root
+
+    try:
+        resolved = resolve_draft_root(candidate)
+    except DraftError:
+        return None
+    try:
+        read_marker(resolved)
+    except DraftError:
+        return None
+    return resolved
+
+
+def _advance_for_command(root: Path) -> None:
+    from draft.trash_lifecycle import prepare_registered_command
+
+    prepare_registered_command(root)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -383,6 +371,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("缺少子命令")
     json_mode = bool(getattr(args, "json", False))
     command = cast(str, args.command)
+
+    candidate_root = _preflight_candidate_root_for(args)
+    if candidate_root is not None:
+        registered = _registered_root_for(candidate_root)
+        if registered is not None:
+            try:
+                _advance_for_command(registered)
+            except DraftError as error:
+                _emit_error(error, json_mode)
+                return _exit_for_error(error)
+
     if command == "check":
         from draft.checker import check_draft
         from draft.models import ValidationMode
@@ -398,17 +397,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         payload, human, code = _dispatch(args)
     except DraftError as error:
-        from draft.trash_lifecycle import LifecycleAdvanceError
-
-        if isinstance(error, LifecycleAdvanceError):
-            report = error.report
-            payload = _structure_preflight_payload(report)
-            _emit(payload, json_mode, _structure_preflight_human(report))
-            failure = report.error
-            assert failure is not None
-            return _exit_for_error(
-                DraftError(failure.code, *failure.paths, details=failure.details)
-            )
         _emit_error(error, json_mode)
         return _exit_for_error(error)
     except OSError as error:

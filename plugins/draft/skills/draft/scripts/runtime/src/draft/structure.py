@@ -37,21 +37,7 @@ from draft.resources import (
     ResourceKind,
     rebase_body_destination,
 )
-from draft.trash_lifecycle import collect_lifecycle_warnings, prepare_structural_write
 from draft.vocabulary import RelationCode
-
-
-def _with_preflight_warnings(result: OperationResult, report: object) -> OperationResult:
-    warnings = collect_lifecycle_warnings(report)  # type: ignore[arg-type]
-    if not warnings:
-        return result
-    return OperationResult(
-        operation_id=result.operation_id,
-        kind=result.kind,
-        phase=result.phase,
-        changed_paths=result.changed_paths,
-        warnings=warnings,
-    )
 
 
 def _is_hub(path: Path) -> bool:
@@ -439,26 +425,26 @@ def _load_clean_graph(root: Path, *, allow_empty_hub: Path | None = None) -> Dra
 def move_page(
     root: Path, source: Path, target: Path, *, now: datetime | None = None
 ) -> OperationResult:
+    del now  # 前置推进由 CLI 编排统一完成；领域函数不再重复调用。
     resolved = resolve_draft_root(root)
-    preflight = prepare_structural_write(resolved, now=now)
     graph = _load_clean_graph(resolved)
     plan = plan_move(graph, source, target)
-    return _with_preflight_warnings(execute_plan(plan), preflight)
+    return execute_plan(plan)
 
 
 def promote_page(
     root: Path, page: Path, children: list[Path], *, now: datetime | None = None
 ) -> OperationResult:
+    del now  # 前置推进由 CLI 编排统一完成；领域函数不再重复调用。
     resolved = resolve_draft_root(root)
-    preflight = prepare_structural_write(resolved, now=now)
     graph = _load_clean_graph(resolved)
     plan = plan_promote(graph, page, tuple(children))
-    return _with_preflight_warnings(execute_plan(plan), preflight)
+    return execute_plan(plan)
 
 
 def collapse_hub(root: Path, hub: Path, *, now: datetime | None = None) -> OperationResult:
+    del now  # 前置推进由 CLI 编排统一完成；领域函数不再重复调用。
     resolved = resolve_draft_root(root)
-    preflight = prepare_structural_write(resolved, now=now)
     graph = _load_clean_graph(resolved, allow_empty_hub=hub)
     plan = plan_collapse(graph, hub)
-    return _with_preflight_warnings(execute_plan(plan), preflight)
+    return execute_plan(plan)
