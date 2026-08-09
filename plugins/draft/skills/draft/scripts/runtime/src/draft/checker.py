@@ -71,6 +71,54 @@ def _sort_key(issue: CheckIssue) -> tuple[str, int, str]:
     return ("" if issue.path is None else str(issue.path), issue.line or 0, issue.code)
 
 
+# 加载期（marker 与页面解析）issue 的报告顺序分组；分组顺序即报告顺序，
+# 组内按 _sort_key 排序。未归入任何分组的加载期诊断不丢弃，追加保留在已知分组之后。
+_LOAD_CANDIDATE_ISSUES = frozenset(
+    {CheckCode.CANDIDATE_ALREADY_REGISTERED, CheckCode.CANDIDATE_INTERNAL_STATE}
+)
+_LOAD_MARKER_ISSUES = frozenset(
+    {
+        CheckCode.FORMAT_MISSING,
+        CheckCode.FORMAT_INVALID,
+        CheckCode.FORMAT_UNSUPPORTED,
+        CheckCode.PATH_SYMLINK_ESCAPE,
+    }
+)
+_LOAD_PAGE_ISSUES = frozenset(
+    {
+        CheckCode.PAGE_UNMANAGED_PATH,
+        CheckCode.PAGE_MISSING_TITLE,
+        CheckCode.PAGE_MISSING_MACHINE_BLOCK,
+        CheckCode.PAGE_MISSING_STATUS,
+        CheckCode.PAGE_DUPLICATE_STATUS,
+        CheckCode.PAGE_UNKNOWN_LABEL,
+        CheckCode.PAGE_INVALID_STATUS,
+        CheckCode.PAGE_INVALID_RELATION,
+        CheckCode.PAGE_PARSE_ERROR,
+        CheckCode.PAGE_CAPACITY,
+    }
+)
+_LOAD_LINK_ISSUES = frozenset({CheckCode.LINK_MISSING, CheckCode.LINK_ESCAPE})
+_LOAD_ISSUE_GROUPS = (
+    _LOAD_CANDIDATE_ISSUES,
+    _LOAD_MARKER_ISSUES,
+    _LOAD_PAGE_ISSUES,
+    _LOAD_LINK_ISSUES,
+)
+_LOAD_KNOWN_ISSUE_VALUES: frozenset[str] = frozenset(
+    code.value for group in _LOAD_ISSUE_GROUPS for code in group
+)
+
+
+def _load_issues_in(
+    issues: list[CheckIssue], group: frozenset[CheckCode] | None
+) -> list[CheckIssue]:
+    if group is None:
+        return [issue for issue in issues if issue.code not in _LOAD_KNOWN_ISSUE_VALUES]
+    values = {code.value for code in group}
+    return [issue for issue in issues if issue.code in values]
+
+
 def _canonical_cycle(cycle: list[Path]) -> tuple[Path, ...]:
     smallest = min(range(len(cycle)), key=lambda index: cycle[index])
     return tuple(cycle[smallest:] + cycle[:smallest])
@@ -582,18 +630,15 @@ def check_draft(
         )
 
     result = load_graph_tolerant(resolved, mode, allow_provisional_adopt=allow_provisional_adopt)
-    format_issues = [issue for issue in result.issues if issue.code.startswith("format.")]
-    candidate_issues = [issue for issue in result.issues if issue.code.startswith("candidate.")]
-    page_issues = [issue for issue in result.issues if issue.code.startswith("page.")]
-    link_issues = [issue for issue in result.issues if issue.code.startswith("link.")]
 
     ordered: list[CheckIssue] = []
     ordered.extend(sorted(layout, key=_sort_key))
-    ordered.extend(sorted(candidate_issues, key=_sort_key))
-    ordered.extend(sorted(format_issues, key=_sort_key))
+    ordered.extend(sorted(_load_issues_in(result.issues, _LOAD_CANDIDATE_ISSUES), key=_sort_key))
+    ordered.extend(sorted(_load_issues_in(result.issues, _LOAD_MARKER_ISSUES), key=_sort_key))
     if include_operation_state and mode == "registered":
         ordered.extend(sorted(_check_operation_state(resolved), key=_sort_key))
-    ordered.extend(sorted(page_issues, key=_sort_key))
-    ordered.extend(sorted(link_issues, key=_sort_key))
+    ordered.extend(sorted(_load_issues_in(result.issues, _LOAD_PAGE_ISSUES), key=_sort_key))
+    ordered.extend(sorted(_load_issues_in(result.issues, _LOAD_LINK_ISSUES), key=_sort_key))
+    ordered.extend(sorted(_load_issues_in(result.issues, None), key=_sort_key))
     ordered.extend(check_graph(result.graph).issues)
     return CheckReport(issues=tuple(ordered))

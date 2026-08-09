@@ -4,6 +4,12 @@ from pathlib import Path
 import pytest
 
 from draft.checker import check_draft
+from draft.diagnostic_codes import (
+    CheckCode,
+    LinkEscapeKind,
+    ReplacementStatusReason,
+    WrongOutputReason,
+)
 from draft.errors import DraftError
 from draft.models import CheckReport, IssueSeverity
 from draft.operations import JOURNAL_VERSION
@@ -76,7 +82,7 @@ def test_journal_operation_id_mismatch_is_corrupt_without_mutation(
 
     report = check_draft(root)
 
-    assert "operation.journal_corrupt" in codes(report)
+    assert CheckCode.OPERATION_JOURNAL_CORRUPT.value in codes(report)
     assert journal_path.read_bytes() == before
 
 
@@ -87,7 +93,7 @@ def test_confirmed_page_without_output_is_an_error(draft_factory: DraftFactory) 
 
     report = check_draft(root)
 
-    assert [issue.code for issue in report.errors] == ["output.missing"]
+    assert [issue.code for issue in report.errors] == [CheckCode.OUTPUT_MISSING.value]
     assert report.errors[0].path == Path("pages/question.md")
 
 
@@ -96,7 +102,7 @@ def test_missing_marker(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert codes(report) == ["format.missing"]
+    assert codes(report) == [CheckCode.FORMAT_MISSING.value]
 
 
 def test_registered_mode_accepts_marker_without_runtime_directories(
@@ -120,7 +126,7 @@ def test_invalid_marker_json(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert codes(report) == ["format.invalid"]
+    assert codes(report) == [CheckCode.FORMAT_INVALID.value]
 
 
 def test_unsupported_format_version(draft_factory: DraftFactory) -> None:
@@ -129,7 +135,18 @@ def test_unsupported_format_version(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert codes(report) == ["format.unsupported"]
+    assert codes(report) == [CheckCode.FORMAT_UNSUPPORTED.value]
+
+
+def test_symlinked_marker_reports_symlink_escape(draft_factory: DraftFactory) -> None:
+    root = draft_factory(healthy())
+    marker = root / ".draft/draft.json"
+    marker.unlink()
+    marker.symlink_to("outside.json")
+
+    report = check_draft(root)
+
+    assert codes(report) == [CheckCode.PATH_SYMLINK_ESCAPE.value]
 
 
 def test_candidate_mode_reports_final_marker_as_already_registered(
@@ -139,7 +156,7 @@ def test_candidate_mode_reports_final_marker_as_already_registered(
 
     report = check_draft(root, mode="candidate")
 
-    assert codes(report) == ["candidate.already_registered"]
+    assert codes(report) == [CheckCode.CANDIDATE_ALREADY_REGISTERED.value]
 
 
 def test_candidate_mode_accepts_unregistered_layout(draft_factory: DraftFactory) -> None:
@@ -156,7 +173,7 @@ def test_candidate_mode_rejects_internal_entries(draft_factory: DraftFactory) ->
 
     report = check_draft(root, mode="candidate")
 
-    assert codes(report) == ["candidate.internal_state"]
+    assert codes(report) == [CheckCode.CANDIDATE_INTERNAL_STATE.value]
 
 
 def test_candidate_mode_provisional_marker_boundary(draft_factory: DraftFactory) -> None:
@@ -182,7 +199,7 @@ def test_marker_with_unknown_fields_is_invalid(draft_factory: DraftFactory) -> N
 
     report = check_draft(root)
 
-    assert codes(report) == ["format.invalid"]
+    assert codes(report) == [CheckCode.FORMAT_INVALID.value]
 
 
 def test_marker_with_unknown_adopt_state_is_invalid(draft_factory: DraftFactory) -> None:
@@ -194,7 +211,7 @@ def test_marker_with_unknown_adopt_state_is_invalid(draft_factory: DraftFactory)
 
     report = check_draft(root)
 
-    assert codes(report) == ["format.invalid"]
+    assert codes(report) == [CheckCode.FORMAT_INVALID.value]
 
 
 def test_missing_required_files(draft_factory: DraftFactory) -> None:
@@ -204,7 +221,7 @@ def test_missing_required_files(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert "root.missing_file" in codes(report)
+    assert CheckCode.ROOT_MISSING_FILE.value in codes(report)
 
 
 def test_unmanaged_markdown_below_root(draft_factory: DraftFactory) -> None:
@@ -214,7 +231,7 @@ def test_unmanaged_markdown_below_root(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert codes(report) == ["page.unmanaged_path"]
+    assert codes(report) == [CheckCode.PAGE_UNMANAGED_PATH.value]
     assert report.errors[0].path == Path("notes.md")
 
 
@@ -225,8 +242,10 @@ def test_parse_error_keeps_specific_code_and_line(draft_factory: DraftFactory) -
 
     report = check_draft(root)
 
-    assert "page.unknown_label" in codes(report)
-    issue = next(issue for issue in report.errors if issue.code == "page.unknown_label")
+    assert CheckCode.PAGE_UNKNOWN_LABEL.value in codes(report)
+    issue = next(
+        issue for issue in report.errors if issue.code == CheckCode.PAGE_UNKNOWN_LABEL.value
+    )
     assert issue.path == Path("pages/question.md")
     assert issue.line == 7
 
@@ -238,7 +257,7 @@ def test_missing_link_target(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert codes(report) == ["link.missing"]
+    assert codes(report) == [CheckCode.LINK_MISSING.value]
 
 
 def test_missing_link_reports_source_line_literal_and_normalized_target(
@@ -247,7 +266,7 @@ def test_missing_link_reports_source_line_literal_and_normalized_target(
     files = healthy()
     files["pages/question.md"] = QUESTION.replace("使用显式状态前缀。", "见 [不存在](missing.md)。")
     report = check_draft(draft_factory(files))
-    issue = next(issue for issue in report.errors if issue.code == "link.missing")
+    issue = next(issue for issue in report.errors if issue.code == CheckCode.LINK_MISSING.value)
     assert issue.path == Path("pages/question.md")
     assert issue.line == 9
     assert issue.details == ("missing.md", "pages/missing.md")
@@ -261,7 +280,7 @@ def test_missing_link_with_distinct_literal_and_normalized_target(
         "使用显式状态前缀。", "见 [不存在](./missing.md)。"
     )
     report = check_draft(draft_factory(files))
-    issue = next(issue for issue in report.errors if issue.code == "link.missing")
+    issue = next(issue for issue in report.errors if issue.code == CheckCode.LINK_MISSING.value)
     assert issue.details == ("./missing.md", "pages/missing.md")
 
 
@@ -271,7 +290,7 @@ def test_two_missing_links_on_one_line_remain_distinguishable(
     files = healthy()
     files["conclusions.md"] = CONCLUSIONS + "[甲](pages/a.md) [乙](pages/b.md)\n"
     report = check_draft(draft_factory(files))
-    issues = [i for i in report.errors if i.code == "link.missing"]
+    issues = [i for i in report.errors if i.code == CheckCode.LINK_MISSING.value]
     assert [(i.line, i.details) for i in issues] == [
         (8, ("pages/a.md", "pages/a.md")),
         (8, ("pages/b.md", "pages/b.md")),
@@ -286,7 +305,7 @@ def test_missing_relation_target_reports_link_missing_once(
         "> 产出：", "> 依赖：[缺失](missing.md)\n>\n> 产出："
     )
     report = check_draft(draft_factory(files))
-    missing = [i for i in report.errors if i.code == "link.missing"]
+    missing = [i for i in report.errors if i.code == CheckCode.LINK_MISSING.value]
     assert len(missing) == 1
     assert missing[0].path == Path("pages/question.md")
     assert missing[0].details == ("missing.md", "pages/missing.md")
@@ -301,7 +320,7 @@ def test_link_escaping_root(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert codes(report) == ["link.escape"]
+    assert codes(report) == [CheckCode.LINK_ESCAPE.value]
 
 
 def test_link_escape_preserves_literal_destination(draft_factory: DraftFactory) -> None:
@@ -310,10 +329,10 @@ def test_link_escape_preserves_literal_destination(draft_factory: DraftFactory) 
         "使用显式状态前缀。", "见 [外部](../../outside.md)。"
     )
     report = check_draft(draft_factory(files))
-    issue = next(issue for issue in report.errors if issue.code == "link.escape")
+    issue = next(issue for issue in report.errors if issue.code == CheckCode.LINK_ESCAPE.value)
     assert issue.path == Path("pages/question.md")
     assert issue.line == 9
-    assert issue.details == ("destination", "../../outside.md")
+    assert issue.details == (LinkEscapeKind.DESTINATION.value, "../../outside.md")
 
 
 def test_page_file_through_symlink(draft_factory: DraftFactory) -> None:
@@ -325,7 +344,7 @@ def test_page_file_through_symlink(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert "link.escape" in codes(report)
+    assert CheckCode.LINK_ESCAPE.value in codes(report)
 
 
 def test_managed_path_symlink_escape_preserves_relative_path(
@@ -338,8 +357,8 @@ def test_managed_path_symlink_escape_preserves_relative_path(
     (root / "pages/linked.md").symlink_to(outside)
 
     report = check_draft(root)
-    issue = next(issue for issue in report.errors if issue.code == "link.escape")
-    assert issue.details == ("managed_path", "pages/linked.md")
+    issue = next(issue for issue in report.errors if issue.code == CheckCode.LINK_ESCAPE.value)
+    assert issue.details == (LinkEscapeKind.MANAGED_PATH.value, "pages/linked.md")
 
 
 def test_non_root_page_without_parent(draft_factory: DraftFactory) -> None:
@@ -349,7 +368,7 @@ def test_non_root_page_without_parent(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert "parent.missing" in codes(report)
+    assert CheckCode.PARENT_MISSING.value in codes(report)
 
 
 def test_multiple_parent_declarations(draft_factory: DraftFactory) -> None:
@@ -361,7 +380,7 @@ def test_multiple_parent_declarations(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert "parent.multiple" in codes(report)
+    assert CheckCode.PARENT_MULTIPLE.value in codes(report)
 
 
 def test_root_declaring_parent(draft_factory: DraftFactory) -> None:
@@ -374,7 +393,7 @@ def test_root_declaring_parent(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert "parent.root_declared" in codes(report)
+    assert CheckCode.PARENT_ROOT_DECLARED.value in codes(report)
 
 
 def test_parent_cycle_reports_one_canonical_cycle(draft_factory: DraftFactory) -> None:
@@ -387,10 +406,10 @@ def test_parent_cycle_reports_one_canonical_cycle(draft_factory: DraftFactory) -
 
     report = check_draft(root)
 
-    cycle_issues = [issue for issue in report.errors if issue.code == "parent.cycle"]
+    cycle_issues = [issue for issue in report.errors if issue.code == CheckCode.PARENT_CYCLE.value]
     assert len(cycle_issues) == 1
     assert cycle_issues[0].details == ("pages/a.md", "pages/b.md", "pages/a.md")
-    assert "parent.unreachable" not in codes(report)
+    assert CheckCode.PARENT_UNREACHABLE.value not in codes(report)
 
 
 def test_unreachable_page(draft_factory: DraftFactory) -> None:
@@ -401,8 +420,8 @@ def test_unreachable_page(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert "parent.missing" in codes(report)
-    assert "parent.unreachable" in codes(report)
+    assert CheckCode.PARENT_MISSING.value in codes(report)
+    assert CheckCode.PARENT_UNREACHABLE.value in codes(report)
 
 
 def test_declared_parent_differs_from_physical_parent(draft_factory: DraftFactory) -> None:
@@ -414,7 +433,9 @@ def test_declared_parent_differs_from_physical_parent(draft_factory: DraftFactor
 
     report = check_draft(root)
 
-    mismatch = [issue for issue in report.errors if issue.code == "layout.parent_mismatch"]
+    mismatch = [
+        issue for issue in report.errors if issue.code == CheckCode.LAYOUT_PARENT_MISMATCH.value
+    ]
     assert len(mismatch) == 1
     assert mismatch[0].details == ("index.md", "pages/sub/index.md")
 
@@ -426,7 +447,7 @@ def test_parent_without_visible_navigation_back(draft_factory: DraftFactory) -> 
 
     report = check_draft(root)
 
-    assert codes(report) == ["parent.navigation_missing"]
+    assert codes(report) == [CheckCode.PARENT_NAVIGATION_MISSING.value]
 
 
 def test_non_root_empty_hub(draft_factory: DraftFactory) -> None:
@@ -438,7 +459,7 @@ def test_non_root_empty_hub(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert "hub.empty" in codes(report)
+    assert CheckCode.HUB_EMPTY.value in codes(report)
 
 
 def test_dependency_self_loop(draft_factory: DraftFactory) -> None:
@@ -450,7 +471,9 @@ def test_dependency_self_loop(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    self_issues = [issue for issue in report.errors if issue.code == "dependency.self"]
+    self_issues = [
+        issue for issue in report.errors if issue.code == CheckCode.DEPENDENCY_SELF.value
+    ]
     assert len(self_issues) == 1
     assert self_issues[0].path == Path("pages/question.md")
     assert self_issues[0].line == 7
@@ -471,7 +494,9 @@ def test_dependency_cycle_reports_one_cycle(draft_factory: DraftFactory) -> None
 
     report = check_draft(root)
 
-    cycle_issues = [issue for issue in report.errors if issue.code == "dependency.cycle"]
+    cycle_issues = [
+        issue for issue in report.errors if issue.code == CheckCode.DEPENDENCY_CYCLE.value
+    ]
     assert len(cycle_issues) == 1
     assert cycle_issues[0].details == ("pages/a.md", "pages/b.md", "pages/a.md")
 
@@ -486,7 +511,9 @@ def test_replacement_pair_missing(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    pair = [issue for issue in report.errors if issue.code == "replacement.pair_missing"]
+    pair = [
+        issue for issue in report.errors if issue.code == CheckCode.REPLACEMENT_PAIR_MISSING.value
+    ]
     assert len(pair) == 1
     assert pair[0].path == Path("pages/new.md")
     assert pair[0].line == 7
@@ -510,7 +537,9 @@ def test_replacement_pair_missing_reverse_branch_uses_forward_label(
 
     report = check_draft(root)
 
-    pair = [issue for issue in report.errors if issue.code == "replacement.pair_missing"]
+    pair = [
+        issue for issue in report.errors if issue.code == CheckCode.REPLACEMENT_PAIR_MISSING.value
+    ]
     assert len(pair) == 1
     assert pair[0].path == Path("pages/old.md")
     assert pair[0].line == 7
@@ -532,11 +561,15 @@ def test_superseded_status_mismatch(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    mismatch = [issue for issue in report.errors if issue.code == "replacement.status_mismatch"]
+    mismatch = [
+        issue
+        for issue in report.errors
+        if issue.code == CheckCode.REPLACEMENT_STATUS_MISMATCH.value
+    ]
     assert len(mismatch) == 1
     assert mismatch[0].path == Path("pages/question.md")
     assert mismatch[0].line == 7
-    assert mismatch[0].details == ("relation_requires_status",)
+    assert mismatch[0].details == (ReplacementStatusReason.RELATION_REQUIRES_STATUS.value,)
 
 
 def test_confirmed_status_without_superseded_by(draft_factory: DraftFactory) -> None:
@@ -546,11 +579,15 @@ def test_confirmed_status_without_superseded_by(draft_factory: DraftFactory) -> 
 
     report = check_draft(root)
 
-    mismatch = [issue for issue in report.errors if issue.code == "replacement.status_mismatch"]
+    mismatch = [
+        issue
+        for issue in report.errors
+        if issue.code == CheckCode.REPLACEMENT_STATUS_MISMATCH.value
+    ]
     assert len(mismatch) == 1
     assert mismatch[0].path == Path("pages/old.md")
     assert mismatch[0].line is None
-    assert mismatch[0].details == ("status_requires_relation",)
+    assert mismatch[0].details == (ReplacementStatusReason.STATUS_REQUIRES_RELATION.value,)
 
 
 def test_replacement_cycle(draft_factory: DraftFactory) -> None:
@@ -567,11 +604,13 @@ def test_replacement_cycle(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    cycle_issues = [issue for issue in report.errors if issue.code == "replacement.cycle"]
+    cycle_issues = [
+        issue for issue in report.errors if issue.code == CheckCode.REPLACEMENT_CYCLE.value
+    ]
     assert len(cycle_issues) == 1
     assert cycle_issues[0].details == ("pages/a.md", "pages/b.md", "pages/a.md")
-    assert "replacement.pair_missing" not in codes(report)
-    assert "replacement.status_mismatch" not in codes(report)
+    assert CheckCode.REPLACEMENT_PAIR_MISSING.value not in codes(report)
+    assert CheckCode.REPLACEMENT_STATUS_MISMATCH.value not in codes(report)
 
 
 def test_replacement_self_loop_is_a_cycle(draft_factory: DraftFactory) -> None:
@@ -588,7 +627,7 @@ def test_replacement_self_loop_is_a_cycle(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    cycle = [issue for issue in report.errors if issue.code == "replacement.cycle"]
+    cycle = [issue for issue in report.errors if issue.code == CheckCode.REPLACEMENT_CYCLE.value]
     assert len(cycle) == 1
     assert cycle[0].details == ("pages/a.md", "pages/a.md")
 
@@ -604,7 +643,7 @@ def test_parent_self_loop_is_a_cycle(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    cycle = [issue for issue in report.errors if issue.code == "parent.cycle"]
+    cycle = [issue for issue in report.errors if issue.code == CheckCode.PARENT_CYCLE.value]
     assert len(cycle) == 1
     assert cycle[0].details == ("pages/a.md", "pages/a.md")
 
@@ -619,7 +658,9 @@ def test_challenge_pair_missing(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    pair = [issue for issue in report.errors if issue.code == "challenge.pair_missing"]
+    pair = [
+        issue for issue in report.errors if issue.code == CheckCode.CHALLENGE_PAIR_MISSING.value
+    ]
     assert len(pair) == 1
     assert pair[0].path == Path("pages/challenger.md")
     assert pair[0].line == 7
@@ -643,7 +684,9 @@ def test_challenge_pair_missing_reverse_branch_uses_forward_label(
 
     report = check_draft(root)
 
-    pair = [issue for issue in report.errors if issue.code == "challenge.pair_missing"]
+    pair = [
+        issue for issue in report.errors if issue.code == CheckCode.CHALLENGE_PAIR_MISSING.value
+    ]
     assert len(pair) == 1
     assert pair[0].path == Path("pages/old.md")
     assert pair[0].line == 7
@@ -679,11 +722,11 @@ def test_output_to_wrong_target(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    wrong = [issue for issue in report.errors if issue.code == "output.wrong_target"]
+    wrong = [issue for issue in report.errors if issue.code == CheckCode.OUTPUT_WRONG_TARGET.value]
     assert len(wrong) == 1
     assert wrong[0].path == Path("pages/question.md")
     assert wrong[0].line == 7
-    assert wrong[0].details == ("not_conclusions", "../index.md")
+    assert wrong[0].details == (WrongOutputReason.NOT_CONCLUSIONS.value, "../index.md")
 
 
 def test_output_duplicate_declaration_is_wrong_target(draft_factory: DraftFactory) -> None:
@@ -696,11 +739,11 @@ def test_output_duplicate_declaration_is_wrong_target(draft_factory: DraftFactor
 
     report = check_draft(root)
 
-    wrong = [issue for issue in report.errors if issue.code == "output.wrong_target"]
+    wrong = [issue for issue in report.errors if issue.code == CheckCode.OUTPUT_WRONG_TARGET.value]
     assert len(wrong) == 1
     assert wrong[0].path == Path("pages/question.md")
     assert wrong[0].line == 9
-    assert wrong[0].details == ("duplicate",)
+    assert wrong[0].details == (WrongOutputReason.DUPLICATE.value,)
 
 
 def test_output_correct_then_wrong_locates_the_wrong_declaration(
@@ -715,14 +758,16 @@ def test_output_correct_then_wrong_locates_the_wrong_declaration(
 
     report = check_draft(root)
 
-    wrong = [issue for issue in report.errors if issue.code == "output.wrong_target"]
-    duplicate = [i for i in wrong if i.details == ("duplicate",)]
-    not_conclusions = [i for i in wrong if i.details and i.details[0] == "not_conclusions"]
+    wrong = [issue for issue in report.errors if issue.code == CheckCode.OUTPUT_WRONG_TARGET.value]
+    duplicate = [i for i in wrong if i.details == (WrongOutputReason.DUPLICATE.value,)]
+    not_conclusions = [
+        i for i in wrong if i.details and i.details[0] == WrongOutputReason.NOT_CONCLUSIONS.value
+    ]
     assert len(duplicate) == 1
     assert duplicate[0].line == 9
     assert len(not_conclusions) == 1
     assert not_conclusions[0].line == 9
-    assert not_conclusions[0].details == ("not_conclusions", "../index.md")
+    assert not_conclusions[0].details == (WrongOutputReason.NOT_CONCLUSIONS.value, "../index.md")
 
 
 def test_output_wrong_then_correct_locates_the_wrong_declaration(
@@ -737,14 +782,16 @@ def test_output_wrong_then_correct_locates_the_wrong_declaration(
 
     report = check_draft(root)
 
-    wrong = [issue for issue in report.errors if issue.code == "output.wrong_target"]
-    duplicate = [i for i in wrong if i.details == ("duplicate",)]
-    not_conclusions = [i for i in wrong if i.details and i.details[0] == "not_conclusions"]
+    wrong = [issue for issue in report.errors if issue.code == CheckCode.OUTPUT_WRONG_TARGET.value]
+    duplicate = [i for i in wrong if i.details == (WrongOutputReason.DUPLICATE.value,)]
+    not_conclusions = [
+        i for i in wrong if i.details and i.details[0] == WrongOutputReason.NOT_CONCLUSIONS.value
+    ]
     assert len(duplicate) == 1
     assert duplicate[0].line == 9
     assert len(not_conclusions) == 1
     assert not_conclusions[0].line == 7
-    assert not_conclusions[0].details == ("not_conclusions", "../index.md")
+    assert not_conclusions[0].details == (WrongOutputReason.NOT_CONCLUSIONS.value, "../index.md")
 
 
 def test_non_confirmed_page_declaring_output(draft_factory: DraftFactory) -> None:
@@ -754,7 +801,7 @@ def test_non_confirmed_page_declaring_output(draft_factory: DraftFactory) -> Non
 
     report = check_draft(root)
 
-    assert "output.forbidden" in codes(report)
+    assert CheckCode.OUTPUT_FORBIDDEN.value in codes(report)
 
 
 def test_conclusions_missing_backlink(draft_factory: DraftFactory) -> None:
@@ -766,7 +813,7 @@ def test_conclusions_missing_backlink(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert codes(report) == ["output.backlink_missing"]
+    assert codes(report) == [CheckCode.OUTPUT_BACKLINK_MISSING.value]
     assert report.errors[0].path == Path("conclusions.md")
     assert report.errors[0].details == ("pages/question.md",)
 
@@ -780,7 +827,7 @@ def test_oversized_ordinary_page_is_review_only(draft_factory: DraftFactory) -> 
     report = check_draft(root)
 
     assert report.errors == ()
-    assert [issue.code for issue in report.reviews] == ["page.capacity"]
+    assert [issue.code for issue in report.reviews] == [CheckCode.PAGE_CAPACITY.value]
     assert report.reviews[0].severity is IssueSeverity.REVIEW
     assert report.reviews[0].details == (
         "620",
@@ -809,7 +856,7 @@ def test_markdown_in_non_pages_subdirectory_is_unmanaged(
 
     report = check_draft(root)
 
-    assert codes(report) == ["page.unmanaged_path"]
+    assert codes(report) == [CheckCode.PAGE_UNMANAGED_PATH.value]
     assert report.errors[0].path == Path("notes/hidden.md")
 
 
@@ -826,8 +873,8 @@ def test_nested_non_pages_markdown_and_symlink_dir(
 
     report = check_draft(root)
 
-    assert "page.unmanaged_path" in codes(report)
-    assert "link.escape" in codes(report)
+    assert CheckCode.PAGE_UNMANAGED_PATH.value in codes(report)
+    assert CheckCode.LINK_ESCAPE.value in codes(report)
     assert not any(issue.path == Path("linked-dir/escape.md") for issue in report.errors)
 
 
@@ -850,7 +897,7 @@ def test_duplicate_normalized_relation_target_is_an_error(
 
     report = check_draft(root)
 
-    assert codes(report) == ["relation.duplicate"]
+    assert codes(report) == [CheckCode.RELATION_DUPLICATE.value]
     issue = report.errors[0]
     assert issue.path == Path("pages/question.md")
     assert issue.line == 9
@@ -1014,7 +1061,7 @@ def test_checker_trash_retained_before_expiry_is_info(
     report = check_draft(root)
     assert snapshot_tree(root) == before
 
-    assert _codes_for(report, operation_id, IssueSeverity.INFO) == ["trash.retained"]
+    assert _codes_for(report, operation_id, IssueSeverity.INFO) == [CheckCode.TRASH_RETAINED.value]
     assert _codes_for(report, operation_id, IssueSeverity.ERROR) == []
     assert _codes_for(report, operation_id, IssueSeverity.WARNING) == []
 
@@ -1031,7 +1078,7 @@ def test_checker_trash_retained_after_expiry_is_still_info(
     report = check_draft(root)
     assert snapshot_tree(root) == before
 
-    assert _codes_for(report, operation_id, IssueSeverity.INFO) == ["trash.retained"]
+    assert _codes_for(report, operation_id, IssueSeverity.INFO) == [CheckCode.TRASH_RETAINED.value]
     assert _codes_for(report, operation_id, IssueSeverity.ERROR) == []
 
 
@@ -1049,7 +1096,9 @@ def test_checker_pending_with_failure_record_is_warning_before_next_attempt(
     report = check_draft(root)
     assert snapshot_tree(root) == before
 
-    assert _codes_for(report, operation_id, IssueSeverity.WARNING) == ["trash.handoff_pending"]
+    assert _codes_for(report, operation_id, IssueSeverity.WARNING) == [
+        CheckCode.TRASH_HANDOFF_PENDING.value
+    ]
     assert _codes_for(report, operation_id, IssueSeverity.ERROR) == []
 
 
@@ -1067,7 +1116,9 @@ def test_checker_pending_with_failure_record_is_warning_after_next_attempt(
     report = check_draft(root)
     assert snapshot_tree(root) == before
 
-    assert _codes_for(report, operation_id, IssueSeverity.WARNING) == ["trash.handoff_pending"]
+    assert _codes_for(report, operation_id, IssueSeverity.WARNING) == [
+        CheckCode.TRASH_HANDOFF_PENDING.value
+    ]
     assert _codes_for(report, operation_id, IssueSeverity.ERROR) == []
 
 
@@ -1084,7 +1135,9 @@ def test_checker_pending_without_failure_record_is_error(
     report = check_draft(root)
     assert snapshot_tree(root) == before
 
-    assert _codes_for(report, operation_id, IssueSeverity.ERROR) == ["trash.pending_unexplained"]
+    assert _codes_for(report, operation_id, IssueSeverity.ERROR) == [
+        CheckCode.TRASH_PENDING_UNEXPLAINED.value
+    ]
     assert _codes_for(report, operation_id, IssueSeverity.WARNING) == []
 
 
@@ -1101,7 +1154,9 @@ def test_checker_retained_with_missing_package_is_error(
     report = check_draft(root)
     assert snapshot_tree(root) == before
 
-    assert _codes_for(report, operation_id, IssueSeverity.ERROR) == ["trash.package_missing"]
+    assert _codes_for(report, operation_id, IssueSeverity.ERROR) == [
+        CheckCode.TRASH_PACKAGE_MISSING.value
+    ]
     assert _codes_for(report, operation_id, IssueSeverity.INFO) == []
 
 
@@ -1118,7 +1173,9 @@ def test_checker_retained_with_invalid_package_is_error(
     report = check_draft(root)
     assert snapshot_tree(root) == before
 
-    assert _codes_for(report, operation_id, IssueSeverity.ERROR) == ["trash.package_corrupt"]
+    assert _codes_for(report, operation_id, IssueSeverity.ERROR) == [
+        CheckCode.TRASH_PACKAGE_CORRUPT.value
+    ]
     assert _codes_for(report, operation_id, IssueSeverity.INFO) == []
 
 
@@ -1139,7 +1196,9 @@ def test_checker_pending_with_failure_but_missing_package_is_error(
     report = check_draft(root)
     assert snapshot_tree(root) == before
 
-    assert _codes_for(report, operation_id, IssueSeverity.ERROR) == ["trash.package_missing"]
+    assert _codes_for(report, operation_id, IssueSeverity.ERROR) == [
+        CheckCode.TRASH_PACKAGE_MISSING.value
+    ]
     assert _codes_for(report, operation_id, IssueSeverity.WARNING) == []
 
 
@@ -1182,7 +1241,9 @@ def test_check_does_not_change_due_or_failed_package(
     # 候选检查对登记根只读拒绝，同样不改动字节。
     report_candidate = check_draft(root, mode="candidate")
     assert snapshot_tree(root) == before
-    assert [issue.code for issue in report_candidate.errors] == ["candidate.already_registered"]
+    assert [issue.code for issue in report_candidate.errors] == [
+        CheckCode.CANDIDATE_ALREADY_REGISTERED.value
+    ]
 
 
 def test_checker_retained_with_invalid_deadlines_is_error(
@@ -1204,5 +1265,7 @@ def test_checker_retained_with_invalid_deadlines_is_error(
     report = check_draft(root)
     assert snapshot_tree(root) == before
 
-    assert _codes_for(report, operation_id, IssueSeverity.ERROR) == ["trash.deadlines_invalid"]
+    assert _codes_for(report, operation_id, IssueSeverity.ERROR) == [
+        CheckCode.TRASH_DEADLINES_INVALID.value
+    ]
     assert _codes_for(report, operation_id, IssueSeverity.INFO) == []
