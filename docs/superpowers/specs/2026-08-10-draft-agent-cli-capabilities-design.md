@@ -106,11 +106,27 @@ Markdown 解析器在边界上把当前中文标签映射为 `StatusCode`；序�
 `output`/`产出` 从格式、解析、检查、命令和测试中删除。页面是否进入结论汇总，只由该页面
 当前是否为 `confirmed` 决定。
 
-### 5.3 测试数据来源
+### 5.3 结果类型与计划操作代码
 
-状态和关系的完整集合只在生产类型中定义。测试遍历这些类型构造用例，不再维护
-`EXPECTED_CODES`、`VARIANT_CODES` 等平行字符串集合。稳定协议值可以精确断言；中文人类
-文案只验证渲染关系、事实、顺序、计数、转义和单行安全。
+成功和失败 JSON 的 `result_type` 是有限、稳定、会影响调用方分支的机器协议。首版合法值
+为：
+
+- `init`、`adopt`、`check`、`move`、`promote`、`collapse`、`trash`、`restore`、`recover`；
+- `query.page`、`query.links`、`query.backlinks`、`query.relations`、`query.status`、
+  `query.recoverable`；
+- `plan`、`create`、`status.set`、`relation.add`、`relation.remove`、
+  `generate-conclusions`、`error`。
+
+预演信封的 `operation` 同样是稳定命令代码，只允许本设计中支持 `--dry-run` 的九种命令
+值。状态、关系、资源事实、`result_type` 和 `operation` 的合法值都必须各自只有一个生产
+代码权威来源；序列化器和命令分派从这些有约束的类型取值，不在各分支手写同一组字面量。
+
+### 5.4 测试数据来源
+
+状态、关系、结果类型和计划操作的完整集合只在生产类型中定义。测试遍历这些类型构造
+用例，不再维护 `EXPECTED_CODES`、`VARIANT_CODES` 等平行字符串集合。测试可以精确断言
+单个稳定协议值，但不得另建一份完整合法值清单；中文人类文案只验证渲染关系、事实、
+顺序、计数、转义和单行安全。
 
 ## 6. 页面参数与正文链接是两类路径
 
@@ -123,6 +139,17 @@ Markdown 解析器在边界上把当前中文标签映射为 `StatusCode`；序�
 
 正文链接不受这项限制。正文需要支持作者实际写下的本地或外部资源，包括 Draft 外路径。
 正式关系仍只能指向同一 Draft 内的受管理页面。
+
+本设计新增命令中，凡是要求操作数指向一个现存受管理页面，均使用稳定错误码
+`page.not_found` 表示“路径语法本身合法，但没有标识当前受管理页面”，退出码为 2。适用
+范围包括 `query page`、`query links`、`query relations` 的 `PAGE`，`status set` 的
+`PAGE`，以及 `relation add/remove` 的 `SOURCE` 和 `TARGET`。绝对路径、反斜杠、`.`、
+`..`、非 Markdown 等语法错误仍使用相应路径错误，不折叠为 `page.not_found`。
+
+`query backlinks` 的 `TARGET` 是宽松资源身份，不要求目标存在，因此不存在
+`page.not_found` 分支。现有结构命令的 `structure.unknown_page` 保持不变；新命令不得为了
+复用实现而把该结构操作专用代码泄漏到查询、状态或关系协议。`page.not_found` 作为稳定
+机器协议值必须只有一个生产代码权威来源。
 
 ## 7. 正文资源解析
 
@@ -162,7 +189,31 @@ Windows 盘符相对路径依赖进程的盘符工作目录，不能可靠解析
 - `scope`：`draft`、`outside`、`unknown`；
 - `target_state`：`present`、`missing`、`unavailable`、`unchecked`、`invalid`。
 
-图片、普通附件、目录和非受管理 Markdown 都使用 `kind: "local"`，不增加文件类型细分。
+分类矩阵如下；先按词法目标确定 `kind` 和 `scope`，再探测 `target_state`：
+
+| 词法目标类别 | `kind` | `scope` | `target_state` |
+|---|---|---|---|
+| 页面命名空间中的普通文件 | `page` | `draft` | `present` |
+| 页面命名空间中不存在的目标 | `page` | `draft` | `missing` |
+| 页面命名空间中含符号链接或不是普通文件的目标 | `page` | `draft` | `invalid` |
+| 其他可解释的 Draft 内本地目标 | `local` | `draft` | `present` 或 `missing` |
+| 其他可解释的 Draft 外本地目标 | `local` | `outside` | `present` 或 `missing` |
+| 当前平台不能解释的本地目标 | `local` | `unknown` | `unavailable` |
+| 写法本身不能形成合法本地目标 | `local` | `unknown` | `invalid` |
+| 外部 URI | `external` | `unknown` | `unchecked` |
+
+资源类型按词法身份判定，不能依赖目标当前是否存在。Draft 内受管理页面命名空间精确定义
+为规范根相对路径 `index.md`、`conclusions.md` 和 `pages/**/*.md`。解析到这个命名空间的
+目标一律使用 `kind: "page"`、`scope: "draft"`：普通文件存在时为 `present`，不存在时为
+`missing`，路径包含符号链接或目标存在但不是普通文件时为 `invalid`。因此，同一链接不会
+因为目标文件稍后出现或消失而在 `page` 与 `local` 之间改变身份。
+
+根目录中除 `index.md`、`conclusions.md` 外的 Markdown、`pages/` 外的 Draft 内 Markdown
+以及 Draft 外 Markdown 都是 `kind: "local"`；其 `scope` 分别按词法位置为 `draft` 或
+`outside`。图片、普通附件和目录也使用 `kind: "local"`，不增加文件类型细分。
+`conclusions_state` 不改变资源的词法类型：尚未生成的 `conclusions.md` 仍可作为
+`page`/`draft`/`missing` 的正文资源事实。
+
 `target` 去掉锚点，机器输出中的分隔符统一为 `/`；身份比较采用词法解析后的资源位置，
 不通过 `realpath` 合并符号链接。多个写法解析到同一资源时只返回一次，输出顺序和展示值
 采用该资源第一次出现的位置及其规范化目标。
@@ -194,6 +245,11 @@ Windows 盘符相对路径依赖进程的盘符工作目录，不能可靠解析
 ## 8. 查询命令
 
 所有查询位于 `draft query` 下，不提供聚合式 `inspect`。
+
+`query page`、`query links` 和 `query relations` 的 `PAGE` 使用第 6 节的严格受管理页面参数
+规则，并要求目标页面存在。`query backlinks` 的 `TARGET` 使用正文资源身份规则，可以是
+Draft 内受管理页面、普通本地资源、Draft 外路径或外部 URI。两类参数不得复用同一个严格
+页面校验器。
 
 ### 8.1 `query page`
 
@@ -276,6 +332,11 @@ draft query status ROOT proposed
 每次只接受一个 `StatusCode`，结果项仅为规范页面路径。查询覆盖所有当前受管理页面，按
 路径排序。首版不提供多状态并集、父路径或 kind 筛选。
 
+所有权状态为 `generated` 时，`conclusions.md` 对查询是普通受管理页面：`query status`
+按其页面讨论状态包含它，`query page` 返回的父页面是 `index.md`，其他查询也不设置特殊
+排除。所有权状态只改变结论生成和检查规则。尚未生成且文件不存在时，它不是可查询的
+现存 `PAGE`，但正文链接仍按第 7.2 节返回 `page`/`draft`/`missing`。
+
 ### 8.6 `query recoverable`
 
 ```bash
@@ -292,8 +353,10 @@ draft query recoverable ROOT
 }
 ```
 
-结果信封包含 `as_of`。排序先按最早到期时间，再按 `operation_id`。当 `as_of` 恰好等于
-到期时间时，该项目已不可恢复，不进入结果。
+命令编排开始时只捕获一次 UTC 当前时间。同一个时间值必须同时传给生命周期前置推进和
+可恢复项过滤，并原样序列化为结果信封的 `as_of`；不能让两个步骤各自读取时钟。排序先按
+最早到期时间，再按 `operation_id`。当 `as_of` 恰好等于到期时间时，该项目已不可恢复，
+不进入结果。
 
 如果任何候选日志、权威删除包或期限字段损坏，以致无法证明结果完整，查询整体失败，
 不返回部分项目。
@@ -308,8 +371,12 @@ draft query recoverable ROOT
 - 支持 `--count-only`；
 - 不提供 `--all`。
 
-信封包含 `total`、`offset`、`limit`、`has_more`、`next_offset` 和 `items`。
-`--count-only` 时 `items` 是空数组，但 `total` 仍为完整数量。
+信封包含 `total`、`offset`、`limit`、`has_more`、`next_offset` 和 `items`。所有集合查询和
+预演使用同一套字段计算规则与序列化边界。
+
+`--count-only` 只把 `items` 替换为空数组；`total`、`offset`、`limit`、`has_more` 和
+`next_offset` 与相同请求不加 `--count-only` 时完全一致。后两个字段描述请求窗口在完整
+结果中的位置，不根据实际输出的空 `items` 重算。
 
 ### 8.8 稳定排序
 
@@ -458,6 +525,13 @@ draft relation remove ROOT pages/new.md supersedes pages/old.md --status propose
 `conclusions.md`；`adopt` 后同样从 `not_generated` 开始。候选目录可以已有
 `confirmed` 页面，接管不会自动生成结论页。
 
+正式登记标记的键集合精确为 `{"format_version","conclusions_state"}`。接管中的临时
+标记键集合精确为
+`{"format_version","conclusions_state","adopt_state","candidate_manifest"}`，其中
+`conclusions_state` 只能是 `not_generated`。旧的 `{"format_version":1}` 标记有意按
+`format.invalid` 拒绝；本次格式变化不提供迁移、双读或兼容分支，即使
+`FORMAT_VERSION` 仍保持为 `1`。
+
 ### 12.3 显式生成
 
 讨论结束并与用户确认后，Agent 必须执行：
@@ -517,6 +591,10 @@ draft generate-conclusions ROOT
 
 根索引 `## 子主题` 中的结论链接由生成器管理：首次生成时在末尾加入；以后保持唯一、
 规范且始终位于最后。
+
+一级标题、页面状态、父主题、章节标题、列表形状和根导航结论链接共同组成一套固定机器
+产物形状。生成、检查、页面创建和结构操作必须依据同一套形状定义识别它，不能分别复制
+标题或链接字面量后各自判断。
 
 ### 12.5 非实时维护
 
@@ -594,8 +672,13 @@ draft generate-conclusions ROOT
 }
 ```
 
-影响项默认 20、最大 100，支持 `offset`，不提供 `--all`。移动必须表现为一个 `move`，
-不能显示成创建加删除。
+影响项默认 20、最大 100，支持 `offset` 和 `--count-only`，不提供 `--all`。移动必须表现为
+一个 `move`，不能显示成创建加删除。
+
+写命令的 `--limit`、`--offset` 和 `--count-only` 只与 `--dry-run` 一起合法；正式执行携带
+任一分页选项时以退出码 2 拒绝。预演使用 `--count-only` 时只把 `effects` 置为空数组，
+`total`、`offset`、`limit`、`has_more` 和 `next_offset` 与相同请求不加该选项时完全一致，
+命令必要的其他业务事实仍保留。
 
 计划不公开文件内容、diff、哈希、锁、日志、回收包、低层临时文件或 `.draft/` 路径。
 幂等无变化时 `effects` 为空；命令可以附带必要业务事实，例如
@@ -603,6 +686,11 @@ draft generate-conclusions ROOT
 
 如果无法构造完整计划，预演整体失败，不返回部分计划。`--dry-run` 不执行当前业务计划，
 但仍按第 15 节静默推进已登记 Draft 的回收生命周期。
+
+`--dry-run` 不获取新的业务写锁，也不忽略、接管或恢复已有业务写锁。生命周期前置推进后
+如果仍存在写锁或未完成操作，使当前快照和计划的完整性无法证明，预演以
+`operation.recovery_required` 和退出码 3 整体失败，不返回部分效果。调用者必须先显式运行
+恢复流程，再重新预演。
 
 ## 14. 正式成功输出
 
@@ -614,6 +702,15 @@ draft generate-conclusions ROOT
 
 成功结果不重复 `ok: true`，不返回成功时恒定的 `phase`，不公开普通操作的内部编号、锁、
 日志或静默生命周期信息。
+
+所有公开 `changed_paths` 都从公开语义效果或等价的公开结果模型派生，不能从底层日志的
+mutation 路径集合直接生成，也不能以过滤 `.draft/` 前缀作为权威规则。日志 mutation 是
+原子执行、回滚和恢复的存储事实，可能包含登记标记、回收包和 payload 等内部路径。
+
+对于支持 `--dry-run` 的命令，正式执行的 `changed_paths` 必须等于同一份未分页
+`PlanEffect` 按顺序去重后的公开路径：`create`、`modify`、`remove` 贡献 `path`，`move`
+依次贡献 `from` 和 `to`。预演分页只影响本次显示的 `effects`，不能改变正式结果。正式执行
+和崩溃恢复如何携带或持久化这些公开语义属于实现选择，但不得回退到从内部路径猜测。
 
 `trash` 是例外：保留 `operation_id` 和 `restore_expires_at`，因为后续 `restore` 必须使用。
 如果故障恢复需要定位某次内部操作，错误结果再提供相应编号。
@@ -633,13 +730,36 @@ draft generate-conclusions ROOT
 
 帮助、版本、`init`、`check --candidate` 和登记完成前的 `adopt` 不执行。
 
+这里的“已登记”不是根据命令名称、`.draft/` 目录或残留操作日志推测，而是必须先以只读方式
+确认第 12.2 节定义的正式登记标记有效。是否允许前置推进按下表判定：
+
+| 根与登记标记状态 | 是否扫描或推进生命周期 | 后续行为 |
+|---|---|---|
+| 根有效，且正式登记标记精确有效 | 是，恰好一次 | 再执行命令自身逻辑 |
+| 根或标记缺失、无效、不支持，或标记仍为临时接管形状 | 否 | 交给命令自身的既有根、格式或恢复验证产生结果 |
+| 帮助、版本、`init`、`check --candidate`、登记前 `adopt` | 否 | 直接执行该命令原有逻辑 |
+
+因此，未登记目录即使残留 `.draft/operations` 或 `.draft/trash` 也不得被前置推进读取、清理
+或修改。资格检查本身不得把 `check` 的 `format.missing` 等有效检查报告改成另一种错误信封；
+实现可以复用同一次标记解析结果，但不能为了避免重复读取而提前产生生命周期副作用。
+
 推进语义：
 
 1. 成功推进不出现在人类或 JSON 输出中。
-2. 临时移交失败保留原状态，当前命令继续；下次命令重试，也不提示用户或 Agent。
+2. 临时移交失败保留原状态，当前命令继续；下次命令重试。前置推进本身不向普通命令附加
+   警告或进度。
 3. 内部记录损坏、无法判断怎样安全推进时，停止当前命令并明确报错。
 4. 查询和检查观察推进后的状态。
 5. `--dry-run` 只阻止当前业务计划，不能阻止这项内部生命周期维护。
+
+`check` 是诊断命令，因此在前置推进成功后仍独立检查当前持久化操作状态，并可以报告
+`trash.retained`、`trash.handoff_pending` 等检查问题。这些是当前状态的检查事实，不是
+生命周期前置推进的活动记录；删除旧生命周期 warning 汇总时不得一并删除。
+
+任何命令（包括 `check`）的前置推进若遇到损坏或需要恢复的内部状态，都不进入自身业务
+逻辑。JSON 只返回标准失败信封 `ok: false`、`result_type: "error"` 和结构化 `error` 事实，
+退出码为 3；不得返回部分 `check` 报告、`lifecycle_results` 或此前已成功推进的内部明细。
+只有诊断确实需要定位内部操作时，`error` 才携带相应 `operation_id`。
 
 公开 `draft recover ROOT` 的职责收紧为修复崩溃或中断留下的未完成写操作。回收到期与移交
 结果不进入它的公开输出；无法安全恢复的操作仍提供明确诊断。
@@ -681,15 +801,20 @@ JSON 错误包含 `ok: false`、稳定错误码、相关路径和结构化事实
 子进程。重点覆盖：
 
 - 两种平台路径语法的分类、规范化和存在性状态；
+- 受管理页面命名空间与文件存在性正交，包括缺失页面、非受管理 Markdown、符号链接和错误
+  文件类型；
 - 正文资源身份去重、图片与附件、锚点忽略；
 - 局部与全局查询范围；
-- 稳定排序、分页、空结果和完整失败；
+- 稳定排序、分页、`--count-only` 同元数据、空结果和完整失败；
+- 严格现存页面操作数的 `page.not_found` 与宽松反向链接目标的缺失成功语义；
 - 状态自由流转与最终不变量；
 - 关系配对、幂等修复、自引用和环路；
 - create 的路径、父页面、标题转义和导航位置；
 - 结论首次生成、空集合、重建、排序、非实时容忍和幂等性；
 - 同一业务计划驱动正式执行与 `--dry-run`；
-- 静默生命周期的成功、临时失败和损坏分类；
+- 公开效果驱动正式 `changed_paths`，且内部 mutation 不进入公开结果；
+- 静默生命周期的成功、临时失败和损坏分类，以及 `check` 自身诊断与前置推进活动的分离；
+- `query recoverable` 的前置推进、过滤和 `as_of` 共享一次时钟读数；
 - JSON 精确协议和人类输出的事实关系。
 
 稳定协议值可以精确断言。人类输出不比较完整中文句子；测试验证路径、计数、顺序、事实
@@ -708,7 +833,11 @@ JSON 错误包含 `ok: false`、稳定错误码、相关路径和结构化事实
 - generate-conclusions 与状态确认的完整工作流；
 - 结论条目过时不阻止结构命令，重新生成后收敛；
 - dry-run 与正式计划的公开影响一致；
+- dry-run 的 `--count-only` 只隐藏 `effects`，正式执行拒绝所有预演分页选项；
+- dry-run 遇到既有业务写锁时不忽略或恢复它，而是以恢复必需失败；
 - 所有已登记命令都执行静默生命周期前置步骤；
+- 无有效正式登记标记时，即使残留内部操作目录也不执行生命周期前置推进；
+- `check` 前置推进硬失败时只返回标准错误信封，不返回部分检查或生命周期结果；
 - 回收边界 `now == restore_expires_at` 不可恢复。
 
 ### 17.3 结构和依赖边界测试
@@ -730,6 +859,9 @@ JSON 错误包含 `ok: false`、稳定错误码、相关路径和结构化事实
 Draft skill 必须明确写出最终工作流：讨论过程中维护页面状态和关系；与用户确认讨论结束后
 运行 `draft generate-conclusions ROOT`；根据新生成的 `proposed` 结论页产出设计文档；产出
 完成后再将结论页状态设为 `confirmed`。
+
+格式文档必须明确记录登记标记精确键集合以及旧 `{"format_version":1}` 标记不兼容，避免
+既有 Draft 在升级后以无迁移说明的 `format.invalid` 失败。
 
 ## 19. 实施顺序
 
