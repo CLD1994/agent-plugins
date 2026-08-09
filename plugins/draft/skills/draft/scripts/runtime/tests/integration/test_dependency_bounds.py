@@ -20,7 +20,8 @@ suite runs in that same cache. Sharing the cache means the probe verifies the
 exact wheel versions the domain suite will install. The domain suite runs via
 ``uvx --isolated --from .`` with ``cwd=RUNTIME_ROOT`` and targets only
 ``tests/unit``, so the slow integration suites never recurse under the
-constrained environment.
+constrained environment. Its test tools come from the locked ``test``
+dependency group rather than a duplicated package list in this module.
 """
 
 from __future__ import annotations
@@ -79,6 +80,30 @@ def _run_uvx(cache_dir: Path, *uvx_args: str) -> subprocess.CompletedProcess[str
     )
 
 
+@pytest.fixture(scope="module")
+def bounds_test_requirements(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    requirements = tmp_path_factory.mktemp("dependency-bounds") / "test-requirements.txt"
+    exported = subprocess.run(
+        [
+            "uv",
+            "export",
+            "--locked",
+            "--only-group",
+            "test",
+            "--output-file",
+            str(requirements),
+        ],
+        cwd=RUNTIME_ROOT,
+        env=_clean_env(),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=BOUNDS_TIMEOUT,
+    )
+    assert exported.returncode == 0, exported.stderr + exported.stdout
+    return requirements
+
+
 def _parse_probe(output: str) -> dict[str, str]:
     pairs: dict[str, str] = {}
     for line in output.strip().splitlines():
@@ -96,7 +121,9 @@ def _major_minor(version: str) -> tuple[int, int]:
 
 
 @pytest.mark.network
-def test_lowest_bound_probe_and_domain_suite_share_cache(tmp_path: Path) -> None:
+def test_lowest_bound_probe_and_domain_suite_share_cache(
+    tmp_path: Path, bounds_test_requirements: Path
+) -> None:
     cache = tmp_path / "low-cache"
 
     # Probe first in the shared cache: assert exact minimum versions resolved.
@@ -128,8 +155,8 @@ def test_lowest_bound_probe_and_domain_suite_share_cache(tmp_path: Path) -> None
         str(CONSTRAINTS_BUILD),
         "--from",
         ".",
-        "--with",
-        "pytest",
+        "--with-requirements",
+        str(bounds_test_requirements),
         "pytest",
         "tests/unit",
         "-q",
@@ -138,7 +165,9 @@ def test_lowest_bound_probe_and_domain_suite_share_cache(tmp_path: Path) -> None
 
 
 @pytest.mark.network
-def test_highest_available_probe_and_domain_suite_share_cache(tmp_path: Path) -> None:
+def test_highest_available_probe_and_domain_suite_share_cache(
+    tmp_path: Path, bounds_test_requirements: Path
+) -> None:
     cache = tmp_path / "high-cache"
 
     # Probe first in the shared cache: assert major.minor stays inside the
@@ -167,8 +196,8 @@ def test_highest_available_probe_and_domain_suite_share_cache(tmp_path: Path) ->
         "highest",
         "--from",
         ".",
-        "--with",
-        "pytest",
+        "--with-requirements",
+        str(bounds_test_requirements),
         "pytest",
         "tests/unit",
         "-q",

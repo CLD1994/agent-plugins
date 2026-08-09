@@ -28,6 +28,10 @@ dev = [
     { name = "pytest-mock" },
     { name = "ruff" },
 ]
+test = [
+    { name = "pytest" },
+    { name = "pytest-mock" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -42,6 +46,10 @@ dev = [
     { name = "pytest" },
     { name = "pytest-mock" },
     { name = "ruff" },
+]
+test = [
+    { name = "pytest" },
+    { name = "pytest-mock" },
 ]
 
 [[package]]

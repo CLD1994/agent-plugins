@@ -12,10 +12,13 @@ dependencies = [
 draft = "draft.cli:main"
 
 [dependency-groups]
-dev = [
-    "hatchling>=1.31,<1.32",
+test = [
     "pytest",
     "pytest-mock",
+]
+dev = [
+    { include-group = "test" },
+    "hatchling>=1.31,<1.32",
     "pyright",
     "ruff",
 ]
