@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import cast
 
 from draft import __version__
+from draft.cli_results import ResultType
 from draft.diagnostics import issue_payload, render_issue
 from draft.errors import DraftError
 from draft.models import (
@@ -17,6 +19,7 @@ from draft.models import (
     OperationResult,
     TrashResult,
 )
+from draft.query import LocalPageSnapshot, SnapshotView
 
 _EXIT_DOMAIN = 2
 _EXIT_OPERATION = 3
@@ -134,6 +137,58 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recover.add_argument("root", metavar="ROOT", help="草稿根目录")
 
+    query = subparsers.add_parser(
+        "query",
+        parents=[shared],
+        help="紧凑结构查询",
+        description=(
+            "以稳定 JSON 返回页面的结构摘要、正文资源、反向链接、正式关系、状态列表与可恢复项。"
+        ),
+    )
+    query_sub = query.add_subparsers(dest="query_command", metavar="QUERY")
+
+    query_page = query_sub.add_parser("page", parents=[shared], help="页面结构摘要")
+    query_page.add_argument("root", metavar="ROOT", help="草稿根目录")
+    query_page.add_argument("page", metavar="PAGE", help="严格受管理页面路径")
+
+    query_links = query_sub.add_parser("links", parents=[shared], help="页面正文资源")
+    query_links.add_argument("root", metavar="ROOT", help="草稿根目录")
+    query_links.add_argument("page", metavar="PAGE", help="严格受管理页面路径")
+
+    query_backlinks = query_sub.add_parser("backlinks", parents=[shared], help="正文反向链接来源")
+    query_backlinks.add_argument("root", metavar="ROOT", help="草稿根目录")
+    query_backlinks.add_argument("target", metavar="TARGET", help="宽松正文资源身份")
+
+    query_relations = query_sub.add_parser("relations", parents=[shared], help="页面正式关系")
+    query_relations.add_argument("root", metavar="ROOT", help="草稿根目录")
+    query_relations.add_argument("page", metavar="PAGE", help="严格受管理页面路径")
+    query_relations.add_argument(
+        "--direction",
+        choices=("incoming", "outgoing"),
+        required=True,
+        help="关系方向",
+    )
+
+    query_status = query_sub.add_parser("status", parents=[shared], help="按状态列页面")
+    query_status.add_argument("root", metavar="ROOT", help="草稿根目录")
+    query_status.add_argument("code", metavar="CODE", help="稳定状态代码")
+
+    query_recoverable = query_sub.add_parser("recoverable", parents=[shared], help="可恢复回收项")
+    query_recoverable.add_argument("root", metavar="ROOT", help="草稿根目录")
+
+    for collection in (
+        query_links,
+        query_backlinks,
+        query_relations,
+        query_status,
+        query_recoverable,
+    ):
+        collection.add_argument(
+            "--limit", type=int, default=20, help="返回项数上限（默认 20，最大 100）"
+        )
+        collection.add_argument("--offset", type=int, default=0, help="跳过前 N 项")
+        collection.add_argument("--count-only", action="store_true", help="只返回计数与分页元数据")
+
     return parser
 
 
@@ -194,7 +249,7 @@ def _render_check(report: CheckReport, json_mode: bool) -> int:
     ok = not report.errors
     payload: dict[str, object] = {
         "ok": ok,
-        "result_type": "check",
+        "result_type": ResultType.CHECK.value,
         "errors": [issue_payload(issue) for issue in report.errors],
         "warnings": [issue_payload(issue) for issue in report.warnings],
         "infos": [issue_payload(issue) for issue in report.infos],
@@ -223,20 +278,177 @@ def _page_operand(root: Path, value: str) -> Path:
     return resolve_page_operand(root, value).relative
 
 
-def _dispatch(args: argparse.Namespace) -> tuple[dict[str, object], str, int]:
+def _query_items_payload(
+    items: Sequence[Mapping[str, object]],
+    *,
+    limit: int,
+    offset: int,
+    count_only: bool,
+) -> dict[str, object]:
+    from draft.cli_results import paginate, slice_payload
+
+    if limit < 1 or limit > 100 or offset < 0:
+        raise DraftError("query.invalid_pagination")
+    slice_ = paginate(tuple(dict(item) for item in items), offset=offset, limit=limit)
+    return slice_payload(slice_, count_only=count_only)  # type: ignore[arg-type]
+
+
+def _dispatch_query(
+    args: argparse.Namespace, *, now: datetime | None = None
+) -> tuple[dict[str, object], str, int]:
+    root = Path(cast(str, args.root))
+    limit = int(getattr(args, "limit", 20))
+    offset = int(getattr(args, "offset", 0))
+    count_only = bool(getattr(args, "count_only", False))
+    if limit < 1 or limit > 100 or offset < 0:
+        raise DraftError("query.invalid_pagination")
+    q = cast(str, args.query_command)
+
+    if q == "page":
+        from draft.query import load_complete_snapshot, page_summary
+
+        page = _page_operand(root, cast(str, args.page))
+        graph = load_complete_snapshot(root)
+        summary = page_summary(graph, page)
+        return (
+            {
+                "result_type": ResultType.QUERY_PAGE.value,
+                "path": summary.path.as_posix(),
+                "title": summary.title,
+                "status": summary.status.value,
+                "parent": None if summary.parent is None else summary.parent.as_posix(),
+                "child_count": summary.child_count,
+                "link_count": summary.link_count,
+                "backlink_count": summary.backlink_count,
+                "outgoing_relation_count": summary.outgoing_relation_count,
+                "incoming_relation_count": summary.incoming_relation_count,
+            },
+            f"{summary.path.as_posix()} {summary.title} {summary.status.value}",
+            0,
+        )
+    if q == "links":
+        from draft.query import load_registered_page, page_links
+
+        page = _page_operand(root, cast(str, args.page))
+        snapshot = load_registered_page(root, page)
+        items = [
+            {
+                "target": item.target,
+                "kind": item.kind.value,
+                "scope": item.scope.value,
+                "target_state": item.target_state.value,
+            }
+            for item in page_links(_graph_view_for_snapshot(snapshot), page)
+        ]
+        payload = _query_items_payload(items, limit=limit, offset=offset, count_only=count_only)
+        return (
+            {"result_type": ResultType.QUERY_LINKS.value, **payload},
+            f"链接 {payload['total']} 项",
+            0,
+        )
+    if q == "backlinks":
+        from draft.query import backlinks, load_complete_snapshot
+        from draft.resources import resource_identity_from_operand
+
+        target = resource_identity_from_operand(root, cast(str, args.target))
+        graph = load_complete_snapshot(root)
+        items = [{"page": path.as_posix()} for path in backlinks(graph, target)]
+        payload = _query_items_payload(items, limit=limit, offset=offset, count_only=count_only)
+        return (
+            {"result_type": ResultType.QUERY_BACKLINKS.value, **payload},
+            f"反向链接 {payload['total']} 项",
+            0,
+        )
+    if q == "relations":
+        from draft.query import (
+            incoming_relations,
+            load_complete_snapshot,
+            load_registered_page,
+            outgoing_relations,
+        )
+
+        page = _page_operand(root, cast(str, args.page))
+        direction = cast(str, args.direction)
+        if direction == "outgoing":
+            snapshot = load_registered_page(root, page)
+            view = _graph_view_for_snapshot(snapshot)
+            relations = outgoing_relations(view, page)
+        else:
+            graph = load_complete_snapshot(root)
+            relations = incoming_relations(graph, page)
+        items = [
+            {"relation": item.relation.value, "page": item.page.as_posix()} for item in relations
+        ]
+        payload = _query_items_payload(items, limit=limit, offset=offset, count_only=count_only)
+        return (
+            {"result_type": ResultType.QUERY_RELATIONS.value, **payload},
+            f"关系 {payload['total']} 项",
+            0,
+        )
+    if q == "status":
+        from draft.query import load_complete_snapshot, pages_with_status
+        from draft.vocabulary import StatusCode
+
+        code = StatusCode(cast(str, args.code))
+        graph = load_complete_snapshot(root)
+        items = [{"page": path.as_posix()} for path in pages_with_status(graph, code)]
+        payload = _query_items_payload(items, limit=limit, offset=offset, count_only=count_only)
+        return (
+            {"result_type": ResultType.QUERY_STATUS.value, **payload},
+            f"状态 {code.value} 共 {payload['total']} 项",
+            0,
+        )
+    if q == "recoverable":
+        from datetime import UTC, datetime
+
+        from draft.trash_lifecycle import list_recoverable
+
+        current = now if now is not None else datetime.now(UTC)
+        items = [
+            {
+                "operation_id": item.operation_id,
+                "page": item.page.as_posix(),
+                "restore_expires_at": item.restore_expires_at.astimezone(UTC)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            }
+            for item in list_recoverable(root, as_of=current)
+        ]
+        payload = _query_items_payload(items, limit=limit, offset=offset, count_only=count_only)
+        as_of = current.isoformat().replace("+00:00", "Z")
+        return (
+            {"result_type": ResultType.QUERY_RECOVERABLE.value, **payload, "as_of": as_of},
+            f"可恢复 {payload['total']} 项",
+            0,
+        )
+    raise DraftError("cli.unknown_query")
+
+
+def _graph_view_for_snapshot(snapshot: LocalPageSnapshot) -> SnapshotView:
+    """把单页快照包装成查询函数需要的最小只读视图。"""
+    from draft.query import SnapshotView
+
+    return SnapshotView(snapshot=snapshot)
+
+
+def _dispatch(
+    args: argparse.Namespace, *, now: datetime | None = None
+) -> tuple[dict[str, object], str, int]:
     command = cast(str, args.command)
+    if command == "query":
+        return _dispatch_query(args, now=now)
     if command == "init":
         from draft.lifecycle import initialize
 
         root = Path(cast(str, args.root))
         initialize(root)
-        return {"result_type": "init", "root": str(root)}, f"已初始化草稿：{root}", 0
+        return {"result_type": ResultType.INIT.value, "root": str(root)}, f"已初始化草稿：{root}", 0
     if command == "adopt":
         from draft.lifecycle import adopt
 
         root = Path(cast(str, args.root))
         adopt(root)
-        return {"result_type": "adopt", "root": str(root)}, f"已接管草稿：{root}", 0
+        return {"result_type": ResultType.ADOPT.value, "root": str(root)}, f"已接管草稿：{root}", 0
     if command == "move":
         from draft.structure import move_page
 
@@ -244,7 +456,7 @@ def _dispatch(args: argparse.Namespace) -> tuple[dict[str, object], str, int]:
         source = _page_operand(root, cast(str, args.source))
         target = _page_operand(root, cast(str, args.target))
         result = move_page(root, source, target)
-        payload: dict[str, object] = {"result_type": "move"}
+        payload: dict[str, object] = {"result_type": ResultType.MOVE.value}
         payload.update(_operation_payload(result))
         return payload, f"已移动 {source} → {target}", 0
     if command == "promote":
@@ -254,7 +466,7 @@ def _dispatch(args: argparse.Namespace) -> tuple[dict[str, object], str, int]:
         page = _page_operand(root, cast(str, args.page))
         children = [_page_operand(root, child) for child in cast(list[str], args.children)]
         result = promote_page(root, page, children)
-        payload = {"result_type": "promote"}
+        payload = {"result_type": ResultType.PROMOTE.value}
         payload.update(_operation_payload(result))
         return payload, f"已升格 {page}（{len(children)} 个子页）", 0
     if command == "collapse":
@@ -263,7 +475,7 @@ def _dispatch(args: argparse.Namespace) -> tuple[dict[str, object], str, int]:
         root = Path(cast(str, args.root))
         hub = _page_operand(root, cast(str, args.hub))
         result = collapse_hub(root, hub)
-        payload = {"result_type": "collapse"}
+        payload = {"result_type": ResultType.COLLAPSE.value}
         payload.update(_operation_payload(result))
         return payload, f"已降级 {hub}", 0
     if command == "trash":
@@ -272,7 +484,7 @@ def _dispatch(args: argparse.Namespace) -> tuple[dict[str, object], str, int]:
         root = Path(cast(str, args.root))
         page = _page_operand(root, cast(str, args.page))
         result = trash_page(root, page)
-        payload: dict[str, object] = {"result_type": "trash"}
+        payload: dict[str, object] = {"result_type": ResultType.TRASH.value}
         payload.update(_trash_payload(result))
         human = f"已回收 {page}（{result.phase.value}）"
         if result.warnings:
@@ -285,13 +497,17 @@ def _dispatch(args: argparse.Namespace) -> tuple[dict[str, object], str, int]:
         operation_id = cast(str, args.operation_id)
         result = restore_retained_trash(root, operation_id)
         if result.phase is OperationPhase.ROLLED_BACK:
-            payload = {"result_type": "restore", **_operation_payload(result), "ok": False}
+            payload = {
+                "result_type": ResultType.RESTORE.value,
+                **_operation_payload(result),
+                "ok": False,
+            }
             return (
                 payload,
                 "恢复未完成，操作已经回滚；权威删除包仍保留。",
                 3,
             )
-        payload = {"result_type": "restore", **_operation_payload(result)}
+        payload = {"result_type": ResultType.RESTORE.value, **_operation_payload(result)}
         return payload, f"已恢复操作 {operation_id} 的页面", 0
     if command == "recover":
         from draft.trash_lifecycle import recover_interrupted_operations
@@ -310,7 +526,7 @@ def _dispatch(args: argparse.Namespace) -> tuple[dict[str, object], str, int]:
             }
         )
         payload = {
-            "result_type": "recover",
+            "result_type": ResultType.RECOVER.value,
             "fixed_count": len(results),
             "paths": [path.as_posix() for path in paths],
         }
@@ -354,10 +570,10 @@ def _registered_root_for(candidate: Path) -> Path | None:
     return resolved
 
 
-def _advance_for_command(root: Path) -> None:
+def _advance_for_command(root: Path, *, now: datetime | None = None) -> None:
     from draft.trash_lifecycle import prepare_registered_command
 
-    prepare_registered_command(root)
+    prepare_registered_command(root, now=now)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -372,12 +588,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     json_mode = bool(getattr(args, "json", False))
     command = cast(str, args.command)
 
+    from datetime import UTC, datetime
+
+    captured_now = datetime.now(UTC)
+
     candidate_root = _preflight_candidate_root_for(args)
     if candidate_root is not None:
         registered = _registered_root_for(candidate_root)
         if registered is not None:
             try:
-                _advance_for_command(registered)
+                _advance_for_command(registered, now=captured_now)
             except DraftError as error:
                 _emit_error(error, json_mode)
                 return _exit_for_error(error)
@@ -395,7 +615,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         code = _render_check(report, json_mode)
         return code
     try:
-        payload, human, code = _dispatch(args)
+        payload, human, code = _dispatch(args, now=captured_now)
     except DraftError as error:
         _emit_error(error, json_mode)
         return _exit_for_error(error)
@@ -413,7 +633,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _emit_error(error: DraftError, json_mode: bool) -> None:
     payload: dict[str, object] = {
         "ok": False,
-        "result_type": "error",
+        "result_type": ResultType.ERROR.value,
         "error": {
             "code": error.code,
             "severity": "error",

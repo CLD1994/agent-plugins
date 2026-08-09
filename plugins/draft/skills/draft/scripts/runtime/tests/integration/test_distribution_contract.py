@@ -309,13 +309,22 @@ def _vocabulary_literal_offenders() -> dict[str, list[tuple[int, str]]]:
         if path == VOCABULARY_OWNER:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        hits = sorted(
-            (node.lineno, node.value)
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and node.value in _VOCABULARY_VALUES
-        )
+        parents: dict[ast.AST, ast.AST] = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+        hits: list[tuple[int, str]] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if node.value not in _VOCABULARY_VALUES:
+                continue
+            parent = parents.get(node)
+            # JSON 字段名（dict 键）不是协议值发射；只有作为值出现的字面量才计数。
+            if isinstance(parent, ast.Dict) and node in parent.keys:
+                continue
+            hits.append((node.lineno, node.value))
+        hits = sorted(set(hits))
         if hits:
             offenders[path.relative_to(RUNTIME_ROOT).as_posix()] = hits
     return offenders
