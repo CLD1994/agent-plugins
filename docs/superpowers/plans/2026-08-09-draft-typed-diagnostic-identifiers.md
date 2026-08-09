@@ -12,8 +12,9 @@
 
 - 开始前依次读取仓库根 `AGENTS.md` 与 `plugins/draft/AGENTS.md`；核心与适配层测试必须分树执行。
 - 不改变任何错误码 wire value（线上字符串值）、诊断文案、严重级别、路径、行号、详情、排序、退出码或 JSON 字段。
+- 加载期诊断不得被字符串前缀过滤静默丢弃；`check_draft` 用 `CheckCode` 分组决定顺序，未归入已知分组的加载期诊断追加保留。
 - `CheckIssue.code` 必须继续声明为 `str`；未知码（如测试中的 `future.code`）必须继续无损 fallback，不得强制转换失败。
-- 只有 `diagnostic_codes.py` 可以包含 48 个已登记检查码的字符串字面量；其他生产模块和 `test_diagnostics.py` 使用枚举成员。
+- 只有 `diagnostic_codes.py` 可以包含 48 个已登记检查码的字符串字面量；其他生产模块和全部测试文件使用枚举成员。
 - `DraftError` 的非检查错误码不在本计划范围内；例如 `link.external`、`adopt.recovery_required`、`runtime.os_error` 继续使用字符串。
 - 分支枚举只覆盖已经跨生产者、校验器、渲染器和测试重复的 7 组 discriminator（判别标识）；普通路径、名称、操作 ID 和任意详情仍为 `str`。
 - `EXPECTED_CODES` 必须删除；`VARIANT_CODES` 和闭环错误码集合可以保留语义分组，但元素必须是 `CheckCode`，不得再写 wire value。
@@ -31,6 +32,7 @@
   - 以类型化 key 定义渲染目录，并在入口处区分已登记码与未知字符串。
 - Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/checker.py`
   - 所有 `_error`、`_warning`、`_info`、`_review` 调用改用 `CheckCode`。
+  - 加载期 issue 按 `CheckCode` 分组决定报告顺序，未归组诊断保留（评审修复，见 Task 6）。
 - Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py`
   - 图加载产生的已登记问题和分支标识改用类型。
 - Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/markdown.py`
@@ -46,7 +48,10 @@
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_diagnostics.py`
   - 删除重复错误码集合和手写 case ID，使用类型化用例。
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_distribution_contract.py`
-  - 用 AST 保证已登记码只在权威类型模块中出现字面量。
+  - 用 AST 保证已登记码只在权威类型模块中出现字面量，覆盖递归生产包与全部测试文件。
+  - 新增分支判别值位置检查：只扫描诊断 details 位置，避免通用词文本误报（见 Task 6）。
+- Modify: 全部单元/集成测试文件
+  - 已登记码与分支判别值改为枚举引用，消除 178 处裸码与 21 处裸分支值（见 Task 6）。
 
 ---
 
@@ -848,27 +853,103 @@ Expected: 全部 exit code `0`，两个 pyright 命令均报告 `0 errors`。
 
 逐项确认：
 
-- `diagnostic_codes.py` 是唯一包含 48 个已登记 wire value 字面量的文件。
+- `diagnostic_codes.py` 是唯一包含 48 个已登记 wire value 字面量的文件（生产与全部测试均无裸码）。
 - `KNOWN_CHECK_CODES == frozenset(code.value for code in CheckCode)`。
 - `_SPECS` 对每个 `CheckCode` 恰有一个 entry。
 - 每个 `CheckCode` 至少有一个合法 `RenderCase`。
 - `EXPECTED_CODES` 与 `RenderCase.case_id` 已删除。
 - `VARIANT_CODES` 与 `CYCLE_CODES` 只包含 `CheckCode` 成员。
-- 七组分支 discriminator 在生产者、校验器、renderer 和测试中均使用对应枚举。
+- 七组分支 discriminator 在生产者、校验器、renderer 和测试中均使用对应枚举；测试的 details 位置无裸分支值。
+- 符号链接 `.draft/draft.json` 经 `check_draft` 报告 `path.symlink_escape`，未归组加载期诊断不被丢弃。
 - `CheckIssue.code` 仍为 `str`，`future.code` 的单行无损 fallback 测试仍通过。
 - `issue_payload` 和 CLI JSON 中的 code 仍是原字符串，不出现枚举成员名。
 - `pyproject.toml`、`uv.lock`、诊断文案和 AGENTS.md 没有变化。
 - `git status --short` 为空；若实施前已有用户改动，只能保留那些基线改动并明确报告。
 
-无需新增提交；Task 1–4 的四个提交即完整实施结果。
+无需新增提交；Task 1–4 的四个提交即 Task 1–5 的完整实施结果。
+
+---
+
+### Task 6: 评审修复——保留未归组加载期诊断并收口唯一来源
+
+评审发现两个问题并暂不验收：`check_draft` 按 `format.`/`candidate.`/`page.`/`link.`
+字符串前缀分组，未匹配前缀的加载期诊断被静默丢弃——例如 `.draft/draft.json` 为
+符号链接时 `graph.py` 产生 `path.symlink_escape`，最终报告却显示 `errors=[]`，
+无效注册文件可能被报告为正常；唯一来源契约只覆盖生产顶层模块与
+`test_diagnostics.py`，14 个测试文件仍有 178 处已登记码裸字符串与 21 处裸分支值。
+本任务修复这两类问题。
+
+**Files:**
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/checker.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_distribution_contract.py`
+- Modify: 14 个含裸码/裸分支值的单元与集成测试文件
+
+**Interfaces:**
+- Produces: `_LOAD_CANDIDATE_ISSUES`、`_LOAD_MARKER_ISSUES`、`_LOAD_PAGE_ISSUES`、
+  `_LOAD_LINK_ISSUES`、`_LOAD_ISSUE_GROUPS`、`_LOAD_KNOWN_ISSUE_VALUES`、
+  `_load_issues_in(issues, group)`。
+- Produces: `_BRANCH_VALUE_ENUMS`、`_BRANCH_VALUES`、`_DIAGNOSTIC_DETAIL_CALLS`、
+  `_branch_literals_in_detail_positions(path)`、
+  `test_branch_discriminators_have_no_bare_literals_in_detail_positions`。
+- Extends: `test_registered_diagnostic_codes_have_one_literal_owner` 覆盖递归生产
+  包与全部测试文件。
+
+- [ ] **Step 1: 红灯——符号链接 marker 必须在 check_draft 报告**
+
+在 `tests/integration/test_checker.py` 添加
+`test_symlinked_marker_reports_symlink_escape`：`draft_factory(healthy())` 后把
+`.draft/draft.json` 替换为符号链接，断言 `check_draft` 的 errors 含
+`path.symlink_escape`。修复前该诊断被前缀过滤丢弃，测试红。
+
+- [ ] **Step 2: 类型化分组并保留未归组诊断**
+
+在 `checker.py` 定义按 `CheckCode` 分组的 `_LOAD_*_ISSUES` 常量（candidate、
+marker[format + path.symlink_escape]、page、link）与 `_load_issues_in` 辅助函数；
+`check_draft` 按组顺序排序，`group=None` 分支把未归入任何分组的加载期诊断追加
+保留，不再用字符串前缀过滤。分组顺序与既有报告顺序一致；`path.symlink_escape`
+随 marker 组报告。
+
+- [ ] **Step 3: 契约扩展——递归生产包与全部测试**
+
+`DIAGNOSTIC_CODE_LITERAL_CONSUMERS` 改为 `(src/draft).rglob("*.py")` 与
+`(tests).rglob("*.py")` 的并集；`test_diagnostics.py` 不再单独追加。
+
+- [ ] **Step 4: 迁移全部测试裸码与分支判别值**
+
+14 个测试文件的已登记码改为 `CheckCode.<MEMBER>.value`，分支判别值改为对应枚举
+`.value`。注意 `ast` 的 `col_offset`/`end_col_offset` 是 UTF-8 字节偏移而非字符
+偏移，多字节源码必须按字节切片替换；docstring、parametrize 参数名等非诊断位置
+保持原样（如 `test_graph.py` 的 `"destination"` 参数名不属于分支值）。
+
+- [ ] **Step 5: 分支值位置 AST 检查**
+
+新增 `test_branch_discriminators_have_no_bare_literals_in_detail_positions`，
+只扫描 details 元组元素、诊断构造调用（`_issue`/`CheckIssue`/`DraftError`/
+`error_issue`）实参、details 下标比较的另一侧。`file`/`duplicate`/`destination`
+等通用词在其他位置允许裸字符串，避免普通文本扫描误报。
+
+- [ ] **Step 6: 全量门禁与变异证明**
+
+按 Task 5 的六组测试、双树 pyright、双树 Ruff、format、`uv lock --check`、
+`git diff --check` 全量运行。变异证明两次：临时把 `checker.py` 中
+`CheckCode.PAGE_CAPACITY` 改回 `"page.capacity"`，契约测试必须精确报告
+`src/draft/checker.py:456`；临时把测试中 `WrongOutputReason.DUPLICATE.value`
+改回 `"duplicate"`，分支值检查必须报告 `tests/integration/test_checker.py`。
+
+- [ ] **Step 7: 提交**
+
+按两个提交落地：`fix(draft): keep unclassified load diagnostics in check_draft
+report`（`checker.py` + 其回归测试文件）；`test(draft): derive every diagnostic
+literal from typed codes`（其余测试文件 + 契约文件）。
 
 ## Implementation Agent Handoff
 
 实施 Agent 完成后必须把以下材料原样交给 reviewer，不自行宣称最终验收完成：
 
-- 四个实施提交的 hash、subject 和各提交文件列表。
+- 六个实施提交的 hash、subject 和各提交文件列表（Task 1–4 的四个 + Task 6 的两个）。
 - Task 1–4 每次红灯的失败原因，以及对应绿灯命令结果。
 - Task 5 AST 临时变异的失败输出和恢复后的通过输出。
+- Task 6 的两次变异证明（检查码 `"page.capacity"` 与分支值 `"duplicate"`）的失败与恢复输出。
 - 六组测试的 passed/deselected 计数。
 - 双树 pyright、双树 Ruff、format、`uv lock --check`、`git diff --check` 的 exit code。
 - 最终 `git status --short` 和 `git diff <实施前基线>..HEAD --stat`。
