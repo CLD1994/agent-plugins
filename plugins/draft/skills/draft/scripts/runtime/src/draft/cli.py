@@ -143,6 +143,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recover.add_argument("root", metavar="ROOT", help="草稿根目录")
 
+    generate_conclusions = subparsers.add_parser(
+        "generate-conclusions",
+        parents=[shared],
+        help="按需生成结论页",
+        description="从当前已确认页面重建结论汇总并推进所有权状态为 generated。",
+    )
+    generate_conclusions.add_argument("root", metavar="ROOT", help="草稿根目录")
+    _add_dry_run_args(generate_conclusions)
+
     query = subparsers.add_parser(
         "query",
         parents=[shared],
@@ -608,6 +617,46 @@ def _dispatch(
         human = f"已回收 {page}（{result.phase.value}）"
         if result.warnings:
             human = f"{human}；警告：{_warning_text(result.warnings[0])}"
+        return payload, human, 0
+    if command == "generate-conclusions":
+        from draft.conclusions import generate_conclusions
+
+        root = Path(cast(str, args.root))
+        if _is_dry_run(args):
+
+            def build(graph: DraftGraph) -> OperationPlan:
+                from draft.conclusions import plan_generation
+                from draft.graph import read_marker
+
+                state = read_marker(graph.root).conclusions_state
+                plan = plan_generation(graph, state=state)
+                if plan.operation is None:
+                    raise DraftError("generate.no_plan")
+                return plan.operation
+
+            return _dry_run_write(
+                args,
+                root=root,
+                operation=DryRunOperation.GENERATE_CONCLUSIONS,
+                build=build,
+            )
+        _reject_pagination_without_dry_run(args)
+        result = generate_conclusions(root)
+        payload: dict[str, object] = {
+            "result_type": ResultType.GENERATE_CONCLUSIONS.value,
+            "generated": result.generated,
+        }
+        if result.reason is not None:
+            payload["reason"] = result.reason.value
+        if result.operation is not None:
+            from draft.plan_effects import public_changed_paths
+
+            payload["changed_paths"] = [
+                path.as_posix() for path in public_changed_paths(result.operation.effects)
+            ]
+        else:
+            payload["changed_paths"] = []
+        human = f"结论生成：{'已生成' if result.generated else '无已确认页面'}"
         return payload, human, 0
     if command == "restore":
         from draft.trash import restore_retained_trash

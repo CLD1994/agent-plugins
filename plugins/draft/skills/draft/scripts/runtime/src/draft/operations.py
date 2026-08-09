@@ -14,7 +14,7 @@ from typing import cast
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
-from draft.graph import INTERNAL_DIR
+from draft.graph import INTERNAL_DIR, MARKER_PATH
 from draft.models import (
     MutationKind,
     OperationPhase,
@@ -467,8 +467,9 @@ def _validate_plan_paths(plan: OperationPlan) -> None:
         if relative.is_absolute() or ".." in relative.parts:
             raise DraftError("path.escape", relative)
         if relative.parts and relative.parts[0] == INTERNAL_DIR:
+            generate_marker = plan.kind == "generate-conclusions" and relative == MARKER_PATH
             trash_package = plan.kind == "trash" and relative.is_relative_to(trash_outgoing)
-            if not trash_package:
+            if not (trash_package or generate_marker):
                 raise DraftError("path.escape", relative)
         cursor = plan.root
         for part in relative.parts:
