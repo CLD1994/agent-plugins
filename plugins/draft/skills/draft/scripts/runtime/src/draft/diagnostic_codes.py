@@ -21,6 +21,8 @@ class CheckCode(StrEnum):
     PAGE_PARSE_ERROR = "page.parse_error"
     PAGE_CAPACITY = "page.capacity"
     LINK_MISSING = "link.missing"
+    LINK_INVALID = "link.invalid"
+    LINK_UNAVAILABLE = "link.unavailable"
     LINK_ESCAPE = "link.escape"
     PATH_SYMLINK_ESCAPE = "path.symlink_escape"
     RELATION_DUPLICATE = "relation.duplicate"

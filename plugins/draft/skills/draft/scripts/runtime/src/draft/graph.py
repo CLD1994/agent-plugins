@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import cast
 from urllib.parse import unquote
@@ -16,10 +16,16 @@ from draft.models import (
     IssueSeverity,
     MarkdownLink,
     PageDocument,
-    SourceSpan,
     ValidationMode,
 )
 from draft.paths import resolve_draft_root
+from draft.resources import (
+    ResourceIdentity,
+    ResourceKind,
+    ResourceReference,
+    TargetState,
+    resolve_page_resources,
+)
 from draft.vocabulary import RelationCode
 
 LoadMode = ValidationMode
@@ -43,6 +49,12 @@ class DraftGraph:
     children: Mapping[Path, tuple[Path, ...]]
     inbound_links: Mapping[Path, tuple[tuple[Path, MarkdownLink], ...]]
     relations: Mapping[RelationCode, tuple[tuple[Path, Path, int], ...]]
+    body_resources: Mapping[Path, tuple[ResourceReference, ...]] = field(
+        default_factory=dict[Path, tuple[ResourceReference, ...]]
+    )
+    inbound_resources: Mapping[ResourceIdentity, tuple[Path, ...]] = field(
+        default_factory=dict[ResourceIdentity, tuple[Path, ...]]
+    )
 
 
 @dataclass(frozen=True)
@@ -285,63 +297,81 @@ def _load(root: Path) -> LoadResult:
         label: [] for label in RelationCode
     }
     link_issues: list[CheckIssue] = []
-
-    def resolve_link(source: Path, link: MarkdownLink) -> Path | None:
-        try:
-            target, _anchor = resolve_local_destination(source, link.destination, root)
-        except DraftError as error:
-            if error.code == "link.external":
-                return None
-            link_issues.append(
-                error_issue(
-                    CheckCode.LINK_ESCAPE,
-                    source,
-                    link.line,
-                    LinkEscapeKind.DESTINATION.value,
-                    link.destination,
-                )
-            )
-            return None
-        return target
+    body_resources: dict[Path, tuple[ResourceReference, ...]] = {}
+    inbound_resources: dict[ResourceIdentity, list[Path]] = {}
 
     for source in sorted(pages):
         page = pages[source]
-        # 同一链接既属于正文链接又属于关系链接；首次解析后缓存结果，关系遍历不再重复解析或重复报错。
-        resolved_links: dict[SourceSpan, Path | None] = {}
-        for link in page.links:
-            target = resolve_link(source, link)
-            resolved_links[link.whole_span] = target
-            if target is None:
-                continue
-            if target.suffix == ".md":
-                if target not in managed_set:
-                    link_issues.append(
-                        error_issue(
-                            CheckCode.LINK_MISSING,
-                            source,
-                            link.line,
-                            link.destination,
-                            target.as_posix(),
-                        )
-                    )
-                    continue
-            elif not (root / target).exists():
+        references = resolve_page_resources(root, page)
+        body_resources[source] = references
+        for reference in references:
+            resource = reference.resource
+            identity = resource.identity
+            inbound_resources.setdefault(identity, []).append(source)
+            target_state = resource.target_state
+            if target_state is TargetState.MISSING:
                 link_issues.append(
                     error_issue(
                         CheckCode.LINK_MISSING,
                         source,
-                        link.line,
-                        link.destination,
+                        reference.link.line,
+                        reference.link.destination,
+                        resource.target,
+                    )
+                )
+            elif target_state is TargetState.INVALID:
+                link_issues.append(
+                    error_issue(
+                        CheckCode.LINK_INVALID,
+                        source,
+                        reference.link.line,
+                        reference.link.destination,
+                        resource.target,
+                    )
+                )
+            elif target_state is TargetState.UNAVAILABLE:
+                link_issues.append(
+                    CheckIssue(
+                        code=CheckCode.LINK_UNAVAILABLE.value,
+                        severity=IssueSeverity.WARNING,
+                        path=source,
+                        line=reference.link.line,
+                        details=(reference.link.destination, resource.target),
+                    )
+                )
+            if identity.kind is ResourceKind.PAGE and target_state is TargetState.PRESENT:
+                target = Path(identity.value)
+                if target in managed_set:
+                    inbound.setdefault(target, []).append((source, reference.link))
+        for relation in page.relations:
+            try:
+                target, _anchor = resolve_local_destination(source, relation.link.destination, root)
+            except DraftError as error:
+                if error.code == "link.external":
+                    continue
+                link_issues.append(
+                    error_issue(
+                        CheckCode.LINK_ESCAPE,
+                        source,
+                        relation.link.line,
+                        LinkEscapeKind.DESTINATION.value,
+                        relation.link.destination,
+                    )
+                )
+                continue
+            if target not in managed_set:
+                link_issues.append(
+                    error_issue(
+                        CheckCode.LINK_MISSING,
+                        source,
+                        relation.link.line,
+                        relation.link.destination,
                         target.as_posix(),
                     )
                 )
                 continue
-            inbound.setdefault(target, []).append((source, link))
-        for relation in page.relations:
-            target = resolved_links.get(relation.link.whole_span)
-            if target is None or target not in managed_set:
-                continue
             relation_edges[relation.code].append((source, target, relation.link.line))
+            inbound.setdefault(target, []).append((source, relation.link))
     issues.extend(link_issues)
 
     parents: dict[Path, Path] = {}
@@ -371,6 +401,10 @@ def _load(root: Path) -> LoadResult:
             for target, entries in sorted(inbound.items())
         },
         relations={label: tuple(sorted(edges)) for label, edges in relation_edges.items()},
+        body_resources={path: body_resources[path] for path in sorted(body_resources)},
+        inbound_resources={
+            identity: tuple(sorted(paths)) for identity, paths in sorted(inbound_resources.items())
+        },
     )
     return LoadResult(graph=graph, issues=issues)
 

@@ -142,6 +142,16 @@ def _render_link_missing(details: tuple[str, ...]) -> str:
     return f"{_safe(literal_destination)} 解析到 {_safe(normalized_target)} 后不存在"
 
 
+def _render_link_invalid(details: tuple[str, ...]) -> str:
+    literal_destination, normalized_target = details
+    return f"链接目标无效：{_safe(literal_destination)}（{_safe(normalized_target)}）"
+
+
+def _render_link_unavailable(details: tuple[str, ...]) -> str:
+    literal_destination, normalized_target = details
+    return f"链接目标在当前平台不可用：{_safe(literal_destination)}（{_safe(normalized_target)}）"
+
+
 def _render_cycle(prefix: str) -> MessageRenderer:
     def render(details: tuple[str, ...]) -> str:
         return f"{prefix}：{' -> '.join(_safe(path) for path in details)}"
@@ -223,6 +233,8 @@ _SPECS: dict[CheckCode, DiagnosticSpec] = {
         ),
     ),
     CheckCode.LINK_MISSING: DiagnosticSpec(_LINE, _fixed(2), _render_link_missing),
+    CheckCode.LINK_INVALID: DiagnosticSpec(_LINE, _fixed(2), _render_link_invalid),
+    CheckCode.LINK_UNAVAILABLE: DiagnosticSpec(_LINE, _fixed(2), _render_link_unavailable),
     CheckCode.LINK_ESCAPE: DiagnosticSpec(
         _LINE_OR_FILE,
         _variant({LinkEscapeKind.DESTINATION.value: 2, LinkEscapeKind.MANAGED_PATH.value: 2}),

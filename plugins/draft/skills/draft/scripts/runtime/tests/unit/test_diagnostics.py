@@ -306,6 +306,26 @@ VALID_RENDER_CASES = [
     ),
     RenderCase(
         CheckIssue(
+            CheckCode.LINK_INVALID.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            9,
+            ("b.md", "pages/b.md"),
+        ),
+        (0, 1),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.LINK_UNAVAILABLE.value,
+            IssueSeverity.WARNING,
+            Path("pages/a.md"),
+            9,
+            (r"C:\docs\a.pdf", r"C:\docs\a.pdf"),
+        ),
+        (0, 1),
+    ),
+    RenderCase(
+        CheckIssue(
             CheckCode.LINK_ESCAPE.value,
             IssueSeverity.ERROR,
             Path("pages/linked.md"),

@@ -310,7 +310,7 @@ def test_missing_relation_target_reports_link_missing_once(
     assert missing[0].details == ("missing.md", "pages/missing.md")
 
 
-def test_link_escaping_root(draft_factory: DraftFactory) -> None:
+def test_link_to_draft_outside_missing_target_is_missing(draft_factory: DraftFactory) -> None:
     files = healthy()
     files["pages/question.md"] = QUESTION.replace(
         "使用显式状态前缀。", "见 [外部](../../outside.md)。"
@@ -319,19 +319,21 @@ def test_link_escaping_root(draft_factory: DraftFactory) -> None:
 
     report = check_draft(root)
 
-    assert codes(report) == [CheckCode.LINK_ESCAPE.value]
+    assert codes(report) == [CheckCode.LINK_MISSING.value]
 
 
-def test_link_escape_preserves_literal_destination(draft_factory: DraftFactory) -> None:
+def test_link_to_draft_outside_missing_preserves_literal_destination(
+    draft_factory: DraftFactory,
+) -> None:
     files = healthy()
     files["pages/question.md"] = QUESTION.replace(
         "使用显式状态前缀。", "见 [外部](../../outside.md)。"
     )
     report = check_draft(draft_factory(files))
-    issue = next(issue for issue in report.errors if issue.code == CheckCode.LINK_ESCAPE.value)
+    issue = next(issue for issue in report.errors if issue.code == CheckCode.LINK_MISSING.value)
     assert issue.path == Path("pages/question.md")
     assert issue.line == 7
-    assert issue.details == (LinkEscapeKind.DESTINATION.value, "../../outside.md")
+    assert issue.details == ("../../outside.md", "../outside.md")
 
 
 def test_page_file_through_symlink(draft_factory: DraftFactory) -> None:
@@ -358,6 +360,90 @@ def test_managed_path_symlink_escape_preserves_relative_path(
     report = check_draft(root)
     issue = next(issue for issue in report.errors if issue.code == CheckCode.LINK_ESCAPE.value)
     assert issue.details == (LinkEscapeKind.MANAGED_PATH.value, "pages/linked.md")
+
+
+def test_existing_draft_outside_resource_is_not_an_error(
+    draft_factory: DraftFactory, tmp_path: Path
+) -> None:
+    files = healthy()
+    outside = tmp_path / "shared.png"
+    outside.write_bytes(b"png")
+    files["pages/question.md"] = QUESTION.replace(
+        "使用显式状态前缀。", "见 [外部](../../shared.png)。"
+    )
+    root = draft_factory(files)
+
+    report = check_draft(root)
+
+    assert report.errors == ()
+
+
+def test_missing_image_inside_draft_reports_line(draft_factory: DraftFactory) -> None:
+    files = healthy()
+    files["pages/question.md"] = QUESTION.replace("使用显式状态前缀。", "![缺失](missing.png)")
+    report = check_draft(draft_factory(files))
+    missing = [i for i in report.errors if i.code == CheckCode.LINK_MISSING.value]
+    assert len(missing) == 1
+    assert missing[0].path == Path("pages/question.md")
+    assert missing[0].line == 7
+    assert missing[0].details == ("missing.png", "pages/missing.png")
+
+
+def test_page_namespace_directory_is_invalid(draft_factory: DraftFactory, tmp_path: Path) -> None:
+    files = healthy()
+    (tmp_path / "draft").mkdir(exist_ok=True)
+    root = draft_factory(files)
+    (root / "pages/target.md").mkdir()
+    files["pages/question.md"] = QUESTION.replace("使用显式状态前缀。", "见 [目录](target.md)。")
+    (root / "pages/question.md").write_text(files["pages/question.md"], encoding="utf-8")
+
+    report = check_draft(root)
+
+    invalid = [i for i in report.errors if i.code == CheckCode.LINK_INVALID.value]
+    assert len(invalid) == 1
+    assert invalid[0].path == Path("pages/question.md")
+    assert invalid[0].details == ("target.md", "pages/target.md")
+
+
+def test_page_namespace_symlink_is_invalid(draft_factory: DraftFactory, tmp_path: Path) -> None:
+    files = healthy()
+    root = draft_factory(files)
+    outside = tmp_path / "outside.md"
+    outside.write_text("# 外\n", encoding="utf-8")
+    (root / "pages/target.md").symlink_to(outside)
+    files["pages/question.md"] = QUESTION.replace("使用显式状态前缀。", "见 [符号](target.md)。")
+    (root / "pages/question.md").write_text(files["pages/question.md"], encoding="utf-8")
+
+    report = check_draft(root)
+
+    invalid = [i for i in report.errors if i.code == CheckCode.LINK_INVALID.value]
+    assert len(invalid) == 1
+    assert invalid[0].details == ("target.md", "pages/target.md")
+
+
+def test_external_uri_is_not_an_error(draft_factory: DraftFactory) -> None:
+    files = healthy()
+    files["pages/question.md"] = QUESTION.replace(
+        "使用显式状态前缀。", "见 [外部](https://example.test/a#part)。"
+    )
+    report = check_draft(draft_factory(files))
+
+    assert report.errors == ()
+
+
+def test_windows_absolute_link_is_unavailable_warning(
+    draft_factory: DraftFactory,
+) -> None:
+    files = healthy()
+    files["pages/question.md"] = QUESTION.replace(
+        "使用显式状态前缀。", "见 [盘符](C:\\docs\\a.pdf)。"
+    )
+    report = check_draft(draft_factory(files))
+
+    assert report.errors == ()
+    unavailable = [i for i in report.warnings if i.code == CheckCode.LINK_UNAVAILABLE.value]
+    assert len(unavailable) == 1
+    assert unavailable[0].details == (r"C:\docs\a.pdf", r"C:\docs\a.pdf")
 
 
 def test_non_root_page_without_parent(draft_factory: DraftFactory) -> None:

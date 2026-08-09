@@ -96,7 +96,14 @@ _LOAD_PAGE_ISSUES = frozenset(
         CheckCode.PAGE_CAPACITY,
     }
 )
-_LOAD_LINK_ISSUES = frozenset({CheckCode.LINK_MISSING, CheckCode.LINK_ESCAPE})
+_LOAD_LINK_ISSUES = frozenset(
+    {
+        CheckCode.LINK_MISSING,
+        CheckCode.LINK_INVALID,
+        CheckCode.LINK_UNAVAILABLE,
+        CheckCode.LINK_ESCAPE,
+    }
+)
 _LOAD_ISSUE_GROUPS = (
     _LOAD_CANDIDATE_ISSUES,
     _LOAD_MARKER_ISSUES,
