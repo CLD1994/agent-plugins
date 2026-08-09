@@ -70,6 +70,13 @@ def _trash_result(
     )
 
 
+def _assert_human_result(human: str, *facts: object) -> None:
+    assert human
+    assert human.splitlines() == [human]
+    for fact in facts:
+        assert str(fact) in human
+
+
 # ---------------------------------------------------------------------------
 # build_parser
 # ---------------------------------------------------------------------------
@@ -122,7 +129,7 @@ def test_dispatch_init_calls_initialize_and_returns_success(mocker: MockerFixtur
     payload, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 init 分派到 initialize 并返回成功载荷
     initialize.assert_called_once_with(Path("/draft"))
     assert payload == {"result_type": "init", "root": "/draft"}
-    assert human == "已初始化草稿：/draft"
+    _assert_human_result(human, Path("/draft"))
     assert exit_code == 0
 
 
@@ -132,7 +139,7 @@ def test_dispatch_adopt_calls_adopt_and_returns_success(mocker: MockerFixture) -
     payload, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 adopt 分派到 adopt 并返回成功载荷
     adopt.assert_called_once_with(Path("/draft"))
     assert payload == {"result_type": "adopt", "root": "/draft"}
-    assert human == "已接管草稿：/draft"
+    _assert_human_result(human, Path("/draft"))
     assert exit_code == 0
 
 
@@ -156,7 +163,7 @@ def test_dispatch_move_calls_move_page_with_paged_operands(mocker: MockerFixture
         "changed_paths": ["pages/a.md", "pages/b.md"],
         "warnings": [],
     }
-    assert human == "已移动 pages/a.md → pages/b.md"
+    _assert_human_result(human, Path("pages/a.md"), Path("pages/b.md"))
     assert exit_code == 0
 
 
@@ -177,7 +184,7 @@ def test_dispatch_promote_calls_promote_page_with_paged_operands(mocker: MockerF
         Path("/draft"), Path("pages/a.md"), [Path("pages/b.md"), Path("pages/c.md")]
     )
     assert payload["result_type"] == "promote"
-    assert human == "已升格 pages/a.md（2 个子页）"
+    _assert_human_result(human, Path("pages/a.md"), len(args.children))
     assert exit_code == 0
 
 
@@ -190,7 +197,7 @@ def test_dispatch_collapse_calls_collapse_hub_with_paged_operand(mocker: MockerF
     payload, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 collapse 分派到 collapse_hub 并组装操作载荷
     collapse_hub.assert_called_once_with(Path("/draft"), Path("pages/hub/index.md"))
     assert payload["result_type"] == "collapse"
-    assert human == "已降级 pages/hub/index.md"
+    _assert_human_result(human, Path("pages/hub/index.md"))
     assert exit_code == 0
 
 
@@ -204,7 +211,7 @@ def test_dispatch_trash_calls_trash_page_with_paged_operand(mocker: MockerFixtur
     trash_page.assert_called_once_with(Path("/draft"), Path("pages/a.md"))
     assert payload["result_type"] == "trash"
     assert payload["phase"] == "trash_retained"
-    assert human == "已回收 pages/a.md（trash_retained）"
+    _assert_human_result(human, Path("pages/a.md"), trash_page.return_value.phase.value)
     assert exit_code == 0
 
 
@@ -220,8 +227,7 @@ def test_dispatch_trash_includes_first_warning_in_human_text(mocker: MockerFixtu
     resolve_page_operand.return_value = _resolved("pages/a.md")
     trash_page.return_value = _trash_result(warnings=(warning,))
     _, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 trash 载荷包含首个警告的人类可读文本
-    assert "警告" in human
-    assert "trash.handoff_failed" in human
+    _assert_human_result(human, warning.code, warning.operation_id, *warning.details)
     assert exit_code == 0
 
 
@@ -243,7 +249,7 @@ def test_dispatch_restore_completed_returns_success_payload(mocker: MockerFixtur
     assert payload["result_type"] == "restore"
     assert payload["phase"] == "completed"
     assert exit_code == 0
-    assert "已恢复" in human
+    _assert_human_result(human, args.operation_id)
 
 
 def test_dispatch_restore_rolled_back_returns_exit_three(mocker: MockerFixture) -> None:
@@ -260,7 +266,7 @@ def test_dispatch_restore_rolled_back_returns_exit_three(mocker: MockerFixture) 
     assert payload["ok"] is False
     assert payload["phase"] == "rolled_back"
     assert exit_code == 3
-    assert "回滚" in human
+    _assert_human_result(human)
 
 
 def test_dispatch_recover_success_returns_results_payload(mocker: MockerFixture) -> None:
@@ -270,7 +276,7 @@ def test_dispatch_recover_success_returns_results_payload(mocker: MockerFixture)
     recover_draft.return_value = report
     payload, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 recover 成功路径返回结果载荷与退出码 0
     assert payload == {"result_type": "recover", "results": []}
-    assert human == "恢复完成：0 项结果"
+    _assert_human_result(human, len(report.results))
     assert exit_code == 0
 
 
@@ -296,7 +302,7 @@ def test_dispatch_recover_error_returns_failure_payload_and_exit_code(
     assert error["code"] == "operation.inconsistent_state"
     assert payload["stopped_at_operation_id"] == "c" * 32
     assert exit_code == 3
-    assert "恢复停止" in human
+    _assert_human_result(human, failure.code, failure.operation_id)
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +315,113 @@ def test_dispatch_unknown_command_raises_draft_error() -> None:
     with pytest.raises(DraftError) as caught:
         cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证未知命令路径抛出 cli.unknown_command
     assert caught.value.code == "cli.unknown_command"
+
+
+# ---------------------------------------------------------------------------
+# _render_check：人类模式分组编排 / 空报告 / JSON 模式
+# ---------------------------------------------------------------------------
+
+
+def _mixed_severity_issues() -> tuple[CheckIssue, ...]:
+    by_severity = {
+        severity: tuple(
+            CheckIssue(
+                code=f"test.{severity.value}.{index}",
+                severity=severity,
+                path=Path(f"{severity.value}-{index}.md"),
+                line=index + 1,
+                details=(f"detail-{index}",),
+            )
+            for index in range(count)
+        )
+        for severity, count in (
+            (IssueSeverity.ERROR, 1),
+            (IssueSeverity.WARNING, 2),
+            (IssueSeverity.INFO, 3),
+            (IssueSeverity.REVIEW, 4),
+        )
+    }
+    return (
+        by_severity[IssueSeverity.REVIEW][0],
+        by_severity[IssueSeverity.WARNING][0],
+        by_severity[IssueSeverity.INFO][0],
+        by_severity[IssueSeverity.REVIEW][1],
+        by_severity[IssueSeverity.ERROR][0],
+        by_severity[IssueSeverity.INFO][1],
+        by_severity[IssueSeverity.WARNING][1],
+        by_severity[IssueSeverity.REVIEW][2],
+        by_severity[IssueSeverity.INFO][2],
+        by_severity[IssueSeverity.REVIEW][3],
+    )
+
+
+def test_render_check_groups_issues_and_emits_each_renderer_result_once(
+    mocker: MockerFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    issues = _mixed_severity_issues()
+    report = CheckReport(issues=issues)
+    grouped = [*report.errors, *report.warnings, *report.infos, *report.reviews]
+    tokens = {issue: f"render-token-{index}" for index, issue in enumerate(grouped)}
+    render_issue = mocker.patch.object(cli, "render_issue", autospec=True)
+    render_issue.side_effect = tokens.__getitem__
+
+    exit_code = cli._render_check(  # pyright: ignore[reportPrivateUsage]
+        report, json_mode=False
+    )
+    lines = capsys.readouterr().out.splitlines()
+
+    assert exit_code == 1
+    assert lines[:-1] == [tokens[issue] for issue in grouped]
+    assert [call.args[0] for call in render_issue.call_args_list] == grouped
+    assert lines[-1]
+    for count in (1, 2, 3, 4):
+        assert str(count) in lines[-1]
+
+
+def test_render_check_clean_human_output_is_one_nonempty_line(
+    mocker: MockerFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    render_issue = mocker.patch.object(cli, "render_issue", autospec=True)
+    exit_code = cli._render_check(  # pyright: ignore[reportPrivateUsage]
+        CheckReport(issues=()), json_mode=False
+    )
+    lines = capsys.readouterr().out.splitlines()
+    assert exit_code == 0
+    assert len(lines) == 1
+    assert lines[0]
+    render_issue.assert_not_called()
+
+
+def test_render_check_json_uses_structured_payload_without_human_renderer(
+    mocker: MockerFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    issue = CheckIssue("output.missing", IssueSeverity.ERROR, Path("pages/a.md"), None)
+    render_issue = mocker.patch.object(cli, "render_issue", autospec=True)
+    exit_code = cli._render_check(  # pyright: ignore[reportPrivateUsage]
+        CheckReport(issues=(issue,)), json_mode=True
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    assert payload == {
+        "ok": False,
+        "result_type": "check",
+        "errors": [
+            {
+                "code": "output.missing",
+                "severity": "error",
+                "path": "pages/a.md",
+                "line": None,
+                "details": [],
+            }
+        ],
+        "warnings": [],
+        "infos": [],
+        "reviews": [],
+    }
+    render_issue.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
