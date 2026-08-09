@@ -462,6 +462,7 @@ def test_trash_payload_maps_result_with_deadlines_to_dict() -> None:
         "restore_expires_at": "2026-08-13T12:00:00Z",
         "purge_eligible_at": "2026-09-12T12:00:00Z",
         "warnings": [],
+        "changed_paths": [],
     }
 
 

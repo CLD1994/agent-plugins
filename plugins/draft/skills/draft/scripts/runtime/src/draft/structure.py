@@ -32,6 +32,7 @@ from draft.models import (
 )
 from draft.operations import execute_plan, read_lock, sha256_bytes
 from draft.paths import physical_parent, resolve_draft_root
+from draft.plan_effects import PlanAction, PlanEffect
 from draft.resources import (
     ResourceIdentity,
     ResourceKind,
@@ -240,6 +241,7 @@ def plan_path_remap(
     rendered = _render_pages(graph, expanded, parent_changes)
 
     mutations: list[FileMutation] = []
+    effects: list[PlanEffect] = []
     for path in sorted(graph.pages, key=str):
         final_path = expanded.get(path, path)
         original_bytes = graph.pages[path].text.encode("utf-8")
@@ -265,6 +267,7 @@ def plan_path_remap(
                     None,
                 )
             )
+            effects.append(PlanEffect(action=PlanAction.MOVE, from_path=path, to_path=final_path))
         else:
             mutations.append(
                 FileMutation(
@@ -275,6 +278,7 @@ def plan_path_remap(
                     rendered_bytes,
                 )
             )
+            effects.append(PlanEffect(action=PlanAction.MODIFY, path=path))
     writes = sorted(
         (mutation for mutation in mutations if mutation.kind is MutationKind.WRITE),
         key=lambda mutation: str(mutation.path),
@@ -303,6 +307,7 @@ def plan_path_remap(
         mutations=tuple([*writes, *deletes]),
         validation_mode="registered",
         remove_empty_directories=tuple(removable),
+        effects=tuple(effects),
     )
 
 

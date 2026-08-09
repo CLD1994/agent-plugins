@@ -978,3 +978,130 @@ def test_check_preflight_corruption_returns_standard_error_envelope(
     assert payload["result_type"] == "error"
     assert "errors" not in payload
     assert "lifecycle_results" not in payload
+
+
+# ---------------------------------------------------------------------------
+# Task 6：dry-run 与公开 PlanEffect
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_move_does_not_write_and_matches_formal(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "topic"
+    build_draft(root)
+    capsys.readouterr()
+    before = snapshot_tree(root)
+
+    code, payload = run_json(
+        ["move", str(root), "pages/a.md", "pages/renamed.md", "--dry-run", "--json"], capsys
+    )
+
+    assert code == 0
+    assert payload["result_type"] == "plan"
+    assert payload["operation"] == "move"
+    items = cast("list[dict[str, object]]", payload["items"])
+    actions = [(i.get("action"), i.get("path")) for i in items]
+    assert ("modify", "index.md") in actions
+    assert "changed_paths" in payload
+    # 未执行写入：源页仍在，目标不存在。
+    assert snapshot_tree(root) == before
+    assert (root / "pages/a.md").is_file()
+    assert not (root / "pages/renamed.md").exists()
+
+    # 正式执行后 changed_paths 与预演效果一致。
+    code, formal = run_json(["move", str(root), "pages/a.md", "pages/renamed.md", "--json"], capsys)
+    assert code == 0
+    assert formal["result_type"] == "move"
+    formal_paths = set(cast("list[str]", formal["changed_paths"]))
+    assert "pages/a.md" in formal_paths
+    assert "pages/renamed.md" in formal_paths
+    assert "index.md" in formal_paths
+
+
+def test_dry_run_count_only_hides_items_keeps_metadata(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "topic"
+    build_draft(root)
+    capsys.readouterr()
+
+    code, normal = run_json(
+        ["move", str(root), "pages/a.md", "pages/b.md", "--dry-run", "--json"], capsys
+    )
+    assert code == 0
+    _code, counted = run_json(
+        ["move", str(root), "pages/a.md", "pages/b.md", "--dry-run", "--count-only", "--json"],
+        capsys,
+    )
+
+    assert counted["items"] == []
+    assert counted["total"] == normal["total"]
+    assert counted["offset"] == normal["offset"]
+    assert counted["limit"] == normal["limit"]
+    assert counted["has_more"] == normal["has_more"]
+    assert counted["next_offset"] == normal["next_offset"]
+
+
+def test_formal_execution_rejects_pagination_options(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "topic"
+    build_draft(root)
+    capsys.readouterr()
+
+    code, payload = run_json(
+        ["move", str(root), "pages/a.md", "pages/b.md", "--limit", "10", "--json"], capsys
+    )
+
+    assert code == 2
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "cli.pagination_requires_dry_run"
+    assert (root / "pages/a.md").is_file()
+    assert not (root / "pages/b.md").exists()
+
+
+def test_dry_run_trash_paths_never_include_dot_draft(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "topic"
+    build_draft(root)
+    capsys.readouterr()
+
+    code, payload = run_json(["trash", str(root), "pages/a.md", "--dry-run", "--json"], capsys)
+
+    assert code == 0
+    assert payload["operation"] == "trash"
+    changed = cast("list[str]", payload["changed_paths"])
+    assert all(not path.startswith(".draft/") for path in changed)
+    assert (root / "pages/a.md").is_file()
+    # 正式回收也不暴露 .draft 路径。
+    code, formal = run_json(["trash", str(root), "pages/a.md", "--json"], capsys)
+    assert code == 0
+    formal_changed = cast("list[str]", formal["changed_paths"])
+    assert all(not path.startswith(".draft/") for path in formal_changed)
+
+
+def test_dry_run_with_existing_lock_fails_recovery_required(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "topic"
+    build_draft(root)
+    from draft.operations import acquire_lock
+
+    acquire_lock(root, "a" * 32)
+    capsys.readouterr()
+
+    code, payload = run_json(
+        ["move", str(root), "pages/a.md", "pages/b.md", "--dry-run", "--json"], capsys
+    )
+
+    assert code == 3
+    assert payload["result_type"] == "error"
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == CheckCode.OPERATION_RECOVERY_REQUIRED.value
+    # 未产生业务写入。
+    assert (root / "pages/a.md").is_file()
+    assert not (root / "pages/b.md").exists()

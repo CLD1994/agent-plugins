@@ -58,6 +58,7 @@ from draft.operations import (
     write_journal,
 )
 from draft.paths import relative_markdown_destination, resolve_draft_root
+from draft.plan_effects import PlanAction, PlanEffect
 from draft.trash_package import (
     OUTGOING_RELATIVE,
     PACKAGE_VERSION,
@@ -254,6 +255,12 @@ def trash_plan(graph: DraftGraph, page: Path) -> tuple[OperationPlan, Path]:
         (mutation for mutation in mutations if mutation.kind is MutationKind.DELETE),
         key=lambda mutation: str(mutation.path),
     )
+    effects: list[PlanEffect] = []
+    effects.append(PlanEffect(action=PlanAction.REMOVE, path=page))
+    if collapsed_hub is not None:
+        effects.append(PlanEffect(action=PlanAction.REMOVE, path=collapsed_hub))
+    for path, _text in sorted(extra_writes.items()):
+        effects.append(PlanEffect(action=PlanAction.MODIFY, path=path))
     plan = OperationPlan(
         kind="trash",
         root=graph.root,
@@ -261,6 +268,7 @@ def trash_plan(graph: DraftGraph, page: Path) -> tuple[OperationPlan, Path]:
         validation_mode="registered",
         remove_empty_directories=tuple(remove_empty),
         metadata={"operation_id": operation_id},
+        effects=tuple(effects),
     )
     return plan, package_relative
 
@@ -654,7 +662,7 @@ def trash_page(root: Path, page: Path, *, now: datetime | None = None) -> TrashR
     graph = load_graph(resolved)
     plan, _package_relative = trash_plan(graph, page)
     plan = dataclasses.replace(plan, metadata={**plan.metadata, **deadlines.to_metadata()})
-    execute_plan(plan)
+    result = execute_plan(plan)
     journal = read_journal(operation_journal_path(resolved, plan.metadata["operation_id"]))
     verified = load_verified_package(resolved, journal)
     return TrashResult(
@@ -663,6 +671,7 @@ def trash_page(root: Path, page: Path, *, now: datetime | None = None) -> TrashR
         package=verified.directory,
         restore_expires_at=deadlines.restore_expires_at,
         purge_eligible_at=deadlines.purge_eligible_at,
+        changed_paths=result.changed_paths,
     )
 
 

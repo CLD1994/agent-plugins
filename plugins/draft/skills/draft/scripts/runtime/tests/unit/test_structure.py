@@ -21,6 +21,7 @@ from draft.models import (
     SourceSpan,
 )
 from draft.operations import sha256_bytes
+from draft.plan_effects import PlanAction, PlanEffect
 from draft.resources import resolve_page_resources
 from draft.structure import (
     plan_collapse,
@@ -140,6 +141,7 @@ def _plan(
     *,
     remove_empty: tuple[Path, ...] = (),
     metadata: dict[str, str] | None = None,
+    effects: tuple[PlanEffect, ...] = (),
 ) -> OperationPlan:
     writes = sorted(
         (m for m in mutations if m.kind is MutationKind.WRITE),
@@ -156,6 +158,7 @@ def _plan(
         validation_mode="registered",
         remove_empty_directories=remove_empty,
         metadata=metadata or {},
+        effects=effects,
     )
 
 
@@ -348,6 +351,13 @@ def test_plan_move_leaf_rewrites_inbound_links() -> None:
             _write(Path("pages/c.md"), None, _A),
             _delete(Path("pages/a.md"), _A),
         ],
+        effects=(
+            PlanEffect(action=PlanAction.MODIFY, path=Path("index.md")),
+            PlanEffect(
+                action=PlanAction.MOVE, from_path=Path("pages/a.md"), to_path=Path("pages/c.md")
+            ),
+            PlanEffect(action=PlanAction.MODIFY, path=Path("pages/b.md")),
+        ),
     )
     assert plan == expected
 
@@ -372,6 +382,12 @@ def test_plan_move_leaf_to_same_directory_omits_unchanged_pages() -> None:
             _write(Path("pages/b.md"), None, _A),
             _delete(Path("pages/a.md"), _A),
         ],
+        effects=(
+            PlanEffect(action=PlanAction.MODIFY, path=Path("index.md")),
+            PlanEffect(
+                action=PlanAction.MOVE, from_path=Path("pages/a.md"), to_path=Path("pages/b.md")
+            ),
+        ),
     )
     assert plan == expected
     # conclusions.md 未变化：不出现在 mutations 中
@@ -612,6 +628,14 @@ def test_plan_collapse_empty_hub_produces_leaf() -> None:
             _delete(Path("pages/sub/index.md"), _EMPTY_HUB),
         ],
         remove_empty=(Path("pages/sub"),),
+        effects=(
+            PlanEffect(action=PlanAction.MODIFY, path=Path("index.md")),
+            PlanEffect(
+                action=PlanAction.MOVE,
+                from_path=Path("pages/sub/index.md"),
+                to_path=Path("pages/sub.md"),
+            ),
+        ),
     )
     assert plan == expected
 

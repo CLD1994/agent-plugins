@@ -3,19 +3,21 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import cast
 
 from draft import __version__
-from draft.cli_results import ResultType
+from draft.cli_results import DryRunOperation, ResultType
 from draft.diagnostics import issue_payload, render_issue
 from draft.errors import DraftError
+from draft.graph import DraftGraph
 from draft.models import (
     CheckReport,
     LifecycleWarning,
     OperationPhase,
+    OperationPlan,
     OperationResult,
     TrashResult,
 )
@@ -80,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     move.add_argument("root", metavar="ROOT", help="草稿根目录")
     move.add_argument("source", metavar="SOURCE", help="源页面相对路径（如 pages/a.md）")
     move.add_argument("target", metavar="TARGET", help="目标页面相对路径")
+    _add_dry_run_args(move)
 
     promote = subparsers.add_parser(
         "promote",
@@ -95,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         help="要降级为子页的页面相对路径（可多个）",
     )
+    _add_dry_run_args(promote)
 
     collapse = subparsers.add_parser(
         "collapse",
@@ -104,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     collapse.add_argument("root", metavar="ROOT", help="草稿根目录")
     collapse.add_argument("hub", metavar="HUB", help="枢纽页面相对路径")
+    _add_dry_run_args(collapse)
 
     trash = subparsers.add_parser(
         "trash",
@@ -115,6 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     trash.add_argument("root", metavar="ROOT", help="草稿根目录")
     trash.add_argument("page", metavar="PAGE", help="要回收的页面相对路径")
+    _add_dry_run_args(trash)
 
     restore = subparsers.add_parser(
         "restore",
@@ -192,6 +198,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_dry_run_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--dry-run", action="store_true", help="只显示计划影响，不执行写入")
+    parser.add_argument(
+        "--limit", type=int, default=None, help="返回影响项数上限（默认 20，最大 100）"
+    )
+    parser.add_argument("--offset", type=int, default=None, help="跳过前 N 项")
+    parser.add_argument("--count-only", action="store_true", help="只返回计数与分页元数据")
+
+
 def _warning_payload(warning: LifecycleWarning) -> dict[str, object]:
     return {
         "code": warning.code,
@@ -235,6 +250,7 @@ def _trash_payload(result: TrashResult) -> dict[str, object]:
         "restore_expires_at": _format_optional_datetime(result.restore_expires_at),
         "purge_eligible_at": _format_optional_datetime(result.purge_eligible_at),
         "warnings": [_warning_payload(warning) for warning in result.warnings],
+        "changed_paths": [path.as_posix() for path in result.changed_paths],
     }
 
 
@@ -431,6 +447,77 @@ def _graph_view_for_snapshot(snapshot: LocalPageSnapshot) -> SnapshotView:
     return SnapshotView(snapshot=snapshot)
 
 
+def _is_dry_run(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "dry_run", False))
+
+
+def _dry_run_write(
+    args: argparse.Namespace,
+    *,
+    root: Path,
+    operation: DryRunOperation,
+    build: Callable[[DraftGraph], OperationPlan],
+) -> tuple[dict[str, object], str, int]:
+    """预演：与正式执行共享同一计划构造边界，分页输出公开效果，不执行写入。"""
+    limit = int(getattr(args, "limit", 20) or 20)
+    offset = int(getattr(args, "offset", 0) or 0)
+    count_only = bool(getattr(args, "count_only", False))
+    if limit < 1 or limit > 100 or offset < 0:
+        raise DraftError("query.invalid_pagination")
+    from draft.cli_results import paginate, slice_payload
+    from draft.operations import read_lock
+    from draft.paths import resolve_draft_root
+    from draft.plan_effects import public_changed_paths
+    from draft.query import load_complete_snapshot
+
+    resolved = resolve_draft_root(root)
+    if read_lock(resolved) is not None:
+        from draft.diagnostic_codes import CheckCode
+
+        raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, resolved)
+    graph = load_complete_snapshot(resolved)
+    plan = build(graph)
+    effects = plan.effects
+    items: list[dict[str, object]] = []
+    for effect in effects:
+        if effect.path is not None:
+            items.append({"action": effect.action.value, "path": effect.path.as_posix()})
+        else:
+            assert effect.from_path is not None and effect.to_path is not None
+            items.append(
+                {
+                    "action": effect.action.value,
+                    "from": effect.from_path.as_posix(),
+                    "to": effect.to_path.as_posix(),
+                }
+            )
+    slice_ = paginate(tuple(items), offset=offset, limit=limit)
+    payload = slice_payload(slice_, count_only=count_only)  # type: ignore[arg-type]
+    return (
+        {
+            "result_type": ResultType.PLAN.value,
+            "operation": operation.value,
+            **payload,
+            "changed_paths": [path.as_posix() for path in public_changed_paths(effects)],
+        },
+        f"预演 {operation.value}：{len(effects)} 项影响",
+        0,
+    )
+
+
+def _reject_pagination_without_dry_run(args: argparse.Namespace) -> None:
+    """写命令的分页选项只与 --dry-run 一起合法；正式执行携带任一选项时退出码 2。"""
+    if _is_dry_run(args):
+        return
+    explicit = (
+        getattr(args, "limit", None) is not None
+        or getattr(args, "offset", None) is not None
+        or bool(getattr(args, "count_only", False))
+    )
+    if explicit:
+        raise DraftError("cli.pagination_requires_dry_run")
+
+
 def _dispatch(
     args: argparse.Namespace, *, now: datetime | None = None
 ) -> tuple[dict[str, object], str, int]:
@@ -450,39 +537,71 @@ def _dispatch(
         adopt(root)
         return {"result_type": ResultType.ADOPT.value, "root": str(root)}, f"已接管草稿：{root}", 0
     if command == "move":
-        from draft.structure import move_page
+        from draft.structure import move_page, plan_move
 
         root = Path(cast(str, args.root))
         source = _page_operand(root, cast(str, args.source))
         target = _page_operand(root, cast(str, args.target))
+        if _is_dry_run(args):
+            return _dry_run_write(
+                args,
+                root=root,
+                operation=DryRunOperation.MOVE,
+                build=lambda graph: plan_move(graph, source, target),
+            )
+        _reject_pagination_without_dry_run(args)
         result = move_page(root, source, target)
         payload: dict[str, object] = {"result_type": ResultType.MOVE.value}
         payload.update(_operation_payload(result))
         return payload, f"已移动 {source} → {target}", 0
     if command == "promote":
-        from draft.structure import promote_page
+        from draft.structure import plan_promote, promote_page
 
         root = Path(cast(str, args.root))
         page = _page_operand(root, cast(str, args.page))
         children = [_page_operand(root, child) for child in cast(list[str], args.children)]
+        if _is_dry_run(args):
+            return _dry_run_write(
+                args,
+                root=root,
+                operation=DryRunOperation.PROMOTE,
+                build=lambda graph: plan_promote(graph, page, tuple(children)),
+            )
+        _reject_pagination_without_dry_run(args)
         result = promote_page(root, page, children)
         payload = {"result_type": ResultType.PROMOTE.value}
         payload.update(_operation_payload(result))
         return payload, f"已升格 {page}（{len(children)} 个子页）", 0
     if command == "collapse":
-        from draft.structure import collapse_hub
+        from draft.structure import collapse_hub, plan_collapse
 
         root = Path(cast(str, args.root))
         hub = _page_operand(root, cast(str, args.hub))
+        if _is_dry_run(args):
+            return _dry_run_write(
+                args,
+                root=root,
+                operation=DryRunOperation.COLLAPSE,
+                build=lambda graph: plan_collapse(graph, hub),
+            )
+        _reject_pagination_without_dry_run(args)
         result = collapse_hub(root, hub)
         payload = {"result_type": ResultType.COLLAPSE.value}
         payload.update(_operation_payload(result))
         return payload, f"已降级 {hub}", 0
     if command == "trash":
-        from draft.trash import trash_page
+        from draft.trash import trash_page, trash_plan
 
         root = Path(cast(str, args.root))
         page = _page_operand(root, cast(str, args.page))
+        if _is_dry_run(args):
+
+            def build(graph: DraftGraph) -> OperationPlan:
+                plan, _pkg = trash_plan(graph, page)
+                return plan
+
+            return _dry_run_write(args, root=root, operation=DryRunOperation.TRASH, build=build)
+        _reject_pagination_without_dry_run(args)
         result = trash_page(root, page)
         payload: dict[str, object] = {"result_type": ResultType.TRASH.value}
         payload.update(_trash_payload(result))

@@ -23,6 +23,7 @@ from draft.models import (
     ValidationMode,
 )
 from draft.paths import resolve_draft_root
+from draft.plan_effects import public_changed_paths
 
 JOURNAL_VERSION = 2
 LOCK_RELATIVE = Path(INTERNAL_DIR) / "operation.lock"
@@ -549,11 +550,13 @@ def finalize_operation(
     plan_kind: str,
     *,
     retain_terminal_lock: bool = False,
+    changed_paths: tuple[Path, ...] | None = None,
 ) -> OperationResult:
     """Mark a terminal phase; by default release the lock and clean recovery copies.
 
     ``retain_terminal_lock=True`` 仅耐久写入终态并移除空目录，不释放写锁、不清理恢复副本，
-    供恢复包装层在证明终态后统一解关联、清理与释放。
+    供恢复包装层在证明终态后统一解关联、清理与释放。``changed_paths`` 由调用方从
+    公开效果派生；缺省回退到日志 mutation 路径（恢复等无公开效果边界）。
     """
     terminal = _with_phase(journal, phase)
     write_journal(terminal)
@@ -563,12 +566,13 @@ def finalize_operation(
     for relative in journal.remove_empty_directories:
         with suppress(OSError):
             (root / relative).rmdir()
-    changed = tuple(mutation.path for mutation in journal.mutations)
+    if changed_paths is None:
+        changed_paths = tuple(mutation.path for mutation in journal.mutations)
     return OperationResult(
         operation_id=journal.operation_id,
         kind=plan_kind,
         phase=phase,
-        changed_paths=changed,
+        changed_paths=changed_paths,
     )
 
 
@@ -578,7 +582,11 @@ def clean_recovery_copies(journal: Journal) -> None:
 
 
 def _rollback(
-    root: Path, journal: Journal, *, retain_terminal_lock: bool = False
+    root: Path,
+    journal: Journal,
+    *,
+    retain_terminal_lock: bool = False,
+    changed_paths: tuple[Path, ...] | None = None,
 ) -> OperationResult:
     """Restore every target to its before state; requires all targets classifiable."""
     for mutation in journal.mutations:
@@ -604,11 +612,16 @@ def _rollback(
         OperationPhase.ROLLED_BACK,
         journal.kind,
         retain_terminal_lock=retain_terminal_lock,
+        changed_paths=changed_paths,
     )
 
 
 def _finish_forward(
-    root: Path, journal: Journal, *, retain_terminal_lock: bool = False
+    root: Path,
+    journal: Journal,
+    *,
+    retain_terminal_lock: bool = False,
+    changed_paths: tuple[Path, ...] | None = None,
 ) -> OperationResult:
     """Apply remaining after states, validate, and complete or roll back."""
     current = journal
@@ -625,9 +638,16 @@ def _finish_forward(
                 mutation.staged is None or sha256_file(current.directory / mutation.staged) is None
             )
         ):
-            return _rollback(root, current, retain_terminal_lock=retain_terminal_lock)
+            return _rollback(
+                root,
+                current,
+                retain_terminal_lock=retain_terminal_lock,
+                changed_paths=changed_paths,
+            )
         current = _apply_one(root, current, mutation)
-    return _validate_and_complete(root, current, retain_terminal_lock=retain_terminal_lock)
+    return _validate_and_complete(
+        root, current, retain_terminal_lock=retain_terminal_lock, changed_paths=changed_paths
+    )
 
 
 def _apply_one(root: Path, journal: Journal, mutation: JournalMutation) -> Journal:
@@ -643,7 +663,11 @@ def _apply_one(root: Path, journal: Journal, mutation: JournalMutation) -> Journ
 
 
 def _validate_and_complete(
-    root: Path, journal: Journal, *, retain_terminal_lock: bool = False
+    root: Path,
+    journal: Journal,
+    *,
+    retain_terminal_lock: bool = False,
+    changed_paths: tuple[Path, ...] | None = None,
 ) -> OperationResult:
     current = _with_phase(journal, OperationPhase.VALIDATING)
     write_journal(current)
@@ -651,19 +675,31 @@ def _validate_and_complete(
         _check(root, current.validation_mode)
     except DraftError as error:
         if error.code == "operation.validation_failed":
-            _rollback(root, current, retain_terminal_lock=retain_terminal_lock)
+            _rollback(
+                root,
+                current,
+                retain_terminal_lock=retain_terminal_lock,
+                changed_paths=changed_paths,
+            )
             raise DraftError("operation.validation_failed", root, details=error.details) from error
         raise
     if current.kind == "trash":
         # 回收以待恢复为耐久终态：写 trash_retained、释放写锁、清理恢复副本；
         # 权威删除包原样保留，到期推进与系统回收站移交由 trash_lifecycle 子系统驱动。
-        return finalize_operation(root, current, OperationPhase.TRASH_RETAINED, current.kind)
+        return finalize_operation(
+            root,
+            current,
+            OperationPhase.TRASH_RETAINED,
+            current.kind,
+            changed_paths=changed_paths,
+        )
     return finalize_operation(
         root,
         current,
         OperationPhase.COMPLETED,
         current.kind,
         retain_terminal_lock=retain_terminal_lock,
+        changed_paths=changed_paths,
     )
 
 
@@ -875,15 +911,27 @@ def _execute_allocated_plan(
     )
     write_journal(prepared)
 
+    changed_paths = public_changed_paths(plan.effects) if plan.effects else None
+
     for mutation in prepared.mutations:
         current_hash = sha256_file(root / mutation.path)
         if current_hash != mutation.before_sha256:
-            return _rollback(root, prepared, retain_terminal_lock=retain_terminal_lock)
+            return _rollback(
+                root,
+                prepared,
+                retain_terminal_lock=retain_terminal_lock,
+                changed_paths=changed_paths,
+            )
 
     applying = _with_phase(prepared, OperationPhase.APPLYING)
     write_journal(applying)
     applied = _execute_apply_phase(root, applying)
-    return _validate_and_complete(root, applied, retain_terminal_lock=retain_terminal_lock)
+    return _validate_and_complete(
+        root,
+        applied,
+        retain_terminal_lock=retain_terminal_lock,
+        changed_paths=changed_paths,
+    )
 
 
 def _classify(root: Path, mutation: JournalMutation) -> str:

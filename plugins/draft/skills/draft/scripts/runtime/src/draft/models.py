@@ -6,6 +6,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
+from draft.plan_effects import PlanEffect
 from draft.vocabulary import RelationCode, StatusCode
 
 ValidationMode = Literal["registered", "candidate"]
@@ -131,6 +132,7 @@ class OperationPlan:
     validation_mode: ValidationMode = "registered"
     remove_empty_directories: tuple[Path, ...] = ()
     metadata: dict[str, str] = field(default_factory=lambda: dict[str, str]())
+    effects: tuple[PlanEffect, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -150,3 +152,4 @@ class TrashResult:
     restore_expires_at: datetime | None = None
     purge_eligible_at: datetime | None = None
     warnings: tuple[LifecycleWarning, ...] = ()
+    changed_paths: tuple[Path, ...] = ()
