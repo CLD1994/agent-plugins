@@ -32,6 +32,11 @@ from draft.models import (
 )
 from draft.operations import execute_plan, read_lock, sha256_bytes
 from draft.paths import physical_parent, resolve_draft_root
+from draft.resources import (
+    ResourceIdentity,
+    ResourceKind,
+    rebase_body_destination,
+)
 from draft.trash_lifecycle import collect_lifecycle_warnings, prepare_structural_write
 from draft.vocabulary import RelationCode
 
@@ -165,6 +170,12 @@ def _render_pages(
     removed_spans = {
         (owner, link.whole_span) for owner, links in nav_removals.items() for link in links
     }
+    moved_targets = {
+        ResourceIdentity(ResourceKind.PAGE, old.as_posix()): ResourceIdentity(
+            ResourceKind.PAGE, new.as_posix()
+        )
+        for old, new in expanded.items()
+    }
 
     for path, page in graph.pages.items():
         final_path = expanded.get(path, path)
@@ -173,29 +184,34 @@ def _render_pages(
             (relation for relation in page.relations if relation.code is RelationCode.PARENT),
             None,
         )
-        if path in parent_changes and parent_relation is not None:
-            new_parent = parent_changes[path]
-            final_parent = expanded.get(new_parent, new_parent)
-            destination = _relative_destination(final_path, final_parent, None)
-            if destination != parent_relation.link.destination:
-                edits[parent_relation.link.destination_span] = destination
+        parent = parent_changes.get(path, graph.parents.get(path))
+        if parent is not None and parent_relation is not None:
+            final_parent = expanded.get(parent, parent)
+            page_moved = final_path != path
+            parent_moved = final_parent != parent
+            if page_moved or parent_moved:
+                destination = _relative_destination(final_path, final_parent, None)
+                if destination != parent_relation.link.destination:
+                    edits[parent_relation.link.destination_span] = destination
+        body_by_span = {
+            reference.link.whole_span: reference for reference in graph.body_resources.get(path, ())
+        }
         for link in page.links:
             if (path, link.whole_span) in removed_spans:
                 continue
-            if (
-                path in parent_changes
-                and parent_relation is not None
-                and link.whole_span == parent_relation.link.whole_span
-            ):
+            if parent_relation is not None and link.whole_span == parent_relation.link.whole_span:
                 continue
-            try:
-                target, anchor = resolve_local_destination(path, link.destination, graph.root)
-            except DraftError:
+            reference = body_by_span.get(link.whole_span)
+            if reference is None:
                 continue
-            final_target = expanded.get(target, target)
-            if final_target == target and final_path == path:
+            resource = reference.resource
+            if final_path == path and resource.identity not in moved_targets:
                 continue
-            destination = _relative_destination(final_path, final_target, anchor)
+            destination = rebase_body_destination(
+                resource,
+                new_source=final_path,
+                moved_targets=moved_targets,
+            )
             if destination != link.destination:
                 edits.setdefault(link.destination_span, destination)
         for link in nav_removals.get(path, []):

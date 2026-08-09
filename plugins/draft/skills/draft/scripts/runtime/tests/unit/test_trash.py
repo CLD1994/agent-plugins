@@ -29,6 +29,7 @@ from draft.operations import (
     TrashDeadlines,
     sha256_bytes,
 )
+from draft.resources import resolve_page_resources
 from draft.trash import require_retained_restore_window, trash_plan
 from draft.trash_package import OUTGOING_RELATIVE, PACKAGE_VERSION
 from draft.vocabulary import RelationCode
@@ -96,6 +97,7 @@ def _graph_from_texts(
     for child, parent in parents.items():
         children.setdefault(parent, []).append(child)
 
+    body_resources = {path: resolve_page_resources(root, pages[path]) for path in sorted(pages)}
     return DraftGraph(
         root=root,
         pages={path: pages[path] for path in sorted(pages)},
@@ -106,6 +108,7 @@ def _graph_from_texts(
             for target, entries in sorted(inbound.items())
         },
         relations={label: tuple(sorted(edges)) for label, edges in relation_edges.items()},
+        body_resources=body_resources,
     )
 
 

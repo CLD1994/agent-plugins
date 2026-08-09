@@ -9,9 +9,11 @@ from draft.resources import (
     HostOS,
     ProbeState,
     ResolvedResource,
+    ResourceIdentity,
     ResourceKind,
     ResourceScope,
     TargetState,
+    rebase_body_destination,
     resolve_body_resource,
     resolve_page_resources,
 )
@@ -126,7 +128,7 @@ def test_page_kind_is_lexical_and_unaffected_by_existence() -> None:
     assert present.target_state is TargetState.PRESENT
 
 
-def test_images_and_links_to_same_resource_deduplicate_by_identity() -> None:
+def test_images_and_links_to_same_resource_keep_distinct_references() -> None:
     text = (
         "# 标题\n\n> 状态：`待讨论`\n>\n> 父主题：[根](../index.md)\n\n"
         "[图](../asset.png) 与 ![图](../asset.png)\n"
@@ -141,8 +143,10 @@ def test_images_and_links_to_same_resource_deduplicate_by_identity() -> None:
         target_probe=_fake_probe(states),  # type: ignore[arg-type]
     )
 
-    identities = [ref.resource.identity for ref in references]
-    assert len(identities) == len(set(identities))
+    # 两条声明各自保留，但身份相同（去重在查询层完成）。
+    assert len(references) == 2
+    identities = {ref.resource.identity for ref in references}
+    assert len(identities) == 1
     assert all(ref.resource.kind is ResourceKind.LOCAL for ref in references)
 
 
@@ -160,9 +164,11 @@ def test_anchor_does_not_participate_in_identity() -> None:
         target_probe=_fake_probe({}),  # type: ignore[arg-type]
     )
 
-    identities = [ref.resource.identity for ref in references]
+    identities = {ref.resource.identity for ref in references}
     assert len(identities) == 1
-    assert identities[0].value == "pages/b.md"
+    (identity,) = identities
+    assert identity.value == "pages/b.md"
+    assert {ref.resource.anchor for ref in references} == {"one", "two"}
 
 
 def test_page_resources_excludes_relation_link_positions() -> None:
@@ -193,3 +199,125 @@ def test_relative_destination_keeps_anchor_and_posix_target() -> None:
     assert result.anchor == "边界"
     assert result.was_relative is True
     assert result.local_absolute == str(ROOT / "pages/b.md")
+
+
+def test_rebase_relative_target_follows_moved_source() -> None:
+    """把 pages/a.md 移到 pages/sub/a.md 时，../shared.png 变为 ../../shared.png。"""
+    old = resolve_body_resource(
+        ROOT,
+        Path("pages/a.md"),
+        "../shared.png",
+        host_os=HostOS.LINUX,
+        target_probe=_fake_probe({}),  # type: ignore[arg-type]
+    )
+    rewritten = rebase_body_destination(
+        old,
+        new_source=Path("pages/sub/a.md"),
+        moved_targets={},
+    )
+
+    assert rewritten == "../../shared.png"
+    new = resolve_body_resource(
+        ROOT,
+        Path("pages/sub/a.md"),
+        rewritten,
+        host_os=HostOS.LINUX,
+        target_probe=_fake_probe({}),  # type: ignore[arg-type]
+    )
+    assert new.identity == old.identity
+
+
+def test_rebase_preserves_windows_primary_separator() -> None:
+    old = resolve_body_resource(
+        ROOT,
+        Path("pages/a.md"),
+        r"..\shared.png",
+        host_os=HostOS.LINUX,
+        target_probe=_fake_probe({}),  # type: ignore[arg-type]
+    )
+    rewritten = rebase_body_destination(
+        old,
+        new_source=Path("pages/sub/a.md"),
+        moved_targets={},
+    )
+
+    assert rewritten == r"..\..\shared.png"
+
+
+def test_rebase_mixed_separator_keeps_first_style() -> None:
+    old = resolve_body_resource(
+        ROOT,
+        Path("pages/a.md"),
+        "..\\shared.png",
+        host_os=HostOS.LINUX,
+        target_probe=_fake_probe({}),  # type: ignore[arg-type]
+    )
+    rewritten = rebase_body_destination(
+        old,
+        new_source=Path("pages/sub/a.md"),
+        moved_targets={},
+    )
+
+    assert rewritten == "..\\..\\shared.png"
+
+
+def test_rebase_leaves_absolute_windows_and_uri_targets_unchanged() -> None:
+    unchanged = [
+        "/opt/shared/a.pdf",
+        r"C:\docs\a.pdf",
+        r"\\server\share\a.pdf",
+        "https://example.test/a#part",
+    ]
+    for destination in unchanged:
+        old = resolve_body_resource(
+            ROOT,
+            Path("pages/a.md"),
+            destination,
+            host_os=HostOS.LINUX,
+            target_probe=_fake_probe({}),  # type: ignore[arg-type]
+        )
+        assert (
+            rebase_body_destination(
+                old,
+                new_source=Path("pages/sub/a.md"),
+                moved_targets={},
+            )
+            == destination
+        )
+
+
+def test_rebase_follows_moved_target_mapping() -> None:
+    """相对链接指向同时移动的页面时，跟随最终目标映射。"""
+    old = resolve_body_resource(
+        ROOT,
+        Path("pages/a.md"),
+        "other.md",
+        host_os=HostOS.LINUX,
+        target_probe=_fake_probe({}),  # type: ignore[arg-type]
+    )
+    target_identity = ResourceIdentity(ResourceKind.PAGE, "pages/other.md")
+    moved = ResourceIdentity(ResourceKind.PAGE, "pages/moved/other.md")
+    rewritten = rebase_body_destination(
+        old,
+        new_source=Path("pages/sub/a.md"),
+        moved_targets={target_identity: moved},
+    )
+
+    assert rewritten == "../moved/other.md"
+
+
+def test_rebase_reappends_anchor() -> None:
+    old = resolve_body_resource(
+        ROOT,
+        Path("pages/a.md"),
+        "b.md#细节",
+        host_os=HostOS.LINUX,
+        target_probe=_fake_probe({}),  # type: ignore[arg-type]
+    )
+    rewritten = rebase_body_destination(
+        old,
+        new_source=Path("pages/sub/a.md"),
+        moved_targets={},
+    )
+
+    assert rewritten == "../b.md#细节"

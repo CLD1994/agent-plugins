@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import posixpath
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
@@ -374,10 +374,13 @@ def resolve_page_resources(
     host_os: HostOS | None = None,
     target_probe: TargetProbe | None = None,
 ) -> tuple[ResourceReference, ...]:
-    """解析一页的全部正文资源，排除正式关系链接位置，按身份去重。"""
+    """解析一页的全部正文资源，排除正式关系链接位置。
+
+    同一身份的多个声明位置各自保留：去重是查询层（``page_links``）的行为，
+    图存储和结构修改需要每条声明的独立引用。
+    """
     relation_spans = {relation.link.whole_span for relation in page.relations}
     references: list[ResourceReference] = []
-    seen: set[ResourceIdentity] = set()
     for link in page.links:
         if link.whole_span in relation_spans:
             continue
@@ -388,9 +391,6 @@ def resolve_page_resources(
             host_os=host_os,
             target_probe=target_probe,
         )
-        if resolved.identity in seen:
-            continue
-        seen.add(resolved.identity)
         references.append(ResourceReference(link=link, resource=resolved))
     return tuple(references)
 
@@ -406,3 +406,28 @@ def resource_identity_from_operand(
         root, ROOT_PAGE, value, host_os=host_os, target_probe=_probe_filesystem
     )
     return resolved.identity
+
+
+def rebase_body_destination(
+    resource: ResolvedResource,
+    *,
+    new_source: Path,
+    moved_targets: Mapping[ResourceIdentity, ResourceIdentity],
+) -> str:
+    """把正文链接目标重算到新的来源页面位置。
+
+    只有当前系统可解释的本地相对目标才重写；本地绝对路径、Windows 绝对路径、
+    UNC、盘符相对路径和外部 URI 保持原文不变。指向同时移动的页面时跟随最终
+    目标映射。相对路径保留原主要分隔符风格与锚点。
+    """
+    if not resource.was_relative or resource.local_absolute is None:
+        anchor = resource.anchor
+        return f"{resource.target}#{anchor}" if anchor is not None else resource.target
+    identity = resource.identity
+    final_identity = moved_targets.get(identity, identity)
+    relative = posixpath.relpath(final_identity.value, new_source.parent.as_posix())
+    encoded = quote(relative, safe="/-._~")
+    if resource.separator == "\\":
+        encoded = encoded.replace("/", "\\")
+    anchor = resource.anchor
+    return f"{encoded}#{anchor}" if anchor is not None else encoded
