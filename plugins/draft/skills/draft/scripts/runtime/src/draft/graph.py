@@ -449,9 +449,7 @@ def _candidate_internal_issues(
             )
         else:
             if provisional_state.provisional_manifest is None:
-                issues.append(
-                    error_issue(CheckCode.FORMAT_INVALID, PROVISIONAL_MARKER_PATH)
-                )
+                issues.append(error_issue(CheckCode.FORMAT_INVALID, PROVISIONAL_MARKER_PATH))
             elif not allow_provisional_adopt:
                 raise DraftError("adopt.recovery_required", provisional)
     allowed = {MARKER_PATH, PROVISIONAL_MARKER_PATH}

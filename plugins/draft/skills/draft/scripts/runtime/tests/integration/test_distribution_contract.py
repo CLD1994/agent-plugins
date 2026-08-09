@@ -76,10 +76,13 @@ def test_runtime_src_contains_no_plugin_only_modules() -> None:
 # 核心测试不复制这些产物字段，避免同一契约在两个测试树漂移。
 
 DIAGNOSTIC_CODE_OWNER = RUNTIME_ROOT / "src/draft/diagnostic_codes.py"
-DIAGNOSTIC_CODE_LITERAL_CONSUMERS = tuple(
-    path
-    for path in sorted((RUNTIME_ROOT / "src/draft").glob("*.py"))
-    if path != DIAGNOSTIC_CODE_OWNER
+DIAGNOSTIC_CODE_LITERAL_CONSUMERS = (
+    *tuple(
+        path
+        for path in sorted((RUNTIME_ROOT / "src/draft").glob("*.py"))
+        if path != DIAGNOSTIC_CODE_OWNER
+    ),
+    RUNTIME_ROOT / "tests/unit/test_diagnostics.py",
 )
 
 

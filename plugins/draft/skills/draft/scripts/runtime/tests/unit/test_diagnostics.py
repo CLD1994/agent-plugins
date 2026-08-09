@@ -4,7 +4,16 @@ from pathlib import Path
 
 import pytest
 
-from draft.diagnostic_codes import CheckCode
+from draft.diagnostic_codes import (
+    CheckCode,
+    InvalidRelationReason,
+    InvalidStatusReason,
+    LinkEscapeKind,
+    ParseErrorReason,
+    ReplacementStatusReason,
+    RootMissingKind,
+    WrongOutputReason,
+)
 from draft.diagnostics import KNOWN_CHECK_CODES, issue_payload, render_issue
 from draft.models import CheckIssue, IssueSeverity
 
@@ -17,7 +26,6 @@ _RECOVERY_ID = "4" * 32
 @dataclass(frozen=True)
 class RenderCase:
     issue: CheckIssue
-    case_id: str
     visible_detail_indexes: tuple[int, ...] = ()
 
 
@@ -55,475 +63,581 @@ def test_catalog_covers_every_typed_check_code() -> None:
 VALID_RENDER_CASES = [
     RenderCase(
         CheckIssue(
-            "candidate.already_registered", IssueSeverity.ERROR, Path(".draft/draft.json"), None
+            CheckCode.CANDIDATE_ALREADY_REGISTERED.value,
+            IssueSeverity.ERROR,
+            Path(".draft/draft.json"),
+            None,
         ),
-        "candidate.already_registered",
     ),
     RenderCase(
-        CheckIssue("candidate.internal_state", IssueSeverity.ERROR, Path(".draft"), None),
-        "candidate.internal_state",
+        CheckIssue(
+            CheckCode.CANDIDATE_INTERNAL_STATE.value,
+            IssueSeverity.ERROR,
+            Path(".draft"),
+            None,
+        ),
     ),
     RenderCase(
-        CheckIssue("format.missing", IssueSeverity.ERROR, Path(".draft/draft.json"), None),
-        "format.missing",
+        CheckIssue(
+            CheckCode.FORMAT_MISSING.value,
+            IssueSeverity.ERROR,
+            Path(".draft/draft.json"),
+            None,
+        ),
     ),
     RenderCase(
-        CheckIssue("format.invalid", IssueSeverity.ERROR, Path(".draft/draft.json"), None),
-        "format.invalid",
+        CheckIssue(
+            CheckCode.FORMAT_INVALID.value,
+            IssueSeverity.ERROR,
+            Path(".draft/draft.json"),
+            None,
+        ),
     ),
     RenderCase(
-        CheckIssue("format.unsupported", IssueSeverity.ERROR, Path(".draft/draft.json"), None),
-        "format.unsupported",
+        CheckIssue(
+            CheckCode.FORMAT_UNSUPPORTED.value,
+            IssueSeverity.ERROR,
+            Path(".draft/draft.json"),
+            None,
+        ),
     ),
     RenderCase(
-        CheckIssue("root.missing_file", IssueSeverity.ERROR, None, None, ("file", "index.md")),
-        "root.missing_file.file",
+        CheckIssue(
+            CheckCode.ROOT_MISSING_FILE.value,
+            IssueSeverity.ERROR,
+            None,
+            None,
+            (RootMissingKind.FILE.value, "index.md"),
+        ),
         (1,),
     ),
     RenderCase(
-        CheckIssue("root.missing_file", IssueSeverity.ERROR, None, None, ("directory", "pages")),
-        "root.missing_file.directory",
+        CheckIssue(
+            CheckCode.ROOT_MISSING_FILE.value,
+            IssueSeverity.ERROR,
+            None,
+            None,
+            (RootMissingKind.DIRECTORY.value, "pages"),
+        ),
         (1,),
     ),
     RenderCase(
-        CheckIssue("page.unmanaged_path", IssueSeverity.ERROR, Path("notes.md"), None),
-        "page.unmanaged_path",
+        CheckIssue(
+            CheckCode.PAGE_UNMANAGED_PATH.value,
+            IssueSeverity.ERROR,
+            Path("notes.md"),
+            None,
+        ),
     ),
     RenderCase(
-        CheckIssue("page.missing_title", IssueSeverity.ERROR, Path("pages/a.md"), None),
-        "page.missing_title",
+        CheckIssue(
+            CheckCode.PAGE_MISSING_TITLE.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            None,
+        ),
     ),
     RenderCase(
-        CheckIssue("page.missing_machine_block", IssueSeverity.ERROR, Path("pages/a.md"), None),
-        "page.missing_machine_block",
+        CheckIssue(
+            CheckCode.PAGE_MISSING_MACHINE_BLOCK.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            None,
+        ),
     ),
     RenderCase(
-        CheckIssue("page.missing_status", IssueSeverity.ERROR, Path("pages/a.md"), None),
-        "page.missing_status",
+        CheckIssue(
+            CheckCode.PAGE_MISSING_STATUS.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            None,
+        ),
     ),
     RenderCase(
-        CheckIssue("page.duplicate_status", IssueSeverity.ERROR, Path("pages/a.md"), 5),
-        "page.duplicate_status",
+        CheckIssue(
+            CheckCode.PAGE_DUPLICATE_STATUS.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            5,
+        ),
     ),
     RenderCase(
-        CheckIssue("page.unknown_label", IssueSeverity.ERROR, Path("pages/a.md"), 7, ("状态依据",)),
-        "page.unknown_label",
+        CheckIssue(
+            CheckCode.PAGE_UNKNOWN_LABEL.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            7,
+            ("状态依据",),
+        ),
         (0,),
     ),
     RenderCase(
         CheckIssue(
-            "page.invalid_status",
+            CheckCode.PAGE_INVALID_STATUS.value,
             IssueSeverity.ERROR,
             Path("pages/x.md"),
             3,
-            ("not_single_code_span",),
+            (InvalidStatusReason.NOT_SINGLE_CODE_SPAN.value,),
         ),
-        "page.invalid_status.not_single_code_span",
     ),
     RenderCase(
         CheckIssue(
-            "page.invalid_status",
+            CheckCode.PAGE_INVALID_STATUS.value,
             IssueSeverity.ERROR,
             Path("pages/x.md"),
             3,
-            ("empty_explanation",),
+            (InvalidStatusReason.EMPTY_EXPLANATION.value,),
         ),
-        "page.invalid_status.empty_explanation",
     ),
     RenderCase(
         CheckIssue(
-            "page.invalid_status",
+            CheckCode.PAGE_INVALID_STATUS.value,
             IssueSeverity.ERROR,
             Path("pages/x.md"),
             3,
-            ("unknown_prefix", "进行中"),
+            (InvalidStatusReason.UNKNOWN_PREFIX.value, "进行中"),
         ),
-        "page.invalid_status.unknown_prefix",
         (1,),
     ),
     RenderCase(
         CheckIssue(
-            "page.invalid_relation",
+            CheckCode.PAGE_INVALID_RELATION.value,
             IssueSeverity.ERROR,
             Path("pages/x.md"),
             5,
-            ("link_cardinality_or_image", "依赖"),
+            (InvalidRelationReason.LINK_CARDINALITY_OR_IMAGE.value, "依赖"),
         ),
-        "page.invalid_relation.link_cardinality_or_image",
         (1,),
     ),
     RenderCase(
         CheckIssue(
-            "page.invalid_relation",
+            CheckCode.PAGE_INVALID_RELATION.value,
             IssueSeverity.ERROR,
             Path("pages/x.md"),
             5,
-            ("extra_content", "父主题"),
+            (InvalidRelationReason.EXTRA_CONTENT.value, "父主题"),
         ),
-        "page.invalid_relation.extra_content",
         (1,),
     ),
     RenderCase(
         CheckIssue(
-            "page.parse_error", IssueSeverity.ERROR, Path("pages/a.md"), 9, ("lazy_continuation",)
-        ),
-        "page.parse_error.lazy_continuation",
-    ),
-    RenderCase(
-        CheckIssue(
-            "page.parse_error",
+            CheckCode.PAGE_PARSE_ERROR.value,
             IssueSeverity.ERROR,
             Path("pages/a.md"),
             9,
-            ("source_alignment_failed", "missing.md"),
+            (ParseErrorReason.LAZY_CONTINUATION.value,),
         ),
-        "page.parse_error.source_alignment_failed",
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.PAGE_PARSE_ERROR.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            9,
+            (ParseErrorReason.SOURCE_ALIGNMENT_FAILED.value, "missing.md"),
+        ),
         (1,),
     ),
     RenderCase(
         CheckIssue(
-            "page.parse_error",
+            CheckCode.PAGE_PARSE_ERROR.value,
             IssueSeverity.ERROR,
             Path("pages/a.md"),
             None,
-            ("machine_block_map_missing",),
+            (ParseErrorReason.MACHINE_BLOCK_MAP_MISSING.value,),
         ),
-        "page.parse_error.machine_block_map_missing",
     ),
     RenderCase(
         CheckIssue(
-            "page.parse_error",
+            CheckCode.PAGE_PARSE_ERROR.value,
             IssueSeverity.ERROR,
             Path("pages/a.md"),
             9,
-            ("link_destination_missing",),
+            (ParseErrorReason.LINK_DESTINATION_MISSING.value,),
         ),
-        "page.parse_error.link_destination_missing",
     ),
     RenderCase(
         CheckIssue(
-            "page.parse_error",
+            CheckCode.PAGE_PARSE_ERROR.value,
             IssueSeverity.ERROR,
             Path("pages/a.md"),
             9,
-            ("image_destination_missing",),
+            (ParseErrorReason.IMAGE_DESTINATION_MISSING.value,),
         ),
-        "page.parse_error.image_destination_missing",
     ),
     RenderCase(
         CheckIssue(
-            "page.capacity", IssueSeverity.REVIEW, Path("pages/a.md"), None, ("620", "70000")
+            CheckCode.PAGE_CAPACITY.value,
+            IssueSeverity.REVIEW,
+            Path("pages/a.md"),
+            None,
+            ("620", "70000"),
         ),
-        "page.capacity",
         (0, 1),
     ),
     RenderCase(
         CheckIssue(
-            "link.missing",
+            CheckCode.LINK_MISSING.value,
             IssueSeverity.ERROR,
             Path("conclusions.md"),
             8,
             ("pages/a.md", "pages/a.md"),
         ),
-        "link.missing.same",
         (1,),
     ),
     RenderCase(
         CheckIssue(
-            "link.missing", IssueSeverity.ERROR, Path("conclusions.md"), 8, ("./a.md", "pages/a.md")
+            CheckCode.LINK_MISSING.value,
+            IssueSeverity.ERROR,
+            Path("conclusions.md"),
+            8,
+            ("./a.md", "pages/a.md"),
         ),
-        "link.missing.distinct",
         (0, 1),
     ),
     RenderCase(
         CheckIssue(
-            "link.escape",
+            CheckCode.LINK_ESCAPE.value,
             IssueSeverity.ERROR,
             Path("pages/a.md"),
             9,
-            ("destination", "../../outside.md"),
+            (LinkEscapeKind.DESTINATION.value, "../../outside.md"),
         ),
-        "link.escape.destination",
         (1,),
     ),
     RenderCase(
         CheckIssue(
-            "link.escape",
+            CheckCode.LINK_ESCAPE.value,
             IssueSeverity.ERROR,
             Path("pages/linked.md"),
             None,
-            ("managed_path", "pages/linked.md"),
+            (LinkEscapeKind.MANAGED_PATH.value, "pages/linked.md"),
         ),
-        "link.escape.managed_path",
         (1,),
     ),
     RenderCase(
-        CheckIssue("path.symlink_escape", IssueSeverity.ERROR, Path(".draft/operations/abc"), None),
-        "path.symlink_escape",
+        CheckIssue(
+            CheckCode.PATH_SYMLINK_ESCAPE.value,
+            IssueSeverity.ERROR,
+            Path(".draft/operations/abc"),
+            None,
+        ),
     ),
     RenderCase(
         CheckIssue(
-            "relation.duplicate",
+            CheckCode.RELATION_DUPLICATE.value,
             IssueSeverity.ERROR,
             Path("pages/question.md"),
             9,
             ("依赖", "pages/question.md"),
         ),
-        "relation.duplicate",
         (0, 1),
     ),
     RenderCase(
-        CheckIssue("parent.root_declared", IssueSeverity.ERROR, Path("index.md"), 4),
-        "parent.root_declared",
-    ),
-    RenderCase(
-        CheckIssue("parent.missing", IssueSeverity.ERROR, Path("pages/a.md"), None),
-        "parent.missing",
-    ),
-    RenderCase(
-        CheckIssue("parent.multiple", IssueSeverity.ERROR, Path("pages/a.md"), 5),
-        "parent.multiple",
+        CheckIssue(
+            CheckCode.PARENT_ROOT_DECLARED.value,
+            IssueSeverity.ERROR,
+            Path("index.md"),
+            4,
+        ),
     ),
     RenderCase(
         CheckIssue(
-            "layout.parent_mismatch",
+            CheckCode.PARENT_MISSING.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            None,
+        ),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.PARENT_MULTIPLE.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            5,
+        ),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.LAYOUT_PARENT_MISMATCH.value,
             IssueSeverity.ERROR,
             Path("pages/sub/x.md"),
             4,
             ("index.md", "pages/sub/index.md"),
         ),
-        "layout.parent_mismatch",
         (0, 1),
     ),
     RenderCase(
         CheckIssue(
-            "parent.cycle",
+            CheckCode.PARENT_CYCLE.value,
             IssueSeverity.ERROR,
             Path("pages/a.md"),
             None,
             ("pages/a.md", "pages/b.md", "pages/a.md"),
         ),
-        "parent.cycle",
         (0, 1, 2),
     ),
     RenderCase(
         CheckIssue(
-            "parent.cycle",
+            CheckCode.PARENT_CYCLE.value,
             IssueSeverity.ERROR,
             Path("pages/a.md"),
             None,
             ("pages/a.md", "pages/a.md"),
         ),
-        "parent.cycle.self_loop",
         (0, 1),
     ),
     RenderCase(
-        CheckIssue("parent.unreachable", IssueSeverity.ERROR, Path("pages/a.md"), None),
-        "parent.unreachable",
+        CheckIssue(
+            CheckCode.PARENT_UNREACHABLE.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            None,
+        ),
     ),
     RenderCase(
         CheckIssue(
-            "parent.navigation_missing",
+            CheckCode.PARENT_NAVIGATION_MISSING.value,
             IssueSeverity.ERROR,
             Path("index.md"),
             None,
             ("pages/a.md",),
         ),
-        "parent.navigation_missing",
         (0,),
     ),
     RenderCase(
-        CheckIssue("hub.empty", IssueSeverity.ERROR, Path("pages/empty/index.md"), None),
-        "hub.empty",
-    ),
-    RenderCase(
-        CheckIssue("dependency.self", IssueSeverity.ERROR, Path("pages/a.md"), 7),
-        "dependency.self",
+        CheckIssue(
+            CheckCode.HUB_EMPTY.value,
+            IssueSeverity.ERROR,
+            Path("pages/empty/index.md"),
+            None,
+        ),
     ),
     RenderCase(
         CheckIssue(
-            "dependency.cycle",
+            CheckCode.DEPENDENCY_SELF.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            7,
+        ),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.DEPENDENCY_CYCLE.value,
             IssueSeverity.ERROR,
             Path("pages/a.md"),
             None,
             ("pages/a.md", "pages/b.md", "pages/a.md"),
         ),
-        "dependency.cycle",
         (0, 1, 2),
     ),
     RenderCase(
         CheckIssue(
-            "dependency.cycle",
+            CheckCode.DEPENDENCY_CYCLE.value,
             IssueSeverity.ERROR,
             Path("pages/a.md"),
             None,
             ("pages/a.md", "pages/a.md"),
         ),
-        "dependency.cycle.self_loop",
         (0, 1),
     ),
     RenderCase(
         CheckIssue(
-            "replacement.pair_missing",
+            CheckCode.REPLACEMENT_PAIR_MISSING.value,
             IssueSeverity.ERROR,
             Path("pages/new.md"),
             7,
             ("pages/question.md", "被取代"),
         ),
-        "replacement.pair_missing",
         (0, 1),
     ),
     RenderCase(
         CheckIssue(
-            "replacement.status_mismatch",
+            CheckCode.REPLACEMENT_STATUS_MISMATCH.value,
             IssueSeverity.ERROR,
             Path("pages/new.md"),
             7,
-            ("relation_requires_status",),
+            (ReplacementStatusReason.RELATION_REQUIRES_STATUS.value,),
         ),
-        "replacement.status_mismatch.relation_requires_status",
     ),
     RenderCase(
         CheckIssue(
-            "replacement.status_mismatch",
+            CheckCode.REPLACEMENT_STATUS_MISMATCH.value,
             IssueSeverity.ERROR,
             Path("pages/old.md"),
             None,
-            ("status_requires_relation",),
+            (ReplacementStatusReason.STATUS_REQUIRES_RELATION.value,),
         ),
-        "replacement.status_mismatch.status_requires_relation",
     ),
     RenderCase(
         CheckIssue(
-            "replacement.cycle",
+            CheckCode.REPLACEMENT_CYCLE.value,
             IssueSeverity.ERROR,
             Path("pages/a.md"),
             None,
             ("pages/a.md", "pages/b.md", "pages/a.md"),
         ),
-        "replacement.cycle",
         (0, 1, 2),
     ),
     RenderCase(
         CheckIssue(
-            "replacement.cycle",
+            CheckCode.REPLACEMENT_CYCLE.value,
             IssueSeverity.ERROR,
             Path("pages/a.md"),
             None,
             ("pages/a.md", "pages/a.md"),
         ),
-        "replacement.cycle.self_loop",
         (0, 1),
     ),
     RenderCase(
         CheckIssue(
-            "challenge.pair_missing",
+            CheckCode.CHALLENGE_PAIR_MISSING.value,
             IssueSeverity.ERROR,
             Path("pages/challenger.md"),
             7,
             ("pages/question.md", "被质疑"),
         ),
-        "challenge.pair_missing",
         (0, 1),
     ),
     RenderCase(
-        CheckIssue("output.forbidden", IssueSeverity.ERROR, Path("pages/a.md"), 7),
-        "output.forbidden",
-    ),
-    RenderCase(
-        CheckIssue("output.missing", IssueSeverity.ERROR, Path("pages/a.md"), None),
-        "output.missing",
-    ),
-    RenderCase(
         CheckIssue(
-            "output.wrong_target", IssueSeverity.ERROR, Path("pages/a.md"), 7, ("duplicate",)
-        ),
-        "output.wrong_target.duplicate",
-    ),
-    RenderCase(
-        CheckIssue(
-            "output.wrong_target",
+            CheckCode.OUTPUT_FORBIDDEN.value,
             IssueSeverity.ERROR,
             Path("pages/a.md"),
             7,
-            ("not_conclusions", "../index.md"),
         ),
-        "output.wrong_target.not_conclusions",
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.OUTPUT_MISSING.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            None,
+        ),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.OUTPUT_WRONG_TARGET.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            7,
+            (WrongOutputReason.DUPLICATE.value,),
+        ),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.OUTPUT_WRONG_TARGET.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            7,
+            (WrongOutputReason.NOT_CONCLUSIONS.value, "../index.md"),
+        ),
         (1,),
     ),
     RenderCase(
         CheckIssue(
-            "output.backlink_missing",
+            CheckCode.OUTPUT_BACKLINK_MISSING.value,
             IssueSeverity.ERROR,
             Path("conclusions.md"),
             None,
             ("pages/a.md",),
         ),
-        "output.backlink_missing",
         (0,),
     ),
     RenderCase(
         CheckIssue(
-            "operation.journal_corrupt", IssueSeverity.ERROR, Path(".draft/operation.lock"), None
+            CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+            IssueSeverity.ERROR,
+            Path(".draft/operation.lock"),
+            None,
         ),
-        "operation.journal_corrupt",
     ),
     RenderCase(
         CheckIssue(
-            "operation.recovery_required",
+            CheckCode.OPERATION_RECOVERY_REQUIRED.value,
             IssueSeverity.ERROR,
             Path(".draft/operation.lock"),
             None,
             (_RECOVERY_ID,),
         ),
-        "operation.recovery_required",
         (0,),
     ),
     RenderCase(
-        CheckIssue("operation.orphan_allocating", IssueSeverity.REVIEW, Path(_JOURNAL), None),
-        "operation.orphan_allocating",
+        CheckIssue(
+            CheckCode.OPERATION_ORPHAN_ALLOCATING.value,
+            IssueSeverity.REVIEW,
+            Path(_JOURNAL),
+            None,
+        ),
     ),
     RenderCase(
         CheckIssue(
-            "operation.inconsistent_state",
+            CheckCode.OPERATION_INCONSISTENT_STATE.value,
             IssueSeverity.ERROR,
             Path(_JOURNAL),
             None,
             ("prepared",),
         ),
-        "operation.inconsistent_state",
-        (0,),
-    ),
-    RenderCase(
-        CheckIssue("trash.deadlines_invalid", IssueSeverity.ERROR, Path(_JOURNAL), None, (_OP_ID,)),
-        "trash.deadlines_invalid",
-        (0,),
-    ),
-    RenderCase(
-        CheckIssue("trash.package_missing", IssueSeverity.ERROR, Path(_JOURNAL), None, (_OP_ID,)),
-        "trash.package_missing",
-        (0,),
-    ),
-    RenderCase(
-        CheckIssue("trash.package_corrupt", IssueSeverity.ERROR, Path(_JOURNAL), None, (_OP_ID,)),
-        "trash.package_corrupt",
-        (0,),
-    ),
-    RenderCase(
-        CheckIssue("trash.retained", IssueSeverity.INFO, Path(_JOURNAL), None, (_OP_ID,)),
-        "trash.retained",
-        (0,),
-    ),
-    RenderCase(
-        CheckIssue("trash.handoff_pending", IssueSeverity.WARNING, Path(_JOURNAL), None, (_OP_ID,)),
-        "trash.handoff_pending",
         (0,),
     ),
     RenderCase(
         CheckIssue(
-            "trash.pending_unexplained", IssueSeverity.ERROR, Path(_JOURNAL), None, (_OP_ID,)
+            CheckCode.TRASH_DEADLINES_INVALID.value,
+            IssueSeverity.ERROR,
+            Path(_JOURNAL),
+            None,
+            (_OP_ID,),
         ),
-        "trash.pending_unexplained",
+        (0,),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.TRASH_PACKAGE_MISSING.value,
+            IssueSeverity.ERROR,
+            Path(_JOURNAL),
+            None,
+            (_OP_ID,),
+        ),
+        (0,),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.TRASH_PACKAGE_CORRUPT.value,
+            IssueSeverity.ERROR,
+            Path(_JOURNAL),
+            None,
+            (_OP_ID,),
+        ),
+        (0,),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.TRASH_RETAINED.value,
+            IssueSeverity.INFO,
+            Path(_JOURNAL),
+            None,
+            (_OP_ID,),
+        ),
+        (0,),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.TRASH_HANDOFF_PENDING.value,
+            IssueSeverity.WARNING,
+            Path(_JOURNAL),
+            None,
+            (_OP_ID,),
+        ),
+        (0,),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.TRASH_PENDING_UNEXPLAINED.value,
+            IssueSeverity.ERROR,
+            Path(_JOURNAL),
+            None,
+            (_OP_ID,),
+        ),
         (0,),
     ),
 ]
@@ -536,24 +650,28 @@ def test_valid_render_cases_cover_every_published_code() -> None:
 @pytest.mark.parametrize(
     "case",
     VALID_RENDER_CASES,
-    ids=[case.case_id for case in VALID_RENDER_CASES],
+    ids=lambda case: case.issue.code,
 )
 def test_each_catalog_case_renders_valid_single_line(case: RenderCase) -> None:
     _assert_valid_render(case)
 
 
-VARIANT_CODES = (
-    "root.missing_file",
-    "page.invalid_status",
-    "page.invalid_relation",
-    "page.parse_error",
-    "link.missing",
-    "link.escape",
-    "replacement.status_mismatch",
-    "output.wrong_target",
+VARIANT_CODES: tuple[CheckCode, ...] = (
+    CheckCode.ROOT_MISSING_FILE,
+    CheckCode.PAGE_INVALID_STATUS,
+    CheckCode.PAGE_INVALID_RELATION,
+    CheckCode.PAGE_PARSE_ERROR,
+    CheckCode.LINK_MISSING,
+    CheckCode.LINK_ESCAPE,
+    CheckCode.REPLACEMENT_STATUS_MISMATCH,
+    CheckCode.OUTPUT_WRONG_TARGET,
 )
+
 VARIANT_GROUPS = [
-    tuple(case.issue for case in VALID_RENDER_CASES if case.issue.code == code)
+    pytest.param(
+        tuple(case.issue for case in VALID_RENDER_CASES if case.issue.code == code.value),
+        id=code.value,
+    )
     for code in VARIANT_CODES
 ]
 
@@ -578,7 +696,9 @@ def test_unknown_issue_fallback_is_one_line_and_lossless() -> None:
 
 
 def test_known_code_with_invalid_location_exposes_code_and_raw_details() -> None:
-    issue = CheckIssue("link.missing", IssueSeverity.ERROR, Path("a.md"), None, ("x", "x"))
+    issue = CheckIssue(
+        CheckCode.LINK_MISSING.value, IssueSeverity.ERROR, Path("a.md"), None, ("x", "x")
+    )
     rendered = render_issue(issue)
     _assert_single_line(rendered)
     assert issue.code in rendered
@@ -586,7 +706,9 @@ def test_known_code_with_invalid_location_exposes_code_and_raw_details() -> None
 
 
 def test_known_code_with_non_positive_line_does_not_render_fake_line() -> None:
-    issue = CheckIssue("link.missing", IssueSeverity.ERROR, Path("a.md"), 0, ("x", "x"))
+    issue = CheckIssue(
+        CheckCode.LINK_MISSING.value, IssueSeverity.ERROR, Path("a.md"), 0, ("x", "x")
+    )
     rendered = render_issue(issue)
     _assert_single_line(rendered)
     assert issue.path is not None
@@ -594,42 +716,22 @@ def test_known_code_with_non_positive_line_does_not_render_fake_line() -> None:
     assert issue.code in rendered
 
 
-CYCLE_FALLBACK_CASES = [
-    pytest.param(
-        CheckIssue(
-            "parent.cycle",
-            IssueSeverity.ERROR,
-            Path("pages/a.md"),
-            None,
-            ("pages/a.md", "pages/b.md"),
-        ),
-        id="parent.cycle.unclosed",
-    ),
-    pytest.param(
-        CheckIssue(
-            "dependency.cycle",
-            IssueSeverity.ERROR,
-            Path("pages/a.md"),
-            None,
-            ("pages/a.md", "pages/b.md"),
-        ),
-        id="dependency.cycle.unclosed",
-    ),
-    pytest.param(
-        CheckIssue(
-            "replacement.cycle",
-            IssueSeverity.ERROR,
-            Path("pages/a.md"),
-            None,
-            ("pages/a.md", "pages/b.md"),
-        ),
-        id="replacement.cycle.unclosed",
-    ),
-]
+CYCLE_CODES: tuple[CheckCode, ...] = (
+    CheckCode.PARENT_CYCLE,
+    CheckCode.DEPENDENCY_CYCLE,
+    CheckCode.REPLACEMENT_CYCLE,
+)
 
 
-@pytest.mark.parametrize(("issue",), CYCLE_FALLBACK_CASES)
-def test_unclosed_cycle_fallback_is_one_line_and_lossless(issue: CheckIssue) -> None:
+@pytest.mark.parametrize("code", CYCLE_CODES, ids=lambda code: code.value)
+def test_unclosed_cycle_fallback_is_one_line_and_lossless(code: CheckCode) -> None:
+    issue = CheckIssue(
+        code.value,
+        IssueSeverity.ERROR,
+        Path("pages/a.md"),
+        None,
+        ("pages/a.md", "pages/b.md"),
+    )
     rendered = render_issue(issue)
     _assert_single_line(rendered)
     assert issue.code in rendered
@@ -638,7 +740,7 @@ def test_unclosed_cycle_fallback_is_one_line_and_lossless(issue: CheckIssue) -> 
 
 def test_complex_issue_explicitly_points_to_json() -> None:
     issue = CheckIssue(
-        "operation.inconsistent_state",
+        CheckCode.OPERATION_INCONSISTENT_STATE.value,
         IssueSeverity.ERROR,
         Path(".draft/operations/a/journal.json"),
         None,
@@ -651,7 +753,7 @@ def test_complex_issue_explicitly_points_to_json() -> None:
 
 def test_path_with_control_character_stays_one_line() -> None:
     path = "bad\nname.md"
-    issue = CheckIssue("link.missing", IssueSeverity.ERROR, Path(path), 5, ("x", "x"))
+    issue = CheckIssue(CheckCode.LINK_MISSING.value, IssueSeverity.ERROR, Path(path), 5, ("x", "x"))
     rendered = render_issue(issue)
     _assert_single_line(rendered)
     assert _escaped_fact(path) in rendered
@@ -667,11 +769,15 @@ def test_code_with_control_character_stays_one_line() -> None:
 
 def test_issue_payload_adds_explicit_severity_and_keeps_raw_details() -> None:
     issue = CheckIssue(
-        "page.capacity", IssueSeverity.REVIEW, Path("pages/a.md"), None, ("601", "70000")
+        CheckCode.PAGE_CAPACITY.value,
+        IssueSeverity.REVIEW,
+        Path("pages/a.md"),
+        None,
+        ("601", "70000"),
     )
     assert issue_payload(issue) == {
-        "code": "page.capacity",
-        "severity": "review",
+        "code": CheckCode.PAGE_CAPACITY.value,
+        "severity": IssueSeverity.REVIEW.value,
         "path": "pages/a.md",
         "line": None,
         "details": ["601", "70000"],
