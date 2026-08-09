@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import provisional_marker_path
 from draft.models import (
@@ -116,7 +117,7 @@ def make_attempt_copy(package: VerifiedTrashPackage) -> Path:
     reject_symlink_components(root, attempt_relative.parent)
     attempt = root / attempt_relative
     if attempt.is_symlink() or (attempt.exists() and not attempt.is_dir()):
-        raise DraftError("operation.inconsistent_state", attempt)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, attempt)
     if attempt.is_dir():
         remove_tree(attempt)
     attempt.mkdir(parents=True, exist_ok=False)
@@ -170,17 +171,17 @@ def require_no_restore_claim_for_expiry(root: Path, journal: Journal) -> None:
     r1_id = validate_operation_id(existing)
     r1_path = operation_journal_path(root, r1_id)
     if not r1_path.is_file():
-        raise DraftError("operation.inconsistent_state", journal.directory)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     r1 = read_journal(r1_path)
     if r1.kind != "restore" or r1.metadata.get("restores_trash_operation") != journal.operation_id:
-        raise DraftError("operation.inconsistent_state", journal.directory)
-    raise DraftError("operation.recovery_required", journal.directory)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+    raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, journal.directory)
 
 
 def reread_matching_trash_journal(root: Path, operation_id: str) -> Journal:
     journal = read_journal(operation_journal_path(root, operation_id))
     if journal.operation_id != operation_id or journal.kind != "trash":
-        raise DraftError("operation.inconsistent_state", journal.directory)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     return journal
 
 
@@ -324,7 +325,7 @@ def _iter_trash_journals(root: Path) -> list[Path]:
     paths: list[Path] = []
     for entry in sorted(operations.iterdir()):
         if entry.is_symlink():
-            raise DraftError("path.symlink_escape", entry)
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, entry)
         if not entry.is_dir() or not (entry / "journal.json").is_file():
             continue
         paths.append(operation_journal_path(root, entry.name))
@@ -422,13 +423,13 @@ def _handle_no_lock_dir(
     """无锁操作目录分类：放弃孤儿分配碎片、保留损坏现场、忽略终态审计。"""
     reject_symlink_components(root, OPERATIONS_RELATIVE)
     if entry.is_symlink():
-        raise DraftError("path.symlink_escape", entry)
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, entry)
     journal_path = operation_journal_path(root, entry.name)
     if not journal_path.is_file():
         if not any(entry.iterdir()):
             entry.rmdir()
             return None
-        raise DraftError("operation.inconsistent_state", entry)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
     journal = read_journal(journal_path)
     if journal.kind == "restore":
         # 孤儿未关联 R（allocating、无 mutation、无 T 反向关联）：安全放弃为 rolled_back。
@@ -446,19 +447,19 @@ def _handle_no_lock_dir(
                 changed_paths=(),
             )
         # 其余无锁 restore（被 T 关联或处于中间阶段）一律保留现场。
-        raise DraftError("operation.inconsistent_state", journal.directory)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     if journal.kind == "trash":
         if journal.phase in (
             OperationPhase.TRASH_HANDOFF_SUCCEEDED,
             OperationPhase.TRASH_PURGE_COMMITTED,
         ):
-            raise DraftError("operation.inconsistent_state", journal.directory)
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
         # trash_retained/trash_handoff_pending：交给批量推进。
         return None
     # 普通操作终态：保留审计；中间阶段由 operations.recover 处理（无锁视为 inconsistent）。
     if journal.phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
         return None
-    raise DraftError("operation.inconsistent_state", journal.directory)
+    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
 
 
 def _restore_linked_back(root: Path, restore_journal: Journal) -> bool:
@@ -470,7 +471,7 @@ def _restore_linked_back(root: Path, restore_journal: Journal) -> bool:
     for entry in operations.iterdir():
         if entry.is_symlink():
             # 链接条目绝不能静默跳过：否则可能漏掉真实反向关联，把 R 误判为孤儿。
-            raise DraftError("path.symlink_escape", entry)
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, entry)
         if not entry.is_dir() or entry.name == restore_journal.operation_id:
             continue
         back_path = operation_journal_path(root, entry.name)
@@ -479,7 +480,7 @@ def _restore_linked_back(root: Path, restore_journal: Journal) -> bool:
                 # 空预分配碎片：无证据可言，与无锁分类对空目录的处理一致。
                 continue
             # 非空目录缺日志：证据可能已丢失，停止并保留现场，不得误判孤儿。
-            raise DraftError("operation.inconsistent_state", entry)
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
         # 日志不可读（损坏/版本不符）时绝不跳过：该日志可能正是本 R 的反向关联
         # 证据，吞掉错误会把证据缺失误判为无关联，进而把 R 错误写成 rolled_back。
         candidate = read_journal(back_path)
@@ -510,7 +511,7 @@ def recover_draft(
     if locked is not None:
         journal = read_journal(operation_journal_path(resolved, locked))
         if journal.operation_id != locked:
-            raise DraftError("operation.inconsistent_state", journal.directory)
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
         if journal.kind == "restore":
             trash_journal = validate_restore_link(resolved, journal)
             package = load_verified_package(resolved, trash_journal)

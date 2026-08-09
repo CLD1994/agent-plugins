@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from draft.checker import check_draft
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import (
     CONCLUSIONS_PAGE,
@@ -298,16 +299,16 @@ def require_no_existing_restore_claim(root: Path, journal: Journal, restore_id: 
     if existing is None:
         return
     if existing == restore_id:
-        raise DraftError("operation.inconsistent_state", journal.directory)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     r1_id = validate_operation_id(existing)
     r1_path = operation_journal_path(root, r1_id)
     if not r1_path.is_file():
-        raise DraftError("operation.inconsistent_state", journal.directory)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     r1 = read_journal(r1_path)
     if r1.kind != "restore" or r1.metadata.get("restores_trash_operation") != journal.operation_id:
-        raise DraftError("operation.inconsistent_state", journal.directory)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     # T <-> R1 合法可恢复关联，但 R1 不是本次 R：交给显式恢复。
-    raise DraftError("operation.recovery_required", journal.directory)
+    raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, journal.directory)
 
 
 def remove_authoritative_package(package: VerifiedTrashPackage) -> None:
@@ -357,7 +358,7 @@ def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackag
     mutations.append(FileMutation(page_path, MutationKind.WRITE, None, page_hash, page_bytes))
     if collapsed:
         if hub_path is None:
-            raise DraftError("trash.package_corrupt", package.directory)
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package.directory)
         leaf_text = (root / parent_path).read_text(encoding="utf-8")
         hub_text = _rebase_links(leaf_text, parent_path, hub_path, root)
         navigation = relative_markdown_destination(hub_path, page_path, None)
@@ -442,9 +443,9 @@ def verify_restore_after_state(
     最后逐项核对活文件与 after 摘要一致、删除文件不存在。
     """
     if restore_journal.metadata.get("restores_trash_operation") != package.operation_id:
-        raise DraftError("operation.inconsistent_state", restore_journal.directory)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, restore_journal.directory)
     if trash_journal.metadata.get("restore_operation_id") != restore_journal.operation_id:
-        raise DraftError("operation.inconsistent_state", restore_journal.directory)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, restore_journal.directory)
 
     internal = Path(INTERNAL_DIR)
     t_structural = [
@@ -455,23 +456,29 @@ def verify_restore_after_state(
     actual = restore_journal.mutations
     actual_paths = [mutation.path for mutation in actual]
     if len(actual_paths) != len(set(actual_paths)) or len(actual) != len(t_structural):
-        raise DraftError("operation.inconsistent_state", restore_journal.directory)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, restore_journal.directory)
     actual_by_path = {mutation.path: mutation for mutation in actual}
 
     for t_mutation in t_structural:
         r_mutation = actual_by_path.get(t_mutation.path)
         if r_mutation is None:
-            raise DraftError("operation.inconsistent_state", restore_journal.directory)
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, restore_journal.directory
+            )
         if t_mutation.kind is MutationKind.DELETE:
             # T 删除 -> R 重建：WRITE，before=None。
             if r_mutation.kind is not MutationKind.WRITE or r_mutation.before_sha256 is not None:
-                raise DraftError("operation.inconsistent_state", restore_journal.directory)
+                raise DraftError(
+                    CheckCode.OPERATION_INCONSISTENT_STATE.value, restore_journal.directory
+                )
             if (
                 t_mutation.path == package.page_path
                 and r_mutation.after_sha256 != t_mutation.before_sha256
             ):
                 # 页面：after 锚定 T.before（=page_sha256，由包内字节给出）。
-                raise DraftError("operation.inconsistent_state", restore_journal.directory)
+                raise DraftError(
+                    CheckCode.OPERATION_INCONSISTENT_STATE.value, restore_journal.directory
+                )
             # 枢纽（collapsed）：after 由独立证明覆盖（子导航追加位置不同，不锚定 T.before）。
         elif t_mutation.before_sha256 is None:
             # T 新建 -> R 移除：DELETE，before 锚定 T.after，after=None。
@@ -480,23 +487,31 @@ def verify_restore_after_state(
                 or r_mutation.before_sha256 != t_mutation.after_sha256
                 or r_mutation.after_sha256 is not None
             ):
-                raise DraftError("operation.inconsistent_state", restore_journal.directory)
+                raise DraftError(
+                    CheckCode.OPERATION_INCONSISTENT_STATE.value, restore_journal.directory
+                )
         else:
             # T 改写 -> R 还原：WRITE，before 锚定 T.after。
             if (
                 r_mutation.kind is not MutationKind.WRITE
                 or r_mutation.before_sha256 != t_mutation.after_sha256
             ):
-                raise DraftError("operation.inconsistent_state", restore_journal.directory)
+                raise DraftError(
+                    CheckCode.OPERATION_INCONSISTENT_STATE.value, restore_journal.directory
+                )
 
     for mutation in actual:
         if mutation.kind is MutationKind.WRITE and (
             mutation.after_sha256 is None
             or sha256_file(root / mutation.path) != mutation.after_sha256
         ):
-            raise DraftError("operation.inconsistent_state", restore_journal.directory)
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, restore_journal.directory
+            )
         if mutation.kind is MutationKind.DELETE and (root / mutation.path).exists():
-            raise DraftError("operation.inconsistent_state", restore_journal.directory)
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, restore_journal.directory
+            )
 
     # 独立证明父/枢纽还原结果：不依赖 R 自报 after 摘要，用包内 parent_sha256 复核。
     _prove_parent_restore(root, package, trash_journal)
@@ -586,11 +601,11 @@ def _prove_parent_restore(
     graph = load_graph(root)
     canonical = canonical_parent_navigation(graph, package.page_path)
     if canonical is None:
-        raise DraftError("operation.inconsistent_state", package.parent_path)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, package.parent_path)
     if package.collapsed:
         hub_path = package.hub_path
         if hub_path is None:
-            raise DraftError("trash.package_corrupt", package.directory)
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package.directory)
         hub_text = (root / hub_path).read_text(encoding="utf-8")
         # 枢纽去掉页面导航（两种候选）后逆 rebase 回叶页，应回到回收后的叶内容。
         if not any(
@@ -600,7 +615,7 @@ def _prove_parent_restore(
             == package.parent_sha256
             for candidate in _parent_restore_candidates(hub_text, canonical)
         ):
-            raise DraftError("operation.inconsistent_state", hub_path)
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, hub_path)
         # 折叠时被重定向的其他页面：对每页应用 T 的 hub->leaf 逆重定向到 live 页，
         # 应回到 T 的 after（leaf 目标版本），不依赖 R 自报 after。
         internal = Path(INTERNAL_DIR)
@@ -615,14 +630,14 @@ def _prove_parent_restore(
                     live_text, t_mutation.path, hub_path, package.parent_path, root
                 )
                 if sha256_bytes(rebased_back.encode("utf-8")) != t_mutation.after_sha256:
-                    raise DraftError("operation.inconsistent_state", t_mutation.path)
+                    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, t_mutation.path)
     else:
         parent_text = (root / package.parent_path).read_text(encoding="utf-8")
         if not any(
             sha256_bytes(candidate.encode("utf-8")) == package.parent_sha256
             for candidate in _parent_restore_candidates(parent_text, canonical)
         ):
-            raise DraftError("operation.inconsistent_state", package.parent_path)
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, package.parent_path)
 
 
 def trash_page(root: Path, page: Path, *, now: datetime | None = None) -> TrashResult:
@@ -637,7 +652,7 @@ def trash_page(root: Path, page: Path, *, now: datetime | None = None) -> TrashR
     normalized_now = normalize_utc(now)
     deadlines = TrashDeadlines.from_created_at(normalized_now)
     if read_lock(resolved) is not None:
-        raise DraftError("operation.recovery_required", resolved)
+        raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, resolved)
     report = check_draft(resolved)
     if report.errors:
         codes = tuple(issue.code for issue in report.errors)
@@ -726,7 +741,9 @@ def resolve_restore_execution(
 
     if terminal_restore.phase is OperationPhase.COMPLETED:
         if execution_error is not None:
-            raise DraftError("operation.inconsistent_state", terminal_restore.directory)
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory
+            )
         verify_restore_after_state(root, current_trash, terminal_restore, package)
         write_journal(with_phase(current_trash, OperationPhase.ROLLED_BACK))
         remove_authoritative_package(package)
@@ -753,7 +770,7 @@ def resolve_restore_execution(
         # 不可证明安全：保留认领、锁、包；原操作错误交给 recover。
         if execution_error is not None:
             raise execution_error
-        raise DraftError("operation.inconsistent_state", terminal_restore.directory)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory)
 
     # 安全回滚/未应用：耐久 R=rolled_back（若尚未），解关联 T，清理，释放。
     if terminal_restore.phase is not OperationPhase.ROLLED_BACK:

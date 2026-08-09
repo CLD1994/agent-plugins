@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import cast
 
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import INTERNAL_DIR
 from draft.models import (
@@ -68,9 +69,9 @@ def _parse_utc_field(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError as exc:
-        raise DraftError("operation.journal_corrupt") from exc
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value) from exc
     if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
-        raise DraftError("operation.journal_corrupt")
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value)
     return parsed.astimezone(UTC)
 
 
@@ -97,7 +98,7 @@ class TrashDeadlines:
         def field(key: str) -> datetime:
             value = metadata.get(key)
             if value is None:
-                raise DraftError("operation.journal_corrupt")
+                raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value)
             return _parse_utc_field(value)
 
         created = field("created_at")
@@ -105,11 +106,11 @@ class TrashDeadlines:
         purge = field("purge_eligible_at")
         next_attempt = field("next_handoff_attempt_at")
         if restore != created + RESTORE_WINDOW:
-            raise DraftError("operation.journal_corrupt")
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value)
         if purge != restore + PURGE_WINDOW_AFTER_RESTORE:
-            raise DraftError("operation.journal_corrupt")
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value)
         if next_attempt < restore:
-            raise DraftError("operation.journal_corrupt")
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value)
         return TrashDeadlines(created, restore, purge, next_attempt)
 
     def to_metadata(self) -> dict[str, str]:
@@ -146,7 +147,7 @@ def handoff_failure_metadata(error: OSError, *, attempted_at: datetime) -> dict[
 
 def sha256_file(path: Path) -> str | None:
     if path.is_symlink():
-        raise DraftError("path.symlink_escape", path)
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, path)
     if not path.exists():
         return None
     return sha256_bytes(path.read_bytes())
@@ -175,7 +176,7 @@ def reject_symlink_components(root: Path, relative: Path) -> None:
     for part in relative.parts:
         cursor = cursor / part
         if cursor.is_symlink():
-            raise DraftError("path.symlink_escape", cursor)
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, cursor)
 
 
 def durable_write(path: Path, value: bytes) -> None:
@@ -198,7 +199,7 @@ def acquire_lock(root: Path, operation_id: str) -> None:
     try:
         descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError as exc:
-        raise DraftError("operation.recovery_required", lock) from exc
+        raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, lock) from exc
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(payload)
         handle.flush()
@@ -209,7 +210,9 @@ def acquire_lock(root: Path, operation_id: str) -> None:
 _OPERATION_ID = re.compile(r"[0-9a-f]{32}")
 
 
-def validate_operation_id(value: str, *, code: str = "operation.journal_corrupt") -> str:
+def validate_operation_id(
+    value: str, *, code: str = CheckCode.OPERATION_JOURNAL_CORRUPT.value
+) -> str:
     """唯一的 operation_id 边界：所有外部标识在任何路径拼接前必须过这里。"""
     if not _OPERATION_ID.fullmatch(value):
         raise DraftError(code)
@@ -224,19 +227,19 @@ def read_lock(root: Path) -> str | None:
     try:
         decoded = json.loads(lock.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise DraftError("operation.journal_corrupt", lock) from exc
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, lock) from exc
     if not isinstance(decoded, dict):
-        raise DraftError("operation.journal_corrupt", lock)
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, lock)
     operation_id = cast("dict[str, object]", decoded).get("operation_id")
     if not isinstance(operation_id, str):
-        raise DraftError("operation.journal_corrupt", lock)
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, lock)
     return validate_operation_id(operation_id)
 
 
 def release_lock(root: Path, operation_id: str) -> None:
     current = read_lock(root)
     if current != operation_id:
-        raise DraftError("operation.journal_corrupt", root / LOCK_RELATIVE)
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, root / LOCK_RELATIVE)
     (root / LOCK_RELATIVE).unlink()
     fsync_directory(root / LOCK_RELATIVE.parent)
 
@@ -291,32 +294,32 @@ def _journal_to_json(journal: Journal) -> bytes:
 
 def _expect_str(value: object, journal_path: Path) -> str:
     if not isinstance(value, str):
-        raise DraftError("operation.journal_corrupt", journal_path)
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
     return value
 
 
 def _expect_optional_str(value: object, journal_path: Path) -> str | None:
     if value is not None and not isinstance(value, str):
-        raise DraftError("operation.journal_corrupt", journal_path)
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
     return value
 
 
 def _validate_journal_path(value: str, journal_path: Path) -> Path:
     relative = PurePosixPath(value)
     if relative.is_absolute() or ".." in relative.parts:
-        raise DraftError("operation.journal_corrupt", journal_path)
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
     return Path(*relative.parts)
 
 
 def read_journal(journal_path: Path) -> Journal:
     if not journal_path.is_file():
-        raise DraftError("operation.journal_corrupt", journal_path)
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
     try:
         decoded = json.loads(journal_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise DraftError("operation.journal_corrupt", journal_path) from exc
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path) from exc
     if not isinstance(decoded, dict):
-        raise DraftError("operation.journal_corrupt", journal_path)
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
     data = cast("dict[str, object]", decoded)
     version = data.get("journal_version")
     if version != JOURNAL_VERSION:
@@ -358,7 +361,7 @@ def read_journal(journal_path: Path) -> Journal:
         if not isinstance(metadata_raw, dict):
             raise TypeError("metadata must be an object")
     except (TypeError, ValueError) as exc:
-        raise DraftError("operation.journal_corrupt", journal_path) from exc
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path) from exc
     metadata = {
         _expect_str(key, journal_path): _expect_str(value, journal_path)
         for key, value in cast("dict[object, object]", metadata_raw).items()
@@ -366,7 +369,7 @@ def read_journal(journal_path: Path) -> Journal:
     directory_id = validate_operation_id(journal_path.parent.name)
     operation_id = validate_operation_id(_expect_str(data.get("operation_id"), journal_path))
     if operation_id != directory_id:
-        raise DraftError("operation.journal_corrupt", journal_path)
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
     return Journal(
         operation_id=operation_id,
         kind=_expect_str(data.get("kind"), journal_path),
@@ -470,7 +473,7 @@ def _validate_plan_paths(plan: OperationPlan) -> None:
         for part in relative.parts:
             cursor /= part
             if cursor.is_symlink():
-                raise DraftError("path.symlink_escape", cursor)
+                raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, cursor)
 
 
 def _check(root: Path, validation_mode: str) -> None:
@@ -489,7 +492,7 @@ def _apply_write(root: Path, target: Path, content: bytes) -> None:
     for part in target.parts[:-1]:
         cursor /= part
         if cursor.is_symlink():
-            raise DraftError("path.symlink_escape", cursor)
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, cursor)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f"{destination.name}.tmp-{uuid.uuid4().hex}")
     with temporary.open("xb") as handle:
@@ -503,7 +506,7 @@ def _apply_write(root: Path, target: Path, content: bytes) -> None:
 def _apply_delete(root: Path, target: Path) -> None:
     destination = root / target
     if destination.is_symlink():
-        raise DraftError("path.symlink_escape", destination)
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, destination)
     if destination.exists():
         destination.unlink()
         fsync_directory(destination.parent)
@@ -593,7 +596,7 @@ def _rollback(
             original = journal.directory / cast(str, mutation.original)
             original_hash = sha256_file(original)
             if original_hash != mutation.before_sha256:
-                raise DraftError("operation.journal_corrupt", original)
+                raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, original)
             _apply_write(root, mutation.path, original.read_bytes())
     return finalize_operation(
         root,
@@ -758,7 +761,7 @@ def execute_plan(plan: OperationPlan) -> OperationResult:
     _validate_plan_paths(plan)
     lock_id = read_lock(root)
     if lock_id is not None:
-        raise DraftError("operation.recovery_required", root / LOCK_RELATIVE)
+        raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, root / LOCK_RELATIVE)
 
     operation_id = validate_operation_id(
         plan.metadata.get("operation_id") or uuid.uuid4().hex, code="operation.plan_invalid"
@@ -897,13 +900,13 @@ def _verify_recovery_material(journal: Journal) -> None:
         if mutation.original is not None:
             original = journal.directory / mutation.original
             if sha256_file(original) != mutation.before_sha256:
-                raise DraftError("operation.journal_corrupt", original)
+                raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, original)
         if mutation.staged is not None:
             staged = journal.directory / mutation.staged
             if not staged.exists():
                 continue  # 暂存缺失只阻断前向完成，回滚仍可从恢复副本进行
             if sha256_file(staged) != mutation.after_sha256:
-                raise DraftError("operation.journal_corrupt", staged)
+                raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, staged)
 
 
 def _recover_terminal(root: Path, journal: Journal, operation_id: str) -> OperationResult:
@@ -928,7 +931,7 @@ def _recover_terminal(root: Path, journal: Journal, operation_id: str) -> Operat
 def _recover_locked(root: Path, operation_id: str) -> OperationResult:
     journal = read_journal(operation_journal_path(root, operation_id))
     if journal.operation_id != operation_id:
-        raise DraftError("operation.journal_corrupt", journal.directory)
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal.directory)
     if journal.phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
         return _recover_terminal(root, journal, operation_id)
     if journal.phase is OperationPhase.ALLOCATING:
@@ -990,7 +993,7 @@ def recover(root_path: Path) -> OperationResult:
             or journal.phase is OperationPhase.TRASH_HANDOFF_SUCCEEDED
             or journal.phase is OperationPhase.TRASH_PURGE_COMMITTED
         ):
-            raise DraftError("operation.inconsistent_state", journal_path)
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal_path)
         # completed / rolled_back / trash_retained / trash_handoff_pending：终态或非写入状态，
         # trash 子系统负责推进 trash_retained 与 trash_handoff_pending。
     return OperationResult(

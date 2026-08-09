@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from draft.checker import check_draft, check_graph
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import (
     CONCLUSIONS_PAGE,
@@ -219,7 +220,7 @@ def plan_path_remap(
         for issue in check_graph(graph).errors
         if not (
             allow_empty_hub is not None
-            and issue.code == "hub.empty"
+            and issue.code == CheckCode.HUB_EMPTY.value
             and issue.path == allow_empty_hub
         )
     ]
@@ -402,14 +403,14 @@ def plan_collapse(graph: DraftGraph, hub: Path) -> OperationPlan:
 def _load_clean_graph(root: Path, *, allow_empty_hub: Path | None = None) -> DraftGraph:
     resolved = resolve_draft_root(root)
     if read_lock(resolved) is not None:
-        raise DraftError("operation.recovery_required", resolved)
+        raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, resolved)
     report = check_draft(resolved)
     errors = [
         issue
         for issue in report.errors
         if not (
             allow_empty_hub is not None
-            and issue.code == "hub.empty"
+            and issue.code == CheckCode.HUB_EMPTY.value
             and issue.path == allow_empty_hub
         )
     ]

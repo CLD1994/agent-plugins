@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
 
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import INTERNAL_DIR
 from draft.models import MutationKind
@@ -62,7 +63,7 @@ def require_journal_write(journal: Journal, relative_path: Path) -> JournalMutat
         if mutation.path == relative_path and mutation.kind is MutationKind.WRITE
     )
     if len(matches) != 1 or matches[0].after_sha256 is None:
-        raise DraftError("trash.package_corrupt", relative_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, relative_path)
     return matches[0]
 
 
@@ -75,36 +76,36 @@ def _require_journal_delete(
         if mutation.path == relative_path and mutation.kind is MutationKind.DELETE
     )
     if len(matches) != 1:
-        raise DraftError("trash.package_corrupt", code_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
     return matches[0]
 
 
 def _relative_path(value: object, *, code_path: Path) -> Path:
     if not isinstance(value, str):
-        raise DraftError("trash.package_corrupt", code_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
     pure = PurePosixPath(value)
     if pure.is_absolute() or ".." in pure.parts or not pure.parts:
-        raise DraftError("trash.package_corrupt", code_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
     return Path(*pure.parts)
 
 
 def _managed_markdown_path(value: object, code_path: Path) -> Path:
     relative = _relative_path(value, code_path=code_path)
     if relative.suffix != ".md" or relative.parts[0] == INTERNAL_DIR:
-        raise DraftError("trash.package_corrupt", code_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
     return relative
 
 
 def _expect_str(data: dict[str, object], key: str, code_path: Path) -> str:
     value = data[key]
     if not isinstance(value, str):
-        raise DraftError("trash.package_corrupt", code_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
     return value
 
 
 def _reject_symlink(path: Path) -> None:
     if path.is_symlink():
-        raise DraftError("path.symlink_escape", path)
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, path)
 
 
 def _reject_symlink_components(base: Path, relative: Path) -> None:
@@ -121,24 +122,24 @@ def _reject_package_extra_entries(
     allowed_files = {Path("package.json"), payload_relative}
     for entry in package_dir.rglob("*"):
         if entry.is_symlink():
-            raise DraftError("trash.package_corrupt", code_path)
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
         if entry.is_file() and entry.relative_to(package_dir) not in allowed_files:
-            raise DraftError("trash.package_corrupt", code_path)
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
 
 
 def _parse_manifest(manifest_path: Path) -> dict[str, object]:
     try:
         decoded = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise DraftError("trash.package_corrupt", manifest_path) from exc
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path) from exc
     if not isinstance(decoded, dict):
-        raise DraftError("trash.package_corrupt", manifest_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
     data = cast("dict[str, object]", decoded)
     if set(data) != set(_MANIFEST_FIELDS):
-        raise DraftError("trash.package_corrupt", manifest_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
     version = data["version"]
     if isinstance(version, bool) or version != PACKAGE_VERSION:
-        raise DraftError("trash.package_corrupt", manifest_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
     return data
 
 
@@ -147,7 +148,7 @@ def load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashPa
     package_relative = OUTGOING_RELATIVE / package_id
     package_dir = root / package_relative
     if trash_journal.kind != "trash":
-        raise DraftError("operation.inconsistent_state", package_dir)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, package_dir)
 
     reject_symlink_components(root, OUTGOING_RELATIVE)
     _reject_symlink(package_dir)
@@ -155,19 +156,19 @@ def load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashPa
     _reject_symlink(manifest_path)
     manifest_mutation = require_journal_write(trash_journal, package_relative / "package.json")
     if sha256_file(manifest_path) != manifest_mutation.after_sha256:
-        raise DraftError("trash.package_corrupt", manifest_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
 
     data = _parse_manifest(manifest_path)
     if _expect_str(data, "operation_id", manifest_path) != package_id:
-        raise DraftError("trash.package_corrupt", manifest_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
     page_hash = _expect_str(data, "page_sha256", manifest_path)
     parent_hash = _expect_str(data, "parent_sha256", manifest_path)
     collapsed = data["collapsed"]
     if not isinstance(collapsed, bool):
-        raise DraftError("trash.package_corrupt", manifest_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
     hub_raw = data["hub_path"]
     if hub_raw is not None and not isinstance(hub_raw, str):
-        raise DraftError("trash.package_corrupt", manifest_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
 
     payload_relative = _relative_path(data["payload"], code_path=manifest_path)
     page_path = _managed_markdown_path(data["page_path"], manifest_path)
@@ -178,24 +179,24 @@ def load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashPa
 
     payload_mutation = require_journal_write(trash_journal, package_relative / payload_relative)
     if payload_mutation.after_sha256 != page_hash:
-        raise DraftError("trash.package_corrupt", manifest_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
     page_delete = _require_journal_delete(trash_journal, page_path, manifest_path)
     if page_delete.before_sha256 != page_hash:
-        raise DraftError("trash.package_corrupt", manifest_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
     parent_write = require_journal_write(trash_journal, parent_path)
     if parent_write.after_sha256 != parent_hash:
-        raise DraftError("trash.package_corrupt", manifest_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
     if collapsed:
         if hub_path is None:
-            raise DraftError("trash.package_corrupt", manifest_path)
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
         _require_journal_delete(trash_journal, hub_path, manifest_path)
     elif hub_path is not None:
-        raise DraftError("trash.package_corrupt", manifest_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
     for mutation in trash_journal.mutations:
         if mutation.path.is_relative_to(OUTGOING_RELATIVE) and not mutation.path.is_relative_to(
             package_relative
         ):
-            raise DraftError("trash.package_corrupt", manifest_path)
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
 
     _reject_symlink_components(root, page_path)
     _reject_symlink_components(root, parent_path)
@@ -205,7 +206,7 @@ def load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashPa
     payload_path = package_dir / payload_relative
     page_bytes = payload_path.read_bytes()
     if sha256_bytes(page_bytes) != payload_mutation.after_sha256:
-        raise DraftError("trash.package_corrupt", payload_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, payload_path)
     return VerifiedTrashPackage(
         operation_id=package_id,
         directory=package_dir,

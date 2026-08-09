@@ -3,6 +3,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 
+from draft.diagnostic_codes import (
+    CheckCode,
+    ReplacementStatusReason,
+    RootMissingKind,
+    WrongOutputReason,
+)
 from draft.errors import DraftError
 from draft.graph import (
     CONCLUSIONS_PAGE,
@@ -35,25 +41,29 @@ CAPACITY_LINES = 600
 CAPACITY_BYTES = 60 * 1024
 
 
-def _error(code: str, path: Path | None, line: int | None = None, *details: str) -> CheckIssue:
+def _error(
+    code: CheckCode, path: Path | None, line: int | None = None, *details: str
+) -> CheckIssue:
     return CheckIssue(
-        code=code, severity=IssueSeverity.ERROR, path=path, line=line, details=details
+        code=code.value, severity=IssueSeverity.ERROR, path=path, line=line, details=details
     )
 
 
-def _warning(code: str, path: Path | None, *details: str) -> CheckIssue:
+def _warning(code: CheckCode, path: Path | None, *details: str) -> CheckIssue:
     return CheckIssue(
-        code=code, severity=IssueSeverity.WARNING, path=path, line=None, details=details
+        code=code.value, severity=IssueSeverity.WARNING, path=path, line=None, details=details
     )
 
 
-def _info(code: str, path: Path | None, *details: str) -> CheckIssue:
-    return CheckIssue(code=code, severity=IssueSeverity.INFO, path=path, line=None, details=details)
-
-
-def _review(code: str, path: Path | None, *details: str) -> CheckIssue:
+def _info(code: CheckCode, path: Path | None, *details: str) -> CheckIssue:
     return CheckIssue(
-        code=code, severity=IssueSeverity.REVIEW, path=path, line=None, details=details
+        code=code.value, severity=IssueSeverity.INFO, path=path, line=None, details=details
+    )
+
+
+def _review(code: CheckCode, path: Path | None, *details: str) -> CheckIssue:
+    return CheckIssue(
+        code=code.value, severity=IssueSeverity.REVIEW, path=path, line=None, details=details
     )
 
 
@@ -134,7 +144,7 @@ def _check_relation_duplicates(graph: DraftGraph) -> list[CheckIssue]:
             if len(lines) > 1:
                 issues.append(
                     _error(
-                        "relation.duplicate",
+                        CheckCode.RELATION_DUPLICATE,
                         source,
                         lines[1],
                         label.value,
@@ -173,19 +183,19 @@ def _check_parents(graph: DraftGraph) -> list[CheckIssue]:
         ]
         if path == ROOT_PAGE:
             if declared:
-                issues.append(_error("parent.root_declared", path, declared[0].link.line))
+                issues.append(_error(CheckCode.PARENT_ROOT_DECLARED, path, declared[0].link.line))
             continue
         if not declared:
-            issues.append(_error("parent.missing", path))
+            issues.append(_error(CheckCode.PARENT_MISSING, path))
         elif len(declared) > 1:
-            issues.append(_error("parent.multiple", path, declared[1].link.line))
+            issues.append(_error(CheckCode.PARENT_MULTIPLE, path, declared[1].link.line))
         elif len(single_edges.get(path, ())) == 1:
             physical = physical_parent(path)
             declared_target = single_edges[path][0]
             if physical is not None and declared_target != physical:
                 issues.append(
                     _error(
-                        "layout.parent_mismatch",
+                        CheckCode.LAYOUT_PARENT_MISMATCH,
                         path,
                         declared[0].link.line,
                         declared_target.as_posix(),
@@ -196,7 +206,7 @@ def _check_parents(graph: DraftGraph) -> list[CheckIssue]:
     cycles = _find_cycles({source: targets for source, targets in parent_edges.items()})
     cycle_members = {member for cycle in cycles for member in cycle}
     for cycle in cycles:
-        issues.append(_error("parent.cycle", cycle[0], None, *_cycle_details(cycle)))
+        issues.append(_error(CheckCode.PARENT_CYCLE, cycle[0], None, *_cycle_details(cycle)))
 
     reachable: set[Path] = set()
     frontier = [ROOT_PAGE]
@@ -209,17 +219,19 @@ def _check_parents(graph: DraftGraph) -> list[CheckIssue]:
     for path in graph.pages:
         if path == ROOT_PAGE or path in reachable or path in cycle_members:
             continue
-        issues.append(_error("parent.unreachable", path))
+        issues.append(_error(CheckCode.PARENT_UNREACHABLE, path))
 
     for child, parent in sorted(graph.parents.items()):
         if parent not in graph.pages:
             continue
         if child not in _body_links_to(graph, parent):
-            issues.append(_error("parent.navigation_missing", parent, None, child.as_posix()))
+            issues.append(
+                _error(CheckCode.PARENT_NAVIGATION_MISSING, parent, None, child.as_posix())
+            )
 
     for path in graph.pages:
         if path.name == ROOT_PAGE.name and path != ROOT_PAGE and not graph.children.get(path):
-            issues.append(_error("hub.empty", path))
+            issues.append(_error(CheckCode.HUB_EMPTY, path))
     return issues
 
 
@@ -229,13 +241,13 @@ def _check_dependencies(graph: DraftGraph) -> list[CheckIssue]:
     depends_lines = _relation_lines(graph, RelationLabel.DEPENDS_ON)
     for (source, target), lines in sorted(depends_lines.items()):
         if source == target:
-            issues.append(_error("dependency.self", source, min(lines)))
+            issues.append(_error(CheckCode.DEPENDENCY_SELF, source, min(lines)))
     non_self = {
         source: tuple(target for target in targets if target != source)
         for source, targets in edges.items()
     }
     for cycle in _find_cycles(non_self):
-        issues.append(_error("dependency.cycle", cycle[0], None, *_cycle_details(cycle)))
+        issues.append(_error(CheckCode.DEPENDENCY_CYCLE, cycle[0], None, *_cycle_details(cycle)))
     return issues
 
 
@@ -247,7 +259,7 @@ def _check_replacements(graph: DraftGraph) -> list[CheckIssue]:
         if (target, source) not in superseded_by:
             issues.append(
                 _error(
-                    "replacement.pair_missing",
+                    CheckCode.REPLACEMENT_PAIR_MISSING,
                     source,
                     min(lines),
                     target.as_posix(),
@@ -258,7 +270,7 @@ def _check_replacements(graph: DraftGraph) -> list[CheckIssue]:
         if (target, source) not in supersedes:
             issues.append(
                 _error(
-                    "replacement.pair_missing",
+                    CheckCode.REPLACEMENT_PAIR_MISSING,
                     source,
                     min(lines),
                     target.as_posix(),
@@ -274,15 +286,25 @@ def _check_replacements(graph: DraftGraph) -> list[CheckIssue]:
         if declares_superseded_by and not is_superseded:
             line = min(relation.link.line for relation in superseded_by_relations)
             issues.append(
-                _error("replacement.status_mismatch", path, line, "relation_requires_status")
+                _error(
+                    CheckCode.REPLACEMENT_STATUS_MISMATCH,
+                    path,
+                    line,
+                    ReplacementStatusReason.RELATION_REQUIRES_STATUS.value,
+                )
             )
         if is_superseded and not declares_superseded_by:
             issues.append(
-                _error("replacement.status_mismatch", path, None, "status_requires_relation")
+                _error(
+                    CheckCode.REPLACEMENT_STATUS_MISMATCH,
+                    path,
+                    None,
+                    ReplacementStatusReason.STATUS_REQUIRES_RELATION.value,
+                )
             )
     edges = _multi_edges(graph, RelationLabel.SUPERSEDES)
     for cycle in _find_cycles(edges):
-        issues.append(_error("replacement.cycle", cycle[0], None, *_cycle_details(cycle)))
+        issues.append(_error(CheckCode.REPLACEMENT_CYCLE, cycle[0], None, *_cycle_details(cycle)))
     return issues
 
 
@@ -294,7 +316,7 @@ def _check_challenges(graph: DraftGraph) -> list[CheckIssue]:
         if (target, source) not in challenged_by:
             issues.append(
                 _error(
-                    "challenge.pair_missing",
+                    CheckCode.CHALLENGE_PAIR_MISSING,
                     source,
                     min(lines),
                     target.as_posix(),
@@ -305,7 +327,7 @@ def _check_challenges(graph: DraftGraph) -> list[CheckIssue]:
         if (target, source) not in challenges:
             issues.append(
                 _error(
-                    "challenge.pair_missing",
+                    CheckCode.CHALLENGE_PAIR_MISSING,
                     source,
                     min(lines),
                     target.as_posix(),
@@ -332,18 +354,25 @@ def _check_outputs(graph: DraftGraph) -> list[CheckIssue]:
         ]
         if path == CONCLUSIONS_PAGE:
             if declared:
-                issues.append(_error("output.forbidden", path, declared[0].link.line))
+                issues.append(_error(CheckCode.OUTPUT_FORBIDDEN, path, declared[0].link.line))
             continue
         is_confirmed = page.status.prefix is StatusPrefix.CONFIRMED
         if not is_confirmed:
             if declared:
-                issues.append(_error("output.forbidden", path, declared[0].link.line))
+                issues.append(_error(CheckCode.OUTPUT_FORBIDDEN, path, declared[0].link.line))
             continue
         if not declared:
-            issues.append(_error("output.missing", path))
+            issues.append(_error(CheckCode.OUTPUT_MISSING, path))
             continue
         if len(declared) > 1:
-            issues.append(_error("output.wrong_target", path, declared[1].link.line, "duplicate"))
+            issues.append(
+                _error(
+                    CheckCode.OUTPUT_WRONG_TARGET,
+                    path,
+                    declared[1].link.line,
+                    WrongOutputReason.DUPLICATE.value,
+                )
+            )
         # 关联每条声明与其规范化目标，定位实际未指向 conclusions.md 的声明；
         # 不能用 declared[0]，否则会把正确声明报成错误事实。
         wrong_targets = [
@@ -354,10 +383,10 @@ def _check_outputs(graph: DraftGraph) -> list[CheckIssue]:
         for relation in wrong_targets:
             issues.append(
                 _error(
-                    "output.wrong_target",
+                    CheckCode.OUTPUT_WRONG_TARGET,
                     path,
                     relation.link.line,
-                    "not_conclusions",
+                    WrongOutputReason.NOT_CONCLUSIONS.value,
                     relation.link.destination,
                 )
             )
@@ -365,7 +394,7 @@ def _check_outputs(graph: DraftGraph) -> list[CheckIssue]:
             continue
         if path not in _body_links_to(graph, CONCLUSIONS_PAGE):
             issues.append(
-                _error("output.backlink_missing", CONCLUSIONS_PAGE, None, path.as_posix())
+                _error(CheckCode.OUTPUT_BACKLINK_MISSING, CONCLUSIONS_PAGE, None, path.as_posix())
             )
     return issues
 
@@ -378,7 +407,7 @@ def _check_capacity(graph: DraftGraph) -> list[CheckIssue]:
         lines = page.text.count("\n") + 1 if page.text else 0
         size = len(page.text.encode("utf-8"))
         if lines > CAPACITY_LINES or size > CAPACITY_BYTES:
-            issues.append(_review("page.capacity", path, str(lines), str(size)))
+            issues.append(_review(CheckCode.PAGE_CAPACITY, path, str(lines), str(size)))
     return issues
 
 
@@ -402,11 +431,11 @@ def _trash_package_issue(root: Path, journal_path: Path, journal: Journal) -> Ch
     relative = journal_path.relative_to(root)
     package_dir = root / OUTGOING_RELATIVE / journal.operation_id
     if not package_dir.is_dir():
-        return _error("trash.package_missing", relative, None, journal.operation_id)
+        return _error(CheckCode.TRASH_PACKAGE_MISSING, relative, None, journal.operation_id)
     try:
         load_verified_package(root, journal)
     except DraftError:
-        return _error("trash.package_corrupt", relative, None, journal.operation_id)
+        return _error(CheckCode.TRASH_PACKAGE_CORRUPT, relative, None, journal.operation_id)
     return None
 
 
@@ -420,15 +449,17 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
     try:
         locked_operation = read_lock(root)
     except DraftError:
-        issues.append(_error("operation.journal_corrupt", lock_path))
+        issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, lock_path))
         locked_operation = None
     if locked_operation is not None:
         try:
             read_journal(operation_journal_path(root, locked_operation))
         except DraftError:
-            issues.append(_error("operation.journal_corrupt", lock_path))
+            issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, lock_path))
         else:
-            issues.append(_error("operation.recovery_required", lock_path, None, locked_operation))
+            issues.append(
+                _error(CheckCode.OPERATION_RECOVERY_REQUIRED, lock_path, None, locked_operation)
+            )
         return issues
     if not operations.is_dir():
         return issues
@@ -436,7 +467,7 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
     for entry in sorted(operations.iterdir()):
         if entry.is_symlink():
             # 链接条目必须报告，不能静默跳过（否则可能漏报反向关联或误判孤儿）。
-            issues.append(_error("path.symlink_escape", entry.relative_to(root)))
+            issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, entry.relative_to(root)))
             continue
         if not entry.is_dir() or not (entry / "journal.json").is_file():
             continue
@@ -444,20 +475,26 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
         try:
             journal = read_journal(journal_path)
         except DraftError:
-            issues.append(_error("operation.journal_corrupt", journal_path.relative_to(root)))
+            issues.append(
+                _error(CheckCode.OPERATION_JOURNAL_CORRUPT, journal_path.relative_to(root))
+            )
             continue
         relative = journal_path.relative_to(root)
         phase = journal.phase
         if phase is OperationPhase.ALLOCATING:
-            issues.append(_review("operation.orphan_allocating", relative))
+            issues.append(_review(CheckCode.OPERATION_ORPHAN_ALLOCATING, relative))
         elif phase in _MID_WRITE_PHASES:
-            issues.append(_error("operation.inconsistent_state", relative, None, phase.value))
+            issues.append(
+                _error(CheckCode.OPERATION_INCONSISTENT_STATE, relative, None, phase.value)
+            )
         elif phase in (
             OperationPhase.TRASH_HANDOFF_SUCCEEDED,
             OperationPhase.TRASH_PURGE_COMMITTED,
         ):
             # 两类提交都必须持有匹配写锁；无锁出现即状态损坏。
-            issues.append(_error("operation.inconsistent_state", relative, None, phase.value))
+            issues.append(
+                _error(CheckCode.OPERATION_INCONSISTENT_STATE, relative, None, phase.value)
+            )
         elif phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
             pass  # 终态审计事实，原样保留。
         elif phase is OperationPhase.TRASH_RETAINED:
@@ -479,7 +516,7 @@ def _deadline_issue(journal: Journal, relative: Path) -> CheckIssue | None:
     try:
         TrashDeadlines.parse(journal.metadata)
     except DraftError:
-        return _error("trash.deadlines_invalid", relative, None, journal.operation_id)
+        return _error(CheckCode.TRASH_DEADLINES_INVALID, relative, None, journal.operation_id)
     return None
 
 
@@ -488,14 +525,14 @@ def _check_trash_retained(
 ) -> list[CheckIssue]:
     """trash_retained 诊断：期限与包有效即 INFO；任一无效即 ERROR。到期但未推进仍为合法 INFO。"""
     if journal.kind != "trash":
-        return [_error("operation.inconsistent_state", relative, None, journal.phase.value)]
+        return [_error(CheckCode.OPERATION_INCONSISTENT_STATE, relative, None, journal.phase.value)]
     deadline_issue = _deadline_issue(journal, relative)
     if deadline_issue is not None:
         return [deadline_issue]
     package_issue = _trash_package_issue(root, journal_path, journal)
     if package_issue is not None:
         return [package_issue]
-    return [_info("trash.retained", relative, journal.operation_id)]
+    return [_info(CheckCode.TRASH_RETAINED, relative, journal.operation_id)]
 
 
 def _check_trash_handoff_pending(
@@ -503,7 +540,7 @@ def _check_trash_handoff_pending(
 ) -> list[CheckIssue]:
     """trash_handoff_pending 诊断：期限有效且失败记录有效为 WARNING；其余为 ERROR。"""
     if journal.kind != "trash":
-        return [_error("operation.inconsistent_state", relative, None, journal.phase.value)]
+        return [_error(CheckCode.OPERATION_INCONSISTENT_STATE, relative, None, journal.phase.value)]
     deadline_issue = _deadline_issue(journal, relative)
     if deadline_issue is not None:
         return [deadline_issue]
@@ -511,8 +548,8 @@ def _check_trash_handoff_pending(
     if package_issue is not None:
         return [package_issue]
     if has_handoff_failure(journal.metadata):
-        return [_warning("trash.handoff_pending", relative, journal.operation_id)]
-    return [_error("trash.pending_unexplained", relative, None, journal.operation_id)]
+        return [_warning(CheckCode.TRASH_HANDOFF_PENDING, relative, journal.operation_id)]
+    return [_error(CheckCode.TRASH_PENDING_UNEXPLAINED, relative, None, journal.operation_id)]
 
 
 def check_draft(
@@ -527,10 +564,22 @@ def check_draft(
     for required in (ROOT_PAGE, CONCLUSIONS_PAGE):
         candidate = resolved / required
         if not candidate.is_file() or candidate.is_symlink():
-            layout.append(_error("root.missing_file", None, None, "file", required.as_posix()))
+            layout.append(
+                _error(
+                    CheckCode.ROOT_MISSING_FILE,
+                    None,
+                    None,
+                    RootMissingKind.FILE.value,
+                    required.as_posix(),
+                )
+            )
     pages_dir = resolved / "pages"
     if not pages_dir.is_dir() or pages_dir.is_symlink():
-        layout.append(_error("root.missing_file", None, None, "directory", "pages"))
+        layout.append(
+            _error(
+                CheckCode.ROOT_MISSING_FILE, None, None, RootMissingKind.DIRECTORY.value, "pages"
+            )
+        )
 
     result = load_graph_tolerant(resolved, mode, allow_provisional_adopt=allow_provisional_adopt)
     format_issues = [issue for issue in result.issues if issue.code.startswith("format.")]
