@@ -427,3 +427,27 @@ def test_locate_status_value_span_missing_status_is_rejected() -> None:
     with pytest.raises(DraftError) as caught:
         locate_status_value_span(text)
     assert caught.value.code == CheckCode.PAGE_MISSING_STATUS.value
+
+
+def test_insert_navigation_before_conclusions_keeps_conclusions_last() -> None:
+    from draft.markdown import insert_navigation_before_conclusions
+
+    text = (
+        "# 根\n\n> 状态：`已关闭`\n\n## 子主题\n\n"
+        "- [甲](pages/a.md)\n- [结论汇总](conclusions.md)\n"
+    )
+    result = insert_navigation_before_conclusions(
+        text, "乙", "pages/b.md", conclusions_target=Path("conclusions.md")
+    )
+    assert result.index("- [乙](pages/b.md)") < result.index("- [结论汇总](conclusions.md)")
+    assert result.index("- [甲](pages/a.md)") < result.index("- [乙](pages/b.md)")
+
+
+def test_insert_navigation_before_conclusions_no_conclusion_returns_unchanged() -> None:
+    from draft.markdown import insert_navigation_before_conclusions
+
+    text = "# 根\n\n> 状态：`已关闭`\n\n## 子主题\n\n- [甲](pages/a.md)\n"
+    result = insert_navigation_before_conclusions(
+        text, "乙", "pages/b.md", conclusions_target=Path("conclusions.md")
+    )
+    assert result == text

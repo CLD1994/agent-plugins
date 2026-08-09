@@ -22,8 +22,11 @@ from draft.models import (
     TrashResult,
 )
 from draft.query import LocalPageSnapshot, SnapshotView
+from draft.vocabulary import StatusCode
 
 _EXIT_DOMAIN = 2
+
+_CREATE_STATUSES = (StatusCode.PENDING, StatusCode.PROPOSED)
 _EXIT_OPERATION = 3
 _EXIT_RUNTIME = 4
 
@@ -142,6 +145,23 @@ def build_parser() -> argparse.ArgumentParser:
         description="推进回收生命周期：到期项移交系统回收站，已到清理期限的项完成最终清理。",
     )
     recover.add_argument("root", metavar="ROOT", help="草稿根目录")
+
+    create = subparsers.add_parser(
+        "create",
+        parents=[shared],
+        help="创建叶子页面",
+        description="在 pages/ 下原子创建新叶子页面并更新父导航。",
+    )
+    create.add_argument("root", metavar="ROOT", help="草稿根目录")
+    create.add_argument("page", metavar="PAGE", help="新页面相对路径（如 pages/topic.md）")
+    create.add_argument("--title", required=True, help="页面标题（单行普通文本）")
+    create.add_argument(
+        "--status",
+        choices=tuple(member.value for member in StatusCode if member in _CREATE_STATUSES),
+        required=True,
+        help="初始状态",
+    )
+    _add_dry_run_args(create)
 
     generate_conclusions = subparsers.add_parser(
         "generate-conclusions",
@@ -618,6 +638,34 @@ def _dispatch(
         if result.warnings:
             human = f"{human}；警告：{_warning_text(result.warnings[0])}"
         return payload, human, 0
+    if command == "create":
+        from draft.page_create import create_page, plan_create_page
+        from draft.vocabulary import StatusCode
+
+        root = Path(cast(str, args.root))
+        page = _page_operand(root, cast(str, args.page))
+        title = cast(str, args.title)
+        status = StatusCode(cast(str, args.status))
+        if _is_dry_run(args):
+
+            def build(graph: DraftGraph) -> OperationPlan:
+                return plan_create_page(graph, page, title=title, status=status)
+
+            return _dry_run_write(
+                args,
+                root=root,
+                operation=DryRunOperation.CREATE,
+                build=build,
+            )
+        _reject_pagination_without_dry_run(args)
+        result = create_page(root, page, title=title, status=status)
+        payload: dict[str, object] = {
+            "result_type": ResultType.CREATE.value,
+            "path": page.as_posix(),
+            "status": status.value,
+            "changed_paths": [path.as_posix() for path in result.changed_paths],
+        }
+        return payload, f"已创建 {page}", 0
     if command == "generate-conclusions":
         from draft.conclusions import generate_conclusions
 

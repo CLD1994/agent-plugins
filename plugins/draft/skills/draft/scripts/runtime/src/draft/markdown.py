@@ -440,7 +440,10 @@ def _token_links(tokens: Sequence[Token]) -> list[_TokenLink]:
 def _labels_match(raw: str, rendered: str) -> bool:
     if raw == rendered or not raw or not rendered:
         return True
-    simplified = re.sub(r"[*_`~]", "", raw)
+    unescaped = _ESCAPED_PUNCT.sub(r"\1", raw)
+    if unescaped == rendered:
+        return True
+    simplified = re.sub(r"[*_`~]", "", unescaped)
     return simplified == rendered
 
 
@@ -785,3 +788,59 @@ def append_parent_navigation(text: str, title: str, destination: str) -> str:
             last_content = index
     lines.insert(last_content + 1, entry)
     return "\n".join(lines)
+
+
+def insert_navigation_before_conclusions(
+    text: str, title: str, destination: str, *, conclusions_target: Path
+) -> str:
+    """把新导航项插入到规范结论链接之前，使结论链接继续保持最后。
+
+    结论链接通过解析后的目标识别，不搜索 ``conclusions.md`` 文本。结论链接
+    必须是 ``## 子主题`` 小节中的最后一个列表项；找不到时不插入并保持原样。
+    """
+    escaped = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    entry = f"- [{escaped}]({destination})"
+    lines = text.split("\n")
+    heading_index = next(
+        (index for index, line in enumerate(lines) if _SUBTOPIC_HEADING.match(line)),
+        None,
+    )
+    if heading_index is None:
+        return text
+    section_end = len(lines)
+    for index in range(heading_index + 1, len(lines)):
+        if lines[index].startswith("#"):
+            section_end = index
+            break
+    # 找到小节中最后一个指向结论页的列表项行（从后往前，跳过空行）。
+    conclusion_line: int | None = None
+    for index in range(section_end - 1, heading_index, -1):
+        if not lines[index].strip():
+            continue
+        if not _LIST_ITEM.match(lines[index]):
+            break
+        parsed = parse_page(
+            Path("__nav__.md"),
+            f"# x\n\n> 状态：`待讨论`\n\n{lines[index]}\n",
+        )
+        if any(_resolves_to(link.destination, conclusions_target) for link in parsed.links):
+            conclusion_line = index
+            break
+    if conclusion_line is None:
+        return text
+    # 结论链接之后不允许再有非空行（必须是最后一个）。
+    for index in range(conclusion_line + 1, section_end):
+        if lines[index].strip():
+            return text
+    lines.insert(conclusion_line, entry)
+    return "\n".join(lines)
+
+
+def _resolves_to(destination: str, target: Path) -> bool:
+    from draft.graph import resolve_local_destination
+
+    try:
+        resolved, _anchor = resolve_local_destination(Path("index.md"), destination, Path("/"))
+    except DraftError:
+        return False
+    return resolved == target
