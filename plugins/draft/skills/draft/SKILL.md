@@ -44,6 +44,11 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 - trash 回收页面为保留态
 - restore 恢复被回收的页面
 - recover 推进回收生命周期
+- create 创建叶子页面
+- status set 修改页面状态
+- relation add / relation remove 修改正式关系
+- generate-conclusions 按需生成结论页
+- query page / links / backlinks / relations / status / recoverable 紧凑结构查询
 
 使用 `uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND --help` 来获得更多信息
 
@@ -79,10 +84,24 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 1. 读根索引和当前相关页面，判断受影响的最小页面集合；
 2. 只改普通内容 -> 直接编辑 Markdown（标题、正文、例子都自由）；
 3. 改名、移动、升格、降级、回收 -> 调用对应 CLI 命令，一次命令完成，不拆成手工步骤；
-4. 更新受影响的正式关系（父主题、依赖、取代/被取代、质疑/被质疑、产出）和 `conclusions.md`；
+4. 更新受影响的正式关系（父主题、依赖、取代/被取代、质疑/被质疑）和页面状态；
 5. 运行 `draft check ROOT`；有客观错误立即修复，有语义歧义立即询问用户。
 
-已确认的结论必须当日或当轮写入 `conclusions.md`；长条目在正式迁移到设计文档后可以压缩成紧凑条目（结论本身 + 草稿来源链接 + 正式文档链接），结论被正式取代时才移除。
+`conclusions.md` 是讨论结束时按需生成的机器产物，不实时维护。日常讨论中不手动写入
+或逐条改写结论列表；已确认页面由 `confirmed` 状态标记。只有讨论结束且与用户确认后
+才运行 `draft generate-conclusions ROOT` 生成。
+
+## 最终工作流
+
+讨论结束并与用户确认后：
+
+1. 运行 `draft generate-conclusions ROOT`，生成 `proposed` 状态的结论汇总页；
+2. 根据这份最新结论页产出设计文档；
+3. 产出完成后运行 `draft status set ROOT conclusions.md confirmed`，表示已据最新结论完成产出。
+
+查询选择：用 `draft query page ROOT PAGE` 做路由，用窄集合命令
+（`query links`/`backlinks`/`relations`/`status`/`recoverable`）获取事实，用
+`rg` 搜索正文。不要要求代理在普通编辑过程中维护结论页。
 
 ## 拆分时机
 

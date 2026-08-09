@@ -14,6 +14,7 @@ from draft.diagnostic_codes import (
     ReplacementStatusReason,
     RootMissingKind,
 )
+from draft.cli_results import DryRunOperation, ResultType
 from draft.vocabulary import RelationCode, StatusCode
 from tests.support.paths import RUNTIME_ROOT
 
@@ -332,3 +333,47 @@ def _vocabulary_literal_offenders() -> dict[str, list[tuple[int, str]]]:
 
 def test_status_and_relation_values_have_one_literal_owner() -> None:
     assert _vocabulary_literal_offenders() == {}
+
+
+# result_type 与预演 operation 值只由 cli_results.py 拥有。生产源码中的裸字面量
+# 会被视为第二份完整定义；测试最接近输出层的精确断言属于测试预期，不参与扫描。
+CLI_RESULTS_OWNER = RUNTIME_ROOT / "src/draft/cli_results.py"
+_CLI_RESULTS_VALUES: frozenset[str] = frozenset(
+    member.value
+    for enum in (ResultType, DryRunOperation)
+    for member in enum
+)
+
+
+def _cli_result_literal_offenders() -> dict[str, list[tuple[int, str]]]:
+    """只在生产模块里检测“第二份完整字面量集合”，不扫单个合法使用。
+
+    result_type/operation 值与子命令名、journal kind 等共享字符串空间，单个出现
+    可能是 argparse 名称或 kind 比较；只有 3 个及以上不同值出现在同一个容器
+    （元组/列表/集合）里，才可能构成第二份权威清单。
+    """
+    offenders: dict[str, list[tuple[int, str]]] = {}
+    for path in sorted((RUNTIME_ROOT / "src/draft").rglob("*.py")):
+        if path == CLI_RESULTS_OWNER:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        hits: list[tuple[int, str]] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+                continue
+            values = {
+                elt.value
+                for elt in node.elts
+                if isinstance(elt, ast.Constant)
+                and isinstance(elt.value, str)
+                and elt.value in _CLI_RESULTS_VALUES
+            }
+            if len(values) >= 3:
+                hits.append((node.lineno, ",".join(sorted(values))))
+        if hits:
+            offenders[path.relative_to(RUNTIME_ROOT).as_posix()] = hits
+    return offenders
+
+
+def test_result_type_and_operation_values_have_one_literal_owner() -> None:
+    assert _cli_result_literal_offenders() == {}

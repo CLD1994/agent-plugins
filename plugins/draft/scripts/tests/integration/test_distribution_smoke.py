@@ -476,10 +476,10 @@ def test_runtime_distribution_online_then_offline(distribution_copy: Path, tmp_p
             assert str(REPO_ROOT) not in output, f"repo path leaked: {output}"
             assert str(PLUGIN_ROOT) not in output, f"plugin path leaked: {output}"
 
-    # Draft 业务文件只在各自所选 root
+    # Draft 业务文件只在各自所选 root；conclusions.md 改为按需生成，init 不再创建。
     for root in (online_root, offline_root):
         assert (root / "index.md").exists()
-        assert (root / "conclusions.md").exists()
+        assert not (root / "conclusions.md").exists()
         assert (root / ".draft").exists()
 
     # uv 缓存中没有 bindings/、hook.jsonl、.draft/
