@@ -6,6 +6,7 @@ import pytest
 
 import draft.lifecycle as lifecycle_module
 from draft.checker import check_draft
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.lifecycle import adopt, initialize
 from tests.integration.support import add_valid_child, build_valid_candidate
@@ -330,12 +331,12 @@ def test_invalid_provisional_marker_is_reported_not_ignored(tmp_path: Path) -> N
 
     # 损坏 JSON。
     provisional.write_text("corrupt\n", encoding="utf-8")
-    with pytest.raises(DraftError, match="format.invalid"):
+    with pytest.raises(DraftError, match=CheckCode.FORMAT_INVALID.value):
         check_draft(root)
 
     # 非临时格式（正式形状的标记出现在临时路径）。
     provisional.write_bytes(FINAL_MARKER_BYTES)
-    with pytest.raises(DraftError, match="format.invalid"):
+    with pytest.raises(DraftError, match=CheckCode.FORMAT_INVALID.value):
         check_draft(root)
 
     # adopt 的已提交待清理路径仍能耐久清掉残留临时标记。
@@ -353,9 +354,9 @@ def test_provisional_marker_path_directory_is_rejected(tmp_path: Path) -> None:
     initialize(root)
     (root / ".draft/draft.provisional.json").mkdir()
 
-    with pytest.raises(DraftError, match="format.invalid"):
+    with pytest.raises(DraftError, match=CheckCode.FORMAT_INVALID.value):
         check_draft(root)
-    with pytest.raises(DraftError, match="format.invalid"):
+    with pytest.raises(DraftError, match=CheckCode.FORMAT_INVALID.value):
         recover_draft(root)
 
 
@@ -368,7 +369,7 @@ def test_symlinked_provisional_marker_is_rejected(tmp_path: Path) -> None:
     provisional = root / ".draft/draft.provisional.json"
     provisional.symlink_to(external)
 
-    with pytest.raises(DraftError, match="path.symlink_escape"):
+    with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
         check_draft(root)
     # 外部目标内容不被读取改动。
     assert external.read_bytes() == FINAL_MARKER_BYTES

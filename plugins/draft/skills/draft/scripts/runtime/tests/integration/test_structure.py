@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from draft.checker import check_draft
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.operations import recover
 from draft.structure import collapse_hub, move_page, promote_page
@@ -601,7 +602,7 @@ def test_corrupt_due_package_blocks_new_structure_write(
     )
     before = (root / "pages/a.md").read_bytes()
 
-    with pytest.raises(DraftError, match="trash.package_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
         move_page(root, Path("pages/a.md"), Path("pages/a2.md"))
 
     assert (root / "pages/a.md").read_bytes() == before

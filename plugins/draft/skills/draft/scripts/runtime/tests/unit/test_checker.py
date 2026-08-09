@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from draft.checker import check_graph
+from draft.diagnostic_codes import CheckCode, ReplacementStatusReason, WrongOutputReason
 from draft.graph import ROOT_PAGE, DraftGraph
 from draft.models import (
     CheckIssue,
@@ -132,12 +133,12 @@ def test_root_page_declaring_parent_is_rejected() -> None:
         },
         relations={RelationLabel.PARENT: ((ROOT_PAGE, A, 1),)},
     )
-    assert _issue("parent.root_declared", ROOT_PAGE, 1) in check_graph(graph).issues
+    assert _issue(CheckCode.PARENT_ROOT_DECLARED.value, ROOT_PAGE, 1) in check_graph(graph).issues
 
 
 def test_non_root_page_without_parent_is_missing() -> None:
     graph = _graph(pages={ROOT_PAGE: _page(ROOT_PAGE), A: _page(A)})
-    assert _issue("parent.missing", A) in check_graph(graph).issues
+    assert _issue(CheckCode.PARENT_MISSING.value, A) in check_graph(graph).issues
 
 
 def test_non_root_page_with_multiple_parents_is_rejected() -> None:
@@ -154,7 +155,7 @@ def test_non_root_page_with_multiple_parents_is_rejected() -> None:
         },
         relations={RelationLabel.PARENT: ((A, ROOT_PAGE, 1), (A, B, 2))},
     )
-    assert _issue("parent.multiple", A, 2) in check_graph(graph).issues
+    assert _issue(CheckCode.PARENT_MULTIPLE.value, A, 2) in check_graph(graph).issues
 
 
 def test_declared_parent_mismatching_physical_parent_is_rejected() -> None:
@@ -174,7 +175,8 @@ def test_declared_parent_mismatching_physical_parent_is_rejected() -> None:
         relations={RelationLabel.PARENT: ((A, B, 3),)},
     )
     assert (
-        _issue("layout.parent_mismatch", A, 3, str(B), str(ROOT_PAGE)) in check_graph(graph).issues
+        _issue(CheckCode.LAYOUT_PARENT_MISMATCH.value, A, 3, str(B), str(ROOT_PAGE))
+        in check_graph(graph).issues
     )
 
 
@@ -191,7 +193,7 @@ def test_parent_cycle_is_reported_with_canonical_rotation() -> None:
         },
     )
     issues = check_graph(graph).issues
-    cycle = next(i for i in issues if i.code == "parent.cycle")
+    cycle = next(i for i in issues if i.code == CheckCode.PARENT_CYCLE.value)
     # 环规范化为从最小节点开始的闭合路径。
     assert cycle.path == A
     assert cycle.details == ("pages/a.md", "pages/b.md", "pages/a.md")
@@ -210,7 +212,7 @@ def test_unreachable_page_is_reported() -> None:
             RelationLabel.PARENT: ((A, ROOT_PAGE, 1), (B, ROOT_PAGE, 1)),
         },
     )
-    assert _issue("parent.unreachable", B) in check_graph(graph).issues
+    assert _issue(CheckCode.PARENT_UNREACHABLE.value, B) in check_graph(graph).issues
 
 
 def test_parent_navigation_missing_when_parent_does_not_link_child() -> None:
@@ -223,7 +225,10 @@ def test_parent_navigation_missing_when_parent_does_not_link_child() -> None:
         children={ROOT_PAGE: (A,)},
         relations={RelationLabel.PARENT: ((A, ROOT_PAGE, 1),)},
     )
-    assert _issue("parent.navigation_missing", ROOT_PAGE, None, str(A)) in check_graph(graph).issues
+    assert (
+        _issue(CheckCode.PARENT_NAVIGATION_MISSING.value, ROOT_PAGE, None, str(A))
+        in check_graph(graph).issues
+    )
 
 
 def test_empty_hub_index_is_reported() -> None:
@@ -239,7 +244,7 @@ def test_empty_hub_index_is_reported() -> None:
         children={ROOT_PAGE: (SUB_INDEX,)},
         relations={RelationLabel.PARENT: ((SUB_INDEX, ROOT_PAGE, 1),)},
     )
-    assert _issue("hub.empty", SUB_INDEX) in check_graph(graph).issues
+    assert _issue(CheckCode.HUB_EMPTY.value, SUB_INDEX) in check_graph(graph).issues
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +274,7 @@ def test_duplicate_non_parent_relation_is_reported() -> None:
         },
     )
     assert (
-        _issue("relation.duplicate", A, 3, RelationLabel.DEPENDS_ON.value, str(B))
+        _issue(CheckCode.RELATION_DUPLICATE.value, A, 3, RelationLabel.DEPENDS_ON.value, str(B))
         in check_graph(graph).issues
     )
 
@@ -292,7 +297,7 @@ def test_dependency_self_is_rejected() -> None:
             RelationLabel.DEPENDS_ON: ((A, A, 4),),
         },
     )
-    assert _issue("dependency.self", A, 4) in check_graph(graph).issues
+    assert _issue(CheckCode.DEPENDENCY_SELF.value, A, 4) in check_graph(graph).issues
 
 
 def test_dependency_cycle_is_reported() -> None:
@@ -310,7 +315,7 @@ def test_dependency_cycle_is_reported() -> None:
         },
     )
     issues = check_graph(graph).issues
-    cycle = next(i for i in issues if i.code == "dependency.cycle")
+    cycle = next(i for i in issues if i.code == CheckCode.DEPENDENCY_CYCLE.value)
     assert cycle.path == A
     assert cycle.details == ("pages/a.md", "pages/b.md", "pages/a.md")
 
@@ -335,7 +340,13 @@ def test_replacement_pair_missing_when_reverse_absent() -> None:
         },
     )
     assert (
-        _issue("replacement.pair_missing", A, 2, str(B), RelationLabel.SUPERSEDED_BY.value)
+        _issue(
+            CheckCode.REPLACEMENT_PAIR_MISSING.value,
+            A,
+            2,
+            str(B),
+            RelationLabel.SUPERSEDED_BY.value,
+        )
         in check_graph(graph).issues
     )
 
@@ -363,7 +374,12 @@ def test_replacement_status_mismatch_relation_without_status() -> None:
         },
     )
     assert (
-        _issue("replacement.status_mismatch", A, 5, "relation_requires_status")
+        _issue(
+            CheckCode.REPLACEMENT_STATUS_MISMATCH.value,
+            A,
+            5,
+            ReplacementStatusReason.RELATION_REQUIRES_STATUS.value,
+        )
         in check_graph(graph).issues
     )
 
@@ -383,7 +399,12 @@ def test_replacement_status_mismatch_status_without_relation() -> None:
         relations={RelationLabel.PARENT: ((A, ROOT_PAGE, 1),)},
     )
     assert (
-        _issue("replacement.status_mismatch", A, None, "status_requires_relation")
+        _issue(
+            CheckCode.REPLACEMENT_STATUS_MISMATCH.value,
+            A,
+            None,
+            ReplacementStatusReason.STATUS_REQUIRES_RELATION.value,
+        )
         in check_graph(graph).issues
     )
 
@@ -408,7 +429,9 @@ def test_challenge_pair_missing_when_reverse_absent() -> None:
         },
     )
     assert (
-        _issue("challenge.pair_missing", A, 2, str(B), RelationLabel.CHALLENGED_BY.value)
+        _issue(
+            CheckCode.CHALLENGE_PAIR_MISSING.value, A, 2, str(B), RelationLabel.CHALLENGED_BY.value
+        )
         in check_graph(graph).issues
     )
 
@@ -432,7 +455,7 @@ def test_confirmed_page_without_output_is_missing() -> None:
         children={ROOT_PAGE: (A,)},
         relations={RelationLabel.PARENT: ((A, ROOT_PAGE, 1),)},
     )
-    assert _issue("output.missing", A) in check_graph(graph).issues
+    assert _issue(CheckCode.OUTPUT_MISSING.value, A) in check_graph(graph).issues
 
 
 def test_non_confirmed_page_with_output_relation_is_forbidden() -> None:
@@ -460,7 +483,7 @@ def test_non_confirmed_page_with_output_relation_is_forbidden() -> None:
             RelationLabel.OUTPUT: ((A, CONCLUSIONS, 6),),
         },
     )
-    assert _issue("output.forbidden", A, 6) in check_graph(graph).issues
+    assert _issue(CheckCode.OUTPUT_FORBIDDEN.value, A, 6) in check_graph(graph).issues
 
 
 def test_confirmed_page_with_wrong_output_target_is_rejected() -> None:
@@ -485,7 +508,14 @@ def test_confirmed_page_with_wrong_output_target_is_rejected() -> None:
         },
     )
     assert (
-        _issue("output.wrong_target", A, 7, "not_conclusions", "b.md") in check_graph(graph).issues
+        _issue(
+            CheckCode.OUTPUT_WRONG_TARGET.value,
+            A,
+            7,
+            WrongOutputReason.NOT_CONCLUSIONS.value,
+            "b.md",
+        )
+        in check_graph(graph).issues
     )
 
 
@@ -515,7 +545,10 @@ def test_confirmed_output_without_backlink_is_rejected() -> None:
             RelationLabel.OUTPUT: ((A, CONCLUSIONS, 6),),
         },
     )
-    assert _issue("output.backlink_missing", CONCLUSIONS, None, str(A)) in check_graph(graph).issues
+    assert (
+        _issue(CheckCode.OUTPUT_BACKLINK_MISSING.value, CONCLUSIONS, None, str(A))
+        in check_graph(graph).issues
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +574,7 @@ def test_oversized_page_is_a_review_not_an_error() -> None:
         relations={RelationLabel.PARENT: ((A, ROOT_PAGE, 1),)},
     )
     report = check_graph(graph)
-    review = next(i for i in report.issues if i.code == "page.capacity")
+    review = next(i for i in report.issues if i.code == CheckCode.PAGE_CAPACITY.value)
     assert review.severity is IssueSeverity.REVIEW
     assert review.path == A
 
@@ -582,6 +615,6 @@ def test_two_independent_errors_preserve_pass_order_and_sort() -> None:
     )
     # a.md 已确认但无产出声明 -> output.missing（产出 pass 在依赖 pass 之后）
     assert check_graph(graph).issues == (
-        _issue("dependency.self", A, 5),
-        _issue("output.missing", A),
+        _issue(CheckCode.DEPENDENCY_SELF.value, A, 5),
+        _issue(CheckCode.OUTPUT_MISSING.value, A),
     )

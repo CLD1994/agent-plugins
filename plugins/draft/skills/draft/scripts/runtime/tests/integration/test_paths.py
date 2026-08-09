@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.paths import resolve_draft_root, resolve_page_operand
 
@@ -22,7 +23,7 @@ def test_page_operand_rejects_symlink_escape(tmp_path: Path) -> None:
     outside.mkdir()
     (root / "pages").symlink_to(outside, target_is_directory=True)
 
-    with pytest.raises(DraftError, match="path.symlink_escape"):
+    with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
         resolve_page_operand(root, "pages/a.md")
 
 

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from draft.diagnostic_codes import CheckCode
 from draft.models import OperationPhase
 from draft.operations import TrashDeadlines
 from draft.trash import trash_page
@@ -390,7 +391,7 @@ def test_package_with_extra_symlink_entry_is_rejected(
     (package_dir / "extra").symlink_to(external, target_is_directory=True)
     journal = read_journal(_journal_path(root, pending.operation_id))
 
-    with pytest.raises(DraftError, match="trash.package_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
         load_verified_package(root, journal)
 
 
@@ -411,7 +412,7 @@ def test_recovery_scan_rejects_symlinked_operations_dir(
     (root / ".draft/operations").symlink_to(external, target_is_directory=True)
     before = (external / "journal.json").read_bytes()
 
-    with pytest.raises(DraftError, match="path.symlink_escape"):
+    with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
         recover_draft(root)
 
     # 外部目录内容不得被读取或改动。
@@ -439,16 +440,16 @@ def test_sub_operation_dir_symlink_is_reported_not_skipped(
     external_journal = (target / pending.operation_id / "journal.json").read_bytes()
 
     # 推进扫描（_iter_trash_journals）必须报错，不静默跳过。
-    with pytest.raises(DraftError, match="path.symlink_escape"):
+    with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
         advance_trash_lifecycle(root, now=EXPIRY, handoff=lambda p: None)
     # 恢复扫描（_handle_no_lock_dir）必须把链接条目报为批量错误，而非静默跳过。
     report = recover_draft(root)
     assert report.error is not None
-    assert report.error.code == "path.symlink_escape"
+    assert report.error.code == CheckCode.PATH_SYMLINK_ESCAPE.value
     assert report.error.operation_id == pending.operation_id
     # 检查器必须报告 path.symlink_escape 问题，而非静默跳过。
     report = check_draft(root)
-    assert any(issue.code == "path.symlink_escape" for issue in report.errors)
+    assert any(issue.code == CheckCode.PATH_SYMLINK_ESCAPE.value for issue in report.errors)
     # 外部内容绝不被读取或改动。
     assert (target / pending.operation_id / "journal.json").read_bytes() == external_journal
 
@@ -479,7 +480,7 @@ def test_terminal_cleanup_rejects_symlinked_outgoing(
     outgoing.symlink_to(external, target_is_directory=True)
     external_payload = (external / pending.operation_id / "package.json").read_bytes()
 
-    with pytest.raises(DraftError, match="path.symlink_escape"):
+    with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
         recover_draft(root)
 
     # 外部目录绝不被清理：外部包内容保持完整。
@@ -558,6 +559,6 @@ def test_orphan_restore_scan_stops_on_unreadable_sibling_journal(
     # 停止并报错；R 保持 allocating，绝不写 rolled_back；T 保持 trash_retained。
     assert report.error is not None
     assert report.error.operation_id == r_id
-    assert report.error.code == "operation.journal_corrupt"
+    assert report.error.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
     assert (r_dir / "journal.json").read_bytes() == r_bytes_before
     assert _phase(root, pending.operation_id) == "trash_retained"

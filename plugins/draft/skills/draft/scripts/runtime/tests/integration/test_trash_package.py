@@ -9,6 +9,7 @@ from typing import IO, Any, cast
 
 import pytest
 
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import TrashResult
 from draft.operations import read_journal
@@ -167,7 +168,7 @@ def test_package_rejects_absolute_payload_before_read(
     _anchor_manifest_to_journal(root, pending.operation_id)
     before = _package_snapshot(package_dir)
 
-    with pytest.raises(DraftError, match="trash.package_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
         _verify_package(root, pending.operation_id)
 
     assert sentinel.hits == []
@@ -190,7 +191,7 @@ def test_package_rejects_parent_escape_before_read(
     _anchor_manifest_to_journal(root, pending.operation_id)
     before = _package_snapshot(package_dir)
 
-    with pytest.raises(DraftError, match="trash.package_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
         _verify_package(root, pending.operation_id)
 
     assert sentinel.hits == []
@@ -212,7 +213,7 @@ def test_package_rejects_self_reported_hash_not_anchored_to_trash_journal(
     )
     before = _package_snapshot(package_dir)
 
-    with pytest.raises(DraftError, match="trash.package_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
         _verify_package(root, pending.operation_id)
 
     assert _package_snapshot(package_dir) == before
@@ -232,7 +233,7 @@ def test_package_rejects_operation_id_or_symlink_mismatch(
     # 情形一：包目录与 T.operation_id 不匹配（权威目录缺失），必须先失败。
     moved = package_dir.with_name("b" * 32)
     package_dir.rename(moved)
-    with pytest.raises(DraftError, match="trash.package_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
         _verify_package(root, pending.operation_id)
     assert _package_snapshot(moved) == original
     moved.rename(package_dir)
@@ -245,7 +246,7 @@ def test_package_rejects_operation_id_or_symlink_mismatch(
     payload.unlink()
     payload.symlink_to(external)
 
-    with pytest.raises(DraftError, match="path.symlink_escape"):
+    with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
         _verify_package(root, pending.operation_id)
 
     assert sentinel.hits == []

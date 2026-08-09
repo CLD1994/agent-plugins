@@ -7,6 +7,7 @@ import pytest
 
 from draft import __version__
 from draft.cli import main
+from draft.diagnostic_codes import CheckCode
 from tests.integration.support import build_valid_candidate, snapshot_tree
 
 
@@ -127,7 +128,7 @@ def test_candidate_check_rejects_registered_root_without_mutation(
     assert payload["ok"] is False
     assert payload["result_type"] == "check"
     assert [issue["code"] for issue in as_dicts(payload["errors"])] == [
-        "candidate.already_registered"
+        CheckCode.CANDIDATE_ALREADY_REGISTERED.value
     ]
     assert snapshot_tree(registered_draft) == before
 
@@ -197,7 +198,7 @@ def test_candidate_check_rejects_internal_state_without_mutation(
         assert code == 1, variant
         assert payload["ok"] is False
         codes = [issue["code"] for issue in as_dicts(payload["errors"])]
-        assert codes == ["candidate.internal_state"], variant
+        assert codes == [CheckCode.CANDIDATE_INTERNAL_STATE.value], variant
         assert snapshot_tree(root) == before, variant
 
 
@@ -221,7 +222,7 @@ def test_check_clean_and_errors(tmp_path: Path, capsys: pytest.CaptureFixture[st
     assert payload["ok"] is False
     error_dicts = as_dicts(payload["errors"])
     codes = {str(issue["code"]) for issue in error_dicts}
-    assert "output.missing" in codes
+    assert CheckCode.OUTPUT_MISSING.value in codes
     first = error_dicts[0]
     assert "path" in first
     assert "line" in first
@@ -304,7 +305,9 @@ def test_check_plain_and_json_agree_on_exit_code_and_raw_details(
     code, payload = run_json(["check", str(root), "--json"], capsys)
     assert code == 1
     link_issues = [
-        issue for issue in as_dicts(payload["errors"]) if issue["code"] == "link.missing"
+        issue
+        for issue in as_dicts(payload["errors"])
+        if issue["code"] == CheckCode.LINK_MISSING.value
     ]
     assert link_issues
     assert link_issues[0]["details"] == [literal_target, normalized_target]
@@ -568,7 +571,7 @@ def test_restore_cli_unknown_operation_is_exit_three(
     assert payload["result_type"] == "error"
     error = payload["error"]
     assert isinstance(error, dict)
-    assert error["code"] == "operation.journal_corrupt"
+    assert error["code"] == CheckCode.OPERATION_JOURNAL_CORRUPT.value
 
 
 def test_recover_nothing_to_do(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

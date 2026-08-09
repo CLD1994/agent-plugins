@@ -10,6 +10,7 @@ from pytest_mock import MockerFixture
 
 import draft.cli as cli
 from draft import __version__
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import (
     CheckIssue,
@@ -286,7 +287,7 @@ def test_dispatch_recover_error_returns_failure_payload_and_exit_code(
     args = cli.build_parser().parse_args(["recover", "/draft"])
     failure = LifecycleFailure(
         operation_id="c" * 32,
-        code="operation.inconsistent_state",
+        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
         paths=(Path(".draft/operations/cccccccccccccccccccccccccccccccc/journal.json"),),
         details=("inconsistent",),
     )
@@ -299,7 +300,7 @@ def test_dispatch_recover_error_returns_failure_payload_and_exit_code(
     error = payload["error"]
     assert isinstance(error, dict)
     assert error["operation_id"] == "c" * 32
-    assert error["code"] == "operation.inconsistent_state"
+    assert error["code"] == CheckCode.OPERATION_INCONSISTENT_STATE.value
     assert payload["stopped_at_operation_id"] == "c" * 32
     assert exit_code == 3
     _assert_human_result(human, failure.code, failure.operation_id)
@@ -398,7 +399,9 @@ def test_render_check_json_uses_structured_payload_without_human_renderer(
     mocker: MockerFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    issue = CheckIssue("output.missing", IssueSeverity.ERROR, Path("pages/a.md"), None)
+    issue = CheckIssue(
+        CheckCode.OUTPUT_MISSING.value, IssueSeverity.ERROR, Path("pages/a.md"), None
+    )
     render_issue = mocker.patch.object(cli, "render_issue", autospec=True)
     exit_code = cli._render_check(  # pyright: ignore[reportPrivateUsage]
         CheckReport(issues=(issue,)), json_mode=True
@@ -410,7 +413,7 @@ def test_render_check_json_uses_structured_payload_without_human_renderer(
         "result_type": "check",
         "errors": [
             {
-                "code": "output.missing",
+                "code": CheckCode.OUTPUT_MISSING.value,
                 "severity": "error",
                 "path": "pages/a.md",
                 "line": None,
@@ -483,7 +486,7 @@ def test_trash_payload_maps_none_deadlines_to_null() -> None:
 
 
 def test_exit_for_error_returns_operation_exit_for_operation_codes() -> None:
-    assert cli._exit_for_error(DraftError("operation.recovery_required")) == 3  # pyright: ignore[reportPrivateUsage]  # 验证 operation.* 错误映射到操作退出码
+    assert cli._exit_for_error(DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value)) == 3  # pyright: ignore[reportPrivateUsage]  # 验证 operation.* 错误映射到操作退出码
 
 
 def test_exit_for_error_returns_operation_exit_for_adopt_recovery_required() -> None:
@@ -523,7 +526,11 @@ def test_main_check_with_errors_returns_one(
     mocker: MockerFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
     report = CheckReport(
-        issues=(CheckIssue("output.missing", IssueSeverity.ERROR, Path("pages/a.md"), None),)
+        issues=(
+            CheckIssue(
+                CheckCode.OUTPUT_MISSING.value, IssueSeverity.ERROR, Path("pages/a.md"), None
+            ),
+        )
     )
     check_draft = mocker.patch("draft.checker.check_draft", autospec=True)
     check_draft.return_value = report

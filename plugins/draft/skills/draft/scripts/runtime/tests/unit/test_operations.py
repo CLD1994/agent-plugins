@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import MutationKind, OperationPhase
 from draft.operations import (
@@ -72,7 +73,7 @@ def test_trash_deadlines_parse_rejects_missing_field() -> None:
         "purge_eligible_at": "2026-09-12T12:00:00Z",
         # next_handoff_attempt_at 缺失
     }
-    with pytest.raises(DraftError, match="operation.journal_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
         TrashDeadlines.parse(metadata)
 
 
@@ -83,7 +84,7 @@ def test_trash_deadlines_parse_rejects_naive_datetime() -> None:
         "purge_eligible_at": "2026-09-12T12:00:00Z",
         "next_handoff_attempt_at": "2026-08-13T12:00:00Z",
     }
-    with pytest.raises(DraftError, match="operation.journal_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
         TrashDeadlines.parse(metadata)
 
 
@@ -94,7 +95,7 @@ def test_trash_deadlines_parse_rejects_non_utc_datetime() -> None:
         "purge_eligible_at": "2026-09-12T12:00:00Z",
         "next_handoff_attempt_at": "2026-08-13T12:00:00Z",
     }
-    with pytest.raises(DraftError, match="operation.journal_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
         TrashDeadlines.parse(metadata)
 
 
@@ -105,7 +106,7 @@ def test_trash_deadlines_parse_rejects_inconsistent_restore_expires_at() -> None
         "purge_eligible_at": "2026-09-12T12:00:00Z",
         "next_handoff_attempt_at": "2026-08-13T12:00:00Z",
     }
-    with pytest.raises(DraftError, match="operation.journal_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
         TrashDeadlines.parse(metadata)
 
 
@@ -116,7 +117,7 @@ def test_trash_deadlines_parse_rejects_inconsistent_purge_eligible_at() -> None:
         "purge_eligible_at": "2026-10-12T12:00:00Z",
         "next_handoff_attempt_at": "2026-08-13T12:00:00Z",
     }
-    with pytest.raises(DraftError, match="operation.journal_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
         TrashDeadlines.parse(metadata)
 
 
@@ -127,7 +128,7 @@ def test_trash_deadlines_parse_rejects_next_attempt_before_restore() -> None:
         "purge_eligible_at": "2026-09-12T12:00:00Z",
         "next_handoff_attempt_at": "2026-08-12T12:00:00Z",
     }
-    with pytest.raises(DraftError, match="operation.journal_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
         TrashDeadlines.parse(metadata)
 
 
@@ -202,7 +203,7 @@ def test_validate_operation_id_accepts_32_hex_lowercase() -> None:
 
 @pytest.mark.parametrize("bad", ["", "a" * 31, "a" * 33, "A" * 32, "g" * 32, "../x", "/etc/passwd"])
 def test_validate_operation_id_rejects_invalid(bad: str) -> None:
-    with pytest.raises(DraftError, match="operation.journal_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
         validate_operation_id(bad)
 
 

@@ -2,6 +2,12 @@ from pathlib import Path
 
 import pytest
 
+from draft.diagnostic_codes import (
+    CheckCode,
+    InvalidRelationReason,
+    InvalidStatusReason,
+    ParseErrorReason,
+)
 from draft.errors import DraftError
 from draft.markdown import (
     append_parent_navigation,
@@ -50,7 +56,7 @@ def test_parse_page_reads_only_the_top_machine_block() -> None:
 def test_parse_page_rejects_unknown_machine_label() -> None:
     text = VALID_PAGE.replace("> 依赖：", "> 状态依据：")
 
-    with pytest.raises(DraftError, match="page.unknown_label"):
+    with pytest.raises(DraftError, match=CheckCode.PAGE_UNKNOWN_LABEL.value):
         parse_page(Path("pages/request.md"), text)
 
 
@@ -85,40 +91,40 @@ def test_exact_five_status_prefixes(prefix: str) -> None:
 
 
 def test_status_explanation_must_be_nonempty_after_colon() -> None:
-    with pytest.raises(DraftError, match="page.invalid_status"):
+    with pytest.raises(DraftError, match=CheckCode.PAGE_INVALID_STATUS.value):
         parse_page(Path("pages/x.md"), make_page("`已关闭：`"))
 
 
 def test_unknown_status_prefix_rejected() -> None:
-    with pytest.raises(DraftError, match="page.invalid_status"):
+    with pytest.raises(DraftError, match=CheckCode.PAGE_INVALID_STATUS.value):
         parse_page(Path("pages/x.md"), make_page("`进行中`"))
 
 
 def test_duplicate_status_rejected() -> None:
     text = "# 标题\n\n> 状态：`待讨论`\n>\n> 状态：`已确认`\n>\n> 父主题：[根](../index.md)\n\nx\n"
 
-    with pytest.raises(DraftError, match="page.duplicate_status"):
+    with pytest.raises(DraftError, match=CheckCode.PAGE_DUPLICATE_STATUS.value):
         parse_page(Path("pages/x.md"), text)
 
 
 def test_missing_status_rejected() -> None:
     text = "# 标题\n\n> 父主题：[根](../index.md)\n\n正文。\n"
 
-    with pytest.raises(DraftError, match="page.missing_status"):
+    with pytest.raises(DraftError, match=CheckCode.PAGE_MISSING_STATUS.value):
         parse_page(Path("pages/x.md"), text)
 
 
 def test_missing_level_one_title_rejected() -> None:
     text = "正文先行。\n\n> 状态：`待讨论`\n"
 
-    with pytest.raises(DraftError, match="page.missing_title"):
+    with pytest.raises(DraftError, match=CheckCode.PAGE_MISSING_TITLE.value):
         parse_page(Path("pages/x.md"), text)
 
 
 def test_machine_block_after_body_text_rejected() -> None:
     text = "# 标题\n\n正文段落。\n\n> 状态：`待讨论`\n>\n> 父主题：[根](../index.md)\n"
 
-    with pytest.raises(DraftError, match="page.missing_machine_block"):
+    with pytest.raises(DraftError, match=CheckCode.PAGE_MISSING_MACHINE_BLOCK.value):
         parse_page(Path("pages/x.md"), text)
 
 
@@ -127,21 +133,21 @@ def test_relation_requires_exactly_one_link() -> None:
         "> 父主题：[根](../index.md)",
         "> 依赖：[甲](a.md) 与 [乙](b.md)",
     )
-    with pytest.raises(DraftError, match="page.invalid_relation"):
+    with pytest.raises(DraftError, match=CheckCode.PAGE_INVALID_RELATION.value):
         parse_page(Path("pages/x.md"), two_links)
 
     image_link = make_page("`待讨论`").replace(
         "> 父主题：[根](../index.md)",
         "> 依赖：![图](a.md)",
     )
-    with pytest.raises(DraftError, match="page.invalid_relation"):
+    with pytest.raises(DraftError, match=CheckCode.PAGE_INVALID_RELATION.value):
         parse_page(Path("pages/x.md"), image_link)
 
     no_link = make_page("`待讨论`").replace(
         "> 父主题：[根](../index.md)",
         "> 依赖：另一页",
     )
-    with pytest.raises(DraftError, match="page.invalid_relation"):
+    with pytest.raises(DraftError, match=CheckCode.PAGE_INVALID_RELATION.value):
         parse_page(Path("pages/x.md"), no_link)
 
 
@@ -291,7 +297,7 @@ def test_unknown_label_preserves_only_the_label_operand() -> None:
     text = VALID_PAGE.replace("> 依赖：", "> 状态依据：")
     with pytest.raises(DraftError) as caught:
         parse_page(Path("pages/request.md"), text)
-    assert caught.value.code == "page.unknown_label"
+    assert caught.value.code == CheckCode.PAGE_UNKNOWN_LABEL.value
     assert caught.value.line == 7
     assert caught.value.details == ("状态依据",)
 
@@ -299,15 +305,15 @@ def test_unknown_label_preserves_only_the_label_operand() -> None:
 @pytest.mark.parametrize(
     ("value", "details"),
     [
-        ("已关闭", ("not_single_code_span",)),
-        ("`已关闭：`", ("empty_explanation",)),
-        ("`进行中`", ("unknown_prefix", "进行中")),
+        ("已关闭", (InvalidStatusReason.NOT_SINGLE_CODE_SPAN.value,)),
+        ("`已关闭：`", (InvalidStatusReason.EMPTY_EXPLANATION.value,)),
+        ("`进行中`", (InvalidStatusReason.UNKNOWN_PREFIX.value, "进行中")),
     ],
 )
 def test_invalid_status_uses_stable_reason(value: str, details: tuple[str, ...]) -> None:
     with pytest.raises(DraftError) as caught:
         parse_page(Path("pages/x.md"), make_page(value))
-    assert caught.value.code == "page.invalid_status"
+    assert caught.value.code == CheckCode.PAGE_INVALID_STATUS.value
     assert caught.value.details == details
 
 
@@ -317,8 +323,8 @@ def test_invalid_relation_cardinality_branch_keeps_label() -> None:
     )
     with pytest.raises(DraftError) as caught:
         parse_page(Path("pages/x.md"), text)
-    assert caught.value.code == "page.invalid_relation"
-    assert caught.value.details == ("link_cardinality_or_image", "依赖")
+    assert caught.value.code == CheckCode.PAGE_INVALID_RELATION.value
+    assert caught.value.details == (InvalidRelationReason.LINK_CARDINALITY_OR_IMAGE.value, "依赖")
 
 
 def test_invalid_relation_extra_content_branch_keeps_label() -> None:
@@ -327,15 +333,15 @@ def test_invalid_relation_extra_content_branch_keeps_label() -> None:
     )
     with pytest.raises(DraftError) as caught:
         parse_page(Path("pages/x.md"), text)
-    assert caught.value.code == "page.invalid_relation"
-    assert caught.value.details == ("extra_content", "父主题")
+    assert caught.value.code == CheckCode.PAGE_INVALID_RELATION.value
+    assert caught.value.details == (InvalidRelationReason.EXTRA_CONTENT.value, "父主题")
 
 
 def test_duplicate_status_uses_empty_details_with_line() -> None:
     text = "# 标题\n\n> 状态：`待讨论`\n>\n> 状态：`已确认`\n>\n> 父主题：[根](../index.md)\n\nx\n"
     with pytest.raises(DraftError) as caught:
         parse_page(Path("pages/x.md"), text)
-    assert caught.value.code == "page.duplicate_status"
+    assert caught.value.code == CheckCode.PAGE_DUPLICATE_STATUS.value
     assert caught.value.details == ()
     assert caught.value.line == 5
 
@@ -344,8 +350,8 @@ def test_machine_block_lazy_continuation_is_a_parse_error() -> None:
     text = "# 标题\n\n> 状态：`待讨论`\n普通文本\n>\n> 父主题：[根](../index.md)\n"
     with pytest.raises(DraftError) as caught:
         parse_page(Path("pages/x.md"), text)
-    assert caught.value.code == "page.parse_error"
-    assert caught.value.details == ("lazy_continuation",)
+    assert caught.value.code == CheckCode.PAGE_PARSE_ERROR.value
+    assert caught.value.details == (ParseErrorReason.LAZY_CONTINUATION.value,)
     assert caught.value.line == 4
 
 
@@ -408,4 +414,4 @@ def test_locate_status_value_span_missing_status_is_rejected() -> None:
     text = "# 标题\n\n> 父主题：[根](../index.md)\n"
     with pytest.raises(DraftError) as caught:
         locate_status_value_span(text)
-    assert caught.value.code == "page.missing_status"
+    assert caught.value.code == CheckCode.PAGE_MISSING_STATUS.value

@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import FileMutation, MutationKind, OperationPlan
 from draft.operations import (
@@ -171,7 +172,7 @@ def test_journal_operation_id_must_match_directory(operation_draft: Path) -> Non
     data["operation_id"] = declared_id
     (journal / "journal.json").write_text(json.dumps(data), encoding="utf-8")
 
-    with pytest.raises(DraftError, match="operation.journal_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
         read_journal(journal / "journal.json")
 
 
@@ -314,7 +315,7 @@ def test_second_writer_rejected_before_markdown_scan(operation_draft: Path) -> N
     (root / "pages/a.md").write_text("not a managed page\n", encoding="utf-8")
     plan, _old_a, _old_b, _new_a, _new_b = two_write_plan(root)
 
-    with pytest.raises(DraftError, match="operation.recovery_required"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_RECOVERY_REQUIRED.value):
         execute_plan(plan)
 
 
@@ -333,7 +334,7 @@ def test_lock_with_missing_journal_is_preserved(operation_draft: Path) -> None:
     lock = root / ".draft/operation.lock"
     lock.write_text('{"operation_id":"cccccccccccccccccccccccccccccccc"}', encoding="utf-8")
 
-    with pytest.raises(DraftError, match="operation.journal_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
         recover(root)
 
     assert lock.exists()
@@ -343,7 +344,7 @@ def test_no_lock_prepared_journal_is_inconsistent(operation_draft: Path) -> None
     root = operation_draft
     write_journal(root, "d" * 32, "prepared")
 
-    with pytest.raises(DraftError, match="operation.inconsistent_state"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
         recover(root)
 
 
@@ -351,7 +352,7 @@ def test_no_lock_succeeded_journal_is_inconsistent(operation_draft: Path) -> Non
     root = operation_draft
     write_journal(root, "e" * 32, "trash_handoff_succeeded")
 
-    with pytest.raises(DraftError, match="operation.inconsistent_state"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
         recover(root)
 
 
@@ -456,7 +457,7 @@ def test_mutation_through_symlink_rejected_before_allocation(
         ),
     )
 
-    with pytest.raises(DraftError, match="path.symlink_escape"):
+    with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
         execute_plan(plan)
 
     operations = root / ".draft/operations"
@@ -492,13 +493,15 @@ def test_checker_reports_operation_states(operation_draft: Path) -> None:
     write_journal(root, "2" * 32, "allocating")
     report = check_draft(root)
     assert [issue.code for issue in report.errors] == []
-    assert [issue.code for issue in report.reviews] == ["operation.orphan_allocating"]
+    assert [issue.code for issue in report.reviews] == [CheckCode.OPERATION_ORPHAN_ALLOCATING.value]
     shutil.rmtree(root / ".draft/operations" / ("2" * 32))
 
     write_journal(root, "3" * 32, "prepared")
     report = check_draft(root)
     inconsistent = next(
-        issue for issue in report.errors if issue.code == "operation.inconsistent_state"
+        issue
+        for issue in report.errors
+        if issue.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
     )
     assert inconsistent.details == ("prepared",)
     shutil.rmtree(root / ".draft/operations" / ("3" * 32))
@@ -506,11 +509,15 @@ def test_checker_reports_operation_states(operation_draft: Path) -> None:
     lock = root / ".draft/operation.lock"
     lock.write_text('{"operation_id":"44444444444444444444444444444444"}', encoding="utf-8")
     report = check_draft(root)
-    assert "operation.journal_corrupt" in [issue.code for issue in report.errors]
+    assert CheckCode.OPERATION_JOURNAL_CORRUPT.value in [issue.code for issue in report.errors]
 
     write_journal(root, "4" * 32, "applying")
     report = check_draft(root)
-    recovery = next(issue for issue in report.errors if issue.code == "operation.recovery_required")
+    recovery = next(
+        issue
+        for issue in report.errors
+        if issue.code == CheckCode.OPERATION_RECOVERY_REQUIRED.value
+    )
     assert recovery.details == ("4" * 32,)
 
 
@@ -541,7 +548,7 @@ def test_lock_with_invalid_operation_id_is_corrupt_not_traversal(
     lock = root / ".draft/operation.lock"
     lock.write_text(json_module.dumps({"operation_id": bad_id}), encoding="utf-8")
 
-    with pytest.raises(DraftError, match="operation.journal_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
         recover(root)
 
     assert lock.exists()
@@ -570,7 +577,7 @@ def test_lock_traversal_never_executes_outside_journal(
     lock = root / ".draft/operation.lock"
     lock.write_text(json.dumps({"operation_id": "../../outside"}), encoding="utf-8")
 
-    with pytest.raises(DraftError, match="operation.journal_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
         recover(root)
 
     assert (outside / "journal.json").read_text(encoding="utf-8") == payload
@@ -717,9 +724,9 @@ def test_internal_state_symlink_escape_rejected(operation_draft: Path, tmp_path:
     shutil.rmtree(root / ".draft")
     (root / ".draft").symlink_to(external, target_is_directory=True)
 
-    with pytest.raises(DraftError, match="path.symlink_escape"):
+    with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
         acquire_lock(root, "a" * 32)
-    with pytest.raises(DraftError, match="path.symlink_escape"):
+    with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
         preallocate_journal(
             root,
             kind="test",

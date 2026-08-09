@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from draft.checker import check_draft
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import OperationPhase
 from draft.trash import restore_retained_trash, trash_page
@@ -332,7 +333,7 @@ def test_second_restore_lock_loser_abandons_its_unlinked_journal(
     before_package = _package_snapshot(root, pending.operation_id)
 
     # R2 启动：写锁仍被 R1 持有，R2 必须放弃自己并报告 recovery_required。
-    with pytest.raises(DraftError, match="operation.recovery_required"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_RECOVERY_REQUIRED.value):
         restore_retained_trash(root, pending.operation_id, now=NOW)
 
     r2_dirs = [d for d in _other_operation_dirs(root, pending.operation_id, r1_id)]
@@ -372,7 +373,7 @@ def test_foreign_restore_claim_seen_after_lock_is_recovery_required(
     before_package = _package_snapshot(root, pending.operation_id)
 
     # R2 取得锁后发现 T 指向 R1：合法可恢复关联 -> recovery_required，不覆盖 T。
-    with pytest.raises(DraftError, match="operation.recovery_required"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_RECOVERY_REQUIRED.value):
         restore_retained_trash(root, pending.operation_id, now=NOW)
 
     assert (
@@ -409,7 +410,7 @@ def test_foreign_restore_claim_with_broken_link_is_inconsistent(
     t_data["metadata"]["restore_operation_id"] = r1_id
     _write_journal(root, pending.operation_id, t_data)
 
-    with pytest.raises(DraftError, match="operation.inconsistent_state"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
         restore_retained_trash(root, pending.operation_id, now=NOW)
 
 
@@ -422,7 +423,7 @@ def test_package_evidence_mismatch_is_not_restore_conflict(
     package_json = root / ".draft/trash/outgoing" / pending.operation_id / "package.json"
     package_json.write_text("corrupt\n", encoding="utf-8")
 
-    with pytest.raises(DraftError, match="trash.package_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
         restore_retained_trash(root, pending.operation_id, now=NOW)
 
     # T 未被改写，包证据原样保留（损坏现场），锁已释放。
@@ -496,7 +497,7 @@ def test_completed_restore_with_extra_mutation_is_rejected(
     _write_journal(root, r_id, r_data)
     before_package = _package_snapshot(root, pending.operation_id)
 
-    with pytest.raises(DraftError, match="operation.inconsistent_state"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
         recover_draft(root)
 
     # 权威包、锁、T 全部保留：绝不因伪造 completed 删除权威包。
@@ -536,7 +537,7 @@ def test_completed_restore_with_wrong_parent_content_is_rejected(
     _write_journal(root, r_id, r_data)
     before_package = _package_snapshot(root, pending.operation_id)
 
-    with pytest.raises(DraftError, match="operation.inconsistent_state"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
         recover_draft(root)
 
     assert _package_snapshot(root, pending.operation_id) == before_package
@@ -579,7 +580,7 @@ def test_completed_restore_with_forged_extra_empty_section_is_rejected(
     _write_journal(root, r_id, r_data)
     before_package = _package_snapshot(root, pending.operation_id)
 
-    with pytest.raises(DraftError, match="operation.inconsistent_state"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
         recover_draft(root)
 
     assert _package_snapshot(root, pending.operation_id) == before_package
@@ -692,7 +693,7 @@ def test_completed_restore_with_trailing_content_on_nav_line_is_rejected(
     _write_journal(root, r_id, r_data)
     before_package = _package_snapshot(root, pending.operation_id)
 
-    with pytest.raises(DraftError, match="operation.inconsistent_state"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
         recover_draft(root)
 
     assert _package_snapshot(root, pending.operation_id) == before_package
@@ -754,7 +755,7 @@ def test_collapsed_restore_forged_rebase_page_is_rejected(
     _write_journal(root, r_id, r_data)
     before_package = _package_snapshot(root, pending.operation_id)
 
-    with pytest.raises(DraftError, match="operation.inconsistent_state"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
         recover_draft(root)
 
     assert _package_snapshot(root, pending.operation_id) == before_package
@@ -796,7 +797,7 @@ def test_completed_restore_without_matching_mutations_preserves_package(
     _acquire_restore_lock(root, r_id)
     before_package = _package_snapshot(root, pending.operation_id)
 
-    with pytest.raises(DraftError, match="operation.inconsistent_state"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
         recover_draft(root)
 
     # 认领、锁、权威包全部保留。
@@ -832,7 +833,7 @@ def test_completed_restore_with_mismatched_journal_identity_preserves_package(
     _acquire_restore_lock(root, r_id)
     before_package = _package_snapshot(root, pending.operation_id)
 
-    with pytest.raises(DraftError, match="operation.journal_corrupt"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
         recover_draft(root)
 
     assert (root / ".draft/operation.lock").exists()

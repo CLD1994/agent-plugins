@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import (
     FORMAT_VERSION,
@@ -43,32 +44,32 @@ def test_parse_marker_value_accepts_provisional_adopt_marker() -> None:
 def test_parse_marker_value_rejects_non_dict(decoded: object) -> None:
     with pytest.raises(DraftError) as caught:
         parse_marker_value(decoded, MARKER)
-    assert caught.value.code == "format.invalid"
+    assert caught.value.code == CheckCode.FORMAT_INVALID.value
 
 
 def test_parse_marker_value_rejects_bool_version() -> None:
     # bool 是 int 子类，但不得被接受为版本号。
     with pytest.raises(DraftError) as caught:
         parse_marker_value({"format_version": True}, MARKER)
-    assert caught.value.code == "format.invalid"
+    assert caught.value.code == CheckCode.FORMAT_INVALID.value
 
 
 def test_parse_marker_value_rejects_non_integer_version() -> None:
     with pytest.raises(DraftError) as caught:
         parse_marker_value({"format_version": "1"}, MARKER)
-    assert caught.value.code == "format.invalid"
+    assert caught.value.code == CheckCode.FORMAT_INVALID.value
 
 
 def test_parse_marker_value_rejects_unsupported_version() -> None:
     with pytest.raises(DraftError) as caught:
         parse_marker_value({"format_version": FORMAT_VERSION + 1}, MARKER)
-    assert caught.value.code == "format.unsupported"
+    assert caught.value.code == CheckCode.FORMAT_UNSUPPORTED.value
 
 
 def test_parse_marker_value_rejects_extra_fields_on_final_marker() -> None:
     with pytest.raises(DraftError) as caught:
         parse_marker_value({"format_version": FORMAT_VERSION, "extra": 1}, MARKER)
-    assert caught.value.code == "format.invalid"
+    assert caught.value.code == CheckCode.FORMAT_INVALID.value
 
 
 def test_parse_marker_value_rejects_wrong_adopt_state() -> None:
@@ -81,7 +82,7 @@ def test_parse_marker_value_rejects_wrong_adopt_state() -> None:
             },
             MARKER,
         )
-    assert caught.value.code == "format.invalid"
+    assert caught.value.code == CheckCode.FORMAT_INVALID.value
 
 
 def test_parse_marker_value_rejects_provisional_with_missing_manifest_field() -> None:
@@ -90,7 +91,7 @@ def test_parse_marker_value_rejects_provisional_with_missing_manifest_field() ->
             {"format_version": FORMAT_VERSION, "adopt_state": "provisional"},
             MARKER,
         )
-    assert caught.value.code == "format.invalid"
+    assert caught.value.code == CheckCode.FORMAT_INVALID.value
 
 
 @pytest.mark.parametrize(
@@ -115,7 +116,7 @@ def test_parse_marker_value_rejects_malformed_manifest(manifest: object) -> None
             },
             MARKER,
         )
-    assert caught.value.code == "format.invalid"
+    assert caught.value.code == CheckCode.FORMAT_INVALID.value
 
 
 def test_parse_marker_value_manifest_preserves_entry_order() -> None:
@@ -199,20 +200,20 @@ def test_resolve_local_destination_rejects_external_scheme() -> None:
 def test_resolve_local_destination_rejects_absolute_path() -> None:
     with pytest.raises(DraftError) as caught:
         resolve_local_destination(Path("index.md"), "/etc/passwd", Path("/unused"))
-    assert caught.value.code == "link.escape"
+    assert caught.value.code == CheckCode.LINK_ESCAPE.value
 
 
 def test_resolve_local_destination_rejects_root_escape() -> None:
     with pytest.raises(DraftError) as caught:
         resolve_local_destination(Path("index.md"), "../outside.md", Path("/unused"))
-    assert caught.value.code == "link.escape"
+    assert caught.value.code == CheckCode.LINK_ESCAPE.value
 
 
 def test_resolve_local_destination_rejects_self_escape_via_dotdot() -> None:
     # pages/a.md -> ../../top.md 逃逸到根之上。
     with pytest.raises(DraftError) as caught:
         resolve_local_destination(Path("pages/a.md"), "../../top.md", Path("/unused"))
-    assert caught.value.code == "link.escape"
+    assert caught.value.code == CheckCode.LINK_ESCAPE.value
 
 
 def test_resolve_local_destination_normalizes_internal_dotdot() -> None:
