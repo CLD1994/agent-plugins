@@ -39,6 +39,3 @@ uv run --project "$RUNTIME" --locked \
 uv run --project "$RUNTIME" --locked \
   pytest plugins/draft/scripts/tests/integration -q -m network
 ```
-
-目录迁移完成前，使用当前实施计划为迁移任务指定的定向命令；迁移汇合后，以上命令
-成为稳定门禁。
