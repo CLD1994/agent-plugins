@@ -113,7 +113,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 
 - `trash` 把页面和权威删除包落地为 7 天保留态（`trash_retained`），不立即移交系统回收站；有其他入站引用时命令拒绝并列出阻碍，先人工解除或改指再回收。
 - `trash` 后 7 天内可 `draft restore ROOT OPERATION_ID` 恢复页面；到期后的系统回收站移交和最终清理由 `draft recover ROOT` 或普通结构写命令惰性推进，Agent 不需要维护计时器。最终清理（`trash_purge_committed`）只在到达清理期限后最后一次投递明确失败时发生，是永久删除授权。
-- `restore` 回滚不是成功：恢复未完成时 `exit 3`、JSON `ok=false`、`phase=rolled_back`，权威删除包仍保留；遇到 `exit 3` 时不要报告"已恢复"。
+- `restore` 回滚不是成功：恢复未完成时 `exit 3`、JSON `ok=false`（`result_type=restore`），权威删除包仍保留；JSON 不暴露内部 phase，遇到 `exit 3` 时不要报告"已恢复"。
 - 移交明确失败只产生警告并继续原命令；状态损坏（`operation.inconsistent_state` 等）才停止写入。结构命令提示需要恢复时，先运行 `draft recover ROOT` 做机械恢复，不要删除锁或日志目录；恢复结果无法解释或需要取舍时再停止并询问用户（见硬停止条件）。
 - `.draft/` 下的操作日志、权威删除包和锁是工具内部状态，绝不手工编辑。
 

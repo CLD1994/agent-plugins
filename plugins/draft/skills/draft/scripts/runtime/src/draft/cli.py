@@ -280,14 +280,6 @@ def _add_dry_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--count-only", action="store_true", help="只返回计数与分页元数据")
 
 
-def _warning_payload(warning: LifecycleWarning) -> dict[str, object]:
-    return {
-        "code": warning.code,
-        "operation_id": warning.operation_id,
-        "details": list(warning.details),
-    }
-
-
 def _warning_text(warning: LifecycleWarning) -> str:
     detail = "：".join(warning.details)
     suffix = f"（{detail}）" if detail else ""
@@ -306,23 +298,25 @@ def _format_optional_datetime(value: object) -> str | None:
     return None
 
 
+def _write_payload(result: OperationResult) -> dict[str, object]:
+    """非回收写命令的正式成功载荷：result_type + 必要业务事实 + changed_paths。"""
+    return {
+        "changed_paths": [path.as_posix() for path in result.changed_paths],
+    }
+
+
 def _operation_payload(result: OperationResult) -> dict[str, object]:
+    """restore 专用载荷：保留 operation_id 供后续关联。"""
     return {
         "operation_id": result.operation_id,
-        "phase": result.phase.value,
         "changed_paths": [path.as_posix() for path in result.changed_paths],
-        "warnings": [_warning_payload(warning) for warning in result.warnings],
     }
 
 
 def _trash_payload(result: TrashResult) -> dict[str, object]:
     return {
         "operation_id": result.operation_id,
-        "phase": result.phase.value,
-        "package": result.package.as_posix(),
         "restore_expires_at": _format_optional_datetime(result.restore_expires_at),
-        "purge_eligible_at": _format_optional_datetime(result.purge_eligible_at),
-        "warnings": [_warning_payload(warning) for warning in result.warnings],
         "changed_paths": [path.as_posix() for path in result.changed_paths],
     }
 
@@ -625,7 +619,7 @@ def _dispatch(
         _reject_pagination_without_dry_run(args)
         result = move_page(root, source, target)
         payload: dict[str, object] = {"result_type": ResultType.MOVE.value}
-        payload.update(_operation_payload(result))
+        payload.update(_write_payload(result))
         return payload, f"已移动 {source} → {target}", 0
     if command == "promote":
         from draft.structure import plan_promote, promote_page
@@ -643,7 +637,7 @@ def _dispatch(
         _reject_pagination_without_dry_run(args)
         result = promote_page(root, page, children)
         payload = {"result_type": ResultType.PROMOTE.value}
-        payload.update(_operation_payload(result))
+        payload.update(_write_payload(result))
         return payload, f"已升格 {page}（{len(children)} 个子页）", 0
     if command == "collapse":
         from draft.structure import collapse_hub, plan_collapse
@@ -660,7 +654,7 @@ def _dispatch(
         _reject_pagination_without_dry_run(args)
         result = collapse_hub(root, hub)
         payload = {"result_type": ResultType.COLLAPSE.value}
-        payload.update(_operation_payload(result))
+        payload.update(_write_payload(result))
         return payload, f"已降级 {hub}", 0
     if command == "trash":
         from draft.trash import trash_page, trash_plan
@@ -961,7 +955,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             json_mode,
         )
         return _EXIT_RUNTIME
-    payload.setdefault("ok", code == 0)
+    # 成功 JSON 不重复 ok: true（规格 §14）；check 与错误信封各自显式携带 ok。
     _emit(payload, json_mode, human)
     return code
 

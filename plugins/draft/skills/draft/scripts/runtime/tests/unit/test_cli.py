@@ -158,10 +158,7 @@ def test_dispatch_move_calls_move_page_with_paged_operands(mocker: MockerFixture
     move_page.assert_called_once_with(Path("/draft"), Path("pages/a.md"), Path("pages/b.md"))
     assert payload == {
         "result_type": "move",
-        "operation_id": "a" * 32,
-        "phase": "completed",
         "changed_paths": ["pages/a.md", "pages/b.md"],
-        "warnings": [],
     }
     _assert_human_result(human, Path("pages/a.md"), Path("pages/b.md"))
     assert exit_code == 0
@@ -210,7 +207,8 @@ def test_dispatch_trash_calls_trash_page_with_paged_operand(mocker: MockerFixtur
     payload, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 trash 分派到 trash_page 并组装回收载荷
     trash_page.assert_called_once_with(Path("/draft"), Path("pages/a.md"))
     assert payload["result_type"] == "trash"
-    assert payload["phase"] == "trash_retained"
+    assert payload["operation_id"] == trash_page.return_value.operation_id
+    assert "phase" not in payload
     _assert_human_result(human, Path("pages/a.md"), trash_page.return_value.phase.value)
     assert exit_code == 0
 
@@ -247,7 +245,8 @@ def test_dispatch_restore_completed_returns_success_payload(mocker: MockerFixtur
     )
     payload, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 restore 成功路径返回完成载荷与退出码 0
     assert payload["result_type"] == "restore"
-    assert payload["phase"] == "completed"
+    assert payload["operation_id"] == "b" * 32
+    assert "phase" not in payload
     assert exit_code == 0
     _assert_human_result(human, args.operation_id)
 
@@ -264,7 +263,7 @@ def test_dispatch_restore_rolled_back_returns_exit_three(mocker: MockerFixture) 
     payload, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 restore 回滚路径返回 ok=False 与退出码 3
     assert payload["result_type"] == "restore"
     assert payload["ok"] is False
-    assert payload["phase"] == "rolled_back"
+    assert payload["operation_id"] == "b" * 32
     assert exit_code == 3
     _assert_human_result(human)
 
@@ -428,20 +427,17 @@ def test_render_check_json_uses_structured_payload_without_human_renderer(
 # ---------------------------------------------------------------------------
 
 
-def test_operation_payload_maps_result_to_dict() -> None:
+def test_operation_payload_maps_restore_result_to_dict() -> None:
     result = OperationResult(
         operation_id="a" * 32,
-        kind="move",
+        kind="restore",
         phase=OperationPhase.COMPLETED,
         changed_paths=(Path("pages/a.md"), Path("pages/b.md")),
-        warnings=(LifecycleWarning(code="op.warning", operation_id="a" * 32, details=("detail",)),),
     )
-    payload = cli._operation_payload(result)  # pyright: ignore[reportPrivateUsage]  # 验证操作结果到 JSON 载荷的完整映射
+    payload = cli._operation_payload(result)  # pyright: ignore[reportPrivateUsage]  # 验证恢复结果到 JSON 载荷：保留 operation_id
     assert payload == {
         "operation_id": "a" * 32,
-        "phase": "completed",
         "changed_paths": ["pages/a.md", "pages/b.md"],
-        "warnings": [{"code": "op.warning", "operation_id": "a" * 32, "details": ["detail"]}],
     }
 
 
@@ -454,14 +450,10 @@ def test_trash_payload_maps_result_with_deadlines_to_dict() -> None:
         purge_eligible_at=datetime(2026, 9, 12, 12, tzinfo=UTC),
         warnings=(),
     )
-    payload = cli._trash_payload(result)  # pyright: ignore[reportPrivateUsage]  # 验证回收结果到 JSON 载荷含期限字段的完整映射
+    payload = cli._trash_payload(result)  # pyright: ignore[reportPrivateUsage]  # 验证回收结果到 JSON 载荷：保留 operation_id 与期限
     assert payload == {
         "operation_id": "b" * 32,
-        "phase": "trash_retained",
-        "package": ".draft/trash/outgoing/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "restore_expires_at": "2026-08-13T12:00:00Z",
-        "purge_eligible_at": "2026-09-12T12:00:00Z",
-        "warnings": [],
         "changed_paths": [],
     }
 
@@ -472,9 +464,10 @@ def test_trash_payload_maps_none_deadlines_to_null() -> None:
         phase=OperationPhase.TRASH_RETAINED,
         package=Path(".draft/trash/outgoing/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
     )
-    payload = cli._trash_payload(result)  # pyright: ignore[reportPrivateUsage]  # 验证回收结果无期限时映射为 null
+    payload = cli._trash_payload(result)  # pyright: ignore[reportPrivateUsage]  # 验证回收结果无期限时映射为 null，且不暴露内部包路径
     assert payload["restore_expires_at"] is None
-    assert payload["purge_eligible_at"] is None
+    assert "package" not in payload
+    assert "phase" not in payload
 
 
 # ---------------------------------------------------------------------------

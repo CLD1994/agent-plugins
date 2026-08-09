@@ -5,6 +5,7 @@ import subprocess
 import tomllib
 from pathlib import Path
 
+from draft.cli_results import DryRunOperation, ResultType
 from draft.diagnostic_codes import (
     CheckCode,
     InvalidRelationReason,
@@ -14,7 +15,6 @@ from draft.diagnostic_codes import (
     ReplacementStatusReason,
     RootMissingKind,
 )
-from draft.cli_results import DryRunOperation, ResultType
 from draft.vocabulary import RelationCode, StatusCode
 from tests.support.paths import RUNTIME_ROOT
 
@@ -339,9 +339,7 @@ def test_status_and_relation_values_have_one_literal_owner() -> None:
 # 会被视为第二份完整定义；测试最接近输出层的精确断言属于测试预期，不参与扫描。
 CLI_RESULTS_OWNER = RUNTIME_ROOT / "src/draft/cli_results.py"
 _CLI_RESULTS_VALUES: frozenset[str] = frozenset(
-    member.value
-    for enum in (ResultType, DryRunOperation)
-    for member in enum
+    member.value for enum in (ResultType, DryRunOperation) for member in enum
 )
 
 

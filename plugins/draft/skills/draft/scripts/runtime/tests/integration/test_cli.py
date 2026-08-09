@@ -46,7 +46,7 @@ def test_init_success_and_not_empty_failure(
     root = tmp_path / "topic"
     code, payload = run_json(["init", str(root), "--json"], capsys)
     assert code == 0
-    assert payload["ok"] is True
+    assert "ok" not in payload
     assert payload["result_type"] == "init"
 
     code, payload = run_json(["init", str(root), "--json"], capsys)
@@ -74,7 +74,7 @@ def test_adopt_success_and_invalid_candidate(
     )
     code, payload = run_json(["adopt", str(root), "--json"], capsys)
     assert code == 0
-    assert payload["ok"] is True
+    assert "ok" not in payload
 
     broken = tmp_path / "broken"
     broken.mkdir()
@@ -351,7 +351,7 @@ def test_move_success_and_escape_failure(
         ["move", str(root), "pages/a.md", "pages/renamed.md", "--json"], capsys
     )
     assert code == 0
-    assert payload["ok"] is True
+    assert "ok" not in payload
     assert (root / "pages/renamed.md").is_file()
 
     code, payload = run_json(
@@ -435,11 +435,13 @@ def test_trash_protected_failure_and_retained_success(
 
     code, payload = run_json(["trash", str(root), "pages/a.md", "--json"], capsys)
     assert code == 0
-    assert payload["ok"] is True
-    assert payload["phase"] == "trash_retained"
-    # 公开 JSON 信封必须携带承诺的两个期限。
+    assert "ok" not in payload
+    assert payload["operation_id"]
+    # 公开 JSON 只携带 operation_id、期限与公开变化路径，不暴露内部包。
     assert payload["restore_expires_at"] is not None
-    assert payload["purge_eligible_at"] is not None
+    assert "phase" not in payload
+    assert "package" not in payload
+    assert "pages/a.md" in cast("list[str]", payload["changed_paths"])
     outgoing = root / ".draft/trash/outgoing"
     assert len(list(outgoing.iterdir())) == 1
     assert not (root / ".draft/operation.lock").exists()
@@ -469,9 +471,11 @@ def test_restore_cli_completed(tmp_path: Path, capsys: pytest.CaptureFixture[str
     code, payload = run_json(["restore", str(root), operation_id, "--json"], capsys)
 
     assert code == 0
-    assert payload["ok"] is True
+    assert "ok" not in payload
     assert payload["result_type"] == "restore"
-    assert payload["phase"] == "completed"
+    # 恢复本身是一次新操作，携带自己的 operation_id，而非原 trash 的 id。
+    assert isinstance(payload["operation_id"], str) and payload["operation_id"]
+    assert "phase" not in payload
     assert (root / "pages/a.md").is_file()
 
 
@@ -507,7 +511,9 @@ def test_restore_cli_rolled_back_is_exit_three(
     assert code == 3
     assert payload["ok"] is False
     assert payload["result_type"] == "restore"
-    assert payload["phase"] == "rolled_back"
+    # 回滚路径同样携带本次恢复操作的 operation_id，不暴露内部 phase。
+    assert isinstance(payload["operation_id"], str) and payload["operation_id"]
+    assert "phase" not in payload
     assert (root / ".draft/trash/outgoing" / operation_id).is_dir()
 
 
@@ -581,7 +587,7 @@ def test_recover_nothing_to_do(tmp_path: Path, capsys: pytest.CaptureFixture[str
 
     code, payload = run_json(["recover", str(root), "--json"], capsys)
     assert code == 0
-    assert payload["ok"] is True
+    assert "ok" not in payload
 
 
 def test_missing_root_is_exit_two(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -674,7 +680,7 @@ def test_move_with_relative_root_from_cwd(
     code, payload = run_json(["move", "topic", "pages/a.md", "pages/renamed.md", "--json"], capsys)
 
     assert code == 0
-    assert payload["ok"] is True
+    assert "ok" not in payload
     assert (root / "pages/renamed.md").is_file()
 
 
