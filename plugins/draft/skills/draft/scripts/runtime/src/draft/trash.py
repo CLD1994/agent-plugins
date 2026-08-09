@@ -118,6 +118,9 @@ def _blockers(graph: DraftGraph, page: Path) -> tuple[str, ...]:
     canonical = canonical_parent_navigation(graph, page)
     blocked: list[tuple[str, int]] = []
     for source, link in graph.inbound_links.get(page, ()):
+        if source == CONCLUSIONS_PAGE:
+            # 机器结论列表允许过时：其中的入站链接不阻碍回收。
+            continue
         if (
             canonical is not None
             and source == graph.parents[page]

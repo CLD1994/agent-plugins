@@ -610,7 +610,16 @@ def check_draft(
     if include_operation_state and mode == "registered":
         ordered.extend(sorted(_check_operation_state(resolved), key=_sort_key))
     ordered.extend(sorted(_load_issues_in(result.issues, _LOAD_PAGE_ISSUES), key=_sort_key))
-    ordered.extend(sorted(_load_issues_in(result.issues, _LOAD_LINK_ISSUES), key=_sort_key))
+    # 所有权为 generated 时，结论页自身的断链/无效链接是允许过时的机器列表事实，不报错。
+    if conclusions_required:
+        link_issues = [
+            issue
+            for issue in _load_issues_in(result.issues, _LOAD_LINK_ISSUES)
+            if issue.path != CONCLUSIONS_PAGE
+        ]
+        ordered.extend(sorted(link_issues, key=_sort_key))
+    else:
+        ordered.extend(sorted(_load_issues_in(result.issues, _LOAD_LINK_ISSUES), key=_sort_key))
     ordered.extend(sorted(_load_issues_in(result.issues, None), key=_sort_key))
     ordered.extend(check_graph(result.graph).issues)
     return CheckReport(issues=tuple(ordered))

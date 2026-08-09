@@ -112,10 +112,26 @@ def _collapse_empty_hubs(
         expanded[page] = leaf
 
 
+def _conclusions_owned_generated(root: Path) -> bool:
+    """结论所有权是否为 generated；标记缺失/无效时视为未生成。"""
+    from draft.graph import read_marker
+    from draft.vocabulary import ConclusionsState
+
+    try:
+        state = read_marker(root)
+    except DraftError:
+        return False
+    if state.provisional_manifest is not None:
+        return False
+    return state.conclusions_state is ConclusionsState.GENERATED
+
+
 def _render_pages(
     graph: DraftGraph,
     expanded: Mapping[Path, Path],
     parent_changes: Mapping[Path, Path],
+    *,
+    skip_conclusions_links: bool = False,
 ) -> dict[Path, str]:
     rendered: dict[Path, str] = {}
     nav_removals: dict[Path, list[MarkdownLink]] = {}
@@ -180,27 +196,33 @@ def _render_pages(
                 destination = _relative_destination(final_path, final_parent, None)
                 if destination != parent_relation.link.destination:
                     edits[parent_relation.link.destination_span] = destination
-        body_by_span = {
-            reference.link.whole_span: reference for reference in graph.body_resources.get(path, ())
-        }
-        for link in page.links:
-            if (path, link.whole_span) in removed_spans:
-                continue
-            if parent_relation is not None and link.whole_span == parent_relation.link.whole_span:
-                continue
-            reference = body_by_span.get(link.whole_span)
-            if reference is None:
-                continue
-            resource = reference.resource
-            if final_path == path and resource.identity not in moved_targets:
-                continue
-            destination = rebase_body_destination(
-                resource,
-                new_source=final_path,
-                moved_targets=moved_targets,
-            )
-            if destination != link.destination:
-                edits.setdefault(link.destination_span, destination)
+        # 机器结论列表允许过时：所有权为 generated 时结构命令不重写结论页正文链接。
+        if not (skip_conclusions_links and path == CONCLUSIONS_PAGE):
+            body_by_span = {
+                reference.link.whole_span: reference
+                for reference in graph.body_resources.get(path, ())
+            }
+            for link in page.links:
+                if (path, link.whole_span) in removed_spans:
+                    continue
+                if (
+                    parent_relation is not None
+                    and link.whole_span == parent_relation.link.whole_span
+                ):
+                    continue
+                reference = body_by_span.get(link.whole_span)
+                if reference is None:
+                    continue
+                resource = reference.resource
+                if final_path == path and resource.identity not in moved_targets:
+                    continue
+                destination = rebase_body_destination(
+                    resource,
+                    new_source=final_path,
+                    moved_targets=moved_targets,
+                )
+                if destination != link.destination:
+                    edits.setdefault(link.destination_span, destination)
         for link in nav_removals.get(path, []):
             edits.update(navigation_removal_edits(page.text, link))
         text = rewrite_link_destinations(page.text, edits)
@@ -238,7 +260,13 @@ def plan_path_remap(
     _collapse_empty_hubs(graph, expanded, final_parents)
     # 降级改变枢纽最终路径后重新推导父映射；不级联再次降级。
     final_parents = _final_parents(graph, expanded, parent_changes)
-    rendered = _render_pages(graph, expanded, parent_changes)
+    conclusions_generated = _conclusions_owned_generated(graph.root)
+    rendered = _render_pages(
+        graph,
+        expanded,
+        parent_changes,
+        skip_conclusions_links=conclusions_generated,
+    )
 
     mutations: list[FileMutation] = []
     effects: list[PlanEffect] = []
