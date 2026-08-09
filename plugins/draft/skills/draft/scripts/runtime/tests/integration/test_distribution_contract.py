@@ -115,9 +115,11 @@ def test_registered_diagnostic_codes_have_one_literal_owner() -> None:
 
 # 分支判别值（如 "not_single_code_span"、"duplicate"）与普通业务字符串（如
 # LocationKind 的 "file"、parametrize 参数名 "destination"）共享字符串空间，不能像
-# 检查码一样做全局字面量扫描。这里只检查出现在诊断 details 位置的裸字符串：details
-# 元组元素、诊断构造调用（_issue / CheckIssue / DraftError / error_issue）实参、
-# 以及 details 下标比较的另一侧。其余出现位置不属于分支值，允许保留裸字符串。
+# 检查码一样做全局字面量扫描。这里只报告与诊断 details 有可证关联的裸字符串：
+# 诊断构造调用（_issue / CheckIssue / DraftError / error_issue）实参、以及和
+# details 派生表达式（直接 .details、下标、list()/tuple() 保元素转换、按作用域
+# 解析的简单别名）比较的另一侧容器。其余出现位置不属于分支值，允许保留裸字符串
+# ——例如 `return ("duplicate",)` 这样的普通元组必须不报告。
 _BRANCH_VALUE_ENUMS = (
     RootMissingKind,
     InvalidStatusReason,
@@ -131,40 +133,120 @@ _BRANCH_VALUES: frozenset[str] = frozenset(
     member.value for enum in _BRANCH_VALUE_ENUMS for member in enum
 )
 _DIAGNOSTIC_DETAIL_CALLS = frozenset({"_issue", "CheckIssue", "DraftError", "error_issue"})
+# 保持元素身份、只改变容器类型的调用，视作仍指向 details 的元素。
+_ELEMENT_PRESERVING_CALLS = frozenset({"list", "tuple", "set", "frozenset"})
 
 
-def _branch_literals_in_detail_positions(path: Path) -> list[tuple[int, str]]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+def _details_derived(node: ast.AST, aliases: frozenset[str]) -> bool:
+    """表达式是否经下标、保元素调用或别名可达某个 `.details` 访问。"""
+    if isinstance(node, ast.Attribute):
+        return node.attr == "details"
+    if isinstance(node, ast.Subscript):
+        return _details_derived(node.value, aliases)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _ELEMENT_PRESERVING_CALLS
+        and len(node.args) == 1
+    ):
+        return _details_derived(node.args[0], aliases)
+    if isinstance(node, ast.Name):
+        return node.id in aliases
+    return False
+
+
+def _scope_owner(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> ast.AST:
+    owner: ast.AST | None = node
+    while owner is not None and not isinstance(
+        owner, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef)
+    ):
+        owner = parents.get(owner)
+    assert owner is not None
+    return owner
+
+
+def _derived_aliases(
+    tree: ast.Module, parents: dict[ast.AST, ast.AST]
+) -> dict[int, frozenset[str]]:
+    """每个作用域内被绑定到 details 派生表达式的名字集合（按作用域做固定点）。"""
+    assignments: dict[int, dict[str, list[ast.AST]]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            value: ast.expr = node.value
+            targets: list[ast.expr] = node.targets
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            value = node.value
+            targets = [node.target]
+        else:
+            continue
+        scope = id(_scope_owner(node, parents))
+        bucket = assignments.setdefault(scope, {})
+        for target in targets:
+            if isinstance(target, ast.Name):
+                bucket.setdefault(target.id, []).append(value)
+
+    aliases: dict[int, frozenset[str]] = {}
+    for scope, bucket in assignments.items():
+        names: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for name, exprs in bucket.items():
+                if name in names:
+                    continue
+                if any(_details_derived(expr, frozenset(names)) for expr in exprs):
+                    names.add(name)
+                    changed = True
+        aliases[scope] = frozenset(names)
+    return aliases
+
+
+def _branch_literals_in_source(source: str) -> list[tuple[int, str]]:
+    """返回源码中与 details 关联的分支值裸字符串（(行号, 值)）。"""
+    tree = ast.parse(source)
     parents: dict[ast.AST, ast.AST] = {}
     for node in ast.walk(tree):
         for child in ast.iter_child_nodes(node):
             parents[child] = node
+    aliases = _derived_aliases(tree, parents)
+
     offenders: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
             continue
         if node.value not in _BRANCH_VALUES:
             continue
+        scope = id(_scope_owner(node, parents))
+        names = aliases.get(scope, frozenset())
+
         parent = parents.get(node)
-        if isinstance(parent, ast.Tuple):
+        if (
+            isinstance(parent, ast.Call)
+            and isinstance(parent.func, ast.Name)
+            and parent.func.id in _DIAGNOSTIC_DETAIL_CALLS
+        ):
             offenders.append((node.lineno, node.value))
-        elif isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name):
-            if parent.func.id in _DIAGNOSTIC_DETAIL_CALLS:
-                offenders.append((node.lineno, node.value))
-        elif isinstance(parent, ast.Compare):
-            for operand in (parent.left, *parent.comparators):
-                if operand is node:
+            continue
+        container: ast.AST = parent if isinstance(parent, (ast.Tuple, ast.List)) else node
+        cparent = parents.get(container)
+        if isinstance(cparent, ast.Compare):
+            for operand in (cparent.left, *cparent.comparators):
+                if operand is container:
                     continue
-                subscript_details = (
-                    isinstance(operand, ast.Subscript)
-                    and isinstance(operand.value, ast.Attribute)
-                    and operand.value.attr == "details"
-                )
-                attribute_details = isinstance(operand, ast.Attribute) and operand.attr == "details"
-                if subscript_details or attribute_details:
+                if _details_derived(operand, names):
                     offenders.append((node.lineno, node.value))
                     break
+        elif (
+            isinstance(cparent, ast.Call)
+            and isinstance(cparent.func, ast.Name)
+            and cparent.func.id in _DIAGNOSTIC_DETAIL_CALLS
+        ):
+            offenders.append((node.lineno, node.value))
     return sorted(set(offenders))
+
+
+def _branch_literals_in_detail_positions(path: Path) -> list[tuple[int, str]]:
+    return _branch_literals_in_source(path.read_text(encoding="utf-8"))
 
 
 def test_branch_discriminators_have_no_bare_literals_in_detail_positions() -> None:
@@ -174,3 +256,36 @@ def test_branch_discriminators_have_no_bare_literals_in_detail_positions() -> No
         if (literals := _branch_literals_in_detail_positions(path))
     }
     assert offenders == {}
+
+
+def test_branch_check_ignores_plain_tuples() -> None:
+    """普通元组中的分支值（与 details 无关联）必须不报告。"""
+    assert _branch_literals_in_source('def f():\n    return ("duplicate",)\n') == []
+
+
+def test_branch_check_reports_direct_details_compare() -> None:
+    """直接与 `.details` 比较的元组或标量必须报告。"""
+    assert _branch_literals_in_source('assert issue.details == ("duplicate",)\n') == [
+        (1, "duplicate")
+    ]
+    assert _branch_literals_in_source('assert "duplicate" in issue.details\n') == [(1, "duplicate")]
+
+
+def test_branch_check_reports_details_alias_access() -> None:
+    """通过局部变量别名访问 details 必须报告；非 details 别名的同名下标不报告。"""
+    assert _branch_literals_in_source(
+        'details = issue.details\nassert details[0] == "duplicate"\n'
+    ) == [(2, "duplicate")]
+    assert (
+        _branch_literals_in_source('details = ["a", "b"]\nassert details[0] == "duplicate"\n') == []
+    )
+
+
+def test_branch_check_reports_details_conversions() -> None:
+    """list()/tuple() 等保元素转换形式必须报告。"""
+    assert _branch_literals_in_source('assert list(issue.details) == ["duplicate"]\n') == [
+        (1, "duplicate")
+    ]
+    assert _branch_literals_in_source('assert tuple(issue.details) == ("duplicate",)\n') == [
+        (1, "duplicate")
+    ]

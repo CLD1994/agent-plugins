@@ -49,7 +49,7 @@
   - 删除重复错误码集合和手写 case ID，使用类型化用例。
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_distribution_contract.py`
   - 用 AST 保证已登记码只在权威类型模块中出现字面量，覆盖递归生产包与全部测试文件。
-  - 新增分支判别值位置检查：只扫描诊断 details 位置，避免通用词文本误报（见 Task 6）。
+  - 新增分支判别值位置检查：只报告与 details 有可证关联的裸字符串，普通元组不误报（见 Task 6）。
 - Modify: 全部单元/集成测试文件
   - 已登记码与分支判别值改为枚举引用，消除 178 处裸码与 21 处裸分支值（见 Task 6）。
 
@@ -889,8 +889,10 @@ Expected: 全部 exit code `0`，两个 pyright 命令均报告 `0 errors`。
   `_LOAD_LINK_ISSUES`、`_LOAD_ISSUE_GROUPS`、`_LOAD_KNOWN_ISSUE_VALUES`、
   `_load_issues_in(issues, group)`。
 - Produces: `_BRANCH_VALUE_ENUMS`、`_BRANCH_VALUES`、`_DIAGNOSTIC_DETAIL_CALLS`、
+  `_ELEMENT_PRESERVING_CALLS`、`_details_derived`、`_scope_owner`、
+  `_derived_aliases`、`_branch_literals_in_source(source)`、
   `_branch_literals_in_detail_positions(path)`、
-  `test_branch_discriminators_have_no_bare_literals_in_detail_positions`。
+  `test_branch_discriminators_have_no_bare_literals_in_detail_positions` 与四个自测试。
 - Extends: `test_registered_diagnostic_codes_have_one_literal_owner` 覆盖递归生产
   包与全部测试文件。
 
@@ -924,9 +926,13 @@ marker[format + path.symlink_escape]、page、link）与 `_load_issues_in` 辅�
 - [ ] **Step 5: 分支值位置 AST 检查**
 
 新增 `test_branch_discriminators_have_no_bare_literals_in_detail_positions`，
-只扫描 details 元组元素、诊断构造调用（`_issue`/`CheckIssue`/`DraftError`/
-`error_issue`）实参、details 下标比较的另一侧。`file`/`duplicate`/`destination`
-等通用词在其他位置允许裸字符串，避免普通文本扫描误报。
+只报告与诊断 details 有可证关联的裸字符串：诊断构造调用（`_issue`/`CheckIssue`/
+`DraftError`/`error_issue`）实参、以及和 details 派生表达式（直接 `.details`、
+下标、`list()`/`tuple()` 保元素转换、按作用域解析的简单别名）比较的另一侧容器。
+`file`/`duplicate`/`destination` 等通用词在其他位置允许裸字符串，例如
+`return ("duplicate",)` 这样的普通元组必须不报告。检查器用合成源码片段自测试
+固定四类判定：普通元组不报告、直接 `.details` 比较报告、局部变量别名访问报告、
+`list(issue.details)` 等转换形式报告。
 
 - [ ] **Step 6: 全量门禁与变异证明**
 
