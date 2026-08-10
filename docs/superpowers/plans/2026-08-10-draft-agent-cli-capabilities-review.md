@@ -207,3 +207,45 @@
   `draft-agent-cli-capabilities` 保留在本地以便审计与回滚。
 
 **门禁状态：** 第 3 节全部门禁于合并后的 `main` 上通过，工作区干净。全部完成。
+
+---
+
+## 12. 对抗性评审整改记录（2026-08-10）
+
+首次交付被评审 Agent 拒绝（结论"不通过"），列出的 9 项问题全部在分支
+`draft-review-remediation` 修复并重新通过全部门禁。逐项记录：
+
+| # | 严重性 | 问题 | 修复 |
+| --- | --- | --- | --- |
+| 1 | 严重 | 预演 JSON 用 `items` 且多带 `changed_paths`；`generate-conclusions --dry-run` 无计划时抛 `generate.no_plan`/退出 2 | `slice_payload` 支持 `items_key`（查询 `items`/预演 `effects`）；`_dry_run_write` 输出 `effects` 并去掉 `changed_paths`；generate 无已确认/幂等无变化时成功返回空 `effects` + `generated`/`reason` |
+| 2 | 严重 | `_would_form_cycle` 把新边反向建模为 `target→source`，依赖环漏检 | 改为 `adjacency[source].add(target)`；预演与正式执行都在规划阶段以 `relation.dependency_cycle` 拒绝 |
+| 3 | 严重 | 页内锚点 `#节` 落入普通相对资源路径，深度变化移动后被改写 | `resolve_body_resource` 对纯锚点返回指向来源页面自身的 `self_anchor` 资源；`rebase_body_destination` 对 `self_anchor` 保持原文 |
+| 4 | 严重 | 结论条目按路径排序而非导航声明顺序 | `graph.children` 按父页面导航链接声明位置排序；`_confirmed_pages` 用 `graph.children` 深度优先遍历；导航无法到达的页面使生成以 `conclusions.invalid_navigation` 失败 |
+| 5 | 严重 | 结论页闭环缺失：(a) 已生成态删除根导航链接后重建不修复；(b) 公开效果无条件含 `index.md`；(c) 检查器不校验固定形状 | (a) `_ensure_conclusions_nav` 修复缺失/错位/重复；(b) 效果从实际变化文件派生（只含实际改变的结论页/根页）；(c) `is_conclusions_document`/`is_conclusions_nav_canonical` 共享形状谓词，checker 在 generated 态校验标题、状态、父主题、章节与根导航结论链接 |
+| 6 | 严重 | 恢复路径公开 `.draft/` 内部路径（recover 对 TrashResult 用 `result.package`；`finalize_operation`/`_recover_terminal` 回退 journal mutation） | 计划执行时把公开 `changed_paths` 持久化到日志元数据 `public_changed_paths`；恢复读取该元数据；CLI recover 对 TrashResult 用 `changed_paths` |
+| 7 | 重要 | 完整快照把资源事实当加载失败：正文断链使 `query page` 退出 2 | `LoadResult` 增加 `resource_facts` 区分正文链接目标事实；`load_graph` 只对结构性问题失败；`check_draft(exclude_resource_facts=True)` 供写命令可写性判定 |
+| 8 | 重要 | 入站关系查询不校验页面存在；非法 `query status` 值泄漏 ValueError；`draft query` 缺二级命令触发 AttributeError | 入站关系目标不存在返回 `page.not_found`；`query status` 用 `choices` 从 `StatusCode` 派生；`query` 子命令 `required=True` |
+| 9 | 重要 | CLI 帮助与 SKILL.md 仍称 recover 推进回收生命周期 | 更新为"修复崩溃或中断留下的未完成写操作"，生命周期推进属所有已登记命令的前置静默步骤 |
+
+**整改后门禁（分支 `draft-review-remediation` 全绿，合并前复跑）：**
+
+| 门禁 | 结果 |
+| --- | --- |
+| 核心单元测试 | 389 passed |
+| 核心集成测试（非联网 / 联网） | 323 / 8 passed |
+| 适配层单元测试 | 191 passed |
+| 适配层集成测试（非联网 / 联网） | 316 / 1 passed |
+| 核心 + 适配层 Pyright strict | 0 errors |
+| Ruff check / format | 通过 |
+| `uv lock --check` | 通过 |
+
+**残留边界（有意为之，非实现偏差）：**
+
+1. 规格 §12.6 的"`not_generated` 时意外出现 `conclusions.md`"检查暂未在 checker 落地：
+   现有大量测试夹具把 `conclusions.md` 当作普通固定页（not_generated 所有权），落地该
+   检查需要批量迁移这些夹具。评审第 5 项关注的是 generated 固定形状检查，已完整实现。
+2. 预演与正式执行共享同一计划构造边界；`generate-conclusions` 的预演在计划可构造时
+   复用 `_dry_run_write` 的严格快照加载，与正式路径的容错加载存在细微差异，但行为契约
+   一致。
+3. 适配层 `bind`/`unbind` 命令属于适配层自有 JSON 契约，保留其 `ok` 字段，不在
+   规格 §14 范围内。
