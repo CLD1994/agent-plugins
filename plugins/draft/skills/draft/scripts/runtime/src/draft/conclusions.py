@@ -21,7 +21,14 @@ from draft.graph import (
     DraftGraph,
 )
 from draft.markdown import append_parent_navigation
-from draft.models import FileMutation, MutationKind, OperationPlan, PageDocument, StatusCode
+from draft.models import (
+    FileMutation,
+    MutationKind,
+    OperationPlan,
+    PageDocument,
+    RelationCode,
+    StatusCode,
+)
 from draft.operations import sha256_bytes
 from draft.vocabulary import ConclusionsState, status_label
 
@@ -38,6 +45,9 @@ class ConclusionsView(Protocol):
     @property
     def parents(self) -> Mapping[Path, Path]: ...
 
+    @property
+    def children(self) -> Mapping[Path, tuple[Path, ...]]: ...
+
 
 CONCLUSIONS_TITLE = "结论汇总"
 CONCLUSIONS_HEADING = "## 已确认结论"
@@ -47,8 +57,64 @@ __all__ = [
     "ConclusionsState",
     "GenerationPlan",
     "GenerationReason",
+    "is_conclusions_document",
+    "is_conclusions_nav_canonical",
     "plan_generation",
 ]
+
+
+def is_conclusions_document(document: PageDocument, root: Path) -> bool:
+    """结论页固定机器形状：一级标题、状态、父主题与章节标题。
+
+    生成、检查、页面创建和结构操作必须依据同一套形状定义识别结论页，
+    不分别复制标题或链接字面量后各自判断（规格 §12.4）。
+    """
+    from draft.graph import resolve_local_destination
+
+    if document.title != CONCLUSIONS_TITLE:
+        return False
+    if document.status.code is not StatusCode.PROPOSED:
+        return False
+    parents = [r for r in document.relations if r.code is RelationCode.PARENT]
+    if len(parents) != 1:
+        return False
+    try:
+        target, _anchor = resolve_local_destination(
+            document.path, parents[0].link.destination, root
+        )
+    except DraftError:
+        return False
+    if target != ROOT_PAGE:
+        return False
+    return CONCLUSIONS_HEADING in document.text
+
+
+def is_conclusions_nav_canonical(index_text: str, root: Path) -> bool:
+    """根导航结论链接是否唯一、规范且位于最后（规格 §12.4）。"""
+    from draft.graph import resolve_local_destination
+    from draft.markdown import MarkdownLink, parse_page
+
+    document = parse_page(ROOT_PAGE, index_text)
+    conclusions_links: list[MarkdownLink] = []
+    for link in document.links:
+        try:
+            target, _anchor = resolve_local_destination(ROOT_PAGE, link.destination, root)
+        except DraftError:
+            continue
+        if target == CONCLUSIONS_PAGE:
+            conclusions_links.append(link)
+    if len(conclusions_links) != 1:
+        return False
+    (link,) = conclusions_links
+    lines = index_text.split("\n")
+    start_line = index_text.count("\n", 0, link.whole_span.start)
+    for line in lines[start_line + 1 :]:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            break
+        if stripped.startswith("- ["):
+            return False
+    return True
 
 
 class GenerationReason(StrEnum):
@@ -56,7 +122,12 @@ class GenerationReason(StrEnum):
 
 
 def _confirmed_pages(graph: ConclusionsView) -> tuple[Path, ...]:
-    """按父导航深度优先顺序收集 confirmed 页面，排除根与结论页。"""
+    """按父导航深度优先顺序收集 confirmed 页面，排除根与结论页。
+
+    导航声明顺序必须可确定：子页未在父导航中声明时生成失败，提示先运行 check，
+    不能退回按路径排序的近似结果（规格 §12.4）。
+    """
+    navigated: set[Path] = set()
 
     def walk(path: Path, order: list[Path]) -> None:
         if (
@@ -68,17 +139,32 @@ def _confirmed_pages(graph: ConclusionsView) -> tuple[Path, ...]:
             if page.status.code is StatusCode.CONFIRMED:
                 order.append(path)
         for child in _children_in_declaration_order(graph, path):
+            if child in navigated:
+                continue
+            navigated.add(child)
             walk(child, order)
 
     order: list[Path] = []
     walk(ROOT_PAGE, order)
+    # 未被根导航遍历到达的受管理页面（孤儿或父关系断裂）：导航结构不合法，
+    # 禁止退回路径排序的近似结果（规格 §12.4）。
+    unreached = sorted(
+        page
+        for page in graph.pages
+        if page not in navigated and page not in (ROOT_PAGE, CONCLUSIONS_PAGE)
+    )
+    if unreached:
+        raise DraftError(
+            "conclusions.invalid_navigation",
+            graph.root,
+            details=(unreached[0].as_posix(),),
+        )
     return tuple(order)
 
 
 def _children_in_declaration_order(graph: ConclusionsView, parent: Path) -> tuple[Path, ...]:
-    """按父页面导航声明顺序返回子页；无法确定声明顺序时按路径排序。"""
-    children = [child for child, declared in graph.parents.items() if declared == parent]
-    return tuple(sorted(children))
+    """按父页面导航声明顺序返回子页。"""
+    return graph.children.get(parent, ())
 
 
 def _render_conclusions(graph: ConclusionsView, confirmed: tuple[Path, ...]) -> str:
@@ -98,8 +184,35 @@ def _render_conclusions(graph: ConclusionsView, confirmed: tuple[Path, ...]) -> 
     return "\n".join(lines) + "\n"
 
 
-def _root_navigation_after(graph: ConclusionsView, index_text: str) -> str:
-    """在根索引 ``## 子主题`` 末尾加入唯一且最后的结论链接。"""
+def _ensure_conclusions_nav(index_text: str, root: Path) -> str:
+    """保证根导航结论链接唯一、规范且位于最后；缺失或错位时修复。"""
+    from draft.graph import resolve_local_destination
+    from draft.markdown import MarkdownLink, parse_page, remove_parent_navigation
+
+    document = parse_page(ROOT_PAGE, index_text)
+    conclusions_link: MarkdownLink | None = None
+    for link in document.links:
+        try:
+            target, _anchor = resolve_local_destination(ROOT_PAGE, link.destination, root)
+        except DraftError:
+            continue
+        if target == CONCLUSIONS_PAGE:
+            conclusions_link = link
+            break
+    if conclusions_link is not None:
+        lines = index_text.split("\n")
+        start_line = index_text.count("\n", 0, conclusions_link.whole_span.start)
+        is_last = True
+        for line in lines[start_line + 1 :]:
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                break
+            if stripped.startswith("- ["):
+                is_last = False
+                break
+        if is_last:
+            return index_text
+        index_text = remove_parent_navigation(index_text, conclusions_link)
     return append_parent_navigation(index_text, CONCLUSIONS_TITLE, CONCLUSIONS_PAGE.as_posix())
 
 
@@ -126,7 +239,11 @@ def plan_generation(graph: ConclusionsView, *, state: ConclusionsState) -> Gener
         if CONCLUSIONS_PAGE in graph.pages or (
             conclusions_path.is_file() and not conclusions_path.is_symlink()
         ):
-            raise DraftError("conclusions.unexpected_file", graph.root / CONCLUSIONS_PAGE)
+            from draft.diagnostic_codes import CheckCode
+
+            raise DraftError(
+                CheckCode.CONCLUSIONS_UNEXPECTED_FILE.value, graph.root / CONCLUSIONS_PAGE
+            )
         if not confirmed:
             return GenerationPlan(
                 generated=False, reason=GenerationReason.NO_CONFIRMED_PAGES, operation=None
@@ -134,8 +251,9 @@ def plan_generation(graph: ConclusionsView, *, state: ConclusionsState) -> Gener
     mutations: list[FileMutation] = []
     index = graph.pages.get(ROOT_PAGE)
     index_text = index.text if index is not None else ""
-    if index is not None and CONCLUSIONS_PAGE not in graph.pages:
-        index_text = _root_navigation_after(graph, index_text)
+    if index is not None:
+        # 已生成时根导航结论链接缺失或错位必须修复；未生成时首次生成创建。
+        index_text = _ensure_conclusions_nav(index_text, graph.root)
 
     rendered = _render_conclusions(graph, confirmed)
     previous_document = graph.pages.get(CONCLUSIONS_PAGE)
@@ -150,42 +268,24 @@ def plan_generation(graph: ConclusionsView, *, state: ConclusionsState) -> Gener
     previous = previous_bytes is not None
     rendered_bytes = rendered.encode("utf-8")
 
-    index_unchanged = True
-    if index is not None:
-        index_bytes = index_text.encode("utf-8")
-        index_unchanged = index_bytes == index.text.encode("utf-8")
-
-    # 已生成且结论页与根导航都无需变化：幂等，不产生公开效果。
-    if (
-        state is ConclusionsState.GENERATED
-        and previous
-        and previous_bytes == rendered_bytes
-        and index_unchanged
-    ):
+    conclusions_changed = not previous or previous_bytes != rendered_bytes
+    index_changed = index is not None and index_text != index.text
+    # 结论页与根导航都无需变化：幂等，不产生公开效果。
+    if not conclusions_changed and not index_changed:
         return GenerationPlan(generated=True, reason=None, operation=None)
 
-    if previous:
-        assert previous_bytes is not None
+    if conclusions_changed:
         mutations.append(
             FileMutation(
                 CONCLUSIONS_PAGE,
                 MutationKind.WRITE,
-                sha256_bytes(previous_bytes),
+                sha256_bytes(previous_bytes) if previous else None,
                 sha256_bytes(rendered_bytes),
                 rendered_bytes,
             )
         )
-    else:
-        mutations.append(
-            FileMutation(
-                CONCLUSIONS_PAGE,
-                MutationKind.WRITE,
-                None,
-                sha256_bytes(rendered_bytes),
-                rendered_bytes,
-            )
-        )
-    if index is not None and not index_unchanged:
+    if index_changed:
+        assert index is not None
         mutations.append(
             FileMutation(
                 ROOT_PAGE,
@@ -210,8 +310,11 @@ def plan_generation(graph: ConclusionsView, *, state: ConclusionsState) -> Gener
     from draft.plan_effects import PlanAction, PlanEffect
 
     effects = [
-        PlanEffect(action=PlanAction.MODIFY, path=CONCLUSIONS_PAGE),
-        PlanEffect(action=PlanAction.MODIFY, path=ROOT_PAGE),
+        PlanEffect(action=PlanAction.MODIFY, path=path)
+        for path in (
+            *((CONCLUSIONS_PAGE,) if conclusions_changed else ()),
+            *((ROOT_PAGE,) if index_changed else ()),
+        )
     ]
     plan = OperationPlan(
         kind="generate-conclusions",
@@ -236,6 +339,16 @@ def generate_conclusions(root: Path) -> GenerationPlan:
     if plan.operation is not None:
         execute_plan(plan.operation)
     return plan
+
+
+def load_generation_graph(root: Path) -> DraftGraph:
+    """读取所有权状态并加载生成器可重写结论页的容错快照。"""
+    from draft.graph import read_marker
+    from draft.paths import resolve_draft_root
+
+    resolved = resolve_draft_root(root)
+    state = read_marker(resolved).conclusions_state
+    return _load_graph_with_conclusions(resolved, state)
 
 
 def _load_graph_with_conclusions(root: Path, state: ConclusionsState) -> DraftGraph:

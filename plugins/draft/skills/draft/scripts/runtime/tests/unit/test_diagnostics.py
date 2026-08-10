@@ -614,6 +614,33 @@ VALID_RENDER_CASES = [
         ),
         (0,),
     ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.CONCLUSIONS_UNEXPECTED_FILE.value,
+            IssueSeverity.ERROR,
+            Path("conclusions.md"),
+            None,
+            (),
+        ),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.CONCLUSIONS_SHAPE_INVALID.value,
+            IssueSeverity.ERROR,
+            Path("conclusions.md"),
+            None,
+            (),
+        ),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.CONCLUSIONS_NAVIGATION_INVALID.value,
+            IssueSeverity.ERROR,
+            Path("index.md"),
+            None,
+            (),
+        ),
+    ),
 ]
 
 

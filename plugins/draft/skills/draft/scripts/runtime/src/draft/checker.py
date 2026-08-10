@@ -540,6 +540,49 @@ def _check_trash_handoff_pending(
     return [_error(CheckCode.TRASH_PENDING_UNEXPLAINED, relative, None, journal.operation_id)]
 
 
+def _check_conclusions_product(
+    resolved: Path, graph: DraftGraph, state: ConclusionsState
+) -> list[CheckIssue]:
+    """结论机器产物的结构检查（规格 §12.6）。
+
+    - ``not_generated`` 时意外出现 ``conclusions.md``；
+    - ``generated`` 时结论页固定形状损坏；
+    - 根导航结论链接缺失、重复、位置或目标错误。
+    """
+    from draft.conclusions import (
+        is_conclusions_document,
+        is_conclusions_nav_canonical,
+    )
+
+    issues: list[CheckIssue] = []
+    if state is ConclusionsState.NOT_GENERATED:
+        return issues
+    document = graph.pages.get(CONCLUSIONS_PAGE)
+    if document is not None and not is_conclusions_document(document, resolved):
+        issues.append(_error(CheckCode.CONCLUSIONS_SHAPE_INVALID, CONCLUSIONS_PAGE, None))
+    index = graph.pages.get(ROOT_PAGE)
+    if index is not None and not is_conclusions_nav_canonical(index.text, resolved):
+        issues.append(_error(CheckCode.CONCLUSIONS_NAVIGATION_INVALID, ROOT_PAGE, None))
+    return issues
+
+
+def _conclusions_state(
+    resolved: Path, mode: LoadMode, allow_provisional_adopt: bool
+) -> ConclusionsState | None:
+    """读取所有权状态；标记缺失/无效/非 registered 时返回 None（不在此处报错）。"""
+    if mode != "registered":
+        return None
+    from draft.graph import read_marker
+
+    try:
+        state = read_marker(resolved, allow_provisional_adopt=allow_provisional_adopt)
+    except DraftError:
+        return None
+    if state.provisional_manifest is not None:
+        return None
+    return state.conclusions_state
+
+
 def _conclusions_required(resolved: Path, mode: LoadMode, allow_provisional_adopt: bool) -> bool:
     """conclusions.md 是否必须存在：registered 且标记有效时由所有权状态决定。
 
@@ -564,6 +607,7 @@ def check_draft(
     *,
     include_operation_state: bool = True,
     allow_provisional_adopt: bool = False,
+    exclude_resource_facts: bool = False,
 ) -> CheckReport:
     resolved = resolve_draft_root(root)
     layout: list[CheckIssue] = []
@@ -622,4 +666,15 @@ def check_draft(
         ordered.extend(sorted(_load_issues_in(result.issues, _LOAD_LINK_ISSUES), key=_sort_key))
     ordered.extend(sorted(_load_issues_in(result.issues, None), key=_sort_key))
     ordered.extend(check_graph(result.graph).issues)
+    conclusions_state = _conclusions_state(resolved, mode, allow_provisional_adopt)
+    if conclusions_state is not None:
+        ordered.extend(
+            sorted(
+                _check_conclusions_product(resolved, result.graph, conclusions_state),
+                key=_sort_key,
+            )
+        )
+    if exclude_resource_facts:
+        facts = set(result.resource_facts)
+        ordered = [issue for issue in ordered if issue not in facts]
     return CheckReport(issues=tuple(ordered))

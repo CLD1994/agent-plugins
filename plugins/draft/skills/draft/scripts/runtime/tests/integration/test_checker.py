@@ -236,6 +236,55 @@ def test_not_generated_absent_conclusions_is_not_missing_file(
     assert CheckCode.ROOT_MISSING_FILE.value not in codes(report)
 
 
+def _generated_conclusions_root(draft_factory: DraftFactory) -> Path:
+    """已生成所有权的草稿：固定形状的结论页 + 结论链接位于最后的规范根导航。"""
+    files = healthy()
+    files["index.md"] = (
+        ROOT_PAGE.replace("- [结论汇总](conclusions.md)\n", "") + "- [结论汇总](conclusions.md)\n"
+    )
+    files["conclusions.md"] = (
+        "# 结论汇总\n\n> 状态：`当前提案`\n>\n> 父主题：[根索引](index.md)\n\n"
+        "## 已确认结论\n\n- [问题](pages/question.md)\n"
+    )
+    root = draft_factory(files)
+    (root / ".draft/draft.json").write_text(
+        '{"format_version":1,"conclusions_state":"generated"}\n', encoding="utf-8"
+    )
+    return root
+
+
+def test_generated_conclusions_shape_change_is_error(
+    draft_factory: DraftFactory,
+) -> None:
+    root = _generated_conclusions_root(draft_factory)
+    assert check_draft(root).errors == ()
+
+    (root / "conclusions.md").write_text(
+        (root / "conclusions.md").read_text(encoding="utf-8").replace("# 结论汇总", "# 任意标题"),
+        encoding="utf-8",
+    )
+
+    report = check_draft(root)
+
+    assert CheckCode.CONCLUSIONS_SHAPE_INVALID.value in codes(report)
+
+
+def test_generated_conclusions_nav_link_deletion_is_error(
+    draft_factory: DraftFactory,
+) -> None:
+    root = _generated_conclusions_root(draft_factory)
+    (root / "index.md").write_text(
+        (root / "index.md")
+        .read_text(encoding="utf-8")
+        .replace("- [结论汇总](conclusions.md)\n", ""),
+        encoding="utf-8",
+    )
+
+    report = check_draft(root)
+
+    assert CheckCode.CONCLUSIONS_NAVIGATION_INVALID.value in codes(report)
+
+
 def test_unmanaged_markdown_below_root(draft_factory: DraftFactory) -> None:
     files = healthy()
     files["notes.md"] = "# 笔记\n\n> 状态：`待讨论`\n\n自由笔记。\n"

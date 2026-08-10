@@ -62,6 +62,10 @@ class SimpleGraph:
         self.pages = dict(pages)
         self.relations = relations
         self.parents = parents
+        children: dict[Path, list[Path]] = {}
+        for child, parent in parents.items():
+            children.setdefault(parent, []).append(child)
+        self.children = {parent: tuple(sorted(entries)) for parent, entries in children.items()}
         self.body_resources: dict[Path, object] = {}
 
 
@@ -75,6 +79,22 @@ def _draft_with_confirmed(*, state: ConclusionsState) -> SimpleGraph:
     }
     parents = {A: INDEX, B: INDEX}
     return _graph_like(pages, relations=relations, parents=parents)
+
+
+def _draft_generated_with_nav() -> SimpleGraph:
+    """已生成状态：根导航已含结论链接（且位于最后），结论页内容与生成结果一致。"""
+    graph = _draft_with_confirmed(state=ConclusionsState.GENERATED)
+    graph.pages[INDEX] = parse_page(
+        INDEX,
+        "# 根\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n## 子主题\n\n"
+        "- [乙](pages/b.md)\n- [结论汇总](conclusions.md)\n",
+    )
+    graph.pages[CONCLUSIONS] = parse_page(
+        CONCLUSIONS,
+        "# 结论汇总\n\n> 状态：`当前提案`\n>\n> 父主题：[根索引](index.md)\n\n"
+        "## 已确认结论\n\n- [t](pages/b.md)\n",
+    )
+    return graph
 
 
 def test_not_generated_without_confirmed_is_no_op() -> None:
@@ -104,13 +124,7 @@ def test_not_generated_with_confirmed_creates_page_and_marks_owner() -> None:
 
 
 def test_generated_unchanged_produces_no_effect() -> None:
-    graph = _draft_with_confirmed(state=ConclusionsState.GENERATED)
-    # 构造与生成结果一致的现有结论页：已确认的 B 页面在列表中。
-    graph.pages[CONCLUSIONS] = parse_page(
-        CONCLUSIONS,
-        "# 结论汇总\n\n> 状态：`当前提案`\n>\n> 父主题：[根索引](index.md)\n\n"
-        "## 已确认结论\n\n- [t](pages/b.md)\n",
-    )
+    graph = _draft_generated_with_nav()
     plan = plan_generation(graph, state=ConclusionsState.GENERATED)
     assert plan.generated is True
     assert plan.operation is None or plan.operation.effects == ()
@@ -144,7 +158,9 @@ def test_generated_without_confirmed_keeps_empty_list() -> None:
 
 
 def test_not_generated_with_unexpected_file_fails() -> None:
+    from draft.diagnostic_codes import CheckCode
+
     graph = _draft_with_confirmed(state=ConclusionsState.NOT_GENERATED)
     graph.pages[CONCLUSIONS] = _page(CONCLUSIONS, status=StatusCode.PROPOSED, title="结论汇总")
-    with pytest.raises(DraftError, match="conclusions.unexpected_file"):
+    with pytest.raises(DraftError, match=CheckCode.CONCLUSIONS_UNEXPECTED_FILE.value):
         plan_generation(graph, state=ConclusionsState.NOT_GENERATED)

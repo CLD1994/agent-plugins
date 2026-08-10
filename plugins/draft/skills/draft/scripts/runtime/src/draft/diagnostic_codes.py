@@ -50,6 +50,9 @@ class CheckCode(StrEnum):
     TRASH_RETAINED = "trash.retained"
     TRASH_HANDOFF_PENDING = "trash.handoff_pending"
     TRASH_PENDING_UNEXPLAINED = "trash.pending_unexplained"
+    CONCLUSIONS_UNEXPECTED_FILE = "conclusions.unexpected_file"
+    CONCLUSIONS_SHAPE_INVALID = "conclusions.shape_invalid"
+    CONCLUSIONS_NAVIGATION_INVALID = "conclusions.navigation_invalid"
 
 
 class RootMissingKind(StrEnum):

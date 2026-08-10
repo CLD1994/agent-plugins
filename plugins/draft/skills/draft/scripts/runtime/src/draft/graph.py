@@ -61,6 +61,8 @@ class DraftGraph:
 class LoadResult:
     graph: DraftGraph
     issues: list[CheckIssue]
+    # 正文链接目标事实（missing/invalid/unavailable）：是查询结果数据，不阻止命令。
+    resource_facts: list[CheckIssue]
 
 
 def error_issue(
@@ -318,6 +320,7 @@ def _load(root: Path) -> LoadResult:
         label: [] for label in RelationCode
     }
     link_issues: list[CheckIssue] = []
+    resource_facts: list[CheckIssue] = []
     body_resources: dict[Path, tuple[ResourceReference, ...]] = {}
     inbound_resources: dict[ResourceIdentity, list[Path]] = {}
 
@@ -331,35 +334,35 @@ def _load(root: Path) -> LoadResult:
             inbound_resources.setdefault(identity, []).append(source)
             target_state = resource.target_state
             if target_state is TargetState.MISSING:
-                link_issues.append(
-                    error_issue(
-                        CheckCode.LINK_MISSING,
-                        source,
-                        reference.link.line,
-                        reference.link.destination,
-                        resource.target,
-                    )
+                issue = error_issue(
+                    CheckCode.LINK_MISSING,
+                    source,
+                    reference.link.line,
+                    reference.link.destination,
+                    resource.target,
                 )
+                link_issues.append(issue)
+                resource_facts.append(issue)
             elif target_state is TargetState.INVALID:
-                link_issues.append(
-                    error_issue(
-                        CheckCode.LINK_INVALID,
-                        source,
-                        reference.link.line,
-                        reference.link.destination,
-                        resource.target,
-                    )
+                issue = error_issue(
+                    CheckCode.LINK_INVALID,
+                    source,
+                    reference.link.line,
+                    reference.link.destination,
+                    resource.target,
                 )
+                link_issues.append(issue)
+                resource_facts.append(issue)
             elif target_state is TargetState.UNAVAILABLE:
-                link_issues.append(
-                    CheckIssue(
-                        code=CheckCode.LINK_UNAVAILABLE.value,
-                        severity=IssueSeverity.WARNING,
-                        path=source,
-                        line=reference.link.line,
-                        details=(reference.link.destination, resource.target),
-                    )
+                issue = CheckIssue(
+                    code=CheckCode.LINK_UNAVAILABLE.value,
+                    severity=IssueSeverity.WARNING,
+                    path=source,
+                    line=reference.link.line,
+                    details=(reference.link.destination, resource.target),
                 )
+                link_issues.append(issue)
+                resource_facts.append(issue)
             if identity.kind is ResourceKind.PAGE and target_state is TargetState.PRESENT:
                 target = Path(identity.value)
                 if target in managed_set:
@@ -412,11 +415,32 @@ def _load(root: Path) -> LoadResult:
     for child, parent in parents.items():
         children.setdefault(parent, []).append(child)
 
+    # 子页按父页面导航声明顺序排列；父导航未声明该子页时按路径排序作为确定性兜底。
+    for parent, entries in children.items():
+        positions: dict[Path, int] = {}
+        document = pages.get(parent)
+        if document is not None:
+            for link in document.links:
+                try:
+                    target, _anchor = resolve_local_destination(parent, link.destination, root)
+                except DraftError:
+                    continue
+                if target in entries and target not in positions:
+                    positions[target] = link.whole_span.start
+
+        def _declared_key(
+            child: Path, positions: Mapping[Path, int] = positions
+        ) -> tuple[object, Path]:
+            return (positions.get(child, 1 << 30), child)
+
+        entries.sort(key=_declared_key)
+
     graph = DraftGraph(
         root=root,
         pages={path: pages[path] for path in sorted(pages)},
         parents={path: parents[path] for path in sorted(parents)},
-        children={parent: tuple(sorted(entries)) for parent, entries in sorted(children.items())},
+        # children 已按父导航声明顺序排序；外层保持父键排序，条目顺序不变。
+        children={parent: tuple(entries) for parent, entries in sorted(children.items())},
         inbound_links={
             target: tuple(sorted(entries, key=lambda entry: (entry[0], entry[1].whole_span.start)))
             for target, entries in sorted(inbound.items())
@@ -427,7 +451,13 @@ def _load(root: Path) -> LoadResult:
             identity: tuple(sorted(paths)) for identity, paths in sorted(inbound_resources.items())
         },
     )
-    return LoadResult(graph=graph, issues=issues)
+    return LoadResult(graph=graph, issues=issues, resource_facts=resource_facts)
+
+
+def structural_issues(result: LoadResult) -> list[CheckIssue]:
+    """结构性问题：排除正文资源事实后的加载问题，用于命令的可写性判定。"""
+    facts = set(result.resource_facts)
+    return [issue for issue in result.issues if issue not in facts]
 
 
 def load_graph(
@@ -438,8 +468,9 @@ def load_graph(
 ) -> DraftGraph:
     resolved = resolve_draft_root(root)
     result = load_graph_tolerant(resolved, mode, allow_provisional_adopt=allow_provisional_adopt)
-    if result.issues:
-        first = result.issues[0]
+    blocking = structural_issues(result)
+    if blocking:
+        first = blocking[0]
         raise DraftError(
             first.code,
             *(() if first.path is None else (first.path,)),
@@ -543,4 +574,8 @@ def load_graph_tolerant(
             _candidate_internal_issues(resolved, allow_provisional_adopt=allow_provisional_adopt)
         )
     result = _load(resolved)
-    return LoadResult(graph=result.graph, issues=[*marker_issues, *result.issues])
+    return LoadResult(
+        graph=result.graph,
+        issues=[*marker_issues, *result.issues],
+        resource_facts=result.resource_facts,
+    )

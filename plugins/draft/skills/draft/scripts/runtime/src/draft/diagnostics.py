@@ -321,6 +321,21 @@ _SPECS: dict[CheckCode, DiagnosticSpec] = {
         _fixed(1),
         lambda details: f"回收操作 {_safe(details[0])} 处于无有效失败记录的待移交态",
     ),
+    CheckCode.CONCLUSIONS_UNEXPECTED_FILE: DiagnosticSpec(
+        _FILE,
+        _fixed(0),
+        _text("所有权为未生成时意外出现 conclusions.md，不能被自动覆盖"),
+    ),
+    CheckCode.CONCLUSIONS_SHAPE_INVALID: DiagnosticSpec(
+        _FILE,
+        _fixed(0),
+        _text("结论页固定机器形状损坏，重新运行 generate-conclusions 修复"),
+    ),
+    CheckCode.CONCLUSIONS_NAVIGATION_INVALID: DiagnosticSpec(
+        _FILE,
+        _fixed(0),
+        _text("根导航结论链接缺失、重复、位置或目标错误"),
+    ),
 }
 
 KNOWN_CHECK_CODES: frozenset[str] = frozenset(code.value for code in _SPECS)
