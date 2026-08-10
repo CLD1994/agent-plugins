@@ -482,7 +482,9 @@ def _check(root: Path, validation_mode: str) -> None:
     from draft.checker import check_draft
 
     mode = "candidate" if validation_mode == "candidate" else "registered"
-    report = check_draft(root, mode=mode, include_operation_state=False)
+    report = check_draft(
+        root, mode=mode, include_operation_state=False, exclude_resource_facts=True
+    )
     if report.errors:
         codes = ", ".join(issue.code for issue in report.errors)
         raise DraftError("operation.validation_failed", root, details=(codes,))
@@ -900,6 +902,10 @@ def _execute_allocated_plan(
                 applied=False,
             )
         )
+    changed_paths = public_changed_paths(plan.effects) if plan.effects else None
+    metadata = dict(journal.metadata)
+    if changed_paths is not None:
+        metadata[PUBLIC_CHANGED_PATHS_KEY] = _encode_public_paths(changed_paths)
     prepared = Journal(
         operation_id=operation_id,
         kind=plan.kind,
@@ -907,12 +913,10 @@ def _execute_allocated_plan(
         validation_mode=plan.validation_mode,
         mutations=tuple(mutations),
         remove_empty_directories=plan.remove_empty_directories,
-        metadata={**plan.metadata, **journal.metadata},
+        metadata={**plan.metadata, **metadata},
         directory=directory,
     )
     write_journal(prepared)
-
-    changed_paths = public_changed_paths(plan.effects) if plan.effects else None
 
     for mutation in prepared.mutations:
         current_hash = sha256_file(root / mutation.path)
@@ -933,6 +937,40 @@ def _execute_allocated_plan(
         retain_terminal_lock=retain_terminal_lock,
         changed_paths=changed_paths,
     )
+
+
+PUBLIC_CHANGED_PATHS_KEY = "public_changed_paths"
+
+
+def _encode_public_paths(paths: tuple[Path, ...]) -> str:
+    return json.dumps([path.as_posix() for path in paths])
+
+
+def _persisted_public_paths(journal: Journal) -> tuple[Path, ...] | None:
+    """恢复时读取日志中持久化的公开变化路径；旧日志缺失时返回 None。"""
+    value = journal.metadata.get(PUBLIC_CHANGED_PATHS_KEY)
+    if value is None:
+        return None
+    try:
+        raw: object = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(raw, list):
+        return None
+    checked: list[str] = []
+    for entry in cast("list[object]", raw):
+        if not isinstance(entry, str):
+            return None
+        checked.append(entry)
+    return tuple(Path(entry) for entry in checked)
+
+
+def _recover_changed_paths(journal: Journal) -> tuple[Path, ...]:
+    """恢复结果的公开路径：优先日志持久化的公开语义，缺失时退回 mutation 路径。"""
+    persisted = _persisted_public_paths(journal)
+    if persisted is not None:
+        return persisted
+    return tuple(mutation.path for mutation in journal.mutations)
 
 
 def _classify(root: Path, mutation: JournalMutation) -> str:
@@ -973,7 +1011,7 @@ def _recover_terminal(root: Path, journal: Journal, operation_id: str) -> Operat
         operation_id=operation_id,
         kind=journal.kind,
         phase=journal.phase,
-        changed_paths=tuple(mutation.path for mutation in journal.mutations),
+        changed_paths=_recover_changed_paths(journal),
     )
 
 
@@ -1005,7 +1043,7 @@ def _recover_locked(root: Path, operation_id: str) -> OperationResult:
     for mutation in journal.mutations:
         if _classify(root, mutation) == "unknown":
             raise DraftError("operation.external_change", root / mutation.path)
-    return _finish_forward(root, journal)
+    return _finish_forward(root, journal, changed_paths=_recover_changed_paths(journal))
 
 
 def recover(root_path: Path) -> OperationResult:

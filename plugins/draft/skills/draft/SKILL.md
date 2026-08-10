@@ -43,7 +43,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 - collapse 降级枢纽为普通页面
 - trash 回收页面为保留态
 - restore 恢复被回收的页面
-- recover 推进回收生命周期
+- recover 修复崩溃或中断留下的未完成写操作（回收生命周期推进由所有已登记命令的前置静默完成）
 - create 创建叶子页面
 - status set 修改页面状态
 - relation add / relation remove 修改正式关系
@@ -112,7 +112,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 ## 回收与恢复
 
 - `trash` 把页面和权威删除包落地为 7 天保留态（`trash_retained`），不立即移交系统回收站；有其他入站引用时命令拒绝并列出阻碍，先人工解除或改指再回收。
-- `trash` 后 7 天内可 `draft restore ROOT OPERATION_ID` 恢复页面；到期后的系统回收站移交和最终清理由 `draft recover ROOT` 或普通结构写命令惰性推进，Agent 不需要维护计时器。最终清理（`trash_purge_committed`）只在到达清理期限后最后一次投递明确失败时发生，是永久删除授权。
+- `trash` 后 7 天内可 `draft restore ROOT OPERATION_ID` 恢复页面；到期后的系统回收站移交和最终清理由所有已登记命令的前置静默推进，Agent 不需要维护计时器。`draft recover ROOT` 只修复崩溃或中断留下的未完成写操作，回收到期与移交结果不进入它的公开输出。最终清理（`trash_purge_committed`）只在到达清理期限后最后一次投递明确失败时发生，是永久删除授权。
 - `restore` 回滚不是成功：恢复未完成时 `exit 3`、JSON `ok=false`（`result_type=restore`），权威删除包仍保留；JSON 不暴露内部 phase，遇到 `exit 3` 时不要报告"已恢复"。
 - 移交明确失败只产生警告并继续原命令；状态损坏（`operation.inconsistent_state` 等）才停止写入。结构命令提示需要恢复时，先运行 `draft recover ROOT` 做机械恢复，不要删除锁或日志目录；恢复结果无法解释或需要取舍时再停止并询问用户（见硬停止条件）。
 - `.draft/` 下的操作日志、权威删除包和锁是工具内部状态，绝不手工编辑。

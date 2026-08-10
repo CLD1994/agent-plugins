@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -260,6 +261,34 @@ def test_purge_committed_recovery_only_finishes_cleanup(
     assert calls == []
     assert _phase(root, pending.operation_id) == "completed"
     assert not _package_exists(root, pending.operation_id)
+
+
+def test_recover_cli_never_exposes_internal_paths(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """recover 的公开 paths 不得包含 .draft/ 内部路径。"""
+    import json
+
+    from draft.cli import main
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+
+    from draft.operations import acquire_lock, read_journal, with_phase, write_journal
+
+    journal = read_journal(_journal_path(root, pending.operation_id))
+    write_journal(with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED))
+    acquire_lock(root, pending.operation_id)
+    capsys.readouterr()
+
+    code = main(["recover", str(root), "--json"])
+    payload = cast("dict[str, object]", json.loads(capsys.readouterr().out))
+
+    assert code == 0
+    assert payload["result_type"] == "recover"
+    assert payload["fixed_count"] == 1
+    paths = cast("list[str]", payload["paths"])
+    assert all(not p.startswith(".draft/") for p in paths)
 
 
 def test_batch_failure_preserves_prior_results_and_never_touches_later_operation(

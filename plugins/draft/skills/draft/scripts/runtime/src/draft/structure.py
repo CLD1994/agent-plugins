@@ -439,7 +439,7 @@ def _load_clean_graph(root: Path, *, allow_empty_hub: Path | None = None) -> Dra
     resolved = resolve_draft_root(root)
     if read_lock(resolved) is not None:
         raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, resolved)
-    report = check_draft(resolved)
+    report = check_draft(resolved, exclude_resource_facts=True)
     errors = [
         issue
         for issue in report.errors

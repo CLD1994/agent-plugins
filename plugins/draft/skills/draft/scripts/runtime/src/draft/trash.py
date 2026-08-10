@@ -358,7 +358,7 @@ def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackag
         raise DraftError("operation.validation_failed", page_path, details=("restore_conflict",))
     if sha256_file(root / parent_path) != parent_hash:
         raise DraftError("operation.validation_failed", parent_path, details=("restore_conflict",))
-    report = check_draft(root, include_operation_state=False)
+    report = check_draft(root, include_operation_state=False, exclude_resource_facts=True)
     if report.errors:
         codes = tuple(issue.code for issue in report.errors)
         raise DraftError("operation.validation_failed", root, details=codes)
@@ -658,7 +658,7 @@ def trash_page(root: Path, page: Path, *, now: datetime | None = None) -> TrashR
     deadlines = TrashDeadlines.from_created_at(normalized_now)
     if read_lock(resolved) is not None:
         raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, resolved)
-    report = check_draft(resolved)
+    report = check_draft(resolved, exclude_resource_facts=True)
     if report.errors:
         codes = tuple(issue.code for issue in report.errors)
         raise DraftError("structure.dirty", resolved, details=codes)
