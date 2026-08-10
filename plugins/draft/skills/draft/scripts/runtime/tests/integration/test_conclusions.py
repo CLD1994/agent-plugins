@@ -126,8 +126,48 @@ def test_generate_conclusions_dry_run_does_not_write(
     assert code == 0
     assert payload["result_type"] == "plan"
     assert payload["operation"] == "generate-conclusions"
+    effects = cast("list[dict[str, object]]", payload["effects"])
+    assert any(e.get("path") == "conclusions.md" for e in effects)
+    assert "changed_paths" not in payload
     assert not (root / "conclusions.md").exists()
     assert read_marker(root).conclusions_state is ConclusionsState.NOT_GENERATED
+
+
+def test_generate_conclusions_dry_run_no_confirmed_is_empty_effects(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """无已确认页面时预演成功，返回空 effects 与业务事实，而不是报错。"""
+    root = build_conc_draft(draft_factory)
+    (root / "pages/a.md").write_text(
+        (root / "pages/a.md").read_text(encoding="utf-8").replace("已确认", "待讨论"),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+
+    code, payload = run_json(["generate-conclusions", str(root), "--dry-run", "--json"], capsys)
+
+    assert code == 0
+    assert payload["result_type"] == "plan"
+    assert payload["operation"] == "generate-conclusions"
+    assert payload["generated"] is False
+    assert payload["reason"] == "no_confirmed_pages"
+    assert cast("list[dict[str, object]]", payload["effects"]) == []
+    assert not (root / "conclusions.md").exists()
+
+
+def test_generate_conclusions_dry_run_idempotent_is_empty_effects(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """已生成且无变化时预演成功，返回空 effects，而不是报错。"""
+    root = build_conc_draft(draft_factory)
+    assert main(["generate-conclusions", str(root)]) == 0
+    capsys.readouterr()
+
+    code, payload = run_json(["generate-conclusions", str(root), "--dry-run", "--json"], capsys)
+
+    assert code == 0
+    assert payload["generated"] is True
+    assert cast("list[dict[str, object]]", payload["effects"]) == []
 
 
 def test_generate_conclusions_rebuilds_damaged_page(
@@ -145,6 +185,55 @@ def test_generate_conclusions_rebuilds_damaged_page(
     assert payload["generated"] is True
     assert "conclusions.md" in cast("list[str]", payload["changed_paths"])
     assert check_draft(root).errors == ()
+
+
+def test_generate_conclusions_follows_navigation_declaration_order(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """结论条目按根导航声明顺序深度优先输出，不按路径排序。"""
+    root = draft_factory(
+        {
+            "index.md": (
+                "# Topic\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n## 子主题\n\n"
+                "- [乙](pages/b.md)\n- [甲](pages/a.md)\n"
+            ),
+            "pages/a.md": "# 甲\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](../index.md)\n\n甲。\n",
+            "pages/b.md": "# 乙\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](../index.md)\n\n乙。\n",
+        }
+    )
+    capsys.readouterr()
+
+    code, payload = run_json(["generate-conclusions", str(root), "--json"], capsys)
+
+    assert code == 0
+    assert payload["generated"] is True
+    conclusions = (root / "conclusions.md").read_text(encoding="utf-8")
+    items = [line for line in conclusions.splitlines() if line.startswith("- [")]
+    assert items == ["- [乙](pages/b.md)", "- [甲](pages/a.md)"], items
+
+
+def test_generate_conclusions_fails_on_invalid_navigation(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """声明了父关系但导航遍历无法到达的页面使生成失败，不退回路径排序。"""
+    root = draft_factory(
+        {
+            "index.md": "# Topic\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n## 子主题\n\n",
+            "pages/a.md": "# 甲\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](../index.md)\n\n甲。\n",
+        }
+    )
+    (root / "pages/b.md").write_text(
+        "# 乙\n\n> 状态：`已确认`\n>\n> 父主题：[缺失](../missing.md)\n\n乙。\n",
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+
+    code, payload = run_json(["generate-conclusions", str(root), "--json"], capsys)
+
+    assert code == 2
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "conclusions.invalid_navigation"
 
 
 def test_conclusions_page_queryable_as_managed_page(

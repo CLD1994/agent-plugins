@@ -141,8 +141,8 @@ def build_parser() -> argparse.ArgumentParser:
     recover = subparsers.add_parser(
         "recover",
         parents=[shared],
-        help="推进回收生命周期",
-        description="推进回收生命周期：到期项移交系统回收站，已到清理期限的项完成最终清理。",
+        help="修复中断的写操作",
+        description="修复崩溃或中断留下的未完成写操作；回收生命周期推进由所有已登记命令的前置静默完成。",
     )
     recover.add_argument("root", metavar="ROOT", help="草稿根目录")
 
@@ -224,7 +224,7 @@ def build_parser() -> argparse.ArgumentParser:
             "以稳定 JSON 返回页面的结构摘要、正文资源、反向链接、正式关系、状态列表与可恢复项。"
         ),
     )
-    query_sub = query.add_subparsers(dest="query_command", metavar="QUERY")
+    query_sub = query.add_subparsers(dest="query_command", metavar="QUERY", required=True)
 
     query_page = query_sub.add_parser("page", parents=[shared], help="页面结构摘要")
     query_page.add_argument("root", metavar="ROOT", help="草稿根目录")
@@ -250,7 +250,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     query_status = query_sub.add_parser("status", parents=[shared], help="按状态列页面")
     query_status.add_argument("root", metavar="ROOT", help="草稿根目录")
-    query_status.add_argument("code", metavar="CODE", help="稳定状态代码")
+    query_status.add_argument(
+        "code",
+        metavar="CODE",
+        choices=tuple(member.value for member in StatusCode),
+        help="稳定状态代码",
+    )
 
     query_recoverable = query_sub.add_parser("recoverable", parents=[shared], help="可恢复回收项")
     query_recoverable.add_argument("root", metavar="ROOT", help="草稿根目录")
@@ -458,6 +463,10 @@ def _dispatch_query(
             relations = outgoing_relations(view, page)
         else:
             graph = load_complete_snapshot(root)
+            if page not in graph.pages:
+                from draft.query import PAGE_NOT_FOUND
+
+                raise DraftError(PAGE_NOT_FOUND, page)
             relations = incoming_relations(graph, page)
         items = [
             {"relation": item.relation.value, "page": item.page.as_posix()} for item in relations
@@ -534,7 +543,6 @@ def _dry_run_write(
     from draft.cli_results import paginate, slice_payload
     from draft.operations import read_lock
     from draft.paths import resolve_draft_root
-    from draft.plan_effects import public_changed_paths
     from draft.query import load_complete_snapshot
 
     resolved = resolve_draft_root(root)
@@ -559,13 +567,12 @@ def _dry_run_write(
                 }
             )
     slice_ = paginate(tuple(items), offset=offset, limit=limit)
-    payload = slice_payload(slice_, count_only=count_only)  # type: ignore[arg-type]
+    payload = slice_payload(slice_, count_only=count_only, items_key="effects")  # type: ignore[arg-type]
     return (
         {
             "result_type": ResultType.PLAN.value,
             "operation": operation.value,
             **payload,
-            "changed_paths": [path.as_posix() for path in public_changed_paths(effects)],
         },
         f"预演 {operation.value}：{len(effects)} 项影响",
         0,
@@ -785,22 +792,40 @@ def _dispatch(
 
         root = Path(cast(str, args.root))
         if _is_dry_run(args):
+            limit = int(getattr(args, "limit", 20) or 20)
+            offset = int(getattr(args, "offset", 0) or 0)
+            count_only = bool(getattr(args, "count_only", False))
+            if limit < 1 or limit > 100 or offset < 0:
+                raise DraftError("query.invalid_pagination")
+            from draft.cli_results import paginate, slice_payload
+            from draft.conclusions import load_generation_graph, plan_generation
+            from draft.graph import read_marker
+            from draft.paths import resolve_draft_root
 
-            def build(graph: DraftGraph) -> OperationPlan:
-                from draft.conclusions import plan_generation
-                from draft.graph import read_marker
-
-                state = read_marker(graph.root).conclusions_state
-                plan = plan_generation(graph, state=state)
-                if plan.operation is None:
-                    raise DraftError("generate.no_plan")
-                return plan.operation
+            resolved = resolve_draft_root(root)
+            state = read_marker(resolved).conclusions_state
+            graph = load_generation_graph(resolved)
+            plan = plan_generation(graph, state=state)
+            if plan.operation is None:
+                # 无已确认页面或幂等无变化：成功返回空 effects 与业务事实。
+                slice_ = paginate((), offset=offset, limit=limit)
+                payload = {
+                    "result_type": ResultType.PLAN.value,
+                    "operation": DryRunOperation.GENERATE_CONCLUSIONS.value,
+                    "generated": plan.generated,
+                    **slice_payload(slice_, count_only=count_only, items_key="effects"),
+                }
+                if plan.reason is not None:
+                    payload["reason"] = plan.reason.value
+                return payload, "预演 generate-conclusions：无变化影响", 0
+            operation = plan.operation
+            assert operation is not None  # 上面已处理无计划分支。
 
             return _dry_run_write(
                 args,
                 root=root,
                 operation=DryRunOperation.GENERATE_CONCLUSIONS,
-                build=build,
+                build=lambda _graph: operation,
             )
         _reject_pagination_without_dry_run(args)
         result = generate_conclusions(root)
@@ -844,17 +869,7 @@ def _dispatch(
 
         root = Path(cast(str, args.root))
         results = recover_interrupted_operations(root)
-        paths = sorted(
-            {
-                path
-                for result in results
-                for path in (
-                    result.changed_paths
-                    if isinstance(result, OperationResult)
-                    else (result.package,)
-                )
-            }
-        )
+        paths = sorted({path for result in results for path in result.changed_paths})
         payload = {
             "result_type": ResultType.RECOVER.value,
             "fixed_count": len(results),
@@ -877,7 +892,10 @@ def _preflight_candidate_root_for(args: argparse.Namespace) -> Path | None:
         return None
     if command == "check" and bool(getattr(args, "candidate", False)):
         return None
-    return Path(cast(str, args.root))
+    value = getattr(args, "root", None)
+    if value is None:
+        return None
+    return Path(cast(str, value))
 
 
 def _registered_root_for(candidate: Path) -> Path | None:

@@ -712,9 +712,9 @@ def _trashable_cli_root(tmp_path: Path) -> Path:
         "- [A](pages/a.md)：A。\n",
         encoding="utf-8",
     )
-    # conclusions.md 已存在：所有权推进为 generated，使检查器认为它必须存在。
+    # conclusions.md 是测试固定页而非机器产物：保持 not_generated 所有权，不触发结论形状检查。
     (root / ".draft/draft.json").write_text(
-        '{"format_version":1,"conclusions_state":"generated"}\n', encoding="utf-8"
+        '{"format_version":1,"conclusions_state":"not_generated"}\n', encoding="utf-8"
     )
     return root
 
@@ -933,7 +933,13 @@ def test_restore_advances_due_package_once(
         encoding="utf-8",
     )
     index = root / "index.md"
-    index.write_text(index.read_text(encoding="utf-8") + "- [B](pages/b.md)\n", encoding="utf-8")
+    index.write_text(
+        index.read_text(encoding="utf-8").replace(
+            "- [结论汇总](conclusions.md)\n",
+            "- [B](pages/b.md)\n- [结论汇总](conclusions.md)\n",
+        ),
+        encoding="utf-8",
+    )
     retained = trash_page(root, Path("pages/b.md"), now=datetime(2026, 8, 20, tzinfo=UTC))
     capsys.readouterr()
     calls: list[str] = []
@@ -1012,10 +1018,10 @@ def test_dry_run_move_does_not_write_and_matches_formal(
     assert code == 0
     assert payload["result_type"] == "plan"
     assert payload["operation"] == "move"
-    items = cast("list[dict[str, object]]", payload["items"])
-    actions = [(i.get("action"), i.get("path")) for i in items]
+    effects = cast("list[dict[str, object]]", payload["effects"])
+    actions = [(e.get("action"), e.get("path")) for e in effects]
     assert ("modify", "index.md") in actions
-    assert "changed_paths" in payload
+    assert "changed_paths" not in payload
     # 未执行写入：源页仍在，目标不存在。
     assert snapshot_tree(root) == before
     assert (root / "pages/a.md").is_file()
@@ -1031,7 +1037,7 @@ def test_dry_run_move_does_not_write_and_matches_formal(
     assert "index.md" in formal_paths
 
 
-def test_dry_run_count_only_hides_items_keeps_metadata(
+def test_dry_run_count_only_hides_effects_keeps_metadata(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = tmp_path / "topic"
@@ -1047,7 +1053,7 @@ def test_dry_run_count_only_hides_items_keeps_metadata(
         capsys,
     )
 
-    assert counted["items"] == []
+    assert counted["effects"] == []
     assert counted["total"] == normal["total"]
     assert counted["offset"] == normal["offset"]
     assert counted["limit"] == normal["limit"]
@@ -1085,7 +1091,13 @@ def test_dry_run_trash_paths_never_include_dot_draft(
 
     assert code == 0
     assert payload["operation"] == "trash"
-    changed = cast("list[str]", payload["changed_paths"])
+    effects = cast("list[dict[str, object]]", payload["effects"])
+    changed = {
+        cast("str", p)
+        for e in effects
+        for p in (e.get("path"), e.get("from"), e.get("to"))
+        if p is not None
+    }
     assert all(not path.startswith(".draft/") for path in changed)
     assert (root / "pages/a.md").is_file()
     # 正式回收也不暴露 .draft 路径。

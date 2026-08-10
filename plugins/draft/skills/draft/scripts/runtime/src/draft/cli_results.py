@@ -77,13 +77,19 @@ def paginate[T](items: tuple[T, ...], *, offset: int, limit: int) -> PageSlice[T
     )
 
 
-def slice_payload(slice_: PageSlice[object], *, count_only: bool) -> dict[str, object]:
-    """分页信封 JSON：``count_only`` 只把 items 置空，其余字段保持正常计算。"""
+def slice_payload(
+    slice_: PageSlice[object], *, count_only: bool, items_key: str = "items"
+) -> dict[str, object]:
+    """分页信封 JSON：``count_only`` 只把结果字段置空，其余字段保持正常计算。
+
+    ``items_key`` 区分集合查询（``items``）与预演（``effects``），字段计算规则
+    共享同一个分页边界。
+    """
     return {
         "total": slice_.total,
         "offset": slice_.offset,
         "limit": slice_.limit,
         "has_more": slice_.has_more,
         "next_offset": slice_.next_offset,
-        "items": [] if count_only else list(slice_.items),
+        items_key: [] if count_only else list(slice_.items),
     }
