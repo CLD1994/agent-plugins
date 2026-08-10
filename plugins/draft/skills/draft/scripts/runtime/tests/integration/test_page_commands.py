@@ -377,3 +377,49 @@ def test_relation_self_reference_is_rejected(
     error = payload["error"]
     assert isinstance(error, dict)
     assert error["code"] == "relation.self_reference"
+
+
+def test_relation_add_cycle_is_rejected_before_write(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """已有 a 依赖 b 时，添加 b 依赖 a 必须被规划阶段拒绝，不落盘也不进入写锁验证。"""
+    root = build_page_draft(draft_factory)
+    capsys.readouterr()
+
+    code, payload = run_json(
+        ["relation", "add", str(root), "pages/a.md", "depends_on", "pages/b.md", "--json"],
+        capsys,
+    )
+    assert code == 0
+    a_before = (root / "pages/a.md").read_text(encoding="utf-8")
+
+    # 预演也必须拒绝：规划边界与正式执行一致。
+    code, payload = run_json(
+        [
+            "relation",
+            "add",
+            str(root),
+            "pages/b.md",
+            "depends_on",
+            "pages/a.md",
+            "--dry-run",
+            "--json",
+        ],
+        capsys,
+    )
+    assert code == 2
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "relation.dependency_cycle"
+
+    # 正式执行同样拒绝，且 b.md 未被修改。
+    code, payload = run_json(
+        ["relation", "add", str(root), "pages/b.md", "depends_on", "pages/a.md", "--json"],
+        capsys,
+    )
+    assert code == 2
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "relation.dependency_cycle"
+    assert (root / "pages/b.md").read_text(encoding="utf-8") == PAGE_B
+    assert (root / "pages/a.md").read_text(encoding="utf-8") == a_before

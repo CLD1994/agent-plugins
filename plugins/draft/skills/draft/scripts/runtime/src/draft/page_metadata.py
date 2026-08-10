@@ -250,7 +250,8 @@ def _would_form_cycle(graph: DraftGraph, code: RelationCode, source: Path, targe
     adjacency: dict[Path, set[Path]] = {path: set() for path in graph.pages}
     for src, dst, _line in graph.relations.get(code, ()):
         adjacency[src].add(dst)
-    adjacency[target].add(source)
+    # 新边是 source → target：加入该边后是否出现有向环。
+    adjacency[source].add(target)
     color: dict[Path, int] = {}
     for start in sorted(adjacency):
         if color.get(start, 0) != 0:

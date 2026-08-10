@@ -135,6 +135,22 @@ def test_move_reparents_and_repairs_both_directions(
     assert check_draft(root).errors == ()
 
 
+def test_move_preserves_pure_in_page_anchor(draft_factory: DraftFactory) -> None:
+    """页面移入子目录时，`#节` 指向来源页面自身，必须保持原文不被重写。"""
+    root = build_two_hub_draft(draft_factory)
+    a_page = root / "pages/old/a.md"
+    a_page.write_text(
+        a_page.read_text(encoding="utf-8") + "\n见 [本页](#节)。\n",
+        encoding="utf-8",
+    )
+
+    move_page(root, Path("pages/old/a.md"), Path("pages/new/a.md"))
+
+    moved = (root / "pages/new/a.md").read_text(encoding="utf-8")
+    assert "见 [本页](#节)。" in moved
+    assert "../old#节" not in moved
+
+
 def test_move_hub_relocates_complete_subtree(draft_factory: DraftFactory) -> None:
     root = build_two_hub_draft(draft_factory)
 
@@ -174,11 +190,30 @@ def test_move_overwrite_fails(draft_factory: DraftFactory) -> None:
 
 
 def test_move_with_dirty_graph_fails(draft_factory: DraftFactory) -> None:
+    """结构性脏图（关系目标缺失）阻止移动；正文断链是资源事实，不再阻止。"""
     root = build_two_hub_draft(draft_factory)
-    (root / "pages/new/b.md").write_text(B_PAGE + "\n见 [断链](missing.md)。\n", encoding="utf-8")
+    (root / "pages/broken.md").write_text(
+        "# 孤儿\n\n> 状态：`待讨论`\n>\n> 父主题：[缺失](../missing.md)\n\n正文。\n",
+        encoding="utf-8",
+    )
 
     with pytest.raises(DraftError, match="structure.dirty"):
         move_page(root, Path("pages/old/a.md"), Path("pages/new/a.md"))
+
+
+def test_move_tolerates_missing_body_link_resource_fact(
+    draft_factory: DraftFactory,
+) -> None:
+    """正文链接目标缺失是资源事实：移动不因它失败。"""
+    root = build_two_hub_draft(draft_factory)
+    (root / "pages/new/b.md").write_text(
+        B_PAGE + "\n见 [断链](missing.md)。\n",
+        encoding="utf-8",
+    )
+
+    move_page(root, Path("pages/old/a.md"), Path("pages/new/a.md"))
+
+    assert (root / "pages/new/a.md").is_file()
 
 
 def test_move_target_escaping_root_fails(draft_factory: DraftFactory) -> None:

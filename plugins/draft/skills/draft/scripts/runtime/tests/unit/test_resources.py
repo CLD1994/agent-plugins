@@ -321,3 +321,40 @@ def test_rebase_reappends_anchor() -> None:
     )
 
     assert rewritten == "../b.md#细节"
+
+
+def test_pure_anchor_resolves_to_the_page_itself() -> None:
+    """`#节` 指向当前页面内的锚点：身份是来源页面，目标必然存在。"""
+    result = resolve_body_resource(
+        ROOT,
+        Path("pages/a.md"),
+        "#节",
+        host_os=HostOS.LINUX,
+        target_probe=_fake_probe({}),  # type: ignore[arg-type]
+    )
+
+    assert result.identity == ResourceIdentity(ResourceKind.PAGE, "pages/a.md")
+    assert result.target == "pages/a.md"
+    assert result.kind is ResourceKind.PAGE
+    assert result.scope is ResourceScope.DRAFT
+    assert result.target_state is TargetState.PRESENT
+    assert result.anchor == "节"
+
+
+def test_rebase_leaves_pure_anchor_unchanged_across_depth_change() -> None:
+    """页面移入子目录时，页内锚点 `#节` 必须保持原文，不被当成相对路径重写。"""
+    old = resolve_body_resource(
+        ROOT,
+        Path("pages/a.md"),
+        "#节",
+        host_os=HostOS.LINUX,
+        target_probe=_fake_probe({}),  # type: ignore[arg-type]
+    )
+
+    rewritten = rebase_body_destination(
+        old,
+        new_source=Path("pages/sub/a.md"),
+        moved_targets={},
+    )
+
+    assert rewritten == "#节"

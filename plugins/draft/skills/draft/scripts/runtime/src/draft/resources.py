@@ -86,6 +86,8 @@ class ResolvedResource:
     was_relative: bool
     separator: str | None
     anchor: str | None
+    # 纯锚点目标（#节）指向来源页面自身：移动时保持原文，不按相对路径重写。
+    self_anchor: bool = False
 
 
 @dataclass(frozen=True)
@@ -262,6 +264,26 @@ def resolve_body_resource(
     host = host_os if host_os is not None else HostOS.LINUX
     probe = target_probe if target_probe is not None else _probe_filesystem
     path_part, separator, anchor = destination.partition("#")
+    if not path_part and separator == "#":
+        # 纯锚点 `#节`：指向来源页面自身的节，不进入相对资源路径。
+        root_relative = source.as_posix() if not source.is_absolute() else None
+        if root_relative is None:
+            try:
+                root_relative = source.relative_to(root).as_posix()
+            except ValueError:
+                root_relative = source.name
+        return ResolvedResource(
+            identity=ResourceIdentity(ResourceKind.PAGE, root_relative),
+            target=root_relative,
+            kind=ResourceKind.PAGE,
+            scope=ResourceScope.DRAFT,
+            target_state=TargetState.PRESENT,
+            local_absolute=str(root / source) if not source.is_absolute() else str(source),
+            was_relative=True,
+            separator="#",
+            anchor=anchor,
+            self_anchor=True,
+        )
     if _WINDOWS_DRIVE_ABS.match(path_part) or _WINDOWS_DRIVE_REL.match(path_part):
         if host is HostOS.WINDOWS and _WINDOWS_DRIVE_ABS.match(path_part):
             lexical = Path(path_part)
@@ -418,8 +440,11 @@ def rebase_body_destination(
 
     只有当前系统可解释的本地相对目标才重写；本地绝对路径、Windows 绝对路径、
     UNC、盘符相对路径和外部 URI 保持原文不变。指向同时移动的页面时跟随最终
-    目标映射。相对路径保留原主要分隔符风格与锚点。
+    目标映射。相对路径保留原主要分隔符风格与锚点。纯锚点（#节）指向来源页面
+    自身，移动后仍指向同一页面的同一节，保持原文不变。
     """
+    if resource.self_anchor:
+        return f"#{resource.anchor}" if resource.anchor is not None else "#"
     if not resource.was_relative or resource.local_absolute is None:
         anchor = resource.anchor
         return f"{resource.target}#{anchor}" if anchor is not None else resource.target
