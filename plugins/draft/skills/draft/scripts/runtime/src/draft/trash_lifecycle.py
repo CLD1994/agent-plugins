@@ -618,7 +618,7 @@ def recover_interrupted_operations(
     """只修复崩溃或中断留下的未完成写操作；不枚举仍保留或等待移交的回收项。
 
     当前 ``recover_draft`` 中锁内恢复与无锁操作目录分类属于这里；批量到期推进
-    由 ``prepare_registered_command`` 在命令前置统一完成。
+    由 ``prepare_managed_command`` 在命令前置统一完成。
     """
     resolved = resolve_draft_root(root)
     normalized_now = normalize_utc(now)

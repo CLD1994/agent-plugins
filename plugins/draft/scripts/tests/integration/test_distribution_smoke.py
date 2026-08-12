@@ -455,7 +455,7 @@ def test_runtime_distribution_online_then_offline(distribution_copy: Path, tmp_p
     offline_root.mkdir()
 
     # 联网首次解析（空缓存 + 网络）
-    for args in (("--version",), ("init", str(online_root)), ("check", str(online_root))):
+    for args in (("--version",), ("init", str(online_root)), ("check", "--root", str(online_root))):
         uvx_result = _run_uvx(runtime_root, cache_dir, tmp_path, *args, online_retries=1)
         assert uvx_result.returncode == 0, uvx_result.stderr + uvx_result.stdout
         if args == ("--version",):
@@ -465,7 +465,11 @@ def test_runtime_distribution_online_then_offline(distribution_copy: Path, tmp_p
             assert str(PLUGIN_ROOT) not in output, f"plugin path leaked: {output}"
 
     # 同一缓存 + --offline 重跑核心 smoke
-    for args in (("--version",), ("init", str(offline_root)), ("check", str(offline_root))):
+    for args in (
+        ("--version",),
+        ("init", str(offline_root)),
+        ("check", "--root", str(offline_root)),
+    ):
         offline_result = _run_uvx(runtime_root, cache_dir, tmp_path, *args, offline=True)
         assert offline_result.returncode == 0, (
             f"offline {args} failed: {offline_result.stderr}{offline_result.stdout}"

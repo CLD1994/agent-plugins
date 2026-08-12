@@ -1044,7 +1044,7 @@ def _dispatch(
 
 
 def _exit_for_error(error: DraftError) -> int:
-    if error.code.startswith("operation.") or error.code == "adopt.recovery_required":
+    if error.code.startswith("operation."):
         return _EXIT_OPERATION
     return _EXIT_DOMAIN
 

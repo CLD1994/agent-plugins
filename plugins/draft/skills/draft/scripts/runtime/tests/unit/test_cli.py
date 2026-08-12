@@ -735,10 +735,6 @@ def test_exit_for_error_returns_operation_exit_for_operation_codes() -> None:
     assert cli._exit_for_error(DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value)) == 3  # pyright: ignore[reportPrivateUsage]  # 验证 operation.* 错误映射到操作退出码
 
 
-def test_exit_for_error_returns_operation_exit_for_adopt_recovery_required() -> None:
-    assert cli._exit_for_error(DraftError("adopt.recovery_required")) == 3  # pyright: ignore[reportPrivateUsage]  # 验证 adopt.recovery_required 映射到操作退出码
-
-
 def test_exit_for_error_returns_domain_exit_for_other_codes() -> None:
     assert cli._exit_for_error(DraftError("init.not_empty")) == 2  # pyright: ignore[reportPrivateUsage]  # 验证普通错误映射到域退出码
     assert cli._exit_for_error(DraftError("path.escape")) == 2  # pyright: ignore[reportPrivateUsage]  # 验证路径错误映射到域退出码

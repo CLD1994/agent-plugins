@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import BinaryIO, cast
 
 import pytest
-
 from adapter.bindings import Binding, bind, binding_path
 from adapter.bridge import PluginContext, load_context
 from adapter.errors import AdapterError

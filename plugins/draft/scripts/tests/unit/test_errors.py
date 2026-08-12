@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from adapter.errors import EXIT_RUNTIME, EXIT_USAGE, AdapterError, error_payload, render_error
 
 # ---------------------------------------------------------------------------
