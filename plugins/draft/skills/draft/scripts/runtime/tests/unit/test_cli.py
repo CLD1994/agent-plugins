@@ -615,6 +615,70 @@ def test_check_path_prefix_accepts_canonical_relative_path() -> None:
 
 
 # ---------------------------------------------------------------------------
+# collection_payload：集合查询双分页信封
+# ---------------------------------------------------------------------------
+
+
+def test_partial_query_pages_items_and_blockers_with_same_window() -> None:
+    from draft.cli_results import collection_payload
+
+    items = [{"page": f"pages/p{i}.md"} for i in range(25)]
+    blockers = [Path(f"pages/broken{i}.md") for i in range(45)]
+    payload = collection_payload(
+        items,
+        blocking_paths=blockers,
+        complete=False,
+        offset=20,
+        limit=20,
+        count_only=False,
+    )
+    assert payload["offset"] == 20
+    assert payload["limit"] == 20
+    assert payload["total"] == 25
+    assert payload["has_more"] is False
+    assert payload["next_offset"] is None
+    assert payload["blocking_total"] == len(blockers)
+    assert payload["blocking_has_more"] is True
+    assert payload["blocking_next_offset"] == 40
+    assert payload["complete"] is False
+
+
+def test_collection_payload_complete_shows_zero_blockers() -> None:
+    from draft.cli_results import collection_payload
+
+    payload = collection_payload(
+        [{"page": "pages/a.md"}],
+        blocking_paths=(),
+        complete=True,
+        offset=0,
+        limit=20,
+        count_only=False,
+    )
+    assert payload["complete"] is True
+    assert payload["blocking_total"] == 0
+    assert payload["blocking_has_more"] is False
+    assert payload["blocking_next_offset"] is None
+    assert payload["blocking_paths"] == []
+
+
+def test_collection_payload_count_only_empties_both_collections() -> None:
+    from draft.cli_results import collection_payload
+
+    payload = collection_payload(
+        [{"page": "pages/a.md"}],
+        blocking_paths=[Path("pages/broken.md")],
+        complete=False,
+        offset=0,
+        limit=20,
+        count_only=True,
+    )
+    assert payload["items"] == []
+    assert payload["blocking_paths"] == []
+    assert payload["total"] == 1
+    assert payload["blocking_total"] == 1
+
+
+# ---------------------------------------------------------------------------
 # _operation_payload / _trash_payload
 # ---------------------------------------------------------------------------
 

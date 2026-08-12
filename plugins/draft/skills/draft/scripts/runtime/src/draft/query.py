@@ -12,9 +12,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import DraftGraph, load_graph
-from draft.models import PageDocument, RelationCode, StatusCode
+from draft.models import CheckIssue, PageDocument, RelationCode, StatusCode
 from draft.paths import resolve_draft_root, resolve_page_operand
 from draft.resources import (
     HostOS,
@@ -138,6 +139,64 @@ def load_complete_snapshot(root: Path) -> DraftGraph:
     """发现并解析所有受管理页面；任一不可读/不可解析/登记无效时整体失败。"""
     resolved = resolve_draft_root(root)
     return load_graph(resolved)
+
+
+_FATAL_QUERY_CODES = frozenset(
+    code.value
+    for code in (
+        CheckCode.FORMAT_MISSING,
+        CheckCode.FORMAT_INVALID,
+        CheckCode.FORMAT_UNSUPPORTED,
+        CheckCode.PATH_SYMLINK_ESCAPE,
+    )
+)
+
+
+@dataclass(frozen=True)
+class TolerantView:
+    """容错全根视图：成功解析的图 + 去重排序阻碍路径 + 首个阻碍 issue。"""
+
+    graph: DraftGraph
+    blocking_paths: tuple[Path, ...]
+    first_blocking: CheckIssue | None
+
+
+def load_tolerant_view(root: Path) -> TolerantView:
+    """容错全根加载：只有能归属到具体页面的解析失败才可成为候选部分结果。
+
+    marker/格式等无法归属到具体页面的根级损坏继续整体失败；未管理路径不属于
+    阻碍页面。``first_blocking`` 供 registered 根传播最具体的损坏代码。
+    """
+    from draft.graph import load_graph_tolerant
+
+    resolved = resolve_draft_root(root)
+    result = load_graph_tolerant(resolved)
+    fatal = [issue for issue in result.issues if issue.code in _FATAL_QUERY_CODES]
+    if fatal:
+        first = fatal[0]
+        raise DraftError(
+            first.code,
+            first.path if first.path is not None else resolved,
+            details=first.details,
+            line=first.line,
+        )
+    blocking_issues = [
+        issue
+        for issue in result.issues
+        if issue.path is not None
+        and issue.path not in result.graph.pages
+        and issue.code != CheckCode.PAGE_UNMANAGED_PATH.value
+    ]
+    blocking_set: set[Path] = set()
+    for issue in blocking_issues:
+        if issue.path is not None:
+            blocking_set.add(issue.path)
+    blocking = sorted(blocking_set)
+    return TolerantView(
+        graph=result.graph,
+        blocking_paths=tuple(blocking),
+        first_blocking=blocking_issues[0] if blocking_issues else None,
+    )
 
 
 def page_links(graph: GraphView, page: Path) -> tuple[LinkItem, ...]:

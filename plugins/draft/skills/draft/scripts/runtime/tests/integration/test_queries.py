@@ -6,6 +6,8 @@ from typing import cast
 import pytest
 
 from draft.cli import main
+from draft.diagnostic_codes import CheckCode, QueryCode
+from draft.models import RootState
 from tests.integration.support import DraftFactory
 
 QUERY_INDEX = """# Topic
@@ -66,6 +68,106 @@ def run_json(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, 
     code = main(args)
     output = capsys.readouterr().out
     return code, cast("dict[str, object]", json.loads(output))
+
+
+def _broken_query_root(draft_factory: DraftFactory, *, root_state: RootState) -> Path:
+    files = {
+        "index.md": QUERY_INDEX,
+        "conclusions.md": QUERY_CONCLUSIONS,
+        "pages/a.md": QUERY_A,
+        "pages/b.md": QUERY_B,
+    }
+    root = draft_factory(files, root_state=root_state)
+    (root / "asset.png").write_bytes(b"png")
+    # 一个无法解析的页面：无标题 → 阻碍页面。
+    (root / "pages/broken.md").write_text("无标题正文。\n", encoding="utf-8")
+    return root
+
+
+def test_query_backlinks_candidate_partial_returns_complete_false(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _broken_query_root(draft_factory, root_state=RootState.CANDIDATE)
+    capsys.readouterr()
+
+    code, payload = run_json(
+        ["query", "backlinks", "--root", str(root), "pages/a.md", "--json"], capsys
+    )
+
+    assert code == 0
+    assert payload["complete"] is False
+    assert payload["blocking_paths"] == ["pages/broken.md"]
+    assert payload["blocking_total"] == 1
+    assert payload["blocking_has_more"] is False
+
+
+def test_query_status_candidate_partial_returns_complete_false(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _broken_query_root(draft_factory, root_state=RootState.CANDIDATE)
+    capsys.readouterr()
+
+    code, payload = run_json(["query", "status", "--root", str(root), "pending", "--json"], capsys)
+
+    assert code == 0
+    assert payload["complete"] is False
+    assert "pages/broken.md" in cast("list[str]", payload["blocking_paths"])
+
+
+def test_query_page_candidate_incomplete_when_counts_unreliable(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _broken_query_root(draft_factory, root_state=RootState.CANDIDATE)
+    capsys.readouterr()
+
+    code, payload = run_json(["query", "page", "--root", str(root), "pages/a.md", "--json"], capsys)
+
+    assert code == 2
+    assert payload["ok"] is False
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == QueryCode.INCOMPLETE.value
+    assert error["details"] == ["1", "pages/broken.md"]
+
+
+def test_query_page_succeeds_on_clean_candidate_with_complete_true(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = draft_factory(
+        {
+            "index.md": QUERY_INDEX,
+            "conclusions.md": QUERY_CONCLUSIONS,
+            "pages/a.md": QUERY_A,
+            "pages/b.md": QUERY_B,
+        },
+        root_state=RootState.CANDIDATE,
+    )
+    capsys.readouterr()
+
+    code, payload = run_json(["query", "page", "--root", str(root), "pages/a.md", "--json"], capsys)
+
+    assert code == 0
+    assert payload["complete"] is True
+    assert payload["path"] == "pages/a.md"
+
+
+def test_query_backlinks_registered_corrupt_fails_with_specific_code(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _broken_query_root(draft_factory, root_state=RootState.REGISTERED)
+    capsys.readouterr()
+
+    code, payload = run_json(
+        ["query", "backlinks", "--root", str(root), "pages/a.md", "--json"], capsys
+    )
+
+    assert code == 2
+    assert payload["ok"] is False
+    error = payload["error"]
+    assert isinstance(error, dict)
+    # 传播最具体的损坏：broken.md 无法解析，而不是伪造部分结果。
+    assert error["code"] == CheckCode.PAGE_MISSING_TITLE.value
+    assert error["paths"] == ["pages/broken.md"]
 
 
 def test_query_page_returns_routing_summary(

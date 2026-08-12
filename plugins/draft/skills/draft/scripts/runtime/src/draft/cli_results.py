@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -96,6 +97,33 @@ def slice_payload(
         "has_more": slice_.has_more,
         "next_offset": slice_.next_offset,
         items_key: [] if count_only else list(slice_.items),
+    }
+
+
+def collection_payload(
+    items: Sequence[Mapping[str, object]],
+    *,
+    blocking_paths: Sequence[Path],
+    complete: bool,
+    offset: int,
+    limit: int,
+    count_only: bool,
+) -> dict[str, object]:
+    """集合查询双分页信封：items 与去重排序的 blocking_paths 应用同一窗口。
+
+    ``complete=True`` 时后三个阻碍字段为 0/false/null（规格 §11）。``count_only``
+    同时置空 items 与 blocking_paths，但两套计数与分页事实保持正常计算。
+    """
+    items_slice = paginate(tuple(dict(item) for item in items), offset=offset, limit=limit)
+    blockers = () if complete else tuple(path.as_posix() for path in sorted(set(blocking_paths)))
+    blockers_slice = paginate(blockers, offset=offset, limit=limit)
+    return {
+        "complete": complete,
+        **slice_payload(items_slice, count_only=count_only),
+        "blocking_paths": [] if count_only else list(blockers_slice.items),
+        "blocking_total": blockers_slice.total,
+        "blocking_has_more": blockers_slice.has_more,
+        "blocking_next_offset": blockers_slice.next_offset,
     }
 
 

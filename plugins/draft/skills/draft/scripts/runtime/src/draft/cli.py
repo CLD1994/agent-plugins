@@ -26,7 +26,7 @@ from draft.models import (
 )
 from draft.paths import FilesystemProbe, ManagedRoot, select_managed_root
 from draft.plan_effects import PlanEffect
-from draft.query import LocalPageSnapshot, SnapshotView
+from draft.query import LocalPageSnapshot, SnapshotView, TolerantView
 from draft.vocabulary import EditableRelationCode, StatusCode
 
 _EXIT_DOMAIN = 2
@@ -416,19 +416,45 @@ def _page_operand(root: Path, value: str) -> Path:
     return resolve_page_operand(root, value).relative
 
 
-def _query_items_payload(
+def _collection_payload(
     items: Sequence[Mapping[str, object]],
     *,
+    blocking_paths: Sequence[Path],
+    complete: bool,
     limit: int,
     offset: int,
     count_only: bool,
 ) -> dict[str, object]:
-    from draft.cli_results import paginate, slice_payload
+    from draft.cli_results import collection_payload
 
     if limit < 1 or limit > 100 or offset < 0:
         raise DraftError("query.invalid_pagination")
-    slice_ = paginate(tuple(dict(item) for item in items), offset=offset, limit=limit)
-    return slice_payload(slice_, count_only=count_only)  # type: ignore[arg-type]
+    return collection_payload(
+        items,
+        blocking_paths=blocking_paths,
+        complete=complete,
+        offset=offset,
+        limit=limit,
+        count_only=count_only,
+    )
+
+
+def _query_root_state(root: Path) -> RootState:
+    from draft.graph import read_marker
+
+    return read_marker(root).root_state
+
+
+def _raise_for_blocking(root: Path, view: TolerantView, root_state: RootState) -> None:
+    """registered 根的全根查询发现阻碍时传播最具体的损坏；候选根返回以便 complete=false。"""
+    if root_state is RootState.REGISTERED and view.first_blocking is not None:
+        issue = view.first_blocking
+        raise DraftError(
+            issue.code,
+            issue.path if issue.path is not None else root,
+            details=issue.details,
+            line=issue.line,
+        )
 
 
 def _dispatch_query(
@@ -440,16 +466,29 @@ def _dispatch_query(
     if limit < 1 or limit > 100 or offset < 0:
         raise DraftError("query.invalid_pagination")
     q = cast(str, args.query_command)
+    root_state = _query_root_state(root)
 
     if q == "page":
-        from draft.query import load_complete_snapshot, page_summary
+        from draft.diagnostic_codes import QueryCode
+        from draft.query import PAGE_NOT_FOUND, load_tolerant_view, page_summary
 
         page = _page_operand(root, cast(str, args.page))
-        graph = load_complete_snapshot(root)
-        summary = page_summary(graph, page)
+        view = load_tolerant_view(root)
+        if page not in view.graph.pages:
+            raise DraftError(PAGE_NOT_FOUND, page)
+        if view.blocking_paths:
+            _raise_for_blocking(root, view, root_state)
+            paths = [path.as_posix() for path in view.blocking_paths]
+            raise DraftError(
+                QueryCode.INCOMPLETE.value,
+                page,
+                details=(str(len(paths)), *paths[:20]),
+            )
+        summary = page_summary(view.graph, page)
         return (
             {
                 "result_type": ResultType.QUERY_PAGE.value,
+                "complete": True,
                 "path": summary.path.as_posix(),
                 "title": summary.title,
                 "status": summary.status.value,
@@ -477,20 +516,35 @@ def _dispatch_query(
             }
             for item in page_links(_graph_view_for_snapshot(snapshot), page)
         ]
-        payload = _query_items_payload(items, limit=limit, offset=offset, count_only=count_only)
+        payload = _collection_payload(
+            items,
+            blocking_paths=(),
+            complete=True,
+            limit=limit,
+            offset=offset,
+            count_only=count_only,
+        )
         return (
             {"result_type": ResultType.QUERY_LINKS.value, **payload},
             f"链接 {payload['total']} 项",
             0,
         )
     if q == "backlinks":
-        from draft.query import backlinks, load_complete_snapshot
+        from draft.query import backlinks, load_tolerant_view
         from draft.resources import resource_identity_from_operand
 
         target = resource_identity_from_operand(root, cast(str, args.target))
-        graph = load_complete_snapshot(root)
-        items = [{"page": path.as_posix()} for path in backlinks(graph, target)]
-        payload = _query_items_payload(items, limit=limit, offset=offset, count_only=count_only)
+        view = load_tolerant_view(root)
+        _raise_for_blocking(root, view, root_state)
+        items = [{"page": path.as_posix()} for path in backlinks(view.graph, target)]
+        payload = _collection_payload(
+            items,
+            blocking_paths=view.blocking_paths,
+            complete=not view.blocking_paths,
+            limit=limit,
+            offset=offset,
+            count_only=count_only,
+        )
         return (
             {"result_type": ResultType.QUERY_BACKLINKS.value, **payload},
             f"反向链接 {payload['total']} 项",
@@ -498,9 +552,10 @@ def _dispatch_query(
         )
     if q == "relations":
         from draft.query import (
+            PAGE_NOT_FOUND,
             incoming_relations,
-            load_complete_snapshot,
             load_registered_page,
+            load_tolerant_view,
             outgoing_relations,
         )
 
@@ -510,30 +565,48 @@ def _dispatch_query(
             snapshot = load_registered_page(root, page)
             view = _graph_view_for_snapshot(snapshot)
             relations = outgoing_relations(view, page)
+            complete = True
+            blocking: tuple[Path, ...] = ()
         else:
-            graph = load_complete_snapshot(root)
-            if page not in graph.pages:
-                from draft.query import PAGE_NOT_FOUND
-
+            tolerant = load_tolerant_view(root)
+            _raise_for_blocking(root, tolerant, root_state)
+            if page not in tolerant.graph.pages:
                 raise DraftError(PAGE_NOT_FOUND, page)
-            relations = incoming_relations(graph, page)
+            relations = incoming_relations(tolerant.graph, page)
+            complete = not tolerant.blocking_paths
+            blocking = tolerant.blocking_paths
         items = [
             {"relation": item.relation.value, "page": item.page.as_posix()} for item in relations
         ]
-        payload = _query_items_payload(items, limit=limit, offset=offset, count_only=count_only)
+        payload = _collection_payload(
+            items,
+            blocking_paths=blocking,
+            complete=complete,
+            limit=limit,
+            offset=offset,
+            count_only=count_only,
+        )
         return (
             {"result_type": ResultType.QUERY_RELATIONS.value, **payload},
             f"关系 {payload['total']} 项",
             0,
         )
     if q == "status":
-        from draft.query import load_complete_snapshot, pages_with_status
+        from draft.query import load_tolerant_view, pages_with_status
         from draft.vocabulary import StatusCode
 
         code = StatusCode(cast(str, args.code))
-        graph = load_complete_snapshot(root)
-        items = [{"page": path.as_posix()} for path in pages_with_status(graph, code)]
-        payload = _query_items_payload(items, limit=limit, offset=offset, count_only=count_only)
+        view = load_tolerant_view(root)
+        _raise_for_blocking(root, view, root_state)
+        items = [{"page": path.as_posix()} for path in pages_with_status(view.graph, code)]
+        payload = _collection_payload(
+            items,
+            blocking_paths=view.blocking_paths,
+            complete=not view.blocking_paths,
+            limit=limit,
+            offset=offset,
+            count_only=count_only,
+        )
         return (
             {"result_type": ResultType.QUERY_STATUS.value, **payload},
             f"状态 {code.value} 共 {payload['total']} 项",
@@ -555,7 +628,14 @@ def _dispatch_query(
             }
             for item in list_recoverable(root, as_of=current)
         ]
-        payload = _query_items_payload(items, limit=limit, offset=offset, count_only=count_only)
+        payload = _collection_payload(
+            items,
+            blocking_paths=(),
+            complete=True,
+            limit=limit,
+            offset=offset,
+            count_only=count_only,
+        )
         as_of = current.isoformat().replace("+00:00", "Z")
         return (
             {"result_type": ResultType.QUERY_RECOVERABLE.value, **payload, "as_of": as_of},
