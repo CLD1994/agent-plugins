@@ -339,11 +339,15 @@ def plan_path_remap(
         key=lambda directory: len(directory.parts),
         reverse=True,
     )
+    from draft.models import RootState
+    from draft.observations import graph_observations
+
     return OperationPlan(
         kind=kind,
         root=graph.root,
         mutations=tuple([*writes, *deletes]),
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=graph_observations(graph),
         remove_empty_directories=tuple(removable),
         effects=tuple(effects),
     )

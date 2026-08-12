@@ -6,7 +6,7 @@ import unicodedata
 from pathlib import Path
 
 from draft.errors import DraftError
-from draft.graph import DraftGraph
+from draft.graph import MARKER_PATH, DraftGraph
 from draft.markdown import locate_status_value_span, parse_page, rewrite_link_destinations
 from draft.models import (
     FileMutation,
@@ -16,7 +16,14 @@ from draft.models import (
     OperationResult,
     PageDocument,
     Relation,
+    RootState,
     StatusCode,
+)
+from draft.observations import (
+    EMPTY_OBSERVATIONS,
+    ObservationManifest,
+    file_digest_observation,
+    graph_observations,
 )
 from draft.operations import sha256_bytes
 from draft.plan_effects import PlanAction, PlanEffect
@@ -26,6 +33,15 @@ from draft.vocabulary import (
     relation_label,
     status_label,
 )
+
+
+def _target_marker_observations(resolved: Path, page: Path, text: str) -> ObservationManifest:
+    """status set 的自有事实闭包：目标页与 marker 所有权。"""
+    entries = [file_digest_observation(page, sha256_bytes(text.encode("utf-8")))]
+    marker = resolved / MARKER_PATH
+    if marker.is_file() and not marker.is_symlink():
+        entries.append(file_digest_observation(MARKER_PATH, sha256_bytes(marker.read_bytes())))
+    return ObservationManifest(entries=tuple(entries))
 
 
 def replace_status(text: str, code: StatusCode, explanation: str | None) -> str:
@@ -131,7 +147,14 @@ def plan_set_status(
     if document is None:
         raise DraftError(PAGE_NOT_FOUND, page)
     if code is document.status.code and note is None and not clear_note:
-        return OperationPlan(kind="status.set", root=resolved, mutations=(), effects=())
+        return OperationPlan(
+            kind="status.set",
+            root=resolved,
+            mutations=(),
+            root_state=RootState.REGISTERED,
+            observations=EMPTY_OBSERVATIONS,
+            effects=(),
+        )
 
     if clear_note:
         explanation: str | None = ""
@@ -139,7 +162,14 @@ def plan_set_status(
         explanation = note if note is not None else document.status.explanation
     new_text = replace_status(document.text, code, explanation)
     if new_text == document.text:
-        return OperationPlan(kind="status.set", root=resolved, mutations=(), effects=())
+        return OperationPlan(
+            kind="status.set",
+            root=resolved,
+            mutations=(),
+            root_state=RootState.REGISTERED,
+            observations=EMPTY_OBSERVATIONS,
+            effects=(),
+        )
 
     _validate_final_graph(resolved, page, new_text)
 
@@ -157,6 +187,8 @@ def plan_set_status(
                 after,
             ),
         ),
+        root_state=RootState.REGISTERED,
+        observations=_target_marker_observations(resolved, page, document.text),
         effects=(PlanEffect(action=PlanAction.MODIFY, path=page),),
     )
     return plan
@@ -290,13 +322,20 @@ def _single_relation_plan(
         for rel in document.relations
     )
     if existing:
-        return OperationPlan(kind="relation.add", root=root, mutations=(), effects=())
+        return OperationPlan(
+            kind="relation.add",
+            root=root,
+            mutations=(),
+            root_state=RootState.REGISTERED,
+            observations=EMPTY_OBSERVATIONS,
+            effects=(),
+        )
     if code is EditableRelationCode.DEPENDS_ON:
         _reject_dependency_cycle(graph, source, target)
     new_text = append_machine_relation(
         document.text, RelationCode(code.value), target, source=source
     )
-    return _write_plan(root, "relation.add", source, document.text, new_text)
+    return _write_plan(root, "relation.add", source, document.text, new_text, graph)
 
 
 def _pair_relation_plan(
@@ -330,8 +369,15 @@ def _pair_relation_plan(
             append_machine_relation(tgt_doc.text, reverse, source, source=target),
         )
     if not edits:
-        return OperationPlan(kind="relation.add", root=root, mutations=(), effects=())
-    return _multi_write_plan(root, "relation.add", edits)
+        return OperationPlan(
+            kind="relation.add",
+            root=root,
+            mutations=(),
+            root_state=RootState.REGISTERED,
+            observations=EMPTY_OBSERVATIONS,
+            effects=(),
+        )
+    return _multi_write_plan(root, "relation.add", edits, graph)
 
 
 def _supersedes_plan(root: Path, graph: DraftGraph, source: Path, target: Path) -> OperationPlan:
@@ -369,8 +415,15 @@ def _supersedes_plan(root: Path, graph: DraftGraph, source: Path, target: Path) 
         target_text = replace_status(target_text, StatusCode.SUPERSEDED, tgt_doc.status.explanation)
         edits[target] = (tgt_doc.text, target_text)
     if not edits:
-        return OperationPlan(kind="relation.add", root=root, mutations=(), effects=())
-    return _multi_write_plan(root, "relation.add", edits)
+        return OperationPlan(
+            kind="relation.add",
+            root=root,
+            mutations=(),
+            root_state=RootState.REGISTERED,
+            observations=EMPTY_OBSERVATIONS,
+            effects=(),
+        )
+    return _multi_write_plan(root, "relation.add", edits, graph)
 
 
 def _resolves_to_page(graph: DraftGraph, source: Path, relation: Relation, target: Path) -> bool:
@@ -387,14 +440,17 @@ def _resolves_to_page(graph: DraftGraph, source: Path, relation: Relation, targe
     return resolved == target
 
 
-def _write_plan(root: Path, kind: str, path: Path, before: str, after: str) -> OperationPlan:
-    return _multi_write_plan(root, kind, {path: (before, after)})
+def _write_plan(
+    root: Path, kind: str, path: Path, before: str, after: str, graph: DraftGraph
+) -> OperationPlan:
+    return _multi_write_plan(root, kind, {path: (before, after)}, graph)
 
 
 def _multi_write_plan(
     root: Path,
     kind: str,
     edits: dict[Path, tuple[str, str]],
+    graph: DraftGraph,
 ) -> OperationPlan:
     mutations = [
         FileMutation(
@@ -413,7 +469,8 @@ def _multi_write_plan(
         kind=kind,
         root=root,
         mutations=tuple(mutations),
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=graph_observations(graph),
         effects=effects,
     )
 
@@ -461,9 +518,16 @@ def _single_relation_remove(
         for rel in document.relations
     )
     if not existing:
-        return OperationPlan(kind="relation.remove", root=root, mutations=(), effects=())
+        return OperationPlan(
+            kind="relation.remove",
+            root=root,
+            mutations=(),
+            root_state=RootState.REGISTERED,
+            observations=EMPTY_OBSERVATIONS,
+            effects=(),
+        )
     new_text = remove_machine_relation(document.text, code, target, source=source)
-    return _write_plan(root, "relation.remove", source, document.text, new_text)
+    return _write_plan(root, "relation.remove", source, document.text, new_text, graph)
 
 
 def _pair_relation_remove(
@@ -496,8 +560,15 @@ def _pair_relation_remove(
             remove_machine_relation(tgt_doc.text, reverse, source, source=target),
         )
     if not edits:
-        return OperationPlan(kind="relation.remove", root=root, mutations=(), effects=())
-    return _multi_write_plan(root, "relation.remove", edits)
+        return OperationPlan(
+            kind="relation.remove",
+            root=root,
+            mutations=(),
+            root_state=RootState.REGISTERED,
+            observations=EMPTY_OBSERVATIONS,
+            effects=(),
+        )
+    return _multi_write_plan(root, "relation.remove", edits, graph)
 
 
 def _supersedes_remove(
@@ -549,8 +620,15 @@ def _supersedes_remove(
         target_text = replace_status(target_text, restored_status, tgt_doc.status.explanation)
         edits[target] = (tgt_doc.text, target_text)
     if not edits:
-        return OperationPlan(kind="relation.remove", root=root, mutations=(), effects=())
-    return _multi_write_plan(root, "relation.remove", edits)
+        return OperationPlan(
+            kind="relation.remove",
+            root=root,
+            mutations=(),
+            root_state=RootState.REGISTERED,
+            observations=EMPTY_OBSERVATIONS,
+            effects=(),
+        )
+    return _multi_write_plan(root, "relation.remove", edits, graph)
 
 
 def _execute_or_empty(plan: OperationPlan, kind: str) -> OperationResult:

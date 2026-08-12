@@ -265,11 +265,15 @@ def trash_plan(graph: DraftGraph, page: Path) -> tuple[OperationPlan, Path]:
         effects.append(PlanEffect(action=PlanAction.REMOVE, path=collapsed_hub))
     for path, _text in sorted(extra_writes.items()):
         effects.append(PlanEffect(action=PlanAction.MODIFY, path=path))
+    from draft.models import RootState
+    from draft.observations import graph_observations
+
     plan = OperationPlan(
         kind="trash",
         root=graph.root,
         mutations=tuple([*writes, *deletes]),
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=graph_observations(graph),
         remove_empty_directories=tuple(remove_empty),
         metadata={"operation_id": operation_id},
         effects=tuple(effects),
@@ -439,11 +443,17 @@ def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackag
         (mutation for mutation in mutations if mutation.kind is MutationKind.DELETE),
         key=lambda mutation: str(mutation.path),
     )
+    from draft.models import RootState
+    from draft.observations import EMPTY_OBSERVATIONS
+
+    # restore 的完整观察闭包在 Task 11 按操作级契约补全；当前恢复复核由
+    # verify_restore_after_state 保证原子性。
     return OperationPlan(
         kind="restore",
         root=root,
         mutations=tuple([*writes, *deletes]),
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
         metadata={"operation_id": restore_id},
     )
 
@@ -697,11 +707,15 @@ def restore_retained_trash(
     normalized_now = normalize_utc(now)
     validate_operation_id(operation_id, code="operation.invalid_id")
     restore_id = uuid.uuid4().hex
+    from draft.models import RootState
+    from draft.observations import EMPTY_OBSERVATIONS
+
     preallocate_journal(
         resolved,
         kind="restore",
         operation_id=restore_id,
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
         metadata={"restores_trash_operation": operation_id},
     )
     try:

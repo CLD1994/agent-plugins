@@ -4,12 +4,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
 
+from draft.observations import ObservationManifest
 from draft.plan_effects import PlanEffect
 from draft.vocabulary import RelationCode, StatusCode
-
-ValidationMode = Literal["registered", "candidate"]
 
 
 class RootState(StrEnum):
@@ -134,7 +132,8 @@ class OperationPlan:
     kind: str
     root: Path
     mutations: tuple[FileMutation, ...]
-    validation_mode: ValidationMode = "registered"
+    root_state: RootState
+    observations: ObservationManifest
     remove_empty_directories: tuple[Path, ...] = ()
     metadata: dict[str, str] = field(default_factory=lambda: dict[str, str]())
     effects: tuple[PlanEffect, ...] = ()

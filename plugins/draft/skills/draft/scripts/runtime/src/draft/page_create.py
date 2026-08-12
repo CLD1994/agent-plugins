@@ -120,11 +120,18 @@ def plan_create_page(
         PlanEffect(action=PlanAction.CREATE, path=path),
         PlanEffect(action=PlanAction.MODIFY, path=parent),
     )
+    from draft.models import RootState
+    from draft.observations import ObservationManifest, graph_observations, missing_observation
+
+    observations = ObservationManifest(
+        entries=(*graph_observations(graph).entries, missing_observation(path))
+    )
     return OperationPlan(
         kind="create",
         root=graph.root,
         mutations=tuple(mutations),
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=observations,
         effects=effects,
     )
 

@@ -18,8 +18,10 @@ from draft.models import (
     MutationKind,
     OperationPlan,
     PageDocument,
+    RootState,
     SourceSpan,
 )
+from draft.observations import EMPTY_OBSERVATIONS
 from draft.operations import sha256_bytes
 from draft.plan_effects import PlanAction, PlanEffect
 from draft.resources import resolve_page_resources
@@ -142,7 +144,10 @@ def _plan(
     remove_empty: tuple[Path, ...] = (),
     metadata: dict[str, str] | None = None,
     effects: tuple[PlanEffect, ...] = (),
+    graph: DraftGraph | None = None,
 ) -> OperationPlan:
+    from draft.observations import graph_observations
+
     writes = sorted(
         (m for m in mutations if m.kind is MutationKind.WRITE),
         key=lambda m: str(m.path),
@@ -151,11 +156,13 @@ def _plan(
         (m for m in mutations if m.kind is MutationKind.DELETE),
         key=lambda m: str(m.path),
     )
+    observations = graph_observations(graph) if graph is not None else EMPTY_OBSERVATIONS
     return OperationPlan(
         kind=kind,
         root=ROOT,
         mutations=tuple([*writes, *deletes]),
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=observations,
         remove_empty_directories=remove_empty,
         metadata=metadata or {},
         effects=effects,
@@ -358,6 +365,7 @@ def test_plan_move_leaf_rewrites_inbound_links() -> None:
             ),
             PlanEffect(action=PlanAction.MODIFY, path=Path("pages/b.md")),
         ),
+        graph=graph,
     )
     assert plan == expected
 
@@ -388,6 +396,7 @@ def test_plan_move_leaf_to_same_directory_omits_unchanged_pages() -> None:
                 action=PlanAction.MOVE, from_path=Path("pages/a.md"), to_path=Path("pages/b.md")
             ),
         ),
+        graph=graph,
     )
     assert plan == expected
     # conclusions.md 未变化：不出现在 mutations 中
@@ -636,6 +645,7 @@ def test_plan_collapse_empty_hub_produces_leaf() -> None:
                 to_path=Path("pages/sub.md"),
             ),
         ),
+        graph=graph,
     )
     assert plan == expected
 

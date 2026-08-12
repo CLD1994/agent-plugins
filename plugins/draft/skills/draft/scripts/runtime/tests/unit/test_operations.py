@@ -9,7 +9,8 @@ import pytest
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
-from draft.models import MutationKind, OperationPhase
+from draft.models import MutationKind, OperationPhase, RootState
+from draft.observations import EMPTY_OBSERVATIONS
 from draft.operations import (
     HANDOFF_ATTEMPTED_AT_KEY,
     HANDOFF_ERROR_MESSAGE_KEY,
@@ -223,7 +224,8 @@ def _journal() -> Journal:
         operation_id="a" * 32,
         kind="move",
         phase=OperationPhase.PREPARED,
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
         mutations=(
             JournalMutation(
                 path=Path("pages/a.md"),
@@ -349,7 +351,8 @@ def _journal_with_metadata(metadata: dict[str, str]) -> Journal:
         operation_id="a" * 32,
         kind="generate-conclusions",
         phase=OperationPhase.COMPLETED,
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
         mutations=(
             JournalMutation(
                 path=Path("conclusions.md"),

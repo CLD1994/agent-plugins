@@ -5,7 +5,8 @@ import pytest
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
-from draft.models import FileMutation, MutationKind, OperationPlan
+from draft.models import FileMutation, MutationKind, OperationPlan, RootState
+from draft.observations import EMPTY_OBSERVATIONS
 from draft.operations import (
     JOURNAL_VERSION,
     execute_plan,
@@ -78,7 +79,8 @@ def two_write_plan(root: Path) -> tuple[OperationPlan, bytes, bytes, bytes, byte
     plan = OperationPlan(
         kind="test",
         root=root,
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
         mutations=(
             FileMutation(
                 Path("pages/a.md"),
@@ -120,7 +122,8 @@ def write_journal(root: Path, operation_id: str, phase: str) -> Path:
         "operation_id": operation_id,
         "kind": "test",
         "phase": phase,
-        "validation_mode": "registered",
+        "root_state": "registered",
+        "observations": [],
         "mutations": [],
         "remove_empty_directories": [],
         "metadata": {},
@@ -140,7 +143,8 @@ def write_trash_journal(
         "operation_id": operation_id,
         "kind": "trash",
         "phase": phase,
-        "validation_mode": "registered",
+        "root_state": "registered",
+        "observations": [],
         "mutations": [],
         "remove_empty_directories": [],
         "metadata": metadata,
@@ -155,7 +159,7 @@ def test_version_one_journal_is_explicitly_unsupported(operation_draft: Path) ->
         read_journal(path)
 
 
-@pytest.mark.parametrize("version", [3, "2"])
+@pytest.mark.parametrize("version", [4, "2"])
 def test_unknown_or_malformed_journal_version_is_rejected(
     operation_draft: Path, version: object
 ) -> None:
@@ -188,7 +192,8 @@ def test_preallocated_restore_requires_reverse_reference(
             root,
             kind="restore",
             operation_id=restore_id,
-            validation_mode="registered",
+            root_state=RootState.REGISTERED,
+            observations=EMPTY_OBSERVATIONS,
             metadata={},
         )
 
@@ -206,7 +211,8 @@ def test_preallocated_restore_rejects_invalid_back_reference(
             root,
             kind="restore",
             operation_id=restore_id,
-            validation_mode="registered",
+            root_state=RootState.REGISTERED,
+            observations=EMPTY_OBSERVATIONS,
             metadata={"restores_trash_operation": bad_reference},
         )
 
@@ -224,13 +230,16 @@ def test_preallocated_restore_requires_forward_reference_before_execution(
         root,
         kind="restore",
         operation_id=restore_id,
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
         metadata={"restores_trash_operation": trash_id},
     )
     plan = OperationPlan(
         kind="restore",
         root=root,
         mutations=(),
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
         metadata={"operation_id": restore_id},
     )
 
@@ -258,7 +267,8 @@ def test_preallocate_never_reuses_existing_operation_directory(
             root,
             kind="test",
             operation_id=operation_id,
-            validation_mode="registered",
+            root_state=RootState.REGISTERED,
+            observations=EMPTY_OBSERVATIONS,
             metadata={},
         )
 
@@ -418,7 +428,8 @@ def test_mutation_path_escape_rejected_before_allocation(operation_draft: Path) 
     plan = OperationPlan(
         kind="test",
         root=root,
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
         mutations=(
             FileMutation(
                 Path("../evil.md"),
@@ -447,7 +458,8 @@ def test_mutation_through_symlink_rejected_before_allocation(
     plan = OperationPlan(
         kind="test",
         root=root,
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
         mutations=(
             FileMutation(
                 Path("pages/sub/x.md"),
@@ -569,7 +581,8 @@ def test_lock_traversal_never_executes_outside_journal(
         "operation_id": "../../outside",
         "kind": "test",
         "phase": "applying",
-        "validation_mode": "registered",
+        "root_state": "registered",
+        "observations": [],
         "mutations": [],
         "remove_empty_directories": [],
         "metadata": {},
@@ -625,7 +638,8 @@ def test_rolled_back_journal_with_matching_lock_releases_lock(
     plan = OperationPlan(
         kind="test",
         root=root,
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
         mutations=(
             FileMutation(
                 Path("pages/a.md"),
@@ -733,7 +747,8 @@ def test_internal_state_symlink_escape_rejected(operation_draft: Path, tmp_path:
             root,
             kind="test",
             operation_id="a" * 32,
-            validation_mode="registered",
+            root_state=RootState.REGISTERED,
+            observations=EMPTY_OBSERVATIONS,
             metadata={},
         )
 

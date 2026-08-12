@@ -454,11 +454,15 @@ def plan_generation(
             *((ROOT_PAGE,) if index_changed else ()),
         )
     ]
+    from draft.models import RootState
+    from draft.observations import graph_observations
+
     plan = OperationPlan(
         kind="generate-conclusions",
         root=graph.root,
         mutations=tuple(mutations),
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=graph_observations(graph),
         effects=tuple(effects),
     )
     return GenerationPlan(generated=True, reason=None, operation=plan)

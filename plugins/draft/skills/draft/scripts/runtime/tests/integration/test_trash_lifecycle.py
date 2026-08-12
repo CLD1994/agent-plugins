@@ -8,7 +8,7 @@ import pytest
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import OperationPhase
-from draft.operations import TrashDeadlines
+from draft.operations import JOURNAL_VERSION, TrashDeadlines
 from draft.trash import trash_page
 from draft.trash_lifecycle import (
     advance_trash_lifecycle,
@@ -567,11 +567,12 @@ def test_orphan_restore_scan_stops_on_unreadable_sibling_journal(
     r_dir = operations / r_id
     r_dir.mkdir()
     r_journal: dict[str, object] = {
-        "journal_version": 2,
+        "journal_version": JOURNAL_VERSION,
         "operation_id": r_id,
         "kind": "restore",
         "phase": "allocating",
-        "validation_mode": "registered",
+        "root_state": "registered",
+        "observations": [],
         "mutations": [],
         "remove_empty_directories": [],
         "metadata": {},

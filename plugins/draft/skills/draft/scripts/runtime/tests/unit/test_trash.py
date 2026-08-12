@@ -22,8 +22,10 @@ from draft.models import (
     MutationKind,
     OperationPhase,
     PageDocument,
+    RootState,
     SourceSpan,
 )
+from draft.observations import EMPTY_OBSERVATIONS
 from draft.operations import (
     Journal,
     TrashDeadlines,
@@ -292,7 +294,8 @@ def _trash_journal(
         operation_id=operation_id,
         kind=kind,
         phase=phase,
-        validation_mode="registered",
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
         mutations=(),
         remove_empty_directories=(),
         metadata=deadlines.to_metadata(),
@@ -320,7 +323,7 @@ def test_trash_plan_valid_leaf_produces_complete_plan(mocker: MockerFixture) -> 
 
     assert plan.kind == "trash"
     assert plan.root == ROOT
-    assert plan.validation_mode == "registered"
+    assert plan.root_state is RootState.REGISTERED
     assert plan.metadata == {"operation_id": FIXED_OPERATION_ID}
     assert plan.remove_empty_directories == ()
 

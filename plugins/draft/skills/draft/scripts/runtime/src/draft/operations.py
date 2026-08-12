@@ -20,12 +20,13 @@ from draft.models import (
     OperationPhase,
     OperationPlan,
     OperationResult,
-    ValidationMode,
+    RootState,
 )
+from draft.observations import ObservationManifest
 from draft.paths import resolve_draft_root
 from draft.plan_effects import public_changed_paths
 
-JOURNAL_VERSION = 2
+JOURNAL_VERSION = 3
 LOCK_RELATIVE = Path(INTERNAL_DIR) / "operation.lock"
 OPERATIONS_RELATIVE = Path(INTERNAL_DIR) / "operations"
 
@@ -261,7 +262,8 @@ class Journal:
     operation_id: str
     kind: str
     phase: OperationPhase
-    validation_mode: str
+    root_state: RootState
+    observations: ObservationManifest
     mutations: tuple[JournalMutation, ...]
     remove_empty_directories: tuple[Path, ...]
     metadata: dict[str, str]
@@ -274,7 +276,16 @@ def _journal_to_json(journal: Journal) -> bytes:
         "operation_id": journal.operation_id,
         "kind": journal.kind,
         "phase": journal.phase.value,
-        "validation_mode": journal.validation_mode,
+        "root_state": journal.root_state.value,
+        "observations": [
+            {
+                "path": observation.path.as_posix(),
+                "kind": observation.kind.value,
+                "sha256": observation.sha256,
+                "members": list(observation.members),
+            }
+            for observation in journal.observations.entries
+        ],
         "mutations": [
             {
                 "path": mutation.path.as_posix(),
@@ -312,6 +323,36 @@ def _validate_journal_path(value: str, journal_path: Path) -> Path:
     return Path(*relative.parts)
 
 
+def _parse_observations(data: object, journal_path: Path) -> ObservationManifest:
+    from draft.observations import EntryKind, Observation
+
+    if not isinstance(data, list):
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+    entries: list[Observation] = []
+    for raw in cast("list[object]", data):
+        if not isinstance(raw, dict):
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+        item = cast("dict[str, object]", raw)
+        kind = EntryKind(_expect_str(item.get("kind"), journal_path))
+        sha256 = _expect_optional_str(item.get("sha256"), journal_path)
+        members_raw = item.get("members")
+        if not isinstance(members_raw, list) or not all(
+            isinstance(member, str) for member in cast("list[object]", members_raw)
+        ):
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+        entries.append(
+            Observation(
+                path=_validate_journal_path(
+                    _expect_str(item.get("path"), journal_path), journal_path
+                ),
+                kind=kind,
+                sha256=sha256,
+                members=tuple(cast("list[str]", members_raw)),
+            )
+        )
+    return ObservationManifest(entries=tuple(entries))
+
+
 def read_journal(journal_path: Path) -> Journal:
     if not journal_path.is_file():
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
@@ -331,6 +372,8 @@ def read_journal(journal_path: Path) -> Journal:
         )
     try:
         phase = OperationPhase(_expect_str(data.get("phase"), journal_path))
+        root_state = RootState(_expect_str(data.get("root_state"), journal_path))
+        observations = _parse_observations(data.get("observations"), journal_path)
         mutations_raw = data.get("mutations")
         if not isinstance(mutations_raw, list):
             raise TypeError("mutations must be a list")
@@ -375,7 +418,8 @@ def read_journal(journal_path: Path) -> Journal:
         operation_id=operation_id,
         kind=_expect_str(data.get("kind"), journal_path),
         phase=phase,
-        validation_mode=_expect_str(data.get("validation_mode"), journal_path),
+        root_state=root_state,
+        observations=observations,
         mutations=tuple(mutations),
         remove_empty_directories=tuple(
             _validate_journal_path(_expect_str(entry, journal_path), journal_path)
@@ -396,7 +440,8 @@ def with_phase(journal: Journal, phase: OperationPhase) -> Journal:
         operation_id=journal.operation_id,
         kind=journal.kind,
         phase=phase,
-        validation_mode=journal.validation_mode,
+        root_state=journal.root_state,
+        observations=journal.observations,
         mutations=journal.mutations,
         remove_empty_directories=journal.remove_empty_directories,
         metadata=journal.metadata,
@@ -410,7 +455,8 @@ def with_metadata(journal: Journal, extra: Mapping[str, str]) -> Journal:
         operation_id=journal.operation_id,
         kind=journal.kind,
         phase=journal.phase,
-        validation_mode=journal.validation_mode,
+        root_state=journal.root_state,
+        observations=journal.observations,
         mutations=journal.mutations,
         remove_empty_directories=journal.remove_empty_directories,
         metadata={**journal.metadata, **extra},
@@ -425,7 +471,8 @@ def without_metadata(journal: Journal, key: str) -> Journal:
         operation_id=journal.operation_id,
         kind=journal.kind,
         phase=journal.phase,
-        validation_mode=journal.validation_mode,
+        root_state=journal.root_state,
+        observations=journal.observations,
         mutations=journal.mutations,
         remove_empty_directories=journal.remove_empty_directories,
         metadata=remaining,
@@ -441,7 +488,8 @@ def _with_applied(journal: Journal, path: Path) -> Journal:
         operation_id=journal.operation_id,
         kind=journal.kind,
         phase=journal.phase,
-        validation_mode=journal.validation_mode,
+        root_state=journal.root_state,
+        observations=journal.observations,
         mutations=tuple(
             JournalMutation(
                 path=mutation.path,
@@ -478,8 +526,7 @@ def _validate_plan_paths(plan: OperationPlan) -> None:
                 raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, cursor)
 
 
-def _check(root: Path, validation_mode: str) -> None:
-    del validation_mode  # 检查协议在 Task 4 起不再按 mode 分支。
+def _check(root: Path) -> None:
     from draft.checker import check_draft
 
     report = check_draft(root, include_operation_state=False, exclude_resource_facts=True)
@@ -673,7 +720,7 @@ def _validate_and_complete(
     current = _with_phase(journal, OperationPhase.VALIDATING)
     write_journal(current)
     try:
-        _check(root, current.validation_mode)
+        _check(root)
     except DraftError as error:
         if error.code == "operation.validation_failed":
             _rollback(
@@ -709,7 +756,8 @@ def preallocate_journal(
     *,
     kind: str,
     operation_id: str,
-    validation_mode: ValidationMode,
+    root_state: RootState,
+    observations: ObservationManifest,
     metadata: dict[str, str],
 ) -> Journal:
     """统一预分配：独占创建操作目录、同步父目录项、耐久写入 allocating 日志。
@@ -739,7 +787,8 @@ def preallocate_journal(
         operation_id=operation_id,
         kind=kind,
         phase=OperationPhase.ALLOCATING,
-        validation_mode=validation_mode,
+        root_state=root_state,
+        observations=observations,
         mutations=(),
         remove_empty_directories=(),
         metadata=dict(metadata),
@@ -793,6 +842,27 @@ def validate_preallocated_journal(plan: OperationPlan, journal: Journal) -> None
         validate_restore_link(plan.root, journal)
 
 
+def _verify_plan_observations(root: Path, plan: OperationPlan, journal: Journal) -> None:
+    """锁内、首次业务变更前复核观察清单；差异即外部变化，不应用 mutation。"""
+    from draft.observations import FilesystemObservationProbe, verify_observations
+
+    excluded = {journal.directory.relative_to(root), LOCK_RELATIVE}
+    entries = tuple(
+        observation
+        for observation in journal.observations.entries
+        if observation.path not in excluded
+    )
+    from draft.observations import ObservationManifest
+
+    changed = verify_observations(
+        FilesystemObservationProbe(root),
+        ObservationManifest(entries=entries),
+        explained_mutations=(),
+    )
+    if changed:
+        raise DraftError("operation.external_change", root / changed[0])
+
+
 def execute_plan(plan: OperationPlan) -> OperationResult:
     root = resolve_draft_root(plan.root)
     _validate_plan_paths(plan)
@@ -815,10 +885,12 @@ def execute_plan(plan: OperationPlan) -> OperationResult:
             root,
             kind=plan.kind,
             operation_id=operation_id,
-            validation_mode=plan.validation_mode,
+            root_state=plan.root_state,
+            observations=plan.observations,
             metadata=dict(plan.metadata),
         )
     acquire_lock(root, operation_id)
+    _verify_plan_observations(root, plan, journal)
     return _execute_allocated_plan(
         plan, journal, lock_already_held=True, retain_terminal_lock=False
     )
@@ -908,7 +980,8 @@ def _execute_allocated_plan(
         operation_id=operation_id,
         kind=plan.kind,
         phase=OperationPhase.PREPARED,
-        validation_mode=plan.validation_mode,
+        root_state=plan.root_state,
+        observations=journal.observations,
         mutations=tuple(mutations),
         remove_empty_directories=plan.remove_empty_directories,
         metadata={**plan.metadata, **metadata},

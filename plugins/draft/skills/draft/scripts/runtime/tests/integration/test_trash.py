@@ -7,6 +7,7 @@ from draft.checker import check_draft
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import OperationPhase
+from draft.operations import JOURNAL_VERSION
 from draft.trash import restore_retained_trash, trash_page
 from draft.trash_lifecycle import recover_draft
 from tests.integration.support import DraftFactory
@@ -365,11 +366,12 @@ def test_foreign_restore_claim_seen_after_lock_is_recovery_required(
         root,
         r1_id,
         {
-            "journal_version": 2,
+            "journal_version": JOURNAL_VERSION,
             "operation_id": r1_id,
             "kind": "restore",
             "phase": "rolled_back",
-            "validation_mode": "registered",
+            "root_state": "registered",
+            "observations": [],
             "mutations": [],
             "remove_empty_directories": [],
             "metadata": {"restores_trash_operation": pending.operation_id},
@@ -404,11 +406,12 @@ def test_foreign_restore_claim_with_broken_link_is_inconsistent(
         root,
         r1_id,
         {
-            "journal_version": 2,
+            "journal_version": JOURNAL_VERSION,
             "operation_id": r1_id,
             "kind": "restore",
             "phase": "rolled_back",
-            "validation_mode": "registered",
+            "root_state": "registered",
+            "observations": [],
             "mutations": [],
             "remove_empty_directories": [],
             "metadata": {"restores_trash_operation": "3" * 32},
@@ -784,11 +787,12 @@ def test_completed_restore_without_matching_mutations_preserves_package(
         root,
         r_id,
         {
-            "journal_version": 2,
+            "journal_version": JOURNAL_VERSION,
             "operation_id": r_id,
             "kind": "restore",
             "phase": "completed",
-            "validation_mode": "registered",
+            "root_state": "registered",
+            "observations": [],
             "mutations": [],
             "remove_empty_directories": [],
             "metadata": {"restores_trash_operation": pending.operation_id},
@@ -820,11 +824,12 @@ def test_completed_restore_with_mismatched_journal_identity_preserves_package(
         root,
         r_id,
         {
-            "journal_version": 2,
+            "journal_version": JOURNAL_VERSION,
             "operation_id": "7" * 32,  # 与目录名不一致
             "kind": "restore",
             "phase": "completed",
-            "validation_mode": "registered",
+            "root_state": "registered",
+            "observations": [],
             "mutations": [],
             "remove_empty_directories": [],
             "metadata": {"restores_trash_operation": pending.operation_id},
