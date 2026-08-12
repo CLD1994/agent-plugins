@@ -6,6 +6,7 @@ import pytest
 
 from draft.checker import check_draft
 from draft.cli import main
+from draft.models import RootState
 from tests.integration.support import DraftFactory
 
 PAGE_INDEX = """# Topic
@@ -45,6 +46,109 @@ def build_page_draft(draft_factory: DraftFactory) -> Path:
             "pages/b.md": PAGE_B,
         }
     )
+
+
+def _candidate_with_unrelated_broken_page(draft_factory: DraftFactory) -> Path:
+    root = draft_factory(
+        {
+            "index.md": PAGE_INDEX,
+            "pages/a.md": PAGE_A,
+            "pages/b.md": PAGE_B,
+            "pages/broken.md": "无标题正文。\n",
+        },
+        root_state=RootState.CANDIDATE,
+    )
+    return root
+
+
+def test_candidate_create_succeeds_with_unrelated_bad_page(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _candidate_with_unrelated_broken_page(draft_factory)
+    capsys.readouterr()
+
+    code, payload = run_json(
+        [
+            "create",
+            "--root",
+            str(root),
+            "pages/c.md",
+            "--title",
+            "丙",
+            "--status",
+            "pending",
+            "--json",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    assert (root / "pages/c.md").is_file()
+    assert payload["result_type"] == "create"
+
+
+def test_candidate_status_set_succeeds_with_unrelated_bad_page(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _candidate_with_unrelated_broken_page(draft_factory)
+    capsys.readouterr()
+
+    code, payload = run_json(
+        ["status", "set", "--root", str(root), "pages/a.md", "confirmed", "--json"], capsys
+    )
+
+    assert code == 0
+    assert payload["result_type"] == "status.set"
+
+
+def test_candidate_status_set_rejects_bad_target_page(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _candidate_with_unrelated_broken_page(draft_factory)
+    capsys.readouterr()
+
+    code, payload = run_json(
+        ["status", "set", "--root", str(root), "pages/broken.md", "confirmed", "--json"], capsys
+    )
+
+    assert code == 2
+    assert payload["ok"] is False
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "page.not_found"
+
+
+def test_registered_create_rejects_any_global_error(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = draft_factory(
+        {
+            "index.md": PAGE_INDEX,
+            "pages/a.md": PAGE_A,
+            "pages/b.md": PAGE_B,
+            "pages/broken.md": "无标题正文。\n",
+        }
+    )
+    capsys.readouterr()
+
+    code, payload = run_json(
+        [
+            "create",
+            "--root",
+            str(root),
+            "pages/c.md",
+            "--title",
+            "丙",
+            "--status",
+            "pending",
+            "--json",
+        ],
+        capsys,
+    )
+
+    assert code == 2
+    assert payload["ok"] is False
+    assert not (root / "pages/c.md").exists()
 
 
 def run_json(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, dict[str, object]]:

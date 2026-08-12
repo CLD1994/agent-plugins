@@ -14,7 +14,6 @@ from draft.cli_results import CheckSlice, DryRunOperation, ResultType, project_c
 from draft.diagnostic_codes import CheckCode
 from draft.diagnostics import issue_payload, render_issue
 from draft.errors import DraftError
-from draft.graph import DraftGraph
 from draft.models import (
     CheckReport,
     LifecycleWarning,
@@ -24,6 +23,7 @@ from draft.models import (
     RootState,
     TrashResult,
 )
+from draft.operation_facts import OperationFacts
 from draft.paths import FilesystemProbe, ManagedRoot, select_managed_root
 from draft.plan_effects import PlanEffect
 from draft.query import LocalPageSnapshot, SnapshotView, TolerantView
@@ -699,20 +699,20 @@ def _dry_run_write(
     *,
     root: Path,
     operation: DryRunOperation,
-    build: Callable[[DraftGraph], OperationPlan],
+    build: Callable[[OperationFacts], OperationPlan],
 ) -> tuple[dict[str, object], str, int]:
-    """预演：与正式执行共享同一计划构造边界，分页输出公开效果，不执行写入。"""
+    """预演：与正式执行共享同一事实加载与计划构造边界，分页输出公开效果。"""
+    from draft.operation_facts import load_operation_facts
     from draft.operations import read_lock
     from draft.paths import resolve_draft_root
-    from draft.query import load_complete_snapshot
 
     resolved = resolve_draft_root(root)
     if read_lock(resolved) is not None:
         from draft.diagnostic_codes import CheckCode
 
         raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, resolved)
-    graph = load_complete_snapshot(resolved)
-    plan = build(graph)
+    facts = load_operation_facts(resolved)
+    plan = build(facts)
     payload, human = _plan_effects_payload(operation, plan.effects, args)
     return payload, human, 0
 
@@ -764,7 +764,7 @@ def _dispatch(
                 args,
                 root=root,
                 operation=DryRunOperation.MOVE,
-                build=lambda graph: plan_move(graph, source, target),
+                build=lambda facts: plan_move(facts.graph, source, target),
             )
         _reject_pagination_without_dry_run(args)
         result = move_page(root, source, target)
@@ -781,7 +781,7 @@ def _dispatch(
                 args,
                 root=root,
                 operation=DryRunOperation.PROMOTE,
-                build=lambda graph: plan_promote(graph, page, tuple(children)),
+                build=lambda facts: plan_promote(facts.graph, page, tuple(children)),
             )
         _reject_pagination_without_dry_run(args)
         result = promote_page(root, page, children)
@@ -797,7 +797,7 @@ def _dispatch(
                 args,
                 root=root,
                 operation=DryRunOperation.COLLAPSE,
-                build=lambda graph: plan_collapse(graph, hub),
+                build=lambda facts: plan_collapse(facts.graph, hub),
             )
         _reject_pagination_without_dry_run(args)
         result = collapse_hub(root, hub)
@@ -810,8 +810,8 @@ def _dispatch(
         page = _page_operand(root, cast(str, args.page))
         if _is_dry_run(args):
 
-            def build(graph: DraftGraph) -> OperationPlan:
-                plan, _pkg = trash_plan(graph, page)
+            def build(facts: OperationFacts) -> OperationPlan:
+                plan, _pkg = trash_plan(facts.graph, page)
                 return plan
 
             return _dry_run_write(args, root=root, operation=DryRunOperation.TRASH, build=build)
@@ -841,15 +841,15 @@ def _dispatch(
         if _is_dry_run(args):
             if sub == "add":
 
-                def build(graph: DraftGraph) -> OperationPlan:
-                    return plan_add_relation(graph.root, source, code, target)
+                def build(facts: OperationFacts) -> OperationPlan:
+                    return plan_add_relation(facts.graph.root, source, code, target)
 
                 operation = DryRunOperation.RELATION_ADD
             else:
 
-                def build(graph: DraftGraph) -> OperationPlan:
+                def build(facts: OperationFacts) -> OperationPlan:
                     return plan_remove_relation(
-                        graph.root, source, code, target, restored_status=restored_status
+                        facts.graph.root, source, code, target, restored_status=restored_status
                     )
 
                 operation = DryRunOperation.RELATION_REMOVE
@@ -879,8 +879,10 @@ def _dispatch(
         clear_note = bool(getattr(args, "clear_note", False))
         if _is_dry_run(args):
 
-            def build(graph: DraftGraph) -> OperationPlan:
-                return plan_set_status(graph.root, page, code, note=note, clear_note=clear_note)
+            def build(facts: OperationFacts) -> OperationPlan:
+                return plan_set_status(
+                    facts.graph.root, page, code, note=note, clear_note=clear_note
+                )
 
             return _dry_run_write(
                 args,
@@ -906,8 +908,15 @@ def _dispatch(
         status = StatusCode(cast(str, args.status))
         if _is_dry_run(args):
 
-            def build(graph: DraftGraph) -> OperationPlan:
-                return plan_create_page(graph, page, title=title, status=status)
+            def build(facts: OperationFacts) -> OperationPlan:
+                return plan_create_page(
+                    facts.graph,
+                    page,
+                    title=title,
+                    status=status,
+                    root_state=facts.root_state,
+                    observations=facts.observations,
+                )
 
             return _dry_run_write(
                 args,

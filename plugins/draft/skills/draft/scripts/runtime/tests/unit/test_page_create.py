@@ -8,7 +8,7 @@ import pytest
 from draft.errors import DraftError
 from draft.graph import DraftGraph
 from draft.markdown import parse_page
-from draft.models import PageDocument, StatusCode
+from draft.models import OperationPlan, PageDocument, StatusCode
 from draft.page_create import (
     PlanAction,
     plan_create_page,
@@ -45,6 +45,26 @@ def _graph(
     )
 
 
+def _create_plan(
+    graph: DraftGraph,
+    path: Path,
+    *,
+    title: str,
+    status: StatusCode,
+) -> OperationPlan:
+    from draft.models import RootState
+    from draft.observations import graph_observations
+
+    return plan_create_page(
+        graph,
+        path,
+        title=title,
+        status=status,
+        root_state=RootState.REGISTERED,
+        observations=graph_observations(graph),
+    )
+
+
 def test_resolve_new_leaf_rejects_illegal_operands() -> None:
     bad = [
         "/abs/a.md",
@@ -70,27 +90,25 @@ def test_resolve_new_leaf_accepts_nested_pages() -> None:
 def test_plan_create_page_requires_existing_parent() -> None:
     graph = _graph(pages={INDEX: _page(INDEX, title="根")}, parents={})
     with pytest.raises(DraftError, match="structure.missing_parent"):
-        plan_create_page(
-            graph, Path("pages/missing/child.md"), title="子", status=StatusCode.PENDING
-        )
+        _create_plan(graph, Path("pages/missing/child.md"), title="子", status=StatusCode.PENDING)
 
 
 def test_plan_create_page_rejects_existing_target() -> None:
     graph = _graph(pages={INDEX: _page(INDEX, title="根"), A: _page(A, title="甲")})
     with pytest.raises(DraftError, match="structure.target_exists"):
-        plan_create_page(graph, A, title="甲", status=StatusCode.PENDING)
+        _create_plan(graph, A, title="甲", status=StatusCode.PENDING)
 
 
 def test_plan_create_page_rejects_confirmed_or_superseded_or_closed() -> None:
     graph = _graph()
     for status in (StatusCode.CONFIRMED, StatusCode.SUPERSEDED, StatusCode.CLOSED):
         with pytest.raises(DraftError, match="create.invalid_status"):
-            plan_create_page(graph, Path("pages/b.md"), title="乙", status=status)
+            _create_plan(graph, Path("pages/b.md"), title="乙", status=status)
 
 
 def test_plan_create_page_creates_leaf_with_create_and_modify() -> None:
     graph = _graph()
-    plan = plan_create_page(graph, Path("pages/b.md"), title="乙", status=StatusCode.PENDING)
+    plan = _create_plan(graph, Path("pages/b.md"), title="乙", status=StatusCode.PENDING)
 
     assert plan.kind == "create"
     actions = [effect.action for effect in plan.effects]
@@ -102,7 +120,7 @@ def test_plan_create_page_creates_leaf_with_create_and_modify() -> None:
 def test_plan_create_page_renders_title_with_escaping() -> None:
     graph = _graph()
     title = "乙：a[b]c (x) _y_"
-    plan = plan_create_page(graph, Path("pages/b.md"), title=title, status=StatusCode.PENDING)
+    plan = _create_plan(graph, Path("pages/b.md"), title=title, status=StatusCode.PENDING)
     created = next(e for e in plan.effects if e.action is PlanAction.CREATE)
     content = next(m.content for m in plan.mutations if m.path == created.path)
     assert content is not None
@@ -114,4 +132,4 @@ def test_plan_create_page_rejects_empty_and_control_titles() -> None:
     graph = _graph()
     for title in ("", "换行\n标题", "控制\x00"):
         with pytest.raises(DraftError, match="create.invalid_title"):
-            plan_create_page(graph, Path("pages/b.md"), title=title, status=StatusCode.PENDING)
+            _create_plan(graph, Path("pages/b.md"), title=title, status=StatusCode.PENDING)

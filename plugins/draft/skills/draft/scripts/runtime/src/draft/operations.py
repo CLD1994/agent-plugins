@@ -728,18 +728,27 @@ def _validate_and_complete(
 ) -> OperationResult:
     current = _with_phase(journal, OperationPhase.VALIDATING)
     write_journal(current)
-    try:
-        _check(root)
-    except DraftError as error:
-        if error.code == "operation.validation_failed":
-            _rollback(
-                root,
-                current,
-                retain_terminal_lock=retain_terminal_lock,
-                changed_paths=changed_paths,
-            )
-            raise DraftError("operation.validation_failed", root, details=error.details) from error
-        raise
+    if journal.root_state is RootState.REGISTERED:
+        # registered 根的应用后完整检查是事务提交前的二次确认。
+        try:
+            _check(root)
+        except DraftError as error:
+            if error.code == "operation.validation_failed":
+                _rollback(
+                    root,
+                    current,
+                    retain_terminal_lock=retain_terminal_lock,
+                    changed_paths=changed_paths,
+                )
+                raise DraftError(
+                    "operation.validation_failed", root, details=error.details
+                ) from error
+            raise
+    else:
+        # candidate 根已由操作级门禁与观察复核保证：只核对 mutation 应用后摘要。
+        for mutation in current.mutations:
+            if sha256_file(root / mutation.path) != mutation.after_sha256:
+                raise DraftError("operation.external_change", root / mutation.path)
     if current.kind == "trash":
         # 回收以待恢复为耐久终态：写 trash_retained、释放写锁、清理恢复副本；
         # 权威删除包原样保留，到期推进与系统回收站移交由 trash_lifecycle 子系统驱动。

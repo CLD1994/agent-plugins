@@ -135,14 +135,21 @@ def plan_set_status(
     note: str | None = None,
     clear_note: bool = False,
 ) -> OperationPlan:
-    """构造状态修改计划；最终内存图验证通过才产生变更。"""
+    """构造状态修改计划；最终内存图验证通过才产生变更。
+
+    candidate 根按操作级门禁：只拒绝目标页不可判定，不要求全根健康。
+    """
+    from draft.operation_facts import load_operation_facts
     from draft.paths import resolve_draft_root
-    from draft.query import PAGE_NOT_FOUND, load_complete_snapshot
+    from draft.query import PAGE_NOT_FOUND
 
     if note is not None and clear_note:
         raise DraftError("status.note_conflict")
     resolved = resolve_draft_root(root)
-    graph = load_complete_snapshot(resolved)
+    facts = load_operation_facts(resolved)
+    graph = facts.graph
+    if page in set(facts.blocking_paths):
+        raise DraftError(PAGE_NOT_FOUND, page)
     document = graph.pages.get(page)
     if document is None:
         raise DraftError(PAGE_NOT_FOUND, page)
@@ -151,7 +158,7 @@ def plan_set_status(
             kind="status.set",
             root=resolved,
             mutations=(),
-            root_state=RootState.REGISTERED,
+            root_state=facts.root_state,
             observations=EMPTY_OBSERVATIONS,
             effects=(),
         )
@@ -166,7 +173,7 @@ def plan_set_status(
             kind="status.set",
             root=resolved,
             mutations=(),
-            root_state=RootState.REGISTERED,
+            root_state=facts.root_state,
             observations=EMPTY_OBSERVATIONS,
             effects=(),
         )
@@ -187,7 +194,7 @@ def plan_set_status(
                 after,
             ),
         ),
-        root_state=RootState.REGISTERED,
+        root_state=facts.root_state,
         observations=_target_marker_observations(resolved, page, document.text),
         effects=(PlanEffect(action=PlanAction.MODIFY, path=page),),
     )
@@ -195,38 +202,19 @@ def plan_set_status(
 
 
 def _validate_final_graph(root: Path, page: Path, new_text: str) -> None:
-    """用修改后的页面重建内存图并检查最终不变量；有错误时抛稳定领域错误。"""
-    from dataclasses import replace
+    """验证目标页最终状态不变量：superseded 当且仅当声明 superseded_by。
 
-    from draft.graph import load_graph_tolerant
-    from draft.resources import resolve_page_resources
-
-    result = load_graph_tolerant(root)
-    if result.issues:
-        codes = tuple(issue.code for issue in result.issues if issue.severity.value == "error")
-        raise DraftError("status.dirty", root, details=codes)
-    graph = result.graph
+    全根健康由 load_operation_facts（registered 严格 / candidate 操作级）把关；
+    状态修改只拥有目标页自身的 superseded 一致性，不自动猜测或改写关系。
+    """
+    del root
     updated_document = parse_page(page, new_text)
-    pages = dict(graph.pages)
-    pages[page] = updated_document
-    body_resources = dict(graph.body_resources)
-    body_resources[page] = resolve_page_resources(root, updated_document)
-    parents = dict(graph.parents)
-    relations = dict(graph.relations)
-    # 重算以 page 为来源的关系边（状态修改不影响关系，仅重建图对象）。
-    graph = replace(
-        graph,
-        pages=pages,
-        body_resources=body_resources,
-        parents=parents,
-        relations=relations,
+    declares_superseded_by = any(
+        relation.code is RelationCode.SUPERSEDED_BY for relation in updated_document.relations
     )
-    from draft.checker import check_graph
-
-    report = check_graph(graph)
-    if report.errors:
-        codes = tuple(issue.code for issue in report.errors)
-        raise DraftError("status.invalid_final_state", page, details=codes)
+    is_superseded = updated_document.status.code is StatusCode.SUPERSEDED
+    if declares_superseded_by != is_superseded:
+        raise DraftError("status.invalid_final_state", page)
 
 
 def plan_add_relation(
@@ -235,22 +223,33 @@ def plan_add_relation(
     code: EditableRelationCode,
     target: Path,
 ) -> OperationPlan:
-    """构造关系添加计划：depends_on 单向，supersedes/challenges 双向原子。"""
+    """构造关系添加计划：depends_on 单向，supersedes/challenges 双向原子。
+
+    candidate 根按操作级门禁：两端可判定即可，不要求全根健康。
+    """
+    from draft.operation_facts import load_operation_facts
     from draft.paths import resolve_draft_root
-    from draft.query import PAGE_NOT_FOUND, load_complete_snapshot
+    from draft.query import PAGE_NOT_FOUND
 
     resolved = resolve_draft_root(root)
-    graph = load_complete_snapshot(resolved)
-    if source not in graph.pages:
+    facts = load_operation_facts(resolved)
+    graph = facts.graph
+    blocking = set(facts.blocking_paths)
+    if source not in graph.pages or source in blocking:
         raise DraftError(PAGE_NOT_FOUND, source)
-    if target not in graph.pages:
+    if target not in graph.pages or target in blocking:
         raise DraftError(PAGE_NOT_FOUND, target)
     if source == target:
         raise DraftError("relation.self_reference", source)
 
     if code is EditableRelationCode.DEPENDS_ON:
         return _single_relation_plan(
-            resolved, graph, source, EditableRelationCode.DEPENDS_ON, target
+            resolved,
+            graph,
+            source,
+            EditableRelationCode.DEPENDS_ON,
+            target,
+            root_state=facts.root_state,
         )
     if code is EditableRelationCode.CHALLENGES:
         return _pair_relation_plan(
@@ -260,9 +259,10 @@ def plan_add_relation(
             EditableRelationCode.CHALLENGES,
             RelationCode.CHALLENGED_BY,
             target,
+            root_state=facts.root_state,
         )
     if code is EditableRelationCode.SUPERSEDES:
-        return _supersedes_plan(resolved, graph, source, target)
+        return _supersedes_plan(resolved, graph, source, target, root_state=facts.root_state)
     raise DraftError("relation.unsupported", source)
 
 
@@ -314,6 +314,8 @@ def _single_relation_plan(
     source: Path,
     code: EditableRelationCode,
     target: Path,
+    *,
+    root_state: RootState,
 ) -> OperationPlan:
     """单向关系添加：若已存在则幂等无变化。"""
     document = graph.pages[source]
@@ -335,7 +337,9 @@ def _single_relation_plan(
     new_text = append_machine_relation(
         document.text, RelationCode(code.value), target, source=source
     )
-    return _write_plan(root, "relation.add", source, document.text, new_text, graph)
+    return _write_plan(
+        root, "relation.add", source, document.text, new_text, graph, root_state=root_state
+    )
 
 
 def _pair_relation_plan(
@@ -345,6 +349,8 @@ def _pair_relation_plan(
     code: EditableRelationCode,
     reverse: RelationCode,
     target: Path,
+    *,
+    root_state: RootState,
 ) -> OperationPlan:
     """双向关系添加：补齐缺失的一边；双方都存在则幂等。"""
     src_doc = graph.pages[source]
@@ -377,10 +383,17 @@ def _pair_relation_plan(
             observations=EMPTY_OBSERVATIONS,
             effects=(),
         )
-    return _multi_write_plan(root, "relation.add", edits, graph)
+    return _multi_write_plan(root, "relation.add", edits, graph, root_state=root_state)
 
 
-def _supersedes_plan(root: Path, graph: DraftGraph, source: Path, target: Path) -> OperationPlan:
+def _supersedes_plan(
+    root: Path,
+    graph: DraftGraph,
+    source: Path,
+    target: Path,
+    *,
+    root_state: RootState,
+) -> OperationPlan:
     """取代：双向 supersedes/superseded_by + 目标状态 superseded。"""
     src_doc = graph.pages[source]
     tgt_doc = graph.pages[target]
@@ -423,7 +436,7 @@ def _supersedes_plan(root: Path, graph: DraftGraph, source: Path, target: Path) 
             observations=EMPTY_OBSERVATIONS,
             effects=(),
         )
-    return _multi_write_plan(root, "relation.add", edits, graph)
+    return _multi_write_plan(root, "relation.add", edits, graph, root_state=root_state)
 
 
 def _resolves_to_page(graph: DraftGraph, source: Path, relation: Relation, target: Path) -> bool:
@@ -441,9 +454,16 @@ def _resolves_to_page(graph: DraftGraph, source: Path, relation: Relation, targe
 
 
 def _write_plan(
-    root: Path, kind: str, path: Path, before: str, after: str, graph: DraftGraph
+    root: Path,
+    kind: str,
+    path: Path,
+    before: str,
+    after: str,
+    graph: DraftGraph,
+    *,
+    root_state: RootState,
 ) -> OperationPlan:
-    return _multi_write_plan(root, kind, {path: (before, after)}, graph)
+    return _multi_write_plan(root, kind, {path: (before, after)}, graph, root_state=root_state)
 
 
 def _multi_write_plan(
@@ -451,6 +471,8 @@ def _multi_write_plan(
     kind: str,
     edits: dict[Path, tuple[str, str]],
     graph: DraftGraph,
+    *,
+    root_state: RootState,
 ) -> OperationPlan:
     mutations = [
         FileMutation(
@@ -469,7 +491,7 @@ def _multi_write_plan(
         kind=kind,
         root=root,
         mutations=tuple(mutations),
-        root_state=RootState.REGISTERED,
+        root_state=root_state,
         observations=graph_observations(graph),
         effects=effects,
     )
@@ -484,24 +506,47 @@ def plan_remove_relation(
     restored_status: StatusCode | None = None,
 ) -> OperationPlan:
     """构造关系删除计划：幂等删除，半对清理，取代关系恢复必要状态。"""
+    from draft.operation_facts import load_operation_facts
     from draft.paths import resolve_draft_root
-    from draft.query import PAGE_NOT_FOUND, load_complete_snapshot
+    from draft.query import PAGE_NOT_FOUND
 
     resolved = resolve_draft_root(root)
-    graph = load_complete_snapshot(resolved)
-    if source not in graph.pages:
+    facts = load_operation_facts(resolved)
+    graph = facts.graph
+    blocking = set(facts.blocking_paths)
+    if source not in graph.pages or source in blocking:
         raise DraftError(PAGE_NOT_FOUND, source)
-    if target not in graph.pages:
+    if target not in graph.pages or target in blocking:
         raise DraftError(PAGE_NOT_FOUND, target)
 
     if code is EditableRelationCode.DEPENDS_ON:
-        return _single_relation_remove(resolved, graph, source, RelationCode.DEPENDS_ON, target)
+        return _single_relation_remove(
+            resolved,
+            graph,
+            source,
+            RelationCode.DEPENDS_ON,
+            target,
+            root_state=facts.root_state,
+        )
     if code is EditableRelationCode.CHALLENGES:
         return _pair_relation_remove(
-            resolved, graph, source, RelationCode.CHALLENGES, RelationCode.CHALLENGED_BY, target
+            resolved,
+            graph,
+            source,
+            RelationCode.CHALLENGES,
+            RelationCode.CHALLENGED_BY,
+            target,
+            root_state=facts.root_state,
         )
     if code is EditableRelationCode.SUPERSEDES:
-        return _supersedes_remove(resolved, graph, source, target, restored_status=restored_status)
+        return _supersedes_remove(
+            resolved,
+            graph,
+            source,
+            target,
+            restored_status=restored_status,
+            root_state=facts.root_state,
+        )
     raise DraftError("relation.unsupported", source)
 
 
@@ -511,6 +556,8 @@ def _single_relation_remove(
     source: Path,
     code: RelationCode,
     target: Path,
+    *,
+    root_state: RootState,
 ) -> OperationPlan:
     document = graph.pages[source]
     existing = any(
@@ -522,12 +569,14 @@ def _single_relation_remove(
             kind="relation.remove",
             root=root,
             mutations=(),
-            root_state=RootState.REGISTERED,
+            root_state=root_state,
             observations=EMPTY_OBSERVATIONS,
             effects=(),
         )
     new_text = remove_machine_relation(document.text, code, target, source=source)
-    return _write_plan(root, "relation.remove", source, document.text, new_text, graph)
+    return _write_plan(
+        root, "relation.remove", source, document.text, new_text, graph, root_state=root_state
+    )
 
 
 def _pair_relation_remove(
@@ -537,6 +586,8 @@ def _pair_relation_remove(
     code: RelationCode,
     reverse: RelationCode,
     target: Path,
+    *,
+    root_state: RootState,
 ) -> OperationPlan:
     src_doc = graph.pages[source]
     tgt_doc = graph.pages[target]
@@ -568,7 +619,7 @@ def _pair_relation_remove(
             observations=EMPTY_OBSERVATIONS,
             effects=(),
         )
-    return _multi_write_plan(root, "relation.remove", edits, graph)
+    return _multi_write_plan(root, "relation.remove", edits, graph, root_state=root_state)
 
 
 def _supersedes_remove(
@@ -578,6 +629,7 @@ def _supersedes_remove(
     target: Path,
     *,
     restored_status: StatusCode | None,
+    root_state: RootState,
 ) -> OperationPlan:
     src_doc = graph.pages[source]
     tgt_doc = graph.pages[target]
@@ -628,7 +680,7 @@ def _supersedes_remove(
             observations=EMPTY_OBSERVATIONS,
             effects=(),
         )
-    return _multi_write_plan(root, "relation.remove", edits, graph)
+    return _multi_write_plan(root, "relation.remove", edits, graph, root_state=root_state)
 
 
 def _execute_or_empty(plan: OperationPlan, kind: str) -> OperationResult:

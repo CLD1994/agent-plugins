@@ -21,8 +21,10 @@ from draft.models import (
     MutationKind,
     OperationPlan,
     OperationResult,
+    RootState,
     StatusCode,
 )
+from draft.observations import ObservationManifest, missing_observation
 from draft.operations import sha256_bytes
 from draft.paths import physical_parent, relative_markdown_destination
 from draft.plan_effects import PlanAction, PlanEffect
@@ -66,6 +68,8 @@ def plan_create_page(
     *,
     title: str,
     status: StatusCode,
+    root_state: RootState,
+    observations: ObservationManifest,
 ) -> OperationPlan:
     """构造创建计划：CREATE 新页 + MODIFY 父导航，原子同计划。"""
     _validate_title(title)
@@ -120,17 +124,12 @@ def plan_create_page(
         PlanEffect(action=PlanAction.CREATE, path=path),
         PlanEffect(action=PlanAction.MODIFY, path=parent),
     )
-    from draft.models import RootState
-    from draft.observations import ObservationManifest, graph_observations, missing_observation
-
-    observations = ObservationManifest(
-        entries=(*graph_observations(graph).entries, missing_observation(path))
-    )
+    observations = ObservationManifest(entries=(*observations.entries, missing_observation(path)))
     return OperationPlan(
         kind="create",
         root=graph.root,
         mutations=tuple(mutations),
-        root_state=RootState.REGISTERED,
+        root_state=root_state,
         observations=observations,
         effects=effects,
     )
@@ -143,12 +142,28 @@ def create_page(
     title: str,
     status: StatusCode,
 ) -> OperationResult:
-    """原子创建叶子页面；前置推进由 CLI 编排统一完成。"""
+    """原子创建叶子页面；前置推进由 CLI 编排统一完成。
+
+    candidate 根按操作级门禁执行：只拒绝目标/父页不可判定，不要求全根健康。
+    """
+    from draft.operation_facts import load_operation_facts
     from draft.operations import execute_plan
     from draft.paths import resolve_draft_root
-    from draft.query import load_complete_snapshot
 
     resolved = resolve_draft_root(root)
-    graph = load_complete_snapshot(resolved)
-    plan = plan_create_page(graph, page, title=title, status=status)
+    facts = load_operation_facts(resolved)
+    blocking = set(facts.blocking_paths)
+    if page in blocking:
+        raise DraftError("structure.target_exists", page)
+    parent = physical_parent(page)
+    if parent in blocking:
+        raise DraftError("structure.missing_parent", page)
+    plan = plan_create_page(
+        facts.graph,
+        page,
+        title=title,
+        status=status,
+        root_state=facts.root_state,
+        observations=facts.observations,
+    )
     return execute_plan(plan)
