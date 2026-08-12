@@ -592,7 +592,7 @@ def test_bound_valid_root_without_hint(
     skill_root = setup.skill_path.parent
     assert (
         f"uvx --isolated --from {shlex.quote(str(skill_root / 'scripts' / 'runtime'))} "
-        f"draft check {shlex.quote(str(bound.root))}"
+        f"draft check --root {shlex.quote(str(bound.root))}"
     ) in output
 
 
@@ -803,7 +803,7 @@ def test_paths_with_spaces_and_single_quotes_are_shell_quoted(
     skill_root = setup.skill_path.parent
     assert (
         f"uvx --isolated --from {shlex.quote(str(skill_root / 'scripts' / 'runtime'))} "
-        f"draft check {shlex.quote(str(root))}"
+        f"draft check --root {shlex.quote(str(root))}"
     ) in output
 
 

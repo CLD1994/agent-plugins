@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import ast
 import subprocess
 import tomllib
@@ -385,3 +386,70 @@ def _cli_result_literal_offenders() -> dict[str, list[tuple[int, str]]]:
 
 def test_result_type_and_operation_values_have_one_literal_owner() -> None:
     assert _cli_result_literal_offenders() == {}
+
+
+# 已退役候选协议符号必须从生产源码消失；基于 AST 的 import/Name/Attribute 检查，
+# 注释与字符串不参与。
+_RETIRED_SYMBOLS = frozenset(
+    {
+        "PROVISIONAL_MARKER_PATH",
+        "provisional_marker_path",
+        "provisional_marker_bytes",
+        "draft_manifest",
+        "CandidateManifest",
+        "prepare_registered_command",
+        "CANDIDATE_ALREADY_REGISTERED",
+        "CANDIDATE_INTERNAL_STATE",
+    }
+)
+
+
+def _retired_symbol_offenders() -> dict[str, list[int]]:
+    offenders: dict[str, list[int]] = {}
+    for path in sorted((RUNTIME_ROOT / "src/draft").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        hits: list[int] = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.Name):
+                names = [node.id]
+            elif isinstance(node, ast.Attribute):
+                names = [node.attr]
+            else:
+                continue
+            if any(name in _RETIRED_SYMBOLS for name in names):
+                hits.append(node.lineno)
+        if hits:
+            offenders[path.relative_to(RUNTIME_ROOT).as_posix()] = sorted(set(hits))
+    return offenders
+
+
+def test_runtime_source_has_no_retired_candidate_protocol_symbols() -> None:
+    assert _retired_symbol_offenders() == {}
+
+
+def test_only_init_has_positional_root_operand() -> None:
+    """只有 init 暴露位置 ROOT；其余命令必须经 --root 或 DRAFT_ROOT/pwd 定位。"""
+    from typing import cast
+
+    from draft import cli
+
+    parser = cli.build_parser()
+    subparsers_action = next(
+        action
+        for action in parser._actions  # pyright: ignore[reportPrivateUsage]
+        if getattr(action, "choices", None) is not None
+    )
+    choices = cast("dict[str, argparse.ArgumentParser]", getattr(subparsers_action, "choices", {}))
+    for name, sub_parser in choices.items():
+        positionals = [
+            action
+            for action in sub_parser._actions  # pyright: ignore[reportPrivateUsage]
+            if getattr(action, "option_strings", None) == []
+            and getattr(action, "nargs", None) is None
+        ]
+        has_positional_root = any(
+            getattr(action, "metavar", None) == "ROOT" for action in positionals
+        )
+        assert has_positional_root == (name == "init"), name

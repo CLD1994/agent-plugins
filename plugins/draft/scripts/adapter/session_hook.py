@@ -248,7 +248,7 @@ def render_rebind(
             "- 继续受管理讨论前，重新完整阅读当前 SKILL.md。",
             "- 修改前运行核心检查：uvx --isolated --from "
             f"{_shell_quote(skill_root / 'scripts' / 'runtime')} "
-            f"draft check {_shell_quote(binding.root)}",
+            f"draft check --root {_shell_quote(binding.root)}",
         ]
     )
     return "\n".join(lines)

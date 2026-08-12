@@ -199,8 +199,7 @@ topic/
 │       ├── index.md
 │       └── 10-1-child-question.md
 └── .draft/
-    ├── draft.json           # 最终登记标记
-    ├── draft.provisional.json  # 接管未决期间的临时登记态
+    ├── draft.json           # 唯一根身份 marker（format_version + root_state + conclusions_state）
     ├── operation.lock
     ├── operations/
     │   └── <operation-id>/
@@ -218,9 +217,9 @@ topic/
 - `pages/` 保存普通讨论页和递归枢纽；
 - 次级枢纽使用完整页面主干名作为目录名，枢纽本身为目录内 `index.md`；
 - `.draft/` 是工具内部区域，普通页面不得链接或写入其中；
-- `draft.json` 是最终登记标记，第一版只保存 `{ "format_version": 1 }`；`draft.provisional.json` 是接管未决期间的临时登记态，只在 `adopt` 未决期间存在，与正式标记分属不同文件；
+- `draft.json` 是根身份的唯一权威来源，精确保存 `format_version`、`root_state`（`candidate`/`registered`）与 `conclusions_state`；
 - `operation.lock` 只在结构操作期间存在，使 Codex 与 Claude Code 即使使用不同平台数据目录也能竞争同一把草稿锁；
-- `operations/` 保存未完成结构操作的日志、恢复副本和暂存内容，任何平台都通过草稿根读取同一份恢复事实；
+- `operations/` 保存未完成结构操作的日志（含根状态与读集观察清单）、恢复副本和暂存内容，任何平台都通过草稿根读取同一份恢复事实；
 - `trash/outgoing/` 保存仍由插件负责的权威删除包，包括恢复保留期和系统回收站待移交阶段；成功移交或已提交到期清理后才删除其中内容。
 
 第一版不保存永久草稿 ID。会话绑定使用显式根路径；目录被移动后，用户重新选择，不由程序猜测。
@@ -313,7 +312,7 @@ topic/
 3. 若只改普通内容，Agent直接编辑 Markdown；
 4. 若发生改名、移动、回收或枢纽升降级，Agent 调用对应 CLI 命令；
 5. Agent 更新父级导航、正式关系和 `conclusions.md`；
-6. Agent 运行 `draft check ROOT` 完整检查；
+6. Agent 运行 `draft check` 完整检查；
 7. 有客观错误就立即修复，有语义歧义就询问用户。
 
 页面达到约 600 行或 60 KB 时，检查器发出拆分审查提醒。提醒不自动拆页，也不阻止继续讨论。语义已经分叉时，即使页面很短也应拆分。`conclusions.md` 不受容量提醒约束。
@@ -324,41 +323,37 @@ topic/
 
 程序入口严格分离：
 
-### `draft init ROOT`
+### `draft init ROOT` / `draft init --candidate ROOT`
 
-- 只接受不存在或空目录；
-- 创建当前版本的 `index.md`、`conclusions.md`、`pages/` 和登记文件；
-- 登记文件使用与 `adopt` 相同的临时态、复核和最终原子发布；若进程中断后留下模板与合法临时态，普通命令仍拒绝使用，Agent 以显式 `adopt ROOT` 完成或撤销接管；
-- 对非空目录拒绝执行，不自动改用接管。
+- `init ROOT` 创建 `root_state=registered` 的全新草稿；`init --candidate ROOT` 创建 `root_state=candidate` 的固定候选根；
+- 两者只接受不存在或空目录；
+- 两者都耐久发布最小骨架与精确三键 marker；任何失败都不留下看似成功的半初始化根；
+- `init` 不使用根定位选择器，`ROOT` 始终显式给出，也忽略 `DRAFT_ROOT`。
 
-### `draft adopt ROOT`
+### `draft adopt`
 
-- 首次执行只接受尚未登记、但已经完整符合当前格式的目录；再次执行可以解释同目录内由先前 `adopt` 留下的合法临时登记态；
-- 内部执行与 `check ROOT --candidate` 相同的只读检查；
-- 候选检查结果必须包含完整协议相关文件集合及逐文件摘要；
-- 检查成功后，在独立文件 `draft.provisional.json` 中耐久写入带完整清单的 `adopt_state="provisional"`（临时登记）状态；它不是正式登记，普通检查、恢复和结构写命令都必须报告 `adopt.recovery_required`；临时状态与正式标记分属不同文件，回滚只清理自己的临时文件，绝不触碰 `draft.json`；
-- 在临时登记状态下立即以同一候选规则复核完整文件集合和摘要；不匹配时只耐久撤销本次临时标记文件并尽力移除自己创建的空内部目录，保留全部并发 Markdown 修改；
-- 复核匹配后先在 `draft.json` 原子写入不含临时清单的最终标记，再清理临时文件；这个最终标记写入是成功接管的线性化点；
-- 如果进程在临时标记写入后崩溃，再次执行 `adopt ROOT` 必须读取原清单并完成同一复核：匹配则发布最终标记并清理临时文件，不匹配则撤销临时标记并报告候选已变化；不得把临时态猜成成功接管；
-- `adopt` 不创建操作日志、锁、权威删除包或空的 `operations/`、`trash/` 运行目录；除承载 `draft.json` 与 `draft.provisional.json` 所必需的内部命名空间外，不写候选内容；
+- 只接受 `root_state=candidate` 的受管根；未受管目录（无 marker）与已登记根都拒绝；
+- 先运行无过滤、无分页的完整候选检查；只有 `errors` 为空才继续；
+- 以 `kind="adopt"` 的普通操作日志承载登记事务，marker 的 `candidate→registered` 替换作为唯一受管根 mutation 原子提交；
+- marker 是最后一项受管根变更；替换后只核对 after 摘要并完成日志，不再运行会以业务校验失败为由回滚的全根检查；
+- 恢复按 `OperationKind.ADOPT` 单向收敛：marker 仍是 before 时可在重新证明观察未变后前向完成，marker 已是 after 时只完成提交与清理，绝不回滚根身份；
 - 不修改页面，不解释旧格式，也不自动改用其他入口。
 
-### `draft check ROOT --candidate`
+### `draft check`
 
-- 只接受尚未登记的自包含候选目录；已有 `draft.json` 最终标记时拒绝，并要求使用普通 `check ROOT`；已有 `draft.provisional.json` 临时标记时视为接管未决，要求先由 `adopt` 完成或撤销；
-- 候选根不得包含 `operation.lock`、操作日志或权威删除包，因为它还不是可恢复的受管理草稿；
-- 除不要求登记文件外，页面树、Markdown 结构、关系、路径边界和链接检查与普通检查完全相同；
-- 保持只读，不创建隐藏目录，不写登记文件，也不把检查成功解释为已经接管。
+- `candidate` 与 `registered` 共享同一页面、关系、链接、路径与内部状态检查协议；marker 的 `root_state` 决定根前置条件；
+- 始终完整扫描并严格只读，不推进回收生命周期、不恢复、不清理、不修改 marker；
+- 输出支持 `--code`、`--path-prefix` 过滤、`--limit`/`--offset` 分页与 `--count-only`；`ok` 与退出码只由未过滤完整扫描决定。
 
 ### Agent 主导迁移
 
-第一版不提供 `migrate` 命令，也不提供 `superpowers-sidecar-v0` 或其他按来源格式命名的适配器。迁移按以下工作流完成：
+第一版不提供 `migrate` 命令，也不提供按来源格式命名的适配器，CLI 也不接受来源路径。迁移按以下工作流完成：
 
-1. Agent 读取来源材料和当前草稿协议；
-2. Agent 把内容复制并重写到一个新的空候选根，来源始终保持不变；
-3. Agent 根据语义处理旧状态、表外标签、外部结构链接和不能唯一映射的关系；
-4. Agent 运行 `check ROOT --candidate`，根据客观错误继续修改候选结果；
-5. 候选检查全绿后执行 `adopt ROOT`，再以普通 `check ROOT` 验证已登记草稿。
+1. Agent 读取只读来源材料和当前草稿协议；
+2. `draft init --candidate TARGET` 建立固定候选根；Agent 把内容建立到候选根并重写，来源始终保持不变；
+3. Agent 连续调用普通结构命令（`create`/`move`/`promote`/`collapse`/`status set`/`relation add|remove`/`trash`/`restore`/`generate-conclusions`），命令间可直接编辑标题、正文和正文链接；候选命令按操作级门禁执行，不要求整个候选根无错；
+4. Agent 自主选择检查点，用 `draft check --code <CODE> --limit N --offset 0` 按诊断类别批量修复；
+5. 完整候选检查全绿后执行 `draft adopt`，再以普通 `draft check` 验证已登记草稿。
 
 程序只判断最终候选是否满足当前协议，不识别旧标签，也不替 Agent 决定旧语义。纯链接列表由 Agent 无须询问地逐行展开为每行单目标；旧行含额外语义，或展开后同一标签重复指向同一规范化目标时，由 Agent 结合上下文决定如何保留、合并或重写，无法确定时再询问用户。外部结构链接同样由 Agent 决定是导入页面、改为正文引用、移除关系还是询问用户；候选检查只验证最终结构关系都位于草稿根内。
 
@@ -371,14 +366,15 @@ topic/
 ```text
 uvx --isolated --from "<skill_root>/scripts/runtime" draft --version
 uvx --isolated --from "<skill_root>/scripts/runtime" draft init ROOT
-uvx --isolated --from "<skill_root>/scripts/runtime" draft adopt ROOT
-uvx --isolated --from "<skill_root>/scripts/runtime" draft check ROOT [--candidate]
-uvx --isolated --from "<skill_root>/scripts/runtime" draft move ROOT SOURCE TARGET
-uvx --isolated --from "<skill_root>/scripts/runtime" draft promote ROOT PAGE CHILD [CHILD ...]
-uvx --isolated --from "<skill_root>/scripts/runtime" draft collapse ROOT HUB
-uvx --isolated --from "<skill_root>/scripts/runtime" draft trash ROOT PAGE
-uvx --isolated --from "<skill_root>/scripts/runtime" draft restore ROOT OPERATION_ID
-uvx --isolated --from "<skill_root>/scripts/runtime" draft recover ROOT
+uvx --isolated --from "<skill_root>/scripts/runtime" draft init --candidate ROOT
+uvx --isolated --from "<skill_root>/scripts/runtime" draft adopt --root ROOT
+uvx --isolated --from "<skill_root>/scripts/runtime" draft check --root ROOT
+uvx --isolated --from "<skill_root>/scripts/runtime" draft move --root ROOT SOURCE TARGET
+uvx --isolated --from "<skill_root>/scripts/runtime" draft promote --root ROOT PAGE CHILD [CHILD ...]
+uvx --isolated --from "<skill_root>/scripts/runtime" draft collapse --root ROOT HUB
+uvx --isolated --from "<skill_root>/scripts/runtime" draft trash --root ROOT PAGE
+uvx --isolated --from "<skill_root>/scripts/runtime" draft restore --root ROOT OPERATION_ID
+uvx --isolated --from "<skill_root>/scripts/runtime" draft recover --root ROOT
 ```
 
 共同规则：
@@ -440,7 +436,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft recover ROOT
 
 锁不因为“时间过去很久”就自动判为陈旧。锁指向合法操作日志时按日志恢复；锁指向缺失或损坏的日志时报告客观损坏并保留现场，不能擅自解锁。没有锁的 `allocating` 操作目录尚未取得写权限，可以作为未开始操作清理；预分配在初始日志落盘前崩溃遗留的空操作目录同样没有授权，只能作为未关联分配残留清理，不能被后续操作复用。没有锁却声称已经进入 `prepared` 或写入阶段的日志属于矛盾状态，必须停止检查。这样 Codex 和 Claude Code 看到的是同一份可恢复事实，不需要访问对方的平台数据目录。
 
-候选检查和接管不创建结构操作日志：候选检查完全只读，并返回完整协议相关文件集合及摘要。`adopt` 先在独立文件 `draft.provisional.json` 耐久发布包含该清单的临时登记标记，在临时态下复核，再在 `draft.json` 原子写入最终登记标记并清理临时文件；最终标记写入是登记线性化点。复核失败只撤销自己的临时标记文件（绝不触碰 `draft.json`），崩溃遗留的临时态只能由再次执行 `adopt` 解释。因此 `recover ROOT` 只接受最终登记的草稿，不根据候选目录形状或临时标记猜测半完成迁移。
+`check` 始终完整扫描并严格只读，对 `candidate` 与 `registered` 使用同一协议；候选写命令按操作级门禁执行，不隐式运行完整检查。`adopt` 以 `kind="adopt"` 的普通操作日志承载登记事务：完整候选检查通过后，marker 的 `candidate→registered` 替换作为唯一受管根 mutation 原子提交；marker 是最后一项受管根变更，替换后只核对 after 摘要并完成日志。恢复按 `OperationKind.ADOPT` 单向收敛：marker 仍是 before 时可在重新证明观察未变后前向完成，marker 已是 after 时只完成提交与清理，绝不回滚根身份。因此 `recover` 对任何受管根都按 marker、锁与操作日志判定，不猜测根状态。
 
 工具不覆盖无法解释的新内容，也不以“尽量恢复”为理由猜测合并。
 
@@ -564,7 +560,7 @@ trash
 
 回收生命周期诊断的严重级别固定为：恢复窗口内的 `trash_retained` 是 `INFO`；已经过 `restore_expires_at` 但尚未被下一次惰性推进处理的 `trash_retained` 仍是合法的 `INFO`；有有效投递失败记录的无锁 `trash_handoff_pending` 是合法但需要注意的 `WARNING`，`now < next_handoff_attempt_at` 时也不能降为信息，到点后只表示已经具备再次推进条件；没有有效失败记录且没有匹配锁的 pending 无法由协议解释，是 `ERROR`。合法状态不必一律降为信息。
 
-普通 `check ROOT` 要求当前 `draft.json`（最终登记标记）并验证运行状态；`check ROOT --candidate` 要求尚未登记且不存在任何运行状态，只把登记文件前置条件切换为候选条件，不降低其他页面和关系规则。候选检查遇到 `draft.json` 最终登记标记时只读拒绝，退出 `1`，使用稳定问题码 `candidate.already_registered` 并提示改用普通 `check`；遇到 `draft.provisional.json` 临时登记态时使用标准操作错误 `adopt.recovery_required` 并退出 `3`，不能把半完成接管混同为最终登记。两种模式都不能创建、恢复、重试、推进或清理任何文件；检查前后文件状态必须相同。
+`check` 对 `candidate` 与 `registered` 使用同一页面、关系、链接、路径与内部状态协议；marker 的 `root_state` 决定根前置条件，`conclusions_state` 决定结论产物所有权。`check` 始终完整扫描并严格只读，不推进回收生命周期、不恢复、不清理，也不修改 marker；它不把“有锁”解释为只报告一条错误后停止扫描。检查前后文件状态必须相同。
 
 检查器不会把 `已确认 + 被质疑` 本身报告为冲突；它分别验证产出完整性和质疑双向关系。产出页是否清楚提示挑战属于 Agent 与用户的语义评审，不通过固定句子测试。
 

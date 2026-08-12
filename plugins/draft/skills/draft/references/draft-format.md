@@ -15,10 +15,9 @@ topic/
 │       ├── index.md    # 枢纽页：目录名与页面主干名一致
 │       └── child.md
 └── .draft/
-    ├── draft.json   # 最终登记标记，接管/迁移时最后写入
-    ├── draft.provisional.json  # 接管过程中的临时登记态，仅 adopt 未决期间存在
+    ├── draft.json   # 唯一根身份 marker：format_version + root_state + conclusions_state
     ├── operation.lock  # 仅结构操作期间存在
-    ├── operations/     # 未完成操作的日志、恢复副本和暂存内容
+    ├── operations/     # 操作日志（含根状态与观察清单）、恢复副本和暂存内容
     └── trash/outgoing/ # 尚未成功移交系统回收站的删除包
 ```
 

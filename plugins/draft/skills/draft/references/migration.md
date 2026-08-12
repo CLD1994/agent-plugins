@@ -1,19 +1,32 @@
 # 迁移参考
 
-本参考描述把旧布局讨论迁移为 draft 自包含草稿的规则。迁移是独立用例：程序不提供来源格式迁移器，旧布局由 Agent 复制到新的空候选根后重写，程序只验证结果（`check ROOT --candidate`）并登记（`adopt ROOT`）。通用格式规则见 [draft-format.md](draft-format.md)。
+本参考描述把旧布局讨论迁移为 draft 自包含草稿的规则。迁移是独立用例：程序不提供
+来源格式迁移器，也不接受来源路径；Agent 在固定候选根中读取并重写来源内容，复用
+普通 Draft CLI 完成已经确定的机械变换，最后 `adopt` 把同一个根推进为正式草稿。
+通用格式规则见 [draft-format.md](draft-format.md)。
 
 ## 迁移流程
 
-1. 建空候选根目录（不含 `.draft/`，候选模式要求无任何内部状态）。
-2. 把源讨论复制到新结构，逐页按本参考改写。
-3. `draft check <ROOT> --candidate`——全绿后才可接管。
-4. `draft adopt <ROOT>` 登记，写入 `.draft/draft.json`。
-5. `draft check <ROOT>`（registered 模式）确认。
-6. 源目录保持原样，不修改。
+1. `draft init --candidate TARGET`——创建固定候选根（`.draft/draft.json` 标记为
+   `root_state=candidate`）。
+2. Agent 读取只读来源，把内容逐页建立到候选根；可直接编辑标题、正文和正文链接。
+3. 连续调用普通结构命令（`create`、`move`、`promote`、`collapse`、`status set`、
+   `relation add/remove`、`trash`/`restore`、`generate-conclusions`），命令间可继续
+   手工编辑；候选命令只在自身操作所需事实缺失或自有不变量被违反时拒绝，不要求
+   整个候选根无错。
+4. `draft check --count-only` 或 `draft check --code <CODE>` 选择检查点，按诊断类别
+   批量修复。
+5. `draft check` 全绿后才可登记。
+6. `draft adopt` 原子推进为 `root_state=registered`。
+7. `draft check`（registered 模式）确认最终可观察状态。
+8. 源目录保持原样，不修改；迁移前后可用来源摘要确认字节一致。
 
 ### 注意事项
 
 - **有子页的旧平级页面必须升格为枢纽目录**
+- 迁移期间只有一个工作根（同一候选根），不存在第二工作根、发布根或临时候选副本。
+- 路径、机器块、正式关系和父导航由 CLI 维护；Agent 不手工修改这些部分。
+- 候选根可以暂时不满足完整 Draft 协议；`adopt` 之前必须通过完整候选检查。
 
 ## 机器区域改写
 

@@ -215,7 +215,7 @@ def test_render_rebind_without_hint_is_byte_exact() -> None:
             f"- 插件入口：{entry}",
             "- 继续受管理讨论前，重新完整阅读当前 SKILL.md。",
             "- 修改前运行核心检查：uvx --isolated --from "
-            f"{shlex.quote(str(runtime))} draft check {shlex.quote(str(binding.root))}",
+            f"{shlex.quote(str(runtime))} draft check --root {shlex.quote(str(binding.root))}",
         ]
     )
 

@@ -54,8 +54,9 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 
 ### CLI 注意事项
 
-- `ROOT` 永远显式给出；`SOURCE`、`TARGET`、`PAGE`、`CHILD`、`HUB` 是草稿根内规范相对页面路径（如 `pages/a.md`、`pages/hub/index.md`），不接受目录别名。
-- `check ROOT --candidate` 只读检查未登记候选布局，要求不存在任何 `.draft/` 内部状态。程序不提供来源格式迁移器，旧布局由 Agent 复制到新空候选根后重写。
+- 除 `init` 外，需要草稿根的命令统一使用可选 `--root ROOT`，缺省回退到绝对 `DRAFT_ROOT`，再回退到物理 `pwd` 祖先发现；`init` 只接受位置 `ROOT`。
+- `SOURCE`、`TARGET`、`PAGE`、`CHILD`、`HUB` 是草稿根内规范相对页面路径（如 `pages/a.md`、`pages/hub/index.md`），不接受目录别名。
+- `check` 对 `candidate` 与 `registered` 使用同一检查协议，始终完整扫描并严格只读；程序不提供来源格式迁移器，旧布局由 Agent 在固定候选根中重写。
 
 ## 第一性边界
 
@@ -74,8 +75,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 入口选择：
 
 - 全新讨论 -> `draft init <ROOT>`
-- 已经完全符合当前格式的未登记目录 -> `draft check <ROOT> --candidate`，然后 `draft adopt ROOT`
-- 任意旧布局 -> 复制到新的空候选根，由 Agent 按当前格式和语义重写；具体规则见 [migration.md](references/migration.md)
+- 任意旧布局 -> `draft init --candidate <ROOT>` 建立固定候选根，Agent 按当前格式和语义重写并逐步调用普通命令，`draft check` 全绿后 `draft adopt`；具体规则见 [migration.md](references/migration.md)
 
 ## 即时维护循环
 
@@ -85,11 +85,11 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 2. 只改普通内容 -> 直接编辑 Markdown（标题、正文、例子都自由）；
 3. 改名、移动、升格、降级、回收 -> 调用对应 CLI 命令，一次命令完成，不拆成手工步骤；
 4. 更新受影响的正式关系（父主题、依赖、取代/被取代、质疑/被质疑）和页面状态；
-5. 运行 `draft check ROOT`；有客观错误立即修复，有语义歧义立即询问用户。
+5. 运行 `draft check`；有客观错误立即修复，有语义歧义立即询问用户。
 
 `conclusions.md` 是讨论结束时按需生成的机器产物，不实时维护。日常讨论中不手动写入
 或逐条改写结论列表；已确认页面由 `confirmed` 状态标记。只有讨论结束且与用户确认后
-才运行 `draft generate-conclusions ROOT` 生成。
+才运行 `draft generate-conclusions` 生成。
 
 ## 最终工作流
 
