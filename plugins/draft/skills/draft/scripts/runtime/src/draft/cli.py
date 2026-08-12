@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import cast
 
 from draft import __version__
-from draft.cli_results import DryRunOperation, ResultType
+from draft.cli_results import CheckSlice, DryRunOperation, ResultType, project_check
+from draft.diagnostic_codes import CheckCode
 from draft.diagnostics import issue_payload, render_issue
 from draft.errors import DraftError
 from draft.graph import DraftGraph
@@ -83,6 +84,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="检查草稿一致性",
         description="按已登记布局检查草稿；candidate 与 registered 共享同一检查协议。",
     )
+    _check.add_argument(
+        "--code",
+        action="append",
+        metavar="CODE",
+        choices=tuple(member.value for member in CheckCode),
+        help="按稳定错误码过滤（可重复，取并集）",
+    )
+    _check.add_argument(
+        "--path-prefix",
+        action="append",
+        metavar="PREFIX",
+        type=_check_path_prefix,
+        help="按根内路径前缀过滤（可重复，取并集；按路径段匹配）",
+    )
+    _check.add_argument("--limit", type=int, default=20, help="返回项数上限（默认 20，最大 100）")
+    _check.add_argument("--offset", type=int, default=0, help="跳过前 N 项")
+    _check.add_argument("--count-only", action="store_true", help="只返回计数与分页事实")
 
     move = subparsers.add_parser(
         "move",
@@ -325,31 +343,71 @@ def _emit(payload: dict[str, object], json_mode: bool, human: str) -> None:
         print(human)
 
 
-def _render_check(report: CheckReport, json_mode: bool) -> int:
-    ok = not report.errors
-    payload: dict[str, object] = {
-        "ok": ok,
-        "result_type": ResultType.CHECK.value,
-        "errors": [issue_payload(issue) for issue in report.errors],
-        "warnings": [issue_payload(issue) for issue in report.warnings],
-        "infos": [issue_payload(issue) for issue in report.infos],
-        "reviews": [issue_payload(issue) for issue in report.reviews],
-    }
+def _check_path_prefix(value: str) -> Path:
+    """校验 --path-prefix：必须是规范根内 POSIX 相对路径，绝对/..//空 都拒绝。"""
+    from pathlib import PurePosixPath
+
+    posix = PurePosixPath(value)
+    if not value or posix.is_absolute() or ".." in posix.parts:
+        raise argparse.ArgumentTypeError(f"非法的根内路径前缀：{value!r}")
+    return Path(*posix.parts)
+
+
+def _render_check(report: CheckReport, args: argparse.Namespace, json_mode: bool) -> int:
+    code_args = cast("list[str] | None", getattr(args, "code", None))
+    codes = tuple(CheckCode(value) for value in (code_args or []))
+    prefixes = tuple(getattr(args, "path_prefix", None) or [])
+    limit = int(getattr(args, "limit", 20))
+    offset = int(getattr(args, "offset", 0))
+    if limit < 1 or limit > 100 or offset < 0:
+        raise DraftError("check.invalid_pagination")
+    count_only = bool(getattr(args, "count_only", False))
+    slice_ = project_check(
+        report,
+        codes=codes,
+        path_prefixes=prefixes,
+        offset=offset,
+        limit=limit,
+        count_only=count_only,
+    )
+    payload = _check_slice_payload(slice_)
     if json_mode:
         print(json.dumps(payload, ensure_ascii=False))
     else:
-        groups = (report.errors, report.warnings, report.infos, report.reviews)
+        groups = (slice_.errors, slice_.warnings, slice_.infos, slice_.reviews)
         if not any(groups):
             print("检查通过：未发现客观错误。")
         else:
             for issues in groups:
                 for issue in issues:
                     print(render_issue(issue))
+            # 人类摘要使用未过滤完整扫描计数，并包含过滤后总数（规格 §10）。
+            severity = dict(slice_.severity_counts)
             print(
-                f"检查完成：{len(report.errors)} 个错误，{len(report.warnings)} 个警告，"
-                f"{len(report.infos)} 个信息，{len(report.reviews)} 个提醒。"
+                f"检查完成：{severity['error']} 个错误，{severity['warning']} 个警告，"
+                f"{severity['info']} 个信息，{severity['review']} 个提醒"
+                f"（过滤后 {slice_.filtered_total} 项）。"
             )
-    return 0 if ok else 1
+    return 0 if slice_.ok else 1
+
+
+def _check_slice_payload(slice_: CheckSlice) -> dict[str, object]:
+    return {
+        "ok": slice_.ok,
+        "result_type": ResultType.CHECK.value,
+        "severity_counts": dict(slice_.severity_counts),
+        "code_counts": [[code, count] for code, count in slice_.code_counts],
+        "filtered_total": slice_.filtered_total,
+        "offset": slice_.offset,
+        "limit": slice_.limit,
+        "returned_count": slice_.returned_count,
+        "has_more": slice_.has_more,
+        "next_offset": slice_.next_offset,
+        "errors": [issue_payload(issue) for issue in slice_.errors],
+        "warnings": [issue_payload(issue) for issue in slice_.warnings],
+        "infos": [issue_payload(issue) for issue in slice_.infos],
+        "reviews": [issue_payload(issue) for issue in slice_.reviews],
+    }
 
 
 def _page_operand(root: Path, value: str) -> Path:
@@ -955,7 +1013,11 @@ def main(
         except DraftError as error:
             _emit_error(error, json_mode)
             return _exit_for_error(error)
-        code = _render_check(report, json_mode)
+        try:
+            code = _render_check(report, args, json_mode)
+        except DraftError as error:
+            _emit_error(error, json_mode)
+            return _exit_for_error(error)
         return code
     try:
         payload, human, code = _dispatch(args, root=root, now=captured_now)

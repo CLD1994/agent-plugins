@@ -10,6 +10,7 @@ from pytest_mock import MockerFixture
 
 import draft.cli as cli
 from draft import __version__
+from draft.cli_results import CheckSlice, project_check
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import MarkerState
@@ -379,6 +380,18 @@ def _mixed_severity_issues() -> tuple[CheckIssue, ...]:
     )
 
 
+def _check_args(**overrides: object) -> argparse.Namespace:
+    args = argparse.Namespace()
+    args.code = None
+    args.path_prefix = None
+    args.limit = 20
+    args.offset = 0
+    args.count_only = False
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
 def test_render_check_groups_issues_and_emits_each_renderer_result_once(
     mocker: MockerFixture,
     capsys: pytest.CaptureFixture[str],
@@ -391,7 +404,7 @@ def test_render_check_groups_issues_and_emits_each_renderer_result_once(
     render_issue.side_effect = tokens.__getitem__
 
     exit_code = cli._render_check(  # pyright: ignore[reportPrivateUsage]
-        report, json_mode=False
+        report, _check_args(), json_mode=False
     )
     lines = capsys.readouterr().out.splitlines()
 
@@ -409,7 +422,7 @@ def test_render_check_clean_human_output_is_one_nonempty_line(
 ) -> None:
     render_issue = mocker.patch.object(cli, "render_issue", autospec=True)
     exit_code = cli._render_check(  # pyright: ignore[reportPrivateUsage]
-        CheckReport(issues=()), json_mode=False
+        CheckReport(issues=()), _check_args(), json_mode=False
     )
     lines = capsys.readouterr().out.splitlines()
     assert exit_code == 0
@@ -427,13 +440,21 @@ def test_render_check_json_uses_structured_payload_without_human_renderer(
     )
     render_issue = mocker.patch.object(cli, "render_issue", autospec=True)
     exit_code = cli._render_check(  # pyright: ignore[reportPrivateUsage]
-        CheckReport(issues=(issue,)), json_mode=True
+        CheckReport(issues=(issue,)), _check_args(), json_mode=True
     )
     payload = json.loads(capsys.readouterr().out)
     assert exit_code == 1
     assert payload == {
         "ok": False,
         "result_type": "check",
+        "severity_counts": {"error": 1, "warning": 0, "info": 0, "review": 0},
+        "code_counts": [[CheckCode.PARENT_MISSING.value, 1]],
+        "filtered_total": 1,
+        "offset": 0,
+        "limit": 20,
+        "returned_count": 1,
+        "has_more": False,
+        "next_offset": None,
         "errors": [
             {
                 "code": CheckCode.PARENT_MISSING.value,
@@ -448,6 +469,149 @@ def test_render_check_json_uses_structured_payload_without_human_renderer(
         "reviews": [],
     }
     render_issue.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# project_check：检查投影（过滤 → 分页 → 严重级别分组）
+# ---------------------------------------------------------------------------
+
+
+def _check_issue(
+    code: CheckCode,
+    path: str | None,
+    severity: IssueSeverity = IssueSeverity.ERROR,
+) -> CheckIssue:
+    return CheckIssue(
+        code.value,
+        severity,
+        None if path is None else Path(path),
+        None,
+    )
+
+
+def _grouped(slice_: CheckSlice) -> list[CheckIssue]:
+    return [*slice_.errors, *slice_.warnings, *slice_.infos, *slice_.reviews]
+
+
+def test_check_filters_union_within_dimension_and_intersection_between_dimensions() -> None:
+    report = CheckReport(
+        issues=(
+            _check_issue(CheckCode.PARENT_MISSING, "pages/a/index.md"),
+            _check_issue(CheckCode.LINK_MISSING, "pages/ab.md"),
+            _check_issue(CheckCode.PARENT_MISSING, "pages/b/index.md"),
+            _check_issue(CheckCode.PAGE_CAPACITY, "pages/a.md", IssueSeverity.REVIEW),
+            _check_issue(CheckCode.ROOT_MISSING_FILE, None),
+        )
+    )
+    result = project_check(
+        report,
+        codes=(CheckCode.PARENT_MISSING, CheckCode.LINK_MISSING),
+        path_prefixes=(Path("pages/a"), Path("pages/b")),
+        offset=0,
+        limit=20,
+        count_only=False,
+    )
+    assert tuple(issue.path for issue in _grouped(result)) == (
+        Path("pages/a/index.md"),
+        Path("pages/b/index.md"),
+    )
+
+
+def test_check_path_prefix_matches_path_segments_not_substrings() -> None:
+    report = CheckReport(
+        issues=(
+            _check_issue(CheckCode.PARENT_MISSING, "pages/a/index.md"),
+            _check_issue(CheckCode.PARENT_MISSING, "pages/ab.md"),
+        )
+    )
+    result = project_check(
+        report, path_prefixes=(Path("pages/a"),), offset=0, limit=20, count_only=False
+    )
+    assert tuple(issue.path for issue in _grouped(result)) == (Path("pages/a/index.md"),)
+
+
+def test_check_repeated_filters_are_idempotent() -> None:
+    report = CheckReport(issues=(_check_issue(CheckCode.PARENT_MISSING, "pages/a.md"),))
+    single = project_check(
+        report, codes=(CheckCode.PARENT_MISSING,), offset=0, limit=20, count_only=False
+    )
+    repeated = project_check(
+        report,
+        codes=(CheckCode.PARENT_MISSING, CheckCode.PARENT_MISSING),
+        path_prefixes=(Path("pages"), Path("pages")),
+        offset=0,
+        limit=20,
+        count_only=False,
+    )
+    assert single.filtered_total == repeated.filtered_total == 1
+
+
+def test_check_root_diagnostic_does_not_match_any_path_prefix() -> None:
+    report = CheckReport(issues=(_check_issue(CheckCode.ROOT_MISSING_FILE, None),))
+    result = project_check(
+        report, path_prefixes=(Path("pages"),), offset=0, limit=20, count_only=False
+    )
+    assert result.filtered_total == 0
+
+
+def test_check_default_limit_is_twenty_and_paginates() -> None:
+    report = CheckReport(
+        issues=tuple(_check_issue(CheckCode.PARENT_MISSING, f"pages/p{i}.md") for i in range(25))
+    )
+    result = project_check(report, offset=0, limit=20, count_only=False)
+    assert result.returned_count == 20
+    assert result.filtered_total == 25
+    assert result.has_more is True
+    assert result.next_offset == 20
+
+
+def test_check_count_only_keeps_counts_but_empties_arrays() -> None:
+    report = CheckReport(
+        issues=tuple(_check_issue(CheckCode.PARENT_MISSING, f"pages/p{i}.md") for i in range(3))
+    )
+    result = project_check(report, offset=0, limit=20, count_only=True)
+    assert result.errors == ()
+    assert result.warnings == ()
+    assert result.infos == ()
+    assert result.reviews == ()
+    assert result.filtered_total == 3
+    assert result.returned_count == 3
+    assert dict(result.severity_counts)["error"] == 3
+
+
+def test_check_severity_and_code_counts_come_from_unfiltered_scan() -> None:
+    report = CheckReport(
+        issues=(
+            _check_issue(CheckCode.PARENT_MISSING, "pages/a.md"),
+            _check_issue(CheckCode.PARENT_MISSING, "pages/b.md"),
+            _check_issue(CheckCode.PAGE_CAPACITY, "pages/c.md", IssueSeverity.REVIEW),
+        )
+    )
+    result = project_check(
+        report, codes=(CheckCode.PAGE_CAPACITY,), offset=0, limit=20, count_only=False
+    )
+    assert result.filtered_total == 1
+    assert dict(result.severity_counts) == {
+        "error": 2,
+        "warning": 0,
+        "info": 0,
+        "review": 1,
+    }
+    assert dict(result.code_counts) == {
+        CheckCode.PARENT_MISSING.value: 2,
+        CheckCode.PAGE_CAPACITY.value: 1,
+    }
+    assert result.ok is False
+
+
+@pytest.mark.parametrize("value", ["", "/abs", "../up", "a/../../b"])
+def test_check_path_prefix_rejects_invalid_forms(value: str) -> None:
+    with pytest.raises(argparse.ArgumentTypeError):
+        cli._check_path_prefix(value)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_check_path_prefix_accepts_canonical_relative_path() -> None:
+    assert cli._check_path_prefix("pages/a") == Path("pages/a")  # pyright: ignore[reportPrivateUsage]
 
 
 # ---------------------------------------------------------------------------

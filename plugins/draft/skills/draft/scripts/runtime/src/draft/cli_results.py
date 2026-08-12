@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
+
+from draft.diagnostic_codes import CheckCode
+from draft.models import CheckIssue, CheckReport, IssueSeverity
 
 
 class ResultType(StrEnum):
@@ -93,3 +97,94 @@ def slice_payload(
         "next_offset": slice_.next_offset,
         items_key: [] if count_only else list(slice_.items),
     }
+
+
+@dataclass(frozen=True)
+class CheckSlice:
+    """完整检查的有界结果投影：parser、人类渲染与 JSON 渲染共享同一信封。"""
+
+    errors: tuple[CheckIssue, ...]
+    warnings: tuple[CheckIssue, ...]
+    infos: tuple[CheckIssue, ...]
+    reviews: tuple[CheckIssue, ...]
+    severity_counts: tuple[tuple[str, int], ...]
+    code_counts: tuple[tuple[str, int], ...]
+    filtered_total: int
+    offset: int
+    limit: int
+    returned_count: int
+    has_more: bool
+    next_offset: int | None
+    ok: bool
+
+
+def _path_prefix_matches(issue: CheckIssue, prefixes: tuple[Path, ...]) -> bool:
+    if issue.path is None:
+        return False
+    return any(issue.path.parts[: len(prefix.parts)] == prefix.parts for prefix in prefixes)
+
+
+def project_check(
+    report: CheckReport,
+    *,
+    codes: tuple[CheckCode, ...] = (),
+    path_prefixes: tuple[Path, ...] = (),
+    offset: int = 0,
+    limit: int = 20,
+    count_only: bool = False,
+) -> CheckSlice:
+    """先过滤、再分页、最后按严重级别分组；计数与 ok 只读未过滤完整扫描。
+
+    ``codes`` 取并集、``path_prefixes`` 取并集，两组之间取交集。``count_only``
+    保留全部计数与分页事实，但四个分组数组为空。
+    """
+    code_values = frozenset(code.value for code in codes)
+    unfiltered = report.issues
+    filtered = [
+        issue
+        for issue in unfiltered
+        if (not code_values or issue.code in code_values)
+        and (not path_prefixes or _path_prefix_matches(issue, path_prefixes))
+    ]
+    filtered_total = len(filtered)
+    page = filtered[offset : offset + limit]
+    returned_count = len(page)
+    next_offset = offset + returned_count
+    has_more = next_offset < filtered_total
+
+    def _group(severity: IssueSeverity) -> tuple[CheckIssue, ...]:
+        if count_only:
+            return ()
+        return tuple(issue for issue in page if issue.severity is severity)
+
+    severity_counts = tuple(
+        (
+            severity.value,
+            sum(1 for issue in unfiltered if issue.severity is severity),
+        )
+        for severity in (
+            IssueSeverity.ERROR,
+            IssueSeverity.WARNING,
+            IssueSeverity.INFO,
+            IssueSeverity.REVIEW,
+        )
+    )
+    code_totals: dict[str, int] = {}
+    for issue in unfiltered:
+        code_totals[issue.code] = code_totals.get(issue.code, 0) + 1
+    code_counts = tuple(sorted(code_totals.items()))
+    return CheckSlice(
+        errors=_group(IssueSeverity.ERROR),
+        warnings=_group(IssueSeverity.WARNING),
+        infos=_group(IssueSeverity.INFO),
+        reviews=_group(IssueSeverity.REVIEW),
+        severity_counts=severity_counts,
+        code_counts=code_counts,
+        filtered_total=filtered_total,
+        offset=offset,
+        limit=limit,
+        returned_count=returned_count,
+        has_more=has_more,
+        next_offset=next_offset if has_more else None,
+        ok=not report.errors,
+    )

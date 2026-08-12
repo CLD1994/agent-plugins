@@ -298,6 +298,44 @@ def test_json_flag_both_positions_identical(
     assert payload_a == payload_b
 
 
+def test_check_rejects_unknown_code_before_scanning(tmp_path: Path) -> None:
+    """未知检查码由生产 CheckCode choices 在扫描前以退出码 2 拒绝。"""
+    root = tmp_path / "topic"
+    assert main(["init", str(root)]) == 0
+
+    with pytest.raises(SystemExit) as caught:
+        main(["check", "--root", str(root), "--code", "no.such.code", "--json"])
+    assert caught.value.code == 2
+
+
+def test_check_code_filter_and_count_only(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "topic"
+    assert main(["init", str(root)]) == 0
+    (root / "pages/a.md").write_text("# A\n\n> 状态：`已确认`\n\nA。\n", encoding="utf-8")
+    capsys.readouterr()
+
+    code, payload = run_json(
+        ["check", "--root", str(root), "--code", CheckCode.PARENT_MISSING.value, "--json"],
+        capsys,
+    )
+    assert code == 1
+    assert payload["ok"] is False
+    assert payload["filtered_total"] == 1
+    assert payload["returned_count"] == 1
+    assert [issue["code"] for issue in as_dicts(payload["errors"])] == [
+        CheckCode.PARENT_MISSING.value
+    ]
+
+    code, payload = run_json(["check", "--root", str(root), "--count-only", "--json"], capsys)
+    assert code == 1
+    assert payload["errors"] == []
+    # count-only 保留全部计数与分页事实：未过滤完整扫描共 2 个错误。
+    assert payload["filtered_total"] == 2
+    assert payload["severity_counts"] == {"error": 2, "warning": 0, "info": 0, "review": 0}
+
+
 def build_draft(root: Path) -> None:
     assert main(["init", str(root)]) == 0
     (root / "pages/a.md").write_text(
