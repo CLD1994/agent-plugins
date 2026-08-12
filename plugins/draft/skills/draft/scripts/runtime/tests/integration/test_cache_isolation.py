@@ -23,9 +23,9 @@ core invocation:
    --from <runtime>`` still reports the runtime version and never the
    conflicting output.
 
-All tests run behind a version gate: the actually executed ``uv`` and ``uvx``
-must both report the supported version (``0.12.1``); any other version fails
-the test explicitly instead of passing silently.
+The tests verify these behaviors directly for the actually executed ``uv`` and
+``uvx``. They do not maintain a version allowlist: an incompatible behavior
+must fail at the assertion that describes the violated cache contract.
 """
 
 from __future__ import annotations
@@ -43,7 +43,6 @@ from tests.support.paths import RUNTIME_ROOT
 SKILL_ROOT = RUNTIME_ROOT.parents[1]
 
 UVX_TIMEOUT = 600
-SUPPORTED_UV_VERSION = "0.12.1"
 
 _STRIP_ENV = (
     "PLUGIN_ROOT",
@@ -70,43 +69,6 @@ def clean_env() -> dict[str, str]:
     for name in _STRIP_ENV:
         env.pop(name, None)
     return env
-
-
-def parse_uv_version(output: str) -> str:
-    """Extract the version field from ``uv --version`` / ``uvx --version`` output.
-
-    Example: ``"uv 0.12.1 (x86_64-unknown-linux-gnu)"`` -> ``"0.12.1"``.
-    """
-    fields = output.split()
-    if len(fields) < 2:
-        pytest.fail(f"unparseable uv version output: {output!r}")
-    return fields[1]
-
-
-def assert_supported_uv_versions(uv_output: str, uvx_output: str) -> None:
-    """Fail explicitly unless both uv and uvx report SUPPORTED_UV_VERSION."""
-    uv_version = parse_uv_version(uv_output)
-    uvx_version = parse_uv_version(uvx_output)
-    if uv_version != SUPPORTED_UV_VERSION or uvx_version != SUPPORTED_UV_VERSION:
-        pytest.fail(
-            f"unsupported uv/uvx versions: expected uv and uvx {SUPPORTED_UV_VERSION}, "
-            f"got uv {uv_version} and uvx {uvx_version}"
-        )
-
-
-@pytest.fixture(scope="module", autouse=True)
-def uv_version_gate() -> None:
-    """Gate this module on the actually executed uv/uvx versions, probing once per module."""
-    env = clean_env()
-    uv = subprocess.run(
-        ["uv", "--version"], env=env, text=True, capture_output=True, check=False, timeout=60
-    )
-    uvx = subprocess.run(
-        ["uvx", "--version"], env=env, text=True, capture_output=True, check=False, timeout=60
-    )
-    if uv.returncode != 0 or uvx.returncode != 0:
-        pytest.fail(f"uv/uvx version probe failed: uv={uv.stderr!r} uvx={uvx.stderr!r}")
-    assert_supported_uv_versions(uv.stdout.strip(), uvx.stdout.strip())
 
 
 def copy_skill(tmp_path: Path, *, name: str = "draft-skill") -> Path:
@@ -431,17 +393,3 @@ def test_isolated_uvx_ignores_conflicting_global_tool(tmp_path: Path) -> None:
     assert result.stdout.strip() == "0.3.0"
     assert "wrong global draft" not in result.stdout
     assert "wrong global draft" not in result.stderr
-
-
-def test_version_gate_rejects_unsupported_versions() -> None:
-    """The gate helper passes on the supported version and fails explicitly otherwise."""
-    assert_supported_uv_versions(
-        "uv 0.12.1 (x86_64-unknown-linux-gnu)",
-        "uvx 0.12.1 (x86_64-unknown-linux-gnu)",
-    )
-    with pytest.raises(pytest.fail.Exception):
-        assert_supported_uv_versions("uv 0.9.9 (x86_64)", "uvx 0.12.1 (x86_64)")
-    with pytest.raises(pytest.fail.Exception):
-        assert_supported_uv_versions("uv 0.12.1 (x86_64)", "uvx 0.13.0 (x86_64)")
-    with pytest.raises(pytest.fail.Exception):
-        assert_supported_uv_versions("", "uvx 0.12.1 (x86_64)")
