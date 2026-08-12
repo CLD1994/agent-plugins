@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -21,8 +22,12 @@ def draft_factory(tmp_path: Path) -> DraftFactory:
             internal.mkdir()
             (internal / "operations").mkdir()
             (internal / "trash" / "outgoing").mkdir(parents=True)
+            # conclusions.md 只属于机器所有权下的 generated 状态；夹具携带该文件时
+            # 所有权状态必须同步为 generated（规格 §12.1/§12.2）。
+            state = "generated" if "conclusions.md" in files else "not_generated"
             (internal / "draft.json").write_text(
-                '{"format_version":1,"conclusions_state":"not_generated"}\n', encoding="utf-8"
+                json.dumps({"format_version": 1, "conclusions_state": state}) + "\n",
+                encoding="utf-8",
             )
         return root
 

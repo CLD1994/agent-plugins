@@ -16,9 +16,9 @@ INDEX = """# Topic
 
 ## 子主题
 
-- [结论汇总](conclusions.md)
 - [旧枢纽](pages/old/index.md)
 - [新枢纽](pages/new/index.md)
+- [结论汇总](conclusions.md)
 """
 
 CONCLUSIONS = """# 结论汇总
@@ -27,7 +27,9 @@ CONCLUSIONS = """# 结论汇总
 >
 > 父主题：[根索引](index.md)
 
-- [A](pages/old/a.md)：A 的结论。
+## 已确认结论
+
+- [A](pages/old/a.md)
 """
 
 OLD_HUB = """# 旧枢纽
@@ -111,7 +113,8 @@ def snapshot(root: Path) -> dict[str, str]:
 
 EXPECTED_REPARENTED_FILES = {
     "index.md": INDEX,
-    "conclusions.md": CONCLUSIONS.replace("pages/old/a.md", "pages/new/a.md"),
+    # 机器所有权（generated）下结构命令不改写结论列表中的旧链接（规格 §12.5）。
+    "conclusions.md": CONCLUSIONS,
     "pages/old/index.md": OLD_HUB.replace("- [A](a.md)\n", "").replace(
         "(a.md#补充)", "(../new/a.md#补充)"
     ),
@@ -170,7 +173,8 @@ def test_move_hub_relocates_complete_subtree(draft_factory: DraftFactory) -> Non
     assert files["pages/archive/a.md"] == A_PAGE.replace("(../old/index.md)", "(index.md)")
     assert files["pages/archive/keep.md"] == KEEP.replace("(../old/index.md)", "(index.md)")
     assert "(pages/archive/index.md)" in files["index.md"]
-    assert "(pages/archive/a.md)" in files["conclusions.md"]
+    # 机器所有权下结论列表中的旧链接保持原样，不随结构命令重写（规格 §12.5）。
+    assert "(pages/old/a.md)" in files["conclusions.md"]
     assert not (root / "pages/old").exists()
     assert check_draft(root).errors == ()
 
@@ -254,8 +258,8 @@ SOLO_INDEX = """# Topic
 
 ## 子主题
 
-- [结论汇总](conclusions.md)
 - [单人枢纽](pages/solo/index.md)
+- [结论汇总](conclusions.md)
 """
 
 SOLO_CONCLUSIONS = """# 结论汇总
@@ -263,6 +267,8 @@ SOLO_CONCLUSIONS = """# 结论汇总
 > 状态：`已确认`
 >
 > 父主题：[根索引](index.md)
+
+## 已确认结论
 """
 
 SOLO_HUB = """# 单人枢纽
@@ -357,10 +363,10 @@ PROMOTE_INDEX = """# Topic
 
 ## 子主题
 
-- [结论汇总](conclusions.md)
 - [主题](pages/topic.md)
 - [甲](pages/child-a.md)
 - [乙](pages/child-b.md)
+- [结论汇总](conclusions.md)
 """
 
 PROMOTE_TOPIC = """# 主题
@@ -552,9 +558,9 @@ LAZY_INDEX = """# Topic
 
 ## 子主题
 
-- [结论汇总](conclusions.md)
 - [甲](pages/a.md)
 - [乙](pages/b.md)
+- [结论汇总](conclusions.md)
 """
 
 LAZY_CONCLUSIONS = """# 结论汇总
@@ -563,7 +569,9 @@ LAZY_CONCLUSIONS = """# 结论汇总
 >
 > 父主题：[根索引](index.md)
 
-- [甲](pages/a.md)：甲。
+## 已确认结论
+
+- [甲](pages/a.md)
 """
 
 LAZY_A = """# 甲

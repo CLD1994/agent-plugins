@@ -21,8 +21,8 @@ ROOT_PAGE = """# Topic
 
 ## 子主题
 
-- [结论汇总](conclusions.md)
 - [问题](pages/question.md)
+- [结论汇总](conclusions.md)
 """
 
 CONCLUSIONS = """# 结论汇总
@@ -31,7 +31,9 @@ CONCLUSIONS = """# 结论汇总
 >
 > 父主题：[根索引](index.md)
 
-- [已确认的问题](pages/question.md)：使用显式状态前缀。
+## 已确认结论
+
+- [已确认的问题](pages/question.md)
 """
 
 QUESTION = """# 问题
@@ -253,6 +255,27 @@ def _generated_conclusions_root(draft_factory: DraftFactory) -> Path:
     return root
 
 
+def test_not_generated_unexpected_conclusions_file_is_error(
+    draft_factory: DraftFactory,
+) -> None:
+    """规格 §12.6：not_generated 时意外出现 conclusions.md 必须报告，不当作普通页。"""
+    files = healthy()
+    del files["conclusions.md"]
+    files["index.md"] = ROOT_PAGE.replace("- [结论汇总](conclusions.md)\n", "")
+    files["conclusions.md"] = CONCLUSIONS
+    root = draft_factory(files)
+    (root / ".draft/draft.json").write_text(
+        '{"format_version":1,"conclusions_state":"not_generated"}\n', encoding="utf-8"
+    )
+
+    report = check_draft(root)
+
+    assert CheckCode.CONCLUSIONS_UNEXPECTED_FILE.value in codes(report)
+    # 不把意外机器文件当作普通页面：不应出现缺父主题/不可达等误导诊断。
+    assert CheckCode.PARENT_MISSING.value not in codes(report)
+    assert CheckCode.PARENT_UNREACHABLE.value not in codes(report)
+
+
 def test_generated_conclusions_shape_change_is_error(
     draft_factory: DraftFactory,
 ) -> None:
@@ -352,12 +375,12 @@ def test_two_missing_links_on_one_line_remain_distinguishable(
     draft_factory: DraftFactory,
 ) -> None:
     files = healthy()
-    files["conclusions.md"] = CONCLUSIONS + "[甲](pages/a.md) [乙](pages/b.md)\n"
+    files["pages/question.md"] = QUESTION + "[甲](pages/a.md) [乙](pages/b.md)\n"
     report = check_draft(draft_factory(files))
     issues = [i for i in report.errors if i.code == CheckCode.LINK_MISSING.value]
     assert [(i.line, i.details) for i in issues] == [
-        (8, ("pages/a.md", "pages/a.md")),
-        (8, ("pages/b.md", "pages/b.md")),
+        (8, ("pages/a.md", "pages/pages/a.md")),
+        (8, ("pages/b.md", "pages/pages/b.md")),
     ]
 
 
@@ -885,7 +908,8 @@ def test_oversized_ordinary_page_is_review_only(draft_factory: DraftFactory) -> 
 
 def test_oversized_conclusions_page_is_exempt(draft_factory: DraftFactory) -> None:
     files = healthy()
-    padding = "\n".join(f"<!-- 填充 {index} -->" for index in range(610))
+    # 填充必须保持固定列表形状，否则 shape_invalid 会掩盖容量豁免断言。
+    padding = "\n".join(f"- [填充 {index}](pages/fill.md)" for index in range(610))
     files["conclusions.md"] = CONCLUSIONS + padding + "\n"
     root = draft_factory(files)
 
@@ -989,9 +1013,9 @@ CHECKER_TRASH_INDEX = """# Topic
 
 ## 子主题
 
-- [结论汇总](conclusions.md)
 - [问题](pages/question.md)
 - [旧页](pages/obsolete.md)
+- [结论汇总](conclusions.md)
 """
 
 CHECKER_TRASH_CONCLUSIONS = """# 结论汇总
@@ -1000,7 +1024,9 @@ CHECKER_TRASH_CONCLUSIONS = """# 结论汇总
 >
 > 父主题：[根索引](index.md)
 
-- [问题](pages/question.md)：问题。
+## 已确认结论
+
+- [问题](pages/question.md)
 """
 
 CHECKER_QUESTION = """# 问题

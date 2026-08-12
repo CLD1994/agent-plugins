@@ -19,6 +19,7 @@ from draft.graph import (
 from draft.markdown import (
     append_parent_navigation,
     canonical_parent_navigation,
+    insert_navigation_before_conclusions,
     navigation_removal_edits,
     rewrite_link_destinations,
 )
@@ -227,6 +228,14 @@ def _render_pages(
             edits.update(navigation_removal_edits(page.text, link))
         text = rewrite_link_destinations(page.text, edits)
         for title, destination in nav_appends.get(path, []):
+            if path == ROOT_PAGE:
+                # 根导航结论链接由生成器管理，必须保持最后（规格 §12.4）。
+                inserted = insert_navigation_before_conclusions(
+                    text, title, destination, conclusions_target=CONCLUSIONS_PAGE
+                )
+                if inserted != text:
+                    text = inserted
+                    continue
             text = append_parent_navigation(text, title, destination)
         rendered[path] = text
     return rendered

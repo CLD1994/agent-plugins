@@ -21,6 +21,7 @@ from draft.graph import (
 from draft.markdown import (
     append_parent_navigation,
     canonical_parent_navigation,
+    insert_navigation_before_conclusions,
     navigation_removal_edits,
     parse_page,
     rewrite_link_destinations,
@@ -408,7 +409,17 @@ def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackag
     else:
         parent_text = (root / parent_path).read_text(encoding="utf-8")
         navigation = relative_markdown_destination(parent_path, page_path, None)
-        restored_text = append_parent_navigation(parent_text, page_title, navigation)
+        if parent_path == ROOT_PAGE:
+            # 根导航结论链接由生成器管理，必须保持最后（规格 §12.4）。
+            inserted = insert_navigation_before_conclusions(
+                parent_text, page_title, navigation, conclusions_target=CONCLUSIONS_PAGE
+            )
+            if inserted != parent_text:
+                restored_text = inserted
+            else:
+                restored_text = append_parent_navigation(parent_text, page_title, navigation)
+        else:
+            restored_text = append_parent_navigation(parent_text, page_title, navigation)
         restored_bytes = restored_text.encode("utf-8")
         mutations.append(
             FileMutation(

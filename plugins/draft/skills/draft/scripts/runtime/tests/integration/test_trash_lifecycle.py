@@ -22,8 +22,8 @@ TRASH_INDEX = """# Topic
 
 ## 子主题
 
-- [结论汇总](conclusions.md)
 - [旧页](pages/obsolete.md)
+- [结论汇总](conclusions.md)
 """
 
 TRASH_CONCLUSIONS = """# 结论汇总
@@ -31,6 +31,8 @@ TRASH_CONCLUSIONS = """# 结论汇总
 > 状态：`已确认`
 >
 > 父主题：[根索引](index.md)
+
+## 已确认结论
 """
 
 OBSOLETE = """# 旧页
@@ -652,7 +654,11 @@ def test_list_recoverable_filters_by_expiry_and_sorts(
     (root / "pages/obsolete.md").write_text(OBSOLETE, encoding="utf-8")
     idx = root / "index.md"
     idx.write_text(
-        idx.read_text(encoding="utf-8") + "- [旧页](pages/obsolete.md)\n", encoding="utf-8"
+        idx.read_text(encoding="utf-8").replace(
+            "- [结论汇总](conclusions.md)\n",
+            "- [旧页](pages/obsolete.md)\n- [结论汇总](conclusions.md)\n",
+        ),
+        encoding="utf-8",
     )
     second = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
 

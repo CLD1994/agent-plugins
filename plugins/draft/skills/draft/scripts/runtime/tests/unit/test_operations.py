@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -336,3 +337,108 @@ def test_handoff_failure_metadata_records_structured_fields() -> None:
         HANDOFF_ERROR_MESSAGE_KEY: "disk full",
         HANDOFF_ATTEMPTED_AT_KEY: "2026-08-06T12:00:00Z",
     }
+
+
+# ---------------------------------------------------------------------------
+# 恢复公开路径：public_changed_paths 元数据解析与安全回退
+# ---------------------------------------------------------------------------
+
+
+def _journal_with_metadata(metadata: dict[str, str]) -> Journal:
+    return Journal(
+        operation_id="a" * 32,
+        kind="generate-conclusions",
+        phase=OperationPhase.COMPLETED,
+        validation_mode="registered",
+        mutations=(
+            JournalMutation(
+                path=Path("conclusions.md"),
+                kind=MutationKind.WRITE,
+                before_sha256="b",
+                after_sha256="a",
+                original=None,
+                staged=None,
+                applied=True,
+            ),
+            JournalMutation(
+                path=Path("index.md"),
+                kind=MutationKind.WRITE,
+                before_sha256="b",
+                after_sha256="a",
+                original=None,
+                staged=None,
+                applied=True,
+            ),
+            JournalMutation(
+                path=Path(".draft/draft.json"),
+                kind=MutationKind.WRITE,
+                before_sha256="b",
+                after_sha256="a",
+                original=None,
+                staged=None,
+                applied=True,
+            ),
+        ),
+        remove_empty_directories=(),
+        metadata=metadata,
+        directory=Path("/draft/.draft/operations/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    )
+
+
+def test_persisted_public_paths_returns_parsed_paths() -> None:
+    from draft.operations import _persisted_public_paths  # pyright: ignore[reportPrivateUsage]
+
+    journal = _journal_with_metadata(
+        {"public_changed_paths": json.dumps(["conclusions.md", "index.md"])}
+    )
+    assert _persisted_public_paths(journal) == (Path("conclusions.md"), Path("index.md"))
+
+
+def test_persisted_public_paths_missing_returns_none() -> None:
+    from draft.operations import _persisted_public_paths  # pyright: ignore[reportPrivateUsage]
+
+    assert _persisted_public_paths(_journal_with_metadata({})) is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["not-json", '{"a": 1}', '"str"', "42", "[1]", '["conclusions.md", 2]'],
+)
+def test_persisted_public_paths_malformed_raises(raw: str) -> None:
+    """元数据存在但损坏时明确停止，不静默回退（规格 §13 不公开内部路径）。"""
+    from draft.operations import _persisted_public_paths  # pyright: ignore[reportPrivateUsage]
+
+    journal = _journal_with_metadata({"public_changed_paths": raw})
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _persisted_public_paths(journal)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["/etc/passwd", "../secret.md", ".draft/draft.json", "pages/../a.md", "a/../../b.md"],
+)
+def test_persisted_public_paths_unsafe_entry_raises(entry: str) -> None:
+    """合法 JSON 但包含绝对路径、.. 或 .draft/ 内部路径的条目视为损坏。"""
+    from draft.operations import _persisted_public_paths  # pyright: ignore[reportPrivateUsage]
+
+    journal = _journal_with_metadata(
+        {"public_changed_paths": json.dumps(["conclusions.md", entry])}
+    )
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _persisted_public_paths(journal)
+
+
+def test_recover_changed_paths_prefers_persisted() -> None:
+    from draft.operations import _recover_changed_paths  # pyright: ignore[reportPrivateUsage]
+
+    journal = _journal_with_metadata({"public_changed_paths": json.dumps(["conclusions.md"])})
+    assert _recover_changed_paths(journal) == (Path("conclusions.md"),)
+
+
+def test_recover_changed_paths_missing_returns_public_mutations_only() -> None:
+    """旧日志缺元数据时只回退到公开安全的 mutation 路径，绝不公开 .draft/。"""
+    from draft.operations import _recover_changed_paths  # pyright: ignore[reportPrivateUsage]
+
+    result = _recover_changed_paths(_journal_with_metadata({}))
+    assert result == (Path("conclusions.md"), Path("index.md"))
+    assert all(".draft" not in path.parts for path in result)

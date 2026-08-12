@@ -164,3 +164,221 @@ def test_not_generated_with_unexpected_file_fails() -> None:
     graph.pages[CONCLUSIONS] = _page(CONCLUSIONS, status=StatusCode.PROPOSED, title="结论汇总")
     with pytest.raises(DraftError, match=CheckCode.CONCLUSIONS_UNEXPECTED_FILE.value):
         plan_generation(graph, state=ConclusionsState.NOT_GENERATED)
+
+
+# --- 固定机器形状谓词 is_conclusions_document（规格 §12.4/§12.5） ---
+
+
+def _conclusions_document(text: str) -> PageDocument:
+    return parse_page(CONCLUSIONS, text)
+
+
+CANONICAL_CONCLUSIONS = (
+    "# 结论汇总\n\n"
+    "> 状态：`当前提案`\n"
+    ">\n"
+    "> 父主题：[根索引](index.md)\n\n"
+    "## 已确认结论\n\n"
+    "- [甲](pages/a.md)\n"
+    "- [乙](pages/b.md)\n"
+)
+
+
+def test_is_conclusions_document_accepts_canonical_proposed() -> None:
+    from draft.conclusions import is_conclusions_document
+
+    assert is_conclusions_document(_conclusions_document(CANONICAL_CONCLUSIONS), ROOT)
+
+
+def test_is_conclusions_document_accepts_confirmed() -> None:
+    """规格 §12.5：生成后 Agent 用 status set 把状态推进为 confirmed 必须合法。"""
+    from draft.conclusions import is_conclusions_document
+
+    text = CANONICAL_CONCLUSIONS.replace("当前提案", "已确认")
+    assert is_conclusions_document(_conclusions_document(text), ROOT)
+
+
+def test_is_conclusions_document_rejects_other_statuses() -> None:
+    from draft.conclusions import is_conclusions_document
+
+    for label in ("待讨论", "已关闭", "已取代"):
+        text = CANONICAL_CONCLUSIONS.replace("当前提案", label)
+        assert not is_conclusions_document(_conclusions_document(text), ROOT), label
+
+
+def test_is_conclusions_document_rejects_wrong_title() -> None:
+    from draft.conclusions import is_conclusions_document
+
+    text = CANONICAL_CONCLUSIONS.replace("# 结论汇总", "# 别的标题")
+    assert not is_conclusions_document(_conclusions_document(text), ROOT)
+
+
+def test_is_conclusions_document_rejects_parent_not_root() -> None:
+    from draft.conclusions import is_conclusions_document
+
+    text = CANONICAL_CONCLUSIONS.replace(
+        "> 父主题：[根索引](index.md)", "> 父主题：[其他](pages/other.md)"
+    )
+    assert not is_conclusions_document(_conclusions_document(text), ROOT)
+
+
+def test_is_conclusions_document_rejects_missing_parent() -> None:
+    from draft.conclusions import is_conclusions_document
+
+    text = CANONICAL_CONCLUSIONS.replace("\n>\n> 父主题：[根索引](index.md)", "")
+    assert not is_conclusions_document(_conclusions_document(text), ROOT)
+
+
+def test_is_conclusions_document_rejects_body_paragraph() -> None:
+    """章节后出现任意段落即形状损坏（规格 §12.4 机器区域）。"""
+    from draft.conclusions import is_conclusions_document
+
+    text = CANONICAL_CONCLUSIONS.replace(
+        "- [甲](pages/a.md)\n", "随便一段文字，不是列表。\n- [甲](pages/a.md)\n"
+    )
+    assert not is_conclusions_document(_conclusions_document(text), ROOT)
+
+
+def test_is_conclusions_document_rejects_illegal_list_item() -> None:
+    """列表项必须只含标题与链接；无链接的列表项即形状损坏。"""
+    from draft.conclusions import is_conclusions_document
+
+    text = CANONICAL_CONCLUSIONS.replace(
+        "- [甲](pages/a.md)\n", "- 非法列表内容没有链接\n- [甲](pages/a.md)\n"
+    )
+    assert not is_conclusions_document(_conclusions_document(text), ROOT)
+
+
+def test_is_conclusions_document_rejects_entry_with_extra_text() -> None:
+    """条目只包含标题和链接；链接后出现正文即形状损坏。"""
+    from draft.conclusions import is_conclusions_document
+
+    text = CANONICAL_CONCLUSIONS.replace("- [甲](pages/a.md)\n", "- [甲](pages/a.md)：甲的结论。\n")
+    assert not is_conclusions_document(_conclusions_document(text), ROOT)
+
+
+def test_is_conclusions_document_rejects_extra_h3_section() -> None:
+    """章节下出现额外三级小节即形状损坏。"""
+    from draft.conclusions import is_conclusions_document
+
+    text = CANONICAL_CONCLUSIONS + "### 额外三级小节\n\n- [丙](pages/c.md)\n"
+    assert not is_conclusions_document(_conclusions_document(text), ROOT)
+
+
+def test_is_conclusions_document_rejects_extra_h2_section() -> None:
+    """页面中只能有唯一 `## 已确认结论` 章节。"""
+    from draft.conclusions import is_conclusions_document
+
+    text = CANONICAL_CONCLUSIONS + "## 额外章节\n\n- [丙](pages/c.md)\n"
+    assert not is_conclusions_document(_conclusions_document(text), ROOT)
+
+
+def test_is_conclusions_document_rejects_extra_h1_heading() -> None:
+    from draft.conclusions import is_conclusions_document
+
+    text = CANONICAL_CONCLUSIONS.replace("## 已确认结论", "# 已确认结论")
+    assert not is_conclusions_document(_conclusions_document(text), ROOT)
+
+
+def test_is_conclusions_document_rejects_extra_machine_line() -> None:
+    """机器块只允许状态行、空引用行与父主题行；额外引用行即损坏。"""
+    from draft.conclusions import is_conclusions_document
+
+    text = CANONICAL_CONCLUSIONS.replace(">\n", ">\n> 任意引用行\n")
+    assert not is_conclusions_document(_conclusions_document(text), ROOT)
+
+
+def test_is_conclusions_document_accepts_empty_list() -> None:
+    """已生成但无已确认页面时重建为空列表，仍属合法形状。"""
+    from draft.conclusions import is_conclusions_document
+
+    text = "# 结论汇总\n\n> 状态：`当前提案`\n>\n> 父主题：[根索引](index.md)\n\n## 已确认结论\n"
+    assert is_conclusions_document(_conclusions_document(text), ROOT)
+
+
+def test_is_conclusions_document_rejects_entry_with_two_links() -> None:
+    """条目必须只含一个标题与链接；一行两个链接即形状损坏。"""
+    from draft.conclusions import is_conclusions_document
+
+    text = CANONICAL_CONCLUSIONS.replace(
+        "- [甲](pages/a.md)\n", "- [甲](pages/a.md) [乙](pages/b.md)\n"
+    )
+    assert not is_conclusions_document(_conclusions_document(text), ROOT)
+
+
+def test_is_conclusions_document_rejects_entry_with_tooltip() -> None:
+    """目标语法不允许 tooltip/属性；`(path "title")` 即形状损坏。"""
+    from draft.conclusions import is_conclusions_document
+
+    text = CANONICAL_CONCLUSIONS.replace("- [甲](pages/a.md)\n", '- [甲](pages/a.md "tooltip")\n')
+    assert not is_conclusions_document(_conclusions_document(text), ROOT)
+
+
+def test_is_canonical_conclusions_entry_rejects_non_dash_marker() -> None:
+    """规范结论条目的列表标记必须恰为 ``-``；``*``/``+``/有序不是规范标记。"""
+    from draft.conclusions import is_canonical_conclusions_entry
+
+    for marker in ("*", "+", "1."):
+        assert not is_canonical_conclusions_entry(f"{marker} [甲](pages/a.md)"), marker
+
+
+def test_is_canonical_conclusions_entry_accepts_escaped_label() -> None:
+    """标题含 ``[``/``]`` 时经转义后的条目仍是规范结论条目，解析标签还原为原始标题。"""
+    from draft.conclusions import is_canonical_conclusions_entry
+
+    assert is_canonical_conclusions_entry("- [甲\\]乙](pages/a.md)")
+    assert is_canonical_conclusions_entry("- [甲\\[乙](pages/a.md)")
+
+
+def test_is_conclusions_document_accepts_escaped_label_entry() -> None:
+    from draft.conclusions import is_conclusions_document
+
+    text = CANONICAL_CONCLUSIONS.replace("- [甲](pages/a.md)\n", "- [甲\\]乙](pages/a.md)\n")
+    assert is_conclusions_document(_conclusions_document(text), ROOT)
+
+
+def test_is_conclusions_nav_canonical_accepts_canonical() -> None:
+    from draft.conclusions import is_conclusions_nav_canonical
+
+    index = (
+        "# 根\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n## 子主题\n\n"
+        "- [甲](pages/a.md)\n- [结论汇总](conclusions.md)\n"
+    )
+    assert is_conclusions_nav_canonical(index, ROOT)
+
+
+def test_is_conclusions_nav_canonical_rejects_wrong_label() -> None:
+    """根导航结论链接必须使用规范标签，目标等价但标签错误即非规范。"""
+    from draft.conclusions import is_conclusions_nav_canonical
+
+    index = (
+        "# 根\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n## 子主题\n\n"
+        "- [错误名字](conclusions.md)\n"
+    )
+    assert not is_conclusions_nav_canonical(index, ROOT)
+
+
+def test_is_conclusions_nav_canonical_rejects_literal_target_variant() -> None:
+    """根导航结论链接必须使用字面目标 `conclusions.md`，`./` 等价目标即非规范。"""
+    from draft.conclusions import is_conclusions_nav_canonical
+
+    index = (
+        "# 根\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n## 子主题\n\n"
+        "- [结论汇总](./conclusions.md)\n"
+    )
+    assert not is_conclusions_nav_canonical(index, ROOT)
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    ["* [后续子页](pages/a.md)\n", "+ [后续子页](pages/a.md)\n", "1. [后续子页](pages/a.md)\n"],
+)
+def test_is_conclusions_nav_canonical_rejects_later_list_item(suffix: str) -> None:
+    """结论链接之后出现任意 Markdown 列表项（-/+/*/有序）即非规范，不只看 `- [`。"""
+    from draft.conclusions import is_conclusions_nav_canonical
+
+    index = (
+        "# 根\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n## 子主题\n\n"
+        f"- [结论汇总](conclusions.md)\n{suffix}"
+    )
+    assert not is_conclusions_nav_canonical(index, ROOT)

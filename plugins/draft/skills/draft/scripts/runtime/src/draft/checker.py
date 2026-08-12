@@ -540,6 +540,12 @@ def _check_trash_handoff_pending(
     return [_error(CheckCode.TRASH_PENDING_UNEXPLAINED, relative, None, journal.operation_id)]
 
 
+def _conclusions_unexpected(resolved: Path) -> bool:
+    """not_generated 状态下磁盘是否意外出现普通结论页文件。"""
+    candidate = resolved / CONCLUSIONS_PAGE
+    return candidate.is_file() and not candidate.is_symlink()
+
+
 def _check_conclusions_product(
     resolved: Path, graph: DraftGraph, state: ConclusionsState
 ) -> list[CheckIssue]:
@@ -556,6 +562,9 @@ def _check_conclusions_product(
 
     issues: list[CheckIssue] = []
     if state is ConclusionsState.NOT_GENERATED:
+        # 规格 §12.6：not_generated 时意外出现 conclusions.md 必须报告，不能被当作普通页。
+        if _conclusions_unexpected(resolved):
+            issues.append(_error(CheckCode.CONCLUSIONS_UNEXPECTED_FILE, CONCLUSIONS_PAGE, None))
         return issues
     document = graph.pages.get(CONCLUSIONS_PAGE)
     if document is not None and not is_conclusions_document(document, resolved):
@@ -667,6 +676,10 @@ def check_draft(
     ordered.extend(sorted(_load_issues_in(result.issues, None), key=_sort_key))
     ordered.extend(check_graph(result.graph).issues)
     conclusions_state = _conclusions_state(resolved, mode, allow_provisional_adopt)
+    if conclusions_state is ConclusionsState.NOT_GENERATED and _conclusions_unexpected(resolved):
+        # not_generated 时意外出现的 conclusions.md 不是普通受管理页面：只报告
+        # conclusions.unexpected_file，不把它的普通页面诊断（缺父主题/不可达等）当作噪声。
+        ordered = [issue for issue in ordered if issue.path != CONCLUSIONS_PAGE]
     if conclusions_state is not None:
         ordered.extend(
             sorted(

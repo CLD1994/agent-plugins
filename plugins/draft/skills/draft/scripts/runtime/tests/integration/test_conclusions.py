@@ -170,6 +170,84 @@ def test_generate_conclusions_dry_run_idempotent_is_empty_effects(
     assert cast("list[dict[str, object]]", payload["effects"]) == []
 
 
+def test_generate_conclusions_dry_run_matches_real_on_damaged_page(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """已生成态损坏结论页时，预演与正式执行调用同一计划构造边界（规格 §13）。"""
+    root = build_conc_draft(draft_factory)
+    assert main(["generate-conclusions", str(root)]) == 0
+    (root / "conclusions.md").write_text("损坏\n", encoding="utf-8")
+    capsys.readouterr()
+
+    code, payload = run_json(["generate-conclusions", str(root), "--dry-run", "--json"], capsys)
+
+    assert code == 0
+    assert payload["result_type"] == "plan"
+    assert payload["operation"] == "generate-conclusions"
+    effects = cast("list[dict[str, object]]", payload["effects"])
+    assert any(e.get("path") == "conclusions.md" for e in effects)
+    assert "changed_paths" not in payload
+    # 预演不执行写入：损坏文件保持原样。
+    assert (root / "conclusions.md").read_text(encoding="utf-8") == "损坏\n"
+
+
+def test_generate_conclusions_handles_bracket_titles(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """标题含 ``[``/``]`` 必须能由生成器表示，生成条目的链接标签还原为原始标题。"""
+    root = build_conc_draft(draft_factory)
+    capsys.readouterr()
+    code, _ = run_json(
+        ["create", str(root), "pages/br.md", "--title", "甲]乙", "--status", "proposed", "--json"],
+        capsys,
+    )
+    assert code == 0
+    code, _ = run_json(["status", "set", str(root), "pages/br.md", "confirmed", "--json"], capsys)
+    assert code == 0
+
+    code, payload = run_json(["generate-conclusions", str(root), "--json"], capsys)
+
+    assert code == 0
+    assert payload["generated"] is True
+    conclusions = (root / "conclusions.md").read_text(encoding="utf-8")
+    assert "- [甲\\]乙](pages/br.md)" in conclusions
+    from draft.markdown import parse_page
+
+    document = parse_page(Path("conclusions.md"), conclusions)
+    link = next(link for link in document.links if "pages/br.md" in link.destination)
+    assert link.label == "甲]乙"
+    assert check_draft(root).errors == ()
+
+
+def test_generate_conclusions_repairs_noncanonical_nav_label(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """生成器必须修复根导航结论链接的规范标签与字面目标，不能只按目标等价放行。"""
+    root = draft_factory(
+        {
+            "index.md": (
+                "# Topic\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n## 子主题\n\n"
+                "- [错误名字](./conclusions.md)\n- [甲](pages/a.md)\n"
+            ),
+            "conclusions.md": (
+                "# 结论汇总\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](index.md)\n\n"
+                "## 已确认结论\n\n- [甲](pages/a.md)\n"
+            ),
+            "pages/a.md": "# 甲\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](../index.md)\n\n甲。\n",
+        }
+    )
+    capsys.readouterr()
+
+    code, payload = run_json(["generate-conclusions", str(root), "--json"], capsys)
+
+    assert code == 0
+    assert payload["generated"] is True
+    index = (root / "index.md").read_text(encoding="utf-8")
+    assert "- [结论汇总](conclusions.md)" in index
+    assert "- [错误名字]" not in index
+    assert check_draft(root).errors == ()
+
+
 def test_generate_conclusions_rebuilds_damaged_page(
     draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
 ) -> None:

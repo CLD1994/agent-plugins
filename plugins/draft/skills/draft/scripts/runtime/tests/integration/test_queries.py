@@ -14,9 +14,9 @@ QUERY_INDEX = """# Topic
 
 ## 子主题
 
-- [结论汇总](conclusions.md)
 - [甲](pages/a.md)
 - [乙](pages/b.md)
+- [结论汇总](conclusions.md)
 """
 
 QUERY_CONCLUSIONS = """# 结论汇总
@@ -24,6 +24,8 @@ QUERY_CONCLUSIONS = """# 结论汇总
 > 状态：`已确认`
 >
 > 父主题：[根索引](index.md)
+
+## 已确认结论
 """
 
 QUERY_A = """# 甲
@@ -226,7 +228,12 @@ def test_query_recoverable_lists_only_in_window(
         encoding="utf-8",
     )
     (root / "index.md").write_text(
-        (root / "index.md").read_text(encoding="utf-8") + "- [孤儿](pages/orphan.md)\n",
+        (root / "index.md")
+        .read_text(encoding="utf-8")
+        .replace(
+            "- [结论汇总](conclusions.md)\n",
+            "- [孤儿](pages/orphan.md)\n- [结论汇总](conclusions.md)\n",
+        ),
         encoding="utf-8",
     )
     retained = trash_page(root, Path("pages/orphan.md"), now=datetime(2026, 8, 20, tzinfo=UTC))

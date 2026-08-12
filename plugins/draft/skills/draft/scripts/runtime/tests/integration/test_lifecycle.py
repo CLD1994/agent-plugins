@@ -213,7 +213,7 @@ def test_adopt_removes_marker_when_recheck_fails(
     def poisoned_write(path: Path, value: bytes) -> None:
         index = root / "index.md"
         index.write_text(
-            index.read_text(encoding="utf-8").replace("- [结论汇总](conclusions.md)\n", ""),
+            index.read_text(encoding="utf-8") + "- [不存在](pages/missing.md)\n",
             encoding="utf-8",
         )
         original(path, value)
@@ -225,7 +225,7 @@ def test_adopt_removes_marker_when_recheck_fails(
 
     assert not (root / ".draft/draft.json").exists()
     assert not (root / ".draft").exists()
-    assert "- [结论汇总](conclusions.md)" not in (root / "index.md").read_text(encoding="utf-8")
+    assert "- [不存在](pages/missing.md)" in (root / "index.md").read_text(encoding="utf-8")
 
 
 def test_adopt_rejects_valid_manifest_change_after_marker_write(

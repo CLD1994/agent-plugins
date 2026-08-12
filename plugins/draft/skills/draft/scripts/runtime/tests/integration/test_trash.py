@@ -17,9 +17,9 @@ TRASH_INDEX = """# Topic
 
 ## 子主题
 
-- [结论汇总](conclusions.md)
 - [旧页](pages/obsolete.md)
 - [其他](pages/other.md)
+- [结论汇总](conclusions.md)
 """
 
 TRASH_CONCLUSIONS = """# 结论汇总
@@ -27,6 +27,8 @@ TRASH_CONCLUSIONS = """# 结论汇总
 > 状态：`已确认`
 >
 > 父主题：[根索引](index.md)
+
+## 已确认结论
 """
 
 OBSOLETE = """# 旧页
@@ -84,9 +86,9 @@ def build_collapsed_rebase_draft(draft_factory: DraftFactory) -> Path:
         {
             "index.md": (
                 "# Topic\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n## 子主题\n\n"
-                "- [结论汇总](conclusions.md)\n"
                 "- [单人枢纽](pages/solo/index.md)\n"
                 "- [其他](pages/other.md)\n"
+                "- [结论汇总](conclusions.md)\n"
             ),
             "conclusions.md": TRASH_CONCLUSIONS,
             "pages/solo/index.md": (
@@ -149,7 +151,13 @@ def test_inbound_references_block_trash(draft_factory: DraftFactory) -> None:
         "> 依赖：[旧页](obsolete.md)\n\n阻碍的正文。\n",
         encoding="utf-8",
     )
-    (root / "index.md").write_text(TRASH_INDEX + "- [阻碍](pages/blocker.md)\n", encoding="utf-8")
+    (root / "index.md").write_text(
+        TRASH_INDEX.replace(
+            "- [结论汇总](conclusions.md)\n",
+            "- [阻碍](pages/blocker.md)\n- [结论汇总](conclusions.md)\n",
+        ),
+        encoding="utf-8",
+    )
 
     with pytest.raises(DraftError, match="trash.inbound_reference") as captured:
         trash_page(root, Path("pages/obsolete.md"), now=datetime(2026, 7, 21, tzinfo=UTC))
@@ -594,10 +602,8 @@ def build_sole_item_section_draft(draft_factory: DraftFactory) -> Path:
         {
             "index.md": (
                 "# Topic\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n"
-                "- [结论汇总](conclusions.md)\n\n"
                 "## 子主题\n\n- [唯一](pages/only.md)\n"
             ),
-            "conclusions.md": TRASH_CONCLUSIONS,
             "pages/only.md": (
                 "# 唯一\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n\n唯一的正文。\n"
             ),
@@ -610,11 +616,8 @@ def build_bare_list_parent_draft(draft_factory: DraftFactory) -> Path:
     return draft_factory(
         {
             "index.md": (
-                "# Topic\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n"
-                "- [结论汇总](conclusions.md)\n"
-                "- [唯一](pages/only.md)\n"
+                "# Topic\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n- [唯一](pages/only.md)\n"
             ),
-            "conclusions.md": TRASH_CONCLUSIONS,
             "pages/only.md": (
                 "# 唯一\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n\n唯一的正文。\n"
             ),

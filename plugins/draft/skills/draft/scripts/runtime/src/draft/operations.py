@@ -946,31 +946,63 @@ def _encode_public_paths(paths: tuple[Path, ...]) -> str:
     return json.dumps([path.as_posix() for path in paths])
 
 
+def _public_path_safe(path: Path) -> bool:
+    """公开变化路径必须为相对、不含 ``..`` 且不位于 ``.draft/`` 内部。"""
+    if path.is_absolute():
+        return False
+    if ".." in path.parts:
+        return False
+    return not (path.parts and path.parts[0] == INTERNAL_DIR)
+
+
+def _journal_corrupt(journal: Journal) -> DraftError:
+    return DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal.directory / "journal.json")
+
+
 def _persisted_public_paths(journal: Journal) -> tuple[Path, ...] | None:
-    """恢复时读取日志中持久化的公开变化路径；旧日志缺失时返回 None。"""
+    """恢复时读取日志中持久化的公开变化路径。
+
+    元数据存在但损坏（非法 JSON、类型错误或包含绝对/``..``/``.draft/`` 内部
+    路径）时视为内部状态损坏，明确停止而不是回退猜测公开语义（规格 §13）；
+    缺失（旧格式日志）返回 None 由调用方安全回退。
+    """
     value = journal.metadata.get(PUBLIC_CHANGED_PATHS_KEY)
     if value is None:
         return None
     try:
         raw: object = json.loads(value)
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as exc:
+        raise _journal_corrupt(journal) from exc
     if not isinstance(raw, list):
-        return None
-    checked: list[str] = []
+        raise _journal_corrupt(journal)
+    checked: list[Path] = []
     for entry in cast("list[object]", raw):
         if not isinstance(entry, str):
-            return None
-        checked.append(entry)
-    return tuple(Path(entry) for entry in checked)
+            raise _journal_corrupt(journal)
+        path = Path(entry)
+        if not _public_path_safe(path):
+            raise _journal_corrupt(journal)
+        checked.append(path)
+    return tuple(checked)
 
 
 def _recover_changed_paths(journal: Journal) -> tuple[Path, ...]:
-    """恢复结果的公开路径：优先日志持久化的公开语义，缺失时退回 mutation 路径。"""
+    """恢复结果的公开路径：优先日志持久化的公开语义，旧日志回退到公开 mutation 子集。
+
+    缺失元数据只回退到公开安全的 mutation 路径，绝不公开 ``.draft/`` 内部路径。
+    """
     persisted = _persisted_public_paths(journal)
     if persisted is not None:
         return persisted
-    return tuple(mutation.path for mutation in journal.mutations)
+    public: list[Path] = []
+    seen: set[Path] = set()
+    for mutation in journal.mutations:
+        if mutation.path in seen:
+            continue
+        if _public_path_safe(mutation.path):
+            public.append(mutation.path)
+            seen.add(mutation.path)
+    return tuple(public)
 
 
 def _classify(root: Path, mutation: JournalMutation) -> str:

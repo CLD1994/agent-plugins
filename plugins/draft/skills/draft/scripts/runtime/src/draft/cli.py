@@ -21,6 +21,7 @@ from draft.models import (
     OperationResult,
     TrashResult,
 )
+from draft.plan_effects import PlanEffect
 from draft.query import LocalPageSnapshot, SnapshotView
 from draft.vocabulary import EditableRelationCode, StatusCode
 
@@ -527,32 +528,19 @@ def _is_dry_run(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "dry_run", False))
 
 
-def _dry_run_write(
-    args: argparse.Namespace,
-    *,
-    root: Path,
+def _plan_effects_payload(
     operation: DryRunOperation,
-    build: Callable[[DraftGraph], OperationPlan],
-) -> tuple[dict[str, object], str, int]:
-    """预演：与正式执行共享同一计划构造边界，分页输出公开效果，不执行写入。"""
+    effects: Sequence[PlanEffect],
+    args: argparse.Namespace,
+) -> tuple[dict[str, object], str]:
+    """把已构造计划的效果格式化为分页预演载荷；分页参数只与预演一起合法。"""
     limit = int(getattr(args, "limit", 20) or 20)
     offset = int(getattr(args, "offset", 0) or 0)
     count_only = bool(getattr(args, "count_only", False))
     if limit < 1 or limit > 100 or offset < 0:
         raise DraftError("query.invalid_pagination")
     from draft.cli_results import paginate, slice_payload
-    from draft.operations import read_lock
-    from draft.paths import resolve_draft_root
-    from draft.query import load_complete_snapshot
 
-    resolved = resolve_draft_root(root)
-    if read_lock(resolved) is not None:
-        from draft.diagnostic_codes import CheckCode
-
-        raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, resolved)
-    graph = load_complete_snapshot(resolved)
-    plan = build(graph)
-    effects = plan.effects
     items: list[dict[str, object]] = []
     for effect in effects:
         if effect.path is not None:
@@ -575,8 +563,30 @@ def _dry_run_write(
             **payload,
         },
         f"预演 {operation.value}：{len(effects)} 项影响",
-        0,
     )
+
+
+def _dry_run_write(
+    args: argparse.Namespace,
+    *,
+    root: Path,
+    operation: DryRunOperation,
+    build: Callable[[DraftGraph], OperationPlan],
+) -> tuple[dict[str, object], str, int]:
+    """预演：与正式执行共享同一计划构造边界，分页输出公开效果，不执行写入。"""
+    from draft.operations import read_lock
+    from draft.paths import resolve_draft_root
+    from draft.query import load_complete_snapshot
+
+    resolved = resolve_draft_root(root)
+    if read_lock(resolved) is not None:
+        from draft.diagnostic_codes import CheckCode
+
+        raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, resolved)
+    graph = load_complete_snapshot(resolved)
+    plan = build(graph)
+    payload, human = _plan_effects_payload(operation, plan.effects, args)
+    return payload, human, 0
 
 
 def _reject_pagination_without_dry_run(args: argparse.Namespace) -> None:
@@ -792,22 +802,28 @@ def _dispatch(
 
         root = Path(cast(str, args.root))
         if _is_dry_run(args):
-            limit = int(getattr(args, "limit", 20) or 20)
-            offset = int(getattr(args, "offset", 0) or 0)
-            count_only = bool(getattr(args, "count_only", False))
-            if limit < 1 or limit > 100 or offset < 0:
-                raise DraftError("query.invalid_pagination")
             from draft.cli_results import paginate, slice_payload
             from draft.conclusions import load_generation_graph, plan_generation
             from draft.graph import read_marker
+            from draft.operations import read_lock
             from draft.paths import resolve_draft_root
 
             resolved = resolve_draft_root(root)
+            if read_lock(resolved) is not None:
+                from draft.diagnostic_codes import CheckCode
+
+                raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, resolved)
+            # 预演与正式执行调用同一个计划构造器：同一容错加载与 plan_generation。
             state = read_marker(resolved).conclusions_state
             graph = load_generation_graph(resolved)
             plan = plan_generation(graph, state=state)
             if plan.operation is None:
                 # 无已确认页面或幂等无变化：成功返回空 effects 与业务事实。
+                limit = int(getattr(args, "limit", 20) or 20)
+                offset = int(getattr(args, "offset", 0) or 0)
+                count_only = bool(getattr(args, "count_only", False))
+                if limit < 1 or limit > 100 or offset < 0:
+                    raise DraftError("query.invalid_pagination")
                 slice_ = paginate((), offset=offset, limit=limit)
                 payload = {
                     "result_type": ResultType.PLAN.value,
@@ -818,15 +834,11 @@ def _dispatch(
                 if plan.reason is not None:
                     payload["reason"] = plan.reason.value
                 return payload, "预演 generate-conclusions：无变化影响", 0
-            operation = plan.operation
-            assert operation is not None  # 上面已处理无计划分支。
-
-            return _dry_run_write(
-                args,
-                root=root,
-                operation=DryRunOperation.GENERATE_CONCLUSIONS,
-                build=lambda _graph: operation,
+            assert plan.operation is not None  # 上面已处理无计划分支。
+            payload, human = _plan_effects_payload(
+                DryRunOperation.GENERATE_CONCLUSIONS, plan.operation.effects, args
             )
+            return payload, human, 0
         _reject_pagination_without_dry_run(args)
         result = generate_conclusions(root)
         payload: dict[str, object] = {

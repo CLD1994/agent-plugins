@@ -25,9 +25,11 @@ def operation_draft(tmp_path: Path) -> Path:
 
 > 状态：`已关闭：纯导航页，不表达独立结论`
 
-- [结论汇总](conclusions.md)
+## 子主题
+
 - [A](pages/a.md)
 - [B](pages/b.md)
+- [结论汇总](conclusions.md)
 """,
         "conclusions.md": """# 结论汇总
 
@@ -35,8 +37,10 @@ def operation_draft(tmp_path: Path) -> Path:
 >
 > 父主题：[根索引](index.md)
 
-- [A](pages/a.md)：A。
-- [B](pages/b.md)：B。
+## 已确认结论
+
+- [A](pages/a.md)
+- [B](pages/b.md)
 """,
         "pages/a.md": """# A
 
@@ -54,7 +58,7 @@ A。
 
 B。
 """,
-        ".draft/draft.json": '{"format_version":1,"conclusions_state":"not_generated"}\n',
+        ".draft/draft.json": '{"format_version":1,"conclusions_state":"generated"}\n',
     }
     for relative, text in files.items():
         path = root / relative

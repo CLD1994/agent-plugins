@@ -719,6 +719,14 @@ _LIST_ITEM = re.compile(r"^(\s*(?:[-+*]|\d{1,9}[.)])\s+)(.*)$")
 _SUBTOPIC_HEADING = re.compile(r"^## 子主题\s*$")
 
 
+def list_item_content(line: str) -> str | None:
+    """返回行首列表项标记之后的内容；不是列表项（``-``/``+``/``*``/有序）时返回 None。"""
+    matched = _LIST_ITEM.match(line)
+    if matched is None:
+        return None
+    return matched.group(2)
+
+
 def canonical_parent_navigation(graph: DraftGraph, child: Path) -> MarkdownLink | None:
     """The earliest non-machine-block, non-image link in the declared parent to child."""
     from draft.graph import resolve_local_destination
@@ -765,9 +773,25 @@ def remove_parent_navigation(text: str, link: MarkdownLink) -> str:
     return _apply_edits(text, navigation_removal_edits(text, link))
 
 
+def remove_parent_navigation_many(text: str, links: Sequence[MarkdownLink]) -> str:
+    """一次移除多个父导航链接，共享同一整行删除语义；跨度必须互不重叠。"""
+    edits: dict[SourceSpan, str] = {}
+    for link in links:
+        edits.update(navigation_removal_edits(text, link))
+    return _apply_edits(text, edits)
+
+
+def escape_link_label(title: str) -> str:
+    """把页面标题转义为 Markdown 链接标签文本：反斜杠、``[``、``]``。
+
+    生成器、导航追加与插入共用同一转义边界，保证转义后可解析还原为原始标题。
+    """
+    return title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
 def append_parent_navigation(text: str, title: str, destination: str) -> str:
     """Append '- [title](destination)' to an existing level-two 子主题 section, or create it."""
-    escaped = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    escaped = escape_link_label(title)
     entry = f"- [{escaped}]({destination})"
     lines = text.split("\n")
     heading_index = next(
@@ -798,7 +822,7 @@ def insert_navigation_before_conclusions(
     结论链接通过解析后的目标识别，不搜索 ``conclusions.md`` 文本。结论链接
     必须是 ``## 子主题`` 小节中的最后一个列表项；找不到时不插入并保持原样。
     """
-    escaped = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    escaped = escape_link_label(title)
     entry = f"- [{escaped}]({destination})"
     lines = text.split("\n")
     heading_index = next(

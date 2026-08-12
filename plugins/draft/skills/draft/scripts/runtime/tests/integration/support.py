@@ -36,12 +36,9 @@ def write_raw_journal(
 def build_valid_candidate(root: Path) -> None:
     root.mkdir()
     (root / "pages").mkdir()
+    # 规格 §12.2：候选目录不允许预先存在 conclusions.md（所有权为 not_generated）。
     (root / "index.md").write_text(
-        "# 主题\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n- [结论汇总](conclusions.md)\n",
-        encoding="utf-8",
-    )
-    (root / "conclusions.md").write_text(
-        "# 结论汇总\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](index.md)\n",
+        "# 主题\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n",
         encoding="utf-8",
     )
 

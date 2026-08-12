@@ -254,13 +254,14 @@ def test_check_human_reports_actionable_multiple_locations(
 ) -> None:
     missing_a = "pages/missing-a.md"
     missing_b = "pages/missing-b.md"
-    (registered_draft / "index.md").write_text(
-        "# 主题\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n- [结论汇总](conclusions.md)\n",
+    (registered_draft / "pages/breaks.md").write_text(
+        "# 断裂\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n\n"
+        f"[甲]({missing_a})\n[乙]({missing_b})\n",
         encoding="utf-8",
     )
-    (registered_draft / "conclusions.md").write_text(
-        "# 结论汇总\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](index.md)\n\n"
-        f"[甲]({missing_a})\n[乙]({missing_b})\n",
+    index = registered_draft / "index.md"
+    index.write_text(
+        index.read_text(encoding="utf-8") + "- [断裂](pages/breaks.md)\n",
         encoding="utf-8",
     )
 
@@ -268,8 +269,8 @@ def test_check_human_reports_actionable_multiple_locations(
     assert_human_output_facts(
         capsys.readouterr().out,
         (
-            ("conclusions.md", 7, missing_a),
-            ("conclusions.md", 8, missing_b),
+            ("pages/breaks.md", 7, missing_a),
+            ("pages/breaks.md", 8, missing_b),
             (2, 0),
         ),
     )
@@ -703,18 +704,18 @@ def _trashable_cli_root(tmp_path: Path) -> Path:
     index = root / "index.md"
     index.write_text(
         index.read_text(encoding="utf-8")
-        + "- [结论汇总](conclusions.md)\n- [A](pages/a.md)\n- [B](pages/b.md)\n",
+        + "- [A](pages/a.md)\n- [B](pages/b.md)\n- [结论汇总](conclusions.md)\n",
         encoding="utf-8",
     )
     conclusions = root / "conclusions.md"
     conclusions.write_text(
         "# 结论汇总\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](index.md)\n\n"
-        "- [A](pages/a.md)：A。\n",
+        "## 已确认结论\n\n- [A](pages/a.md)\n",
         encoding="utf-8",
     )
-    # conclusions.md 是测试固定页而非机器产物：保持 not_generated 所有权，不触发结论形状检查。
+    # conclusions.md 是机器所有权下的固定产物：所有权状态必须为 generated（规格 §12.1）。
     (root / ".draft/draft.json").write_text(
-        '{"format_version":1,"conclusions_state":"not_generated"}\n', encoding="utf-8"
+        '{"format_version":1,"conclusions_state":"generated"}\n', encoding="utf-8"
     )
     return root
 
@@ -771,7 +772,12 @@ def test_recover_preflight_corruption_is_standard_error_envelope(
         encoding="utf-8",
     )
     index = root / "index.md"
-    index.write_text(index.read_text(encoding="utf-8") + "- [B](pages/b.md)\n", encoding="utf-8")
+    index.write_text(
+        index.read_text(encoding="utf-8").replace(
+            "- [结论汇总](conclusions.md)\n", "- [B](pages/b.md)\n- [结论汇总](conclusions.md)\n"
+        ),
+        encoding="utf-8",
+    )
     second = trash_page(root, Path("pages/b.md"), now=datetime(2026, 7, 21, tzinfo=UTC))
     # 把两个包都改到已过期、清理期限之前，并破坏排序在后者的证据。
     for op_id in (first.operation_id, second.operation_id):
@@ -816,7 +822,12 @@ def test_structure_preflight_corruption_never_starts_write(
         encoding="utf-8",
     )
     index = root / "index.md"
-    index.write_text(index.read_text(encoding="utf-8") + "- [B](pages/b.md)\n", encoding="utf-8")
+    index.write_text(
+        index.read_text(encoding="utf-8").replace(
+            "- [结论汇总](conclusions.md)\n", "- [B](pages/b.md)\n- [结论汇总](conclusions.md)\n"
+        ),
+        encoding="utf-8",
+    )
     second = trash_page(root, Path("pages/b.md"), now=datetime(2026, 7, 21, tzinfo=UTC))
     import json as json_module
 

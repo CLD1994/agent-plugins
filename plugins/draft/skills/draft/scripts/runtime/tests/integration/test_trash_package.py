@@ -27,9 +27,9 @@ TRASH_INDEX = """# Topic
 
 ## 子主题
 
-- [结论汇总](conclusions.md)
 - [旧页](pages/obsolete.md)
 - [其他](pages/other.md)
+- [结论汇总](conclusions.md)
 """
 
 TRASH_CONCLUSIONS = """# 结论汇总
@@ -37,6 +37,8 @@ TRASH_CONCLUSIONS = """# 结论汇总
 > 状态：`已确认`
 >
 > 父主题：[根索引](index.md)
+
+## 已确认结论
 """
 
 OBSOLETE = """# 旧页
