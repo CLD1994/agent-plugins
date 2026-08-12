@@ -33,9 +33,11 @@ from draft.models import (
     OperationPhase,
     OperationPlan,
     OperationResult,
+    RootState,
     SourceSpan,
     TrashResult,
 )
+from draft.observations import ObservationManifest
 from draft.operations import (
     Journal,
     TrashDeadlines,
@@ -136,7 +138,13 @@ def _blockers(graph: DraftGraph, page: Path) -> tuple[str, ...]:
     return tuple(f"{source}@{offset}" for source, offset in sorted(set(blocked)))
 
 
-def trash_plan(graph: DraftGraph, page: Path) -> tuple[OperationPlan, Path]:
+def trash_plan(
+    graph: DraftGraph,
+    page: Path,
+    *,
+    root_state: RootState,
+    observations: ObservationManifest,
+) -> tuple[OperationPlan, Path]:
     if page in (ROOT_PAGE, CONCLUSIONS_PAGE):
         raise DraftError("trash.protected", page)
     if page not in graph.pages:
@@ -265,15 +273,12 @@ def trash_plan(graph: DraftGraph, page: Path) -> tuple[OperationPlan, Path]:
         effects.append(PlanEffect(action=PlanAction.REMOVE, path=collapsed_hub))
     for path, _text in sorted(extra_writes.items()):
         effects.append(PlanEffect(action=PlanAction.MODIFY, path=path))
-    from draft.models import RootState
-    from draft.observations import graph_observations
-
     plan = OperationPlan(
         kind="trash",
         root=graph.root,
         mutations=tuple([*writes, *deletes]),
-        root_state=RootState.REGISTERED,
-        observations=graph_observations(graph),
+        root_state=root_state,
+        observations=observations,
         remove_empty_directories=tuple(remove_empty),
         metadata={"operation_id": operation_id},
         effects=tuple(effects),
@@ -674,17 +679,20 @@ def _prove_parent_restore(
 
 def trash_page(root: Path, page: Path, *, now: datetime | None = None) -> TrashResult:
     """回收页面：创建权威删除包并落地为 7 天保留态，不立即移交系统回收站。"""
+    from draft.operation_facts import load_operation_facts
+
     resolved = resolve_draft_root(root)
     normalized_now = normalize_utc(now)
     deadlines = TrashDeadlines.from_created_at(normalized_now)
     if read_lock(resolved) is not None:
         raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, resolved)
-    report = check_draft(resolved, exclude_resource_facts=True)
-    if report.errors:
-        codes = tuple(issue.code for issue in report.errors)
-        raise DraftError("structure.dirty", resolved, details=codes)
-    graph = load_graph(resolved)
-    plan, _package_relative = trash_plan(graph, page)
+    facts = load_operation_facts(resolved)
+    if facts.blocking_paths:
+        details = tuple(path.as_posix() for path in facts.blocking_paths)
+        raise DraftError("structure.dirty", resolved, details=details)
+    plan, _package_relative = trash_plan(
+        facts.graph, page, root_state=facts.root_state, observations=facts.observations
+    )
     plan = dataclasses.replace(plan, metadata={**plan.metadata, **deadlines.to_metadata()})
     result = execute_plan(plan)
     journal = read_journal(operation_journal_path(resolved, plan.metadata["operation_id"]))

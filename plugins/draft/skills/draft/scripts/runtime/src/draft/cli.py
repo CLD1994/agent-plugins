@@ -811,7 +811,9 @@ def _dispatch(
         if _is_dry_run(args):
 
             def build(facts: OperationFacts) -> OperationPlan:
-                plan, _pkg = trash_plan(facts.graph, page)
+                plan, _pkg = trash_plan(
+                    facts.graph, page, root_state=facts.root_state, observations=facts.observations
+                )
                 return plan
 
             return _dry_run_write(args, root=root, operation=DryRunOperation.TRASH, build=build)
@@ -938,7 +940,12 @@ def _dispatch(
 
         if _is_dry_run(args):
             from draft.cli_results import paginate, slice_payload
-            from draft.conclusions import load_generation_graph, plan_generation
+            from draft.conclusions import (
+                CONCLUSIONS_PAGE,
+                ConclusionsState,
+                load_generation_graph,
+                plan_generation,
+            )
             from draft.graph import read_marker
             from draft.operations import read_lock
             from draft.paths import resolve_draft_root
@@ -948,12 +955,22 @@ def _dispatch(
                 from draft.diagnostic_codes import CheckCode
 
                 raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, resolved)
-            # 预演与正式执行调用同一个计划构造器：同一容错加载与 plan_generation。
+            # 预演与正式执行调用同一个门禁与计划构造器。
+            from draft.query import load_tolerant_view
+
             marker = read_marker(resolved)
+            state = marker.conclusions_state
+            view = load_tolerant_view(resolved)
+            blocking = [
+                path
+                for path in view.blocking_paths
+                if not (state is ConclusionsState.GENERATED and path == CONCLUSIONS_PAGE)
+            ]
+            if blocking:
+                details = tuple(path.as_posix() for path in blocking)
+                raise DraftError("conclusions.incomplete", resolved, details=details)
             graph = load_generation_graph(resolved)
-            plan = plan_generation(
-                graph, state=marker.conclusions_state, root_state=marker.root_state
-            )
+            plan = plan_generation(graph, state=state, root_state=marker.root_state)
             if plan.operation is None:
                 # 无已确认页面或幂等无变化：成功返回空 effects 与业务事实。
                 limit = int(getattr(args, "limit", 20) or 20)

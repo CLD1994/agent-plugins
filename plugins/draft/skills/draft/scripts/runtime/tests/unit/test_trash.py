@@ -21,6 +21,7 @@ from draft.models import (
     MarkdownLink,
     MutationKind,
     OperationPhase,
+    OperationPlan,
     PageDocument,
     RootState,
     SourceSpan,
@@ -308,6 +309,18 @@ def _trash_journal(
 # ===========================================================================
 
 
+def _trash_plan(graph: DraftGraph, page: Path) -> tuple[OperationPlan, Path]:
+    from draft.models import RootState
+    from draft.observations import graph_observations
+
+    return trash_plan(
+        graph,
+        page,
+        root_state=RootState.REGISTERED,
+        observations=graph_observations(graph),
+    )
+
+
 def test_trash_plan_valid_leaf_produces_complete_plan(mocker: MockerFixture) -> None:
     """合法叶页回收：生成完整删除包、父导航移除、页面删除，比较完整 OperationPlan。"""
     graph = _graph_from_texts(
@@ -319,7 +332,7 @@ def test_trash_plan_valid_leaf_produces_complete_plan(mocker: MockerFixture) -> 
     )
 
     mocker.patch("draft.trash.uuid.uuid4", autospec=True, return_value=FIXED_UUID)
-    plan, package_relative = trash_plan(graph, Path("pages/a.md"))
+    plan, package_relative = _trash_plan(graph, Path("pages/a.md"))
 
     assert plan.kind == "trash"
     assert plan.root == ROOT
@@ -393,7 +406,7 @@ def test_trash_plan_last_child_collapses_single_child_hub(mocker: MockerFixture)
     )
 
     mocker.patch("draft.trash.uuid.uuid4", autospec=True, return_value=FIXED_UUID)
-    plan, _ = trash_plan(graph, Path("pages/solo/only.md"))
+    plan, _ = _trash_plan(graph, Path("pages/solo/only.md"))
 
     mutation_paths = {m.path for m in plan.mutations}
     # 折叠后的叶页写入
@@ -436,7 +449,7 @@ def test_trash_plan_navigation_removal_removes_canonical_parent_link(
     )
 
     mocker.patch("draft.trash.uuid.uuid4", autospec=True, return_value=FIXED_UUID)
-    plan, _ = trash_plan(graph, Path("pages/a.md"))
+    plan, _ = _trash_plan(graph, Path("pages/a.md"))
 
     writes = [m for m in plan.mutations if m.kind is MutationKind.WRITE]
     index_mutation = next(m for m in writes if m.path == Path("index.md"))
@@ -463,7 +476,7 @@ def test_trash_plan_deterministic_mutation_ordering(mocker: MockerFixture) -> No
     )
 
     mocker.patch("draft.trash.uuid.uuid4", autospec=True, return_value=FIXED_UUID)
-    plan, _ = trash_plan(graph, Path("pages/a.md"))
+    plan, _ = _trash_plan(graph, Path("pages/a.md"))
 
     kinds = [m.kind for m in plan.mutations]
     writes = [m for m in plan.mutations if m.kind is MutationKind.WRITE]
@@ -489,7 +502,7 @@ def test_trash_plan_protected_root_raises() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        trash_plan(graph, ROOT_PAGE)
+        _trash_plan(graph, ROOT_PAGE)
     assert caught.value.code == "trash.protected"
 
 
@@ -502,7 +515,7 @@ def test_trash_plan_protected_conclusions_raises() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        trash_plan(graph, CONCLUSIONS_PAGE)
+        _trash_plan(graph, CONCLUSIONS_PAGE)
     assert caught.value.code == "trash.protected"
 
 
@@ -515,7 +528,7 @@ def test_trash_plan_unknown_page_raises() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        trash_plan(graph, Path("pages/missing.md"))
+        _trash_plan(graph, Path("pages/missing.md"))
     assert caught.value.code == "structure.unknown_page"
 
 
@@ -534,7 +547,7 @@ def test_trash_plan_has_children_raises() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        trash_plan(graph, Path("pages/hub/index.md"))
+        _trash_plan(graph, Path("pages/hub/index.md"))
     assert caught.value.code == "trash.has_children"
 
 
@@ -553,7 +566,7 @@ def test_trash_plan_parent_non_canonical_link_blocks() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        trash_plan(graph, Path("pages/a.md"))
+        _trash_plan(graph, Path("pages/a.md"))
     assert caught.value.code == "trash.inbound_reference"
     details = " ".join(caught.value.details)
     assert "index.md" in details
@@ -570,7 +583,7 @@ def test_trash_plan_other_page_inbound_link_blocks() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        trash_plan(graph, Path("pages/a.md"))
+        _trash_plan(graph, Path("pages/a.md"))
     assert caught.value.code == "trash.inbound_reference"
     details = " ".join(caught.value.details)
     assert "pages/b.md" in details
@@ -587,7 +600,7 @@ def test_trash_plan_dependency_relation_blocks() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        trash_plan(graph, Path("pages/a.md"))
+        _trash_plan(graph, Path("pages/a.md"))
     assert caught.value.code == "trash.inbound_reference"
     details = " ".join(caught.value.details)
     assert "pages/b.md" in details
@@ -604,7 +617,7 @@ def test_trash_plan_supersede_relation_blocks() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        trash_plan(graph, Path("pages/a.md"))
+        _trash_plan(graph, Path("pages/a.md"))
     assert caught.value.code == "trash.inbound_reference"
     details = " ".join(caught.value.details)
     assert "pages/b.md" in details
@@ -621,7 +634,7 @@ def test_trash_plan_challenge_relation_blocks() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        trash_plan(graph, Path("pages/a.md"))
+        _trash_plan(graph, Path("pages/a.md"))
     assert caught.value.code == "trash.inbound_reference"
     details = " ".join(caught.value.details)
     assert "pages/b.md" in details
@@ -638,7 +651,7 @@ def test_trash_plan_blocker_details_are_deterministic_and_sorted() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        trash_plan(graph, Path("pages/a.md"))
+        _trash_plan(graph, Path("pages/a.md"))
     assert caught.value.code == "trash.inbound_reference"
     # 阻碍详情按 (source, offset) 排序
     details = caught.value.details

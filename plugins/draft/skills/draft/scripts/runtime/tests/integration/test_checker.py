@@ -1092,7 +1092,15 @@ def _build_trash_state(
     from draft.trash_package import OUTGOING_RELATIVE
 
     graph = load_graph(root)
-    plan, _package_relative = trash_plan(graph, Path("pages/obsolete.md"))
+    from draft.models import RootState
+    from draft.observations import graph_observations
+
+    plan, _package_relative = trash_plan(
+        graph,
+        Path("pages/obsolete.md"),
+        root_state=RootState.REGISTERED,
+        observations=graph_observations(graph),
+    )
     execute_plan(plan)
     operation_id = plan.metadata["operation_id"]
     if read_lock(root) == operation_id:

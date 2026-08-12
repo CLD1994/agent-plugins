@@ -469,14 +469,29 @@ def plan_generation(
 
 
 def generate_conclusions(root: Path) -> GenerationPlan:
-    """按需生成结论页并原子更新根导航与登记标记；返回生成结果。"""
+    """按需生成结论页并原子更新根导航与登记标记；返回生成结果。
+
+    门禁是生成器的可判定性而非一般健康：全部受管页面路径/标题/状态/导航可判定才
+    允许（不可解析页面阻止，不完整导航由生成器报 conclusions.invalid_navigation）。
+    结论页在 generated 所有权下是可替换的机器产物，损坏不阻止生成。
+    """
     from draft.graph import read_marker
     from draft.operations import execute_plan
     from draft.paths import resolve_draft_root
+    from draft.query import load_tolerant_view
 
     resolved = resolve_draft_root(root)
     marker = read_marker(resolved)
     state = marker.conclusions_state
+    view = load_tolerant_view(resolved)
+    blocking = [
+        path
+        for path in view.blocking_paths
+        if not (state is ConclusionsState.GENERATED and path == CONCLUSIONS_PAGE)
+    ]
+    if blocking:
+        details = tuple(path.as_posix() for path in blocking)
+        raise DraftError("conclusions.incomplete", resolved, details=details)
     graph = _load_graph_with_conclusions(resolved, state)
     plan = plan_generation(graph, state=state, root_state=marker.root_state)
     if plan.operation is not None:
