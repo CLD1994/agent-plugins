@@ -12,7 +12,9 @@ from draft.diagnostic_codes import (
     InvalidStatusReason,
     LinkEscapeKind,
     ParseErrorReason,
+    QueryCode,
     ReplacementStatusReason,
+    RootCode,
     RootMissingKind,
 )
 from draft.vocabulary import RelationCode, StatusCode
@@ -93,8 +95,7 @@ DIAGNOSTIC_CODE_LITERAL_CONSUMERS = tuple(
 ) + tuple(sorted((RUNTIME_ROOT / "tests").rglob("*.py")))
 
 
-def _raw_registered_code_literals(path: Path) -> list[tuple[int, str]]:
-    registered = frozenset(code.value for code in CheckCode)
+def _raw_registered_code_literals(path: Path, registered: frozenset[str]) -> list[tuple[int, str]]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     return sorted(
         (node.lineno, node.value)
@@ -105,13 +106,24 @@ def _raw_registered_code_literals(path: Path) -> list[tuple[int, str]]:
     )
 
 
-def test_registered_diagnostic_codes_have_one_literal_owner() -> None:
-    offenders = {
+def _literal_owner_offenders(registered: frozenset[str]) -> dict[str, list[tuple[int, str]]]:
+    return {
         path.relative_to(RUNTIME_ROOT).as_posix(): literals
         for path in DIAGNOSTIC_CODE_LITERAL_CONSUMERS
-        if (literals := _raw_registered_code_literals(path))
+        if (literals := _raw_registered_code_literals(path, registered))
     }
-    assert offenders == {}
+
+
+def test_registered_diagnostic_codes_have_one_literal_owner() -> None:
+    assert _literal_owner_offenders(frozenset(code.value for code in CheckCode)) == {}
+
+
+def test_root_and_query_codes_have_one_literal_owner() -> None:
+    """root.* 与 query.* 协议值只由诊断码权威枚举拥有，不得在 src/tests 出现裸字面量。"""
+    registered = frozenset(
+        code.value for enum in (RootCode, QueryCode) for code in enum
+    )
+    assert _literal_owner_offenders(registered) == {}
 
 
 # 分支判别值（如 "not_single_code_span"、"relation_requires_status"）与普通业务字符串（如

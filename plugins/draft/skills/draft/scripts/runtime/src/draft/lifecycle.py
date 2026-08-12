@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from draft.checker import check_draft
-from draft.diagnostic_codes import CheckCode
+from draft.diagnostic_codes import CheckCode, RootCode
 from draft.errors import DraftError
 from draft.graph import (
     FORMAT_VERSION,
@@ -113,7 +113,7 @@ def initialize(root: Path) -> None:
     pre_existing = target.exists()
     if pre_existing:
         if target.is_symlink() or not target.is_dir():
-            raise DraftError("root.invalid", target)
+            raise DraftError(RootCode.INVALID.value, target)
         if any(target.iterdir()):
             raise DraftError("init.not_empty", target)
     created: list[Path] = []

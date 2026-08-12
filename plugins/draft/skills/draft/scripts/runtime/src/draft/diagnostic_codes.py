@@ -3,12 +3,23 @@ from __future__ import annotations
 from enum import StrEnum
 
 
+class RootCode(StrEnum):
+    INVALID = "root.invalid"
+    NOT_FOUND = "root.not_found"
+    AMBIGUOUS = "root.ambiguous"
+
+
+class QueryCode(StrEnum):
+    INCOMPLETE = "query.incomplete"
+
+
 class CheckCode(StrEnum):
     CANDIDATE_ALREADY_REGISTERED = "candidate.already_registered"
     CANDIDATE_INTERNAL_STATE = "candidate.internal_state"
     FORMAT_MISSING = "format.missing"
     FORMAT_INVALID = "format.invalid"
     FORMAT_UNSUPPORTED = "format.unsupported"
+    INTERNAL_UNEXPECTED_ENTRY = "internal.unexpected_entry"
     ROOT_MISSING_FILE = "root.missing_file"
     PAGE_UNMANAGED_PATH = "page.unmanaged_path"
     PAGE_MISSING_TITLE = "page.missing_title"

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from draft.diagnostic_codes import CheckCode
+from draft.diagnostic_codes import CheckCode, QueryCode, RootCode
 from draft.errors import DraftError
 from draft.graph import (
     FORMAT_VERSION,
@@ -13,9 +13,30 @@ from draft.graph import (
     parse_marker_value,
     resolve_local_destination,
 )
+from draft.models import RootState
 from draft.vocabulary import ConclusionsState
 
 MARKER = Path(".draft/draft.json")
+
+
+# ---------------------------------------------------------------------------
+# 受管根协议权威类型
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("root_state", tuple(RootState))
+def test_root_state_round_trips_through_authority(root_state: RootState) -> None:
+    assert RootState(root_state.value) is root_state
+
+
+@pytest.mark.parametrize("code", tuple(RootCode))
+def test_root_code_round_trips_through_authority(code: RootCode) -> None:
+    assert RootCode(code.value) is code
+
+
+@pytest.mark.parametrize("code", tuple(QueryCode))
+def test_query_code_round_trips_through_authority(code: QueryCode) -> None:
+    assert QueryCode(code.value) is code
 
 
 # ---------------------------------------------------------------------------

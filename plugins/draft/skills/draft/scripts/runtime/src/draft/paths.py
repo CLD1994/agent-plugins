@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
-from draft.diagnostic_codes import CheckCode
+from draft.diagnostic_codes import CheckCode, RootCode
 from draft.errors import DraftError
 
 
@@ -28,7 +28,7 @@ def resolve_draft_root(value: Path, *, allow_missing: bool = False) -> Path:
     if not allow_missing and not expanded.exists():
         raise DraftError("root.missing", expanded)
     if expanded.exists() and (expanded.is_symlink() or not expanded.is_dir()):
-        raise DraftError("root.invalid", expanded)
+        raise DraftError(RootCode.INVALID.value, expanded)
     return expanded.resolve(strict=False)
 
 

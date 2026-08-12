@@ -78,6 +78,14 @@ VALID_RENDER_CASES = [
     ),
     RenderCase(
         CheckIssue(
+            CheckCode.INTERNAL_UNEXPECTED_ENTRY.value,
+            IssueSeverity.ERROR,
+            Path(".draft/unregistered.json"),
+            None,
+        ),
+    ),
+    RenderCase(
+        CheckIssue(
             CheckCode.FORMAT_MISSING.value,
             IssueSeverity.ERROR,
             Path(".draft/draft.json"),

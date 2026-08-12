@@ -171,6 +171,9 @@ _SPECS: dict[CheckCode, DiagnosticSpec] = {
     CheckCode.CANDIDATE_INTERNAL_STATE: DiagnosticSpec(
         _FILE, _fixed(0), _text("候选目录包含 Draft 内部状态")
     ),
+    CheckCode.INTERNAL_UNEXPECTED_ENTRY: DiagnosticSpec(
+        _FILE, _fixed(0), _text("内部命名空间出现未登记条目")
+    ),
     CheckCode.FORMAT_MISSING: DiagnosticSpec(_FILE, _fixed(0), _text("登记文件不存在")),
     CheckCode.FORMAT_INVALID: DiagnosticSpec(_FILE, _fixed(0), _text("登记文件格式无效")),
     CheckCode.FORMAT_UNSUPPORTED: DiagnosticSpec(_FILE, _fixed(0), _text("登记文件版本不受支持")),

@@ -12,6 +12,11 @@ from draft.vocabulary import RelationCode, StatusCode
 ValidationMode = Literal["registered", "candidate"]
 
 
+class RootState(StrEnum):
+    CANDIDATE = "candidate"
+    REGISTERED = "registered"
+
+
 class IssueSeverity(StrEnum):
     ERROR = "error"
     WARNING = "warning"
