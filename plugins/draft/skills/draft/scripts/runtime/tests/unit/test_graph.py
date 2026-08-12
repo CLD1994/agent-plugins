@@ -109,7 +109,11 @@ def test_parse_marker_value_rejects_unknown_root_state() -> None:
 def test_parse_marker_value_rejects_non_string_root_state() -> None:
     with pytest.raises(DraftError) as caught:
         parse_marker_value(
-            {"format_version": FORMAT_VERSION, "root_state": 1, "conclusions_state": "not_generated"},
+            {
+                "format_version": FORMAT_VERSION,
+                "root_state": 1,
+                "conclusions_state": "not_generated",
+            },
             MARKER,
         )
     assert caught.value.code == CheckCode.FORMAT_INVALID.value

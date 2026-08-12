@@ -97,13 +97,13 @@ def test_adopt_success_and_invalid_candidate(
         "# 结论汇总\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](index.md)\n",
         encoding="utf-8",
     )
-    code, payload = run_json(["adopt", str(root), "--json"], capsys)
+    code, payload = run_json(["adopt", "--root", str(root), "--json"], capsys)
     assert code == 0
     assert "ok" not in payload
 
     broken = tmp_path / "broken"
     broken.mkdir()
-    code, payload = run_json(["adopt", str(broken), "--json"], capsys)
+    code, payload = run_json(["adopt", "--root", str(broken), "--json"], capsys)
     assert code == 2
     error = payload["error"]
     assert isinstance(error, dict)
@@ -121,7 +121,7 @@ def test_check_parser_accepts_candidate_flag(
     root = tmp_path / "candidate"
     build_legacy_unmarked_candidate(root)
 
-    code, payload = run_json(["check", str(root), "--candidate", "--json"], capsys)
+    code, payload = run_json(["check", "--root", str(root), "--candidate", "--json"], capsys)
 
     assert code == 0
     assert payload["ok"] is True
@@ -132,7 +132,7 @@ def test_candidate_check_is_read_only(tmp_path: Path, capsys: pytest.CaptureFixt
     build_legacy_unmarked_candidate(root)
     before = snapshot_tree(root)
 
-    code, payload = run_json(["check", str(root), "--candidate", "--json"], capsys)
+    code, payload = run_json(["check", "--root", str(root), "--candidate", "--json"], capsys)
 
     assert code == 0
     assert payload["ok"] is True
@@ -146,7 +146,7 @@ def test_candidate_check_rejects_registered_root_without_mutation(
 ) -> None:
     before = snapshot_tree(registered_draft)
     code, payload = run_json(
-        ["check", str(registered_draft), "--candidate", "--json"],
+        ["check", "--root", str(registered_draft), "--candidate", "--json"],
         capsys,
     )
     assert code == 1
@@ -162,7 +162,7 @@ def test_candidate_check_registered_root_human_hint(
     registered_draft: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    code = main(["check", str(registered_draft), "--candidate"])
+    code = main(["check", "--root", str(registered_draft), "--candidate"])
     output = capsys.readouterr().out
     assert code == 1
     assert_human_output_facts(
@@ -184,12 +184,10 @@ def test_candidate_check_provisional_marker_is_recovery_required(
     before_manifest = draft_manifest(root, mode="candidate")
     internal = root / ".draft"
     internal.mkdir()
-    (internal / "draft.provisional.json").write_bytes(
-        provisional_marker_bytes(before_manifest)
-    )
+    (internal / "draft.provisional.json").write_bytes(provisional_marker_bytes(before_manifest))
     before = snapshot_tree(root)
 
-    code, payload = run_json(["check", str(root), "--candidate", "--json"], capsys)
+    code, payload = run_json(["check", "--root", str(root), "--candidate", "--json"], capsys)
 
     assert code == 3
     assert payload["ok"] is False
@@ -220,7 +218,7 @@ def test_candidate_check_rejects_internal_state_without_mutation(
             (package / "page.md").write_text("# 回收\n", encoding="utf-8")
         before = snapshot_tree(root)
 
-        code, payload = run_json(["check", str(root), "--candidate", "--json"], capsys)
+        code, payload = run_json(["check", "--root", str(root), "--candidate", "--json"], capsys)
 
         assert code == 1, variant
         assert payload["ok"] is False
@@ -234,7 +232,7 @@ def test_check_clean_and_errors(tmp_path: Path, capsys: pytest.CaptureFixture[st
     assert main(["init", str(root)]) == 0
     capsys.readouterr()
 
-    code, payload = run_json(["check", str(root), "--json"], capsys)
+    code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
     assert code == 0
     assert payload["ok"] is True
     assert payload["errors"] == []
@@ -244,7 +242,7 @@ def test_check_clean_and_errors(tmp_path: Path, capsys: pytest.CaptureFixture[st
         "# 问题\n\n> 状态：`已确认`\n\n无父主题声明。\n",
         encoding="utf-8",
     )
-    code, payload = run_json(["check", str(root), "--json"], capsys)
+    code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
     assert code == 1
     assert payload["ok"] is False
     error_dicts = as_dicts(payload["errors"])
@@ -262,7 +260,7 @@ def test_check_clean_and_errors(tmp_path: Path, capsys: pytest.CaptureFixture[st
 def test_check_human_clean_prints_one_nonempty_line(
     registered_draft: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["check", str(registered_draft)]) == 0
+    assert main(["check", "--root", str(registered_draft)]) == 0
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 1
     assert lines[0]
@@ -272,7 +270,7 @@ def test_check_human_is_read_only(
     registered_draft: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     before = snapshot_tree(registered_draft)
-    main(["check", str(registered_draft)])
+    main(["check", "--root", str(registered_draft)])
     assert snapshot_tree(registered_draft) == before
 
 
@@ -292,7 +290,7 @@ def test_check_human_reports_actionable_multiple_locations(
         encoding="utf-8",
     )
 
-    assert main(["check", str(registered_draft)]) == 1
+    assert main(["check", "--root", str(registered_draft)]) == 1
     assert_human_output_facts(
         capsys.readouterr().out,
         (
@@ -321,7 +319,7 @@ def test_check_plain_and_json_agree_on_exit_code_and_raw_details(
     )
     capsys.readouterr()
 
-    assert main(["check", str(root)]) == 1
+    assert main(["check", "--root", str(root)]) == 1
     assert_human_output_facts(
         capsys.readouterr().out,
         (
@@ -330,7 +328,7 @@ def test_check_plain_and_json_agree_on_exit_code_and_raw_details(
         ),
     )
 
-    code, payload = run_json(["check", str(root), "--json"], capsys)
+    code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
     assert code == 1
     link_issues = [
         issue
@@ -349,8 +347,8 @@ def test_json_flag_both_positions_identical(
     assert main(["init", str(root)]) == 0
     capsys.readouterr()
 
-    code_a, payload_a = run_json(["--json", "check", str(root)], capsys)
-    code_b, payload_b = run_json(["check", str(root), "--json"], capsys)
+    code_a, payload_a = run_json(["--json", "check", "--root", str(root)], capsys)
+    code_b, payload_b = run_json(["check", "--root", str(root), "--json"], capsys)
     assert code_a == code_b == 0
     assert payload_a == payload_b
 
@@ -376,14 +374,14 @@ def test_move_success_and_escape_failure(
     capsys.readouterr()
 
     code, payload = run_json(
-        ["move", str(root), "pages/a.md", "pages/renamed.md", "--json"], capsys
+        ["move", "--root", str(root), "pages/a.md", "pages/renamed.md", "--json"], capsys
     )
     assert code == 0
     assert "ok" not in payload
     assert (root / "pages/renamed.md").is_file()
 
     code, payload = run_json(
-        ["move", str(root), "pages/renamed.md", "../outside.md", "--json"], capsys
+        ["move", "--root", str(root), "pages/renamed.md", "../outside.md", "--json"], capsys
     )
     assert code == 2
     error = payload["error"]
@@ -398,7 +396,7 @@ def test_promote_success_and_missing_child(
     build_draft(root)
     capsys.readouterr()
 
-    code, payload = run_json(["promote", str(root), "pages/a.md", "--json"], capsys)
+    code, payload = run_json(["promote", "--root", str(root), "pages/a.md", "--json"], capsys)
     assert code == 2
     error = payload["error"]
     assert isinstance(error, dict)
@@ -414,7 +412,7 @@ def test_promote_success_and_missing_child(
         encoding="utf-8",
     )
     code, payload = run_json(
-        ["promote", str(root), "pages/a.md", "pages/child.md", "--json"], capsys
+        ["promote", "--root", str(root), "pages/a.md", "pages/child.md", "--json"], capsys
     )
     assert code == 0
     assert (root / "pages/a/index.md").is_file()
@@ -436,11 +434,13 @@ def test_collapse_success_and_not_hub(tmp_path: Path, capsys: pytest.CaptureFixt
     )
     capsys.readouterr()
 
-    code, payload = run_json(["collapse", str(root), "pages/empty/index.md", "--json"], capsys)
+    code, payload = run_json(
+        ["collapse", "--root", str(root), "pages/empty/index.md", "--json"], capsys
+    )
     assert code == 0
     assert (root / "pages/empty.md").is_file()
 
-    code, payload = run_json(["collapse", str(root), "pages/a.md", "--json"], capsys)
+    code, payload = run_json(["collapse", "--root", str(root), "pages/a.md", "--json"], capsys)
     assert code == 2
     error = payload["error"]
     assert isinstance(error, dict)
@@ -455,13 +455,13 @@ def test_trash_protected_failure_and_retained_success(
     build_draft(root)
     capsys.readouterr()
 
-    code, payload = run_json(["trash", str(root), "index.md", "--json"], capsys)
+    code, payload = run_json(["trash", "--root", str(root), "index.md", "--json"], capsys)
     assert code == 2
     error = payload["error"]
     assert isinstance(error, dict)
     assert error["code"] == "trash.protected"
 
-    code, payload = run_json(["trash", str(root), "pages/a.md", "--json"], capsys)
+    code, payload = run_json(["trash", "--root", str(root), "pages/a.md", "--json"], capsys)
     assert code == 0
     assert "ok" not in payload
     assert payload["operation_id"]
@@ -492,11 +492,11 @@ def test_restore_cli_completed(tmp_path: Path, capsys: pytest.CaptureFixture[str
     root = tmp_path / "topic"
     build_draft(root)
     capsys.readouterr()
-    _, trash_payload = run_json(["trash", str(root), "pages/a.md", "--json"], capsys)
+    _, trash_payload = run_json(["trash", "--root", str(root), "pages/a.md", "--json"], capsys)
     operation_id = trash_payload["operation_id"]
     assert isinstance(operation_id, str)
 
-    code, payload = run_json(["restore", str(root), operation_id, "--json"], capsys)
+    code, payload = run_json(["restore", "--root", str(root), operation_id, "--json"], capsys)
 
     assert code == 0
     assert "ok" not in payload
@@ -515,7 +515,7 @@ def test_restore_cli_rolled_back_is_exit_three(
     root = tmp_path / "topic"
     build_draft(root)
     capsys.readouterr()
-    _, trash_payload = run_json(["trash", str(root), "pages/a.md", "--json"], capsys)
+    _, trash_payload = run_json(["trash", "--root", str(root), "pages/a.md", "--json"], capsys)
     operation_id = trash_payload["operation_id"]
     assert isinstance(operation_id, str)
 
@@ -533,7 +533,7 @@ def test_restore_cli_rolled_back_is_exit_three(
             )
 
     monkeypatch.setattr("draft.operations.write_journal", inject_concurrent_page)
-    code, payload = run_json(["restore", str(root), operation_id, "--json"], capsys)
+    code, payload = run_json(["restore", "--root", str(root), operation_id, "--json"], capsys)
     monkeypatch.undo()
 
     assert code == 3
@@ -551,13 +551,13 @@ def test_restore_cli_expired_is_exit_two(
     root = tmp_path / "topic"
     build_draft(root)
     capsys.readouterr()
-    _, trash_payload = run_json(["trash", str(root), "pages/a.md", "--json"], capsys)
+    _, trash_payload = run_json(["trash", "--root", str(root), "pages/a.md", "--json"], capsys)
     operation_id = trash_payload["operation_id"]
     assert isinstance(operation_id, str)
     # 模拟到期推进已把 T 转为 trash_handoff_pending。
     _rewrite_journal_phase(root, operation_id, "trash_handoff_pending")
 
-    code, payload = run_json(["restore", str(root), operation_id, "--json"], capsys)
+    code, payload = run_json(["restore", "--root", str(root), operation_id, "--json"], capsys)
 
     assert code == 2
     assert payload["ok"] is False
@@ -574,13 +574,13 @@ def test_restore_cli_conflict_is_exit_two(
     root = tmp_path / "topic"
     build_draft(root)
     capsys.readouterr()
-    _, trash_payload = run_json(["trash", str(root), "pages/a.md", "--json"], capsys)
+    _, trash_payload = run_json(["trash", "--root", str(root), "pages/a.md", "--json"], capsys)
     operation_id = trash_payload["operation_id"]
     assert isinstance(operation_id, str)
     # 原路径已被外部重建：恢复在认领后发现冲突。
     (root / "pages/a.md").write_text("# 重建\n", encoding="utf-8")
 
-    code, payload = run_json(["restore", str(root), operation_id, "--json"], capsys)
+    code, payload = run_json(["restore", "--root", str(root), operation_id, "--json"], capsys)
 
     assert code == 2
     assert payload["ok"] is False
@@ -598,7 +598,7 @@ def test_restore_cli_unknown_operation_is_exit_three(
     build_draft(root)
     capsys.readouterr()
 
-    code, payload = run_json(["restore", str(root), "f" * 32, "--json"], capsys)
+    code, payload = run_json(["restore", "--root", str(root), "f" * 32, "--json"], capsys)
 
     assert code == 3
     assert payload["ok"] is False
@@ -613,23 +613,26 @@ def test_recover_nothing_to_do(tmp_path: Path, capsys: pytest.CaptureFixture[str
     assert main(["init", str(root)]) == 0
     capsys.readouterr()
 
-    code, payload = run_json(["recover", str(root), "--json"], capsys)
+    code, payload = run_json(["recover", "--root", str(root), "--json"], capsys)
     assert code == 0
     assert "ok" not in payload
 
 
 def test_missing_root_is_exit_two(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    code, payload = run_json(["check", str(tmp_path / "nope"), "--json"], capsys)
+    from draft.diagnostic_codes import RootCode
+
+    code, payload = run_json(["check", "--root", str(tmp_path / "nope"), "--json"], capsys)
     assert code == 2
     error = payload["error"]
     assert isinstance(error, dict)
-    assert error["code"] == "root.missing"
+    assert error["code"] == RootCode.NOT_FOUND.value
+    assert error["details"] == ["cli"]
 
 
 def test_unresolvable_home_maps_to_root_missing_json(
     unresolvable_home: None, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    for args in (["check", "~/topic", "--json"], ["init", "~/topic", "--json"]):
+    for args in (["check", "--root", "~/topic", "--json"], ["init", "~/topic", "--json"]):
         code, payload = run_json(args, capsys)
         assert code == 2
         assert payload["ok"] is False
@@ -643,7 +646,7 @@ def test_unresolvable_home_maps_to_root_missing_json(
 def test_unresolvable_home_maps_to_root_missing_text(
     unresolvable_home: None, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["check", "~/topic"]) == 2
+    assert main(["check", "--root", "~/topic"]) == 2
     output = capsys.readouterr().out
     assert "root.missing" in output
 
@@ -654,7 +657,7 @@ def test_unresolvable_home_page_operand_maps_to_root_missing(
     # move/promote/collapse/trash resolve page operands against the raw root
     # before resolve_draft_root runs, so the page-operand expansion must also
     # normalize the failure instead of leaking a RuntimeError traceback.
-    code, payload = run_json(["move", "~/topic", "a.md", "b.md", "--json"], capsys)
+    code, payload = run_json(["move", "--root", "~/topic", "a.md", "b.md", "--json"], capsys)
     assert code == 2
     error = payload["error"]
     assert isinstance(error, dict)
@@ -705,7 +708,9 @@ def test_move_with_relative_root_from_cwd(
     monkeypatch.chdir(tmp_path)
     capsys.readouterr()
 
-    code, payload = run_json(["move", "topic", "pages/a.md", "pages/renamed.md", "--json"], capsys)
+    code, payload = run_json(
+        ["move", "--root", "topic", "pages/a.md", "pages/renamed.md", "--json"], capsys
+    )
 
     assert code == 0
     assert "ok" not in payload
@@ -753,14 +758,14 @@ def test_check_json_separates_errors_warnings_infos_and_reviews(
     root = _trashable_cli_root(tmp_path)
     capsys.readouterr()
     # 制造一个 info（trash_retained）与一个 error（a.md 缺少父主题声明）。
-    run_json(["trash", str(root), "pages/b.md", "--json"], capsys)
+    run_json(["trash", "--root", str(root), "pages/b.md", "--json"], capsys)
     (root / "pages/a.md").write_text(
         "# A\n\n> 状态：`已确认`\n\nA。\n",
         encoding="utf-8",
     )
     capsys.readouterr()
 
-    code, payload = run_json(["check", str(root), "--json"], capsys)
+    code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
 
     assert code == 1
     assert payload["ok"] is False
@@ -822,7 +827,7 @@ def test_recover_preflight_corruption_is_standard_error_envelope(
     broken_path.write_text(json_module.dumps(broken_data), encoding="utf-8")
     capsys.readouterr()
 
-    code, payload = run_json(["recover", str(root), "--json"], capsys)
+    code, payload = run_json(["recover", "--root", str(root), "--json"], capsys)
 
     # 前置推进损坏：recover 不进入自身逻辑，只返回标准错误信封，退出码 3。
     assert code == 3
@@ -880,7 +885,9 @@ def test_structure_preflight_corruption_never_starts_write(
     before_a = (root / "pages/a.md").read_bytes()
     capsys.readouterr()
 
-    code, payload = run_json(["move", str(root), "pages/a.md", "pages/a2.md", "--json"], capsys)
+    code, payload = run_json(
+        ["move", "--root", str(root), "pages/a.md", "pages/a2.md", "--json"], capsys
+    )
 
     # 前置推进损坏：只返回标准错误信封，不暴露推进明细，退出码 3。
     assert code == 3
@@ -918,17 +925,18 @@ def _due_package_root(tmp_path: Path) -> Path:
     return root
 
 
-def test_check_advances_due_package_once(
+def test_check_is_read_only_and_does_not_advance_due_package(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """check 严格只读：已到期包只作为持久化事实报告，不触发回收生命周期推进。"""
     root = _due_package_root(tmp_path)
     calls: list[str] = []
     monkeypatch.setattr("draft.trash_lifecycle._default_handoff", calls.append)
     capsys.readouterr()
 
-    code, payload = run_json(["check", str(root), "--json"], capsys)
+    code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
 
-    assert len(calls) == 1
+    assert calls == []
     assert code == 0
     assert payload["ok"] is True
     assert "lifecycle_results" not in payload
@@ -942,7 +950,9 @@ def test_move_advances_due_package_once(
     calls: list[str] = []
     monkeypatch.setattr("draft.trash_lifecycle._default_handoff", calls.append)
 
-    code, _payload = run_json(["move", str(root), "pages/a.md", "pages/a2.md", "--json"], capsys)
+    code, _payload = run_json(
+        ["move", "--root", str(root), "pages/a.md", "pages/a2.md", "--json"], capsys
+    )
 
     assert len(calls) == 1
     assert code == 0
@@ -983,7 +993,9 @@ def test_restore_advances_due_package_once(
     calls: list[str] = []
     monkeypatch.setattr("draft.trash_lifecycle._default_handoff", calls.append)
 
-    code, _payload = run_json(["restore", str(root), retained.operation_id, "--json"], capsys)
+    code, _payload = run_json(
+        ["restore", "--root", str(root), retained.operation_id, "--json"], capsys
+    )
 
     assert len(calls) == 1
     assert code == 0
@@ -998,18 +1010,18 @@ def test_init_and_candidate_check_do_not_preflight(
     build_legacy_unmarked_candidate(root)
     capsys.readouterr()
 
-    code, _payload = run_json(["check", str(root), "--candidate", "--json"], capsys)
+    code, _payload = run_json(["check", "--root", str(root), "--candidate", "--json"], capsys)
 
     assert code == 0
     assert calls == []
 
 
-def test_check_preflight_corruption_returns_standard_error_envelope(
+def test_check_does_not_preflight_corrupted_journal(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """check 不执行前置推进：损坏的恢复关联只作为回收事实原样报告，不产生推进错误信封。"""
     root = _trashable_cli_root(tmp_path)
     capsys.readouterr()
-    # 已登记根 + 损坏日志：check 的前置推进失败，只返回标准错误信封。
     import json as json_module
 
     from draft.operations import TrashDeadlines
@@ -1027,12 +1039,10 @@ def test_check_preflight_corruption_returns_standard_error_envelope(
     path.write_text(json_module.dumps(broken), encoding="utf-8")
     capsys.readouterr()
 
-    code, payload = run_json(["check", str(root), "--json"], capsys)
+    code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
 
-    assert code == 3
-    assert payload["ok"] is False
-    assert payload["result_type"] == "error"
-    assert "errors" not in payload
+    assert code == 0
+    assert payload["ok"] is True
     assert "lifecycle_results" not in payload
 
 
@@ -1050,7 +1060,8 @@ def test_dry_run_move_does_not_write_and_matches_formal(
     before = snapshot_tree(root)
 
     code, payload = run_json(
-        ["move", str(root), "pages/a.md", "pages/renamed.md", "--dry-run", "--json"], capsys
+        ["move", "--root", str(root), "pages/a.md", "pages/renamed.md", "--dry-run", "--json"],
+        capsys,
     )
 
     assert code == 0
@@ -1066,7 +1077,9 @@ def test_dry_run_move_does_not_write_and_matches_formal(
     assert not (root / "pages/renamed.md").exists()
 
     # 正式执行后 changed_paths 与预演效果一致。
-    code, formal = run_json(["move", str(root), "pages/a.md", "pages/renamed.md", "--json"], capsys)
+    code, formal = run_json(
+        ["move", "--root", str(root), "pages/a.md", "pages/renamed.md", "--json"], capsys
+    )
     assert code == 0
     assert formal["result_type"] == "move"
     formal_paths = set(cast("list[str]", formal["changed_paths"]))
@@ -1083,11 +1096,20 @@ def test_dry_run_count_only_hides_effects_keeps_metadata(
     capsys.readouterr()
 
     code, normal = run_json(
-        ["move", str(root), "pages/a.md", "pages/b.md", "--dry-run", "--json"], capsys
+        ["move", "--root", str(root), "pages/a.md", "pages/b.md", "--dry-run", "--json"], capsys
     )
     assert code == 0
     _code, counted = run_json(
-        ["move", str(root), "pages/a.md", "pages/b.md", "--dry-run", "--count-only", "--json"],
+        [
+            "move",
+            "--root",
+            str(root),
+            "pages/a.md",
+            "pages/b.md",
+            "--dry-run",
+            "--count-only",
+            "--json",
+        ],
         capsys,
     )
 
@@ -1107,7 +1129,7 @@ def test_formal_execution_rejects_pagination_options(
     capsys.readouterr()
 
     code, payload = run_json(
-        ["move", str(root), "pages/a.md", "pages/b.md", "--limit", "10", "--json"], capsys
+        ["move", "--root", str(root), "pages/a.md", "pages/b.md", "--limit", "10", "--json"], capsys
     )
 
     assert code == 2
@@ -1125,7 +1147,9 @@ def test_dry_run_trash_paths_never_include_dot_draft(
     build_draft(root)
     capsys.readouterr()
 
-    code, payload = run_json(["trash", str(root), "pages/a.md", "--dry-run", "--json"], capsys)
+    code, payload = run_json(
+        ["trash", "--root", str(root), "pages/a.md", "--dry-run", "--json"], capsys
+    )
 
     assert code == 0
     assert payload["operation"] == "trash"
@@ -1139,7 +1163,7 @@ def test_dry_run_trash_paths_never_include_dot_draft(
     assert all(not path.startswith(".draft/") for path in changed)
     assert (root / "pages/a.md").is_file()
     # 正式回收也不暴露 .draft 路径。
-    code, formal = run_json(["trash", str(root), "pages/a.md", "--json"], capsys)
+    code, formal = run_json(["trash", "--root", str(root), "pages/a.md", "--json"], capsys)
     assert code == 0
     formal_changed = cast("list[str]", formal["changed_paths"])
     assert all(not path.startswith(".draft/") for path in formal_changed)
@@ -1156,7 +1180,7 @@ def test_dry_run_with_existing_lock_fails_recovery_required(
     capsys.readouterr()
 
     code, payload = run_json(
-        ["move", str(root), "pages/a.md", "pages/b.md", "--dry-run", "--json"], capsys
+        ["move", "--root", str(root), "pages/a.md", "pages/b.md", "--dry-run", "--json"], capsys
     )
 
     assert code == 3

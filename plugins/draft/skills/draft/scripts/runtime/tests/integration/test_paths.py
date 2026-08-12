@@ -2,9 +2,121 @@ from pathlib import Path
 
 import pytest
 
-from draft.diagnostic_codes import CheckCode
+from draft.diagnostic_codes import CheckCode, RootCode
 from draft.errors import DraftError
-from draft.paths import resolve_draft_root, resolve_page_operand
+from draft.lifecycle import initialize
+from draft.paths import (
+    FilesystemProbe,
+    ManagedRoot,
+    RootSource,
+    resolve_draft_root,
+    resolve_page_operand,
+    select_managed_root,
+)
+
+
+def _select(
+    *,
+    explicit: str | None = None,
+    environment_value: str | None = None,
+    physical_cwd: Path,
+) -> ManagedRoot:
+    return select_managed_root(
+        explicit=explicit,
+        environment_value=environment_value,
+        physical_cwd=physical_cwd,
+        probe=FilesystemProbe(),
+    )
+
+
+def test_pwd_discovery_from_deep_subdirectory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "topic"
+    initialize(root)
+    deep = root / "pages" / "sub" / "deep"
+    deep.mkdir(parents=True)
+    monkeypatch.chdir(deep)
+
+    managed = _select(physical_cwd=Path.cwd())
+
+    assert managed.path == root.resolve()
+    assert managed.source is RootSource.PWD
+
+
+def test_nested_legal_roots_is_ambiguous(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    outer = tmp_path / "outer"
+    initialize(outer)
+    inner = tmp_path / "outer" / "inner"
+    initialize(inner)
+    monkeypatch.chdir(inner / "pages")
+
+    with pytest.raises(DraftError) as caught:
+        _select(physical_cwd=Path.cwd())
+    assert caught.value.code == RootCode.AMBIGUOUS.value
+    assert caught.value.paths == (Path.cwd(),)
+    assert caught.value.details == (
+        inner.resolve().as_posix(),
+        outer.resolve().as_posix(),
+    )
+
+
+def test_damaged_near_root_blocks_outer_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "topic"
+    initialize(root)
+    near = root / "pages" / "sub"
+    near.mkdir(parents=True)
+    (near / ".draft").mkdir()
+    (near / ".draft/draft.json").write_text("not json\n", encoding="utf-8")
+    monkeypatch.chdir(near)
+
+    with pytest.raises(DraftError) as caught:
+        _select(physical_cwd=Path.cwd())
+    assert caught.value.code == CheckCode.FORMAT_INVALID.value
+
+
+def test_absolute_draft_root_operates_from_any_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "topic"
+    initialize(root)
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.chdir(other)
+
+    managed = _select(environment_value=str(root), physical_cwd=Path.cwd())
+
+    assert managed.path == root.resolve()
+    assert managed.source is RootSource.ENV
+
+
+def test_explicit_root_overrides_environment(tmp_path: Path) -> None:
+    a = tmp_path / "a"
+    initialize(a)
+    b = tmp_path / "b"
+    initialize(b)
+
+    managed = _select(explicit=str(a), environment_value=str(b), physical_cwd=tmp_path)
+
+    assert managed.path == a.resolve()
+
+
+def test_missing_explicit_root_reports_not_found(tmp_path: Path) -> None:
+    with pytest.raises(DraftError) as caught:
+        _select(explicit=str(tmp_path / "nope"), physical_cwd=tmp_path)
+    assert caught.value.code == RootCode.NOT_FOUND.value
+    assert caught.value.details == (RootSource.CLI.value,)
+
+
+def test_non_directory_explicit_root_reports_invalid(tmp_path: Path) -> None:
+    target = tmp_path / "file"
+    target.write_text("x", encoding="utf-8")
+
+    with pytest.raises(DraftError) as caught:
+        _select(explicit=str(target), physical_cwd=tmp_path)
+    assert caught.value.code == RootCode.INVALID.value
 
 
 def test_page_operand_rejects_absolute_and_parent_escape(tmp_path: Path) -> None:

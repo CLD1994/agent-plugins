@@ -74,7 +74,7 @@ def test_query_page_returns_routing_summary(
     root = build_query_draft(draft_factory)
     capsys.readouterr()
 
-    code, payload = run_json(["query", "page", str(root), "pages/a.md", "--json"], capsys)
+    code, payload = run_json(["query", "page", "--root", str(root), "pages/a.md", "--json"], capsys)
 
     assert code == 0
     assert payload["result_type"] == "query.page"
@@ -90,7 +90,9 @@ def test_query_links_returns_deduplicated_resources(
     root = build_query_draft(draft_factory)
     capsys.readouterr()
 
-    code, payload = run_json(["query", "links", str(root), "pages/a.md", "--json"], capsys)
+    code, payload = run_json(
+        ["query", "links", "--root", str(root), "pages/a.md", "--json"], capsys
+    )
 
     assert code == 0
     assert payload["result_type"] == "query.links"
@@ -114,12 +116,14 @@ def test_query_succeeds_with_missing_body_link_resource_fact(
     )
     capsys.readouterr()
 
-    code, payload = run_json(["query", "page", str(root), "pages/a.md", "--json"], capsys)
+    code, payload = run_json(["query", "page", "--root", str(root), "pages/a.md", "--json"], capsys)
 
     assert code == 0
     assert payload["result_type"] == "query.page"
 
-    code, payload = run_json(["query", "links", str(root), "pages/a.md", "--json"], capsys)
+    code, payload = run_json(
+        ["query", "links", "--root", str(root), "pages/a.md", "--json"], capsys
+    )
 
     assert code == 0
     items = cast("list[dict[str, object]]", payload["items"])
@@ -134,7 +138,9 @@ def test_query_page_missing_page_is_page_not_found_exit_two(
     root = build_query_draft(draft_factory)
     capsys.readouterr()
 
-    code, payload = run_json(["query", "page", str(root), "pages/missing.md", "--json"], capsys)
+    code, payload = run_json(
+        ["query", "page", "--root", str(root), "pages/missing.md", "--json"], capsys
+    )
 
     assert code == 2
     assert payload["result_type"] == "error"
@@ -149,7 +155,9 @@ def test_query_backlinks_resolves_root_relative_target(
     root = build_query_draft(draft_factory)
     capsys.readouterr()
 
-    code, payload = run_json(["query", "backlinks", str(root), "pages/a.md", "--json"], capsys)
+    code, payload = run_json(
+        ["query", "backlinks", "--root", str(root), "pages/a.md", "--json"], capsys
+    )
 
     assert code == 0
     assert payload["result_type"] == "query.backlinks"
@@ -167,13 +175,31 @@ def test_query_relations_outgoing_and_incoming(
     capsys.readouterr()
 
     code, out = run_json(
-        ["query", "relations", str(root), "pages/b.md", "--direction", "outgoing", "--json"],
+        [
+            "query",
+            "relations",
+            "--root",
+            str(root),
+            "pages/b.md",
+            "--direction",
+            "outgoing",
+            "--json",
+        ],
         capsys,
     )
     assert code == 0
     assert out["total"] == 2
     _code, inc = run_json(
-        ["query", "relations", str(root), "pages/a.md", "--direction", "incoming", "--json"],
+        [
+            "query",
+            "relations",
+            "--root",
+            str(root),
+            "pages/a.md",
+            "--direction",
+            "incoming",
+            "--json",
+        ],
         capsys,
     )
     assert inc["total"] == 1
@@ -188,7 +214,7 @@ def test_query_status_filters_by_stable_code(
     root = build_query_draft(draft_factory)
     capsys.readouterr()
 
-    code, payload = run_json(["query", "status", str(root), "pending", "--json"], capsys)
+    code, payload = run_json(["query", "status", "--root", str(root), "pending", "--json"], capsys)
 
     assert code == 0
     assert payload["result_type"] == "query.status"
@@ -202,10 +228,10 @@ def test_query_count_only_shares_pagination_metadata(
     root = build_query_draft(draft_factory)
     capsys.readouterr()
 
-    code, normal = run_json(["query", "links", str(root), "pages/a.md", "--json"], capsys)
+    code, normal = run_json(["query", "links", "--root", str(root), "pages/a.md", "--json"], capsys)
     assert code == 0
     _code, counted = run_json(
-        ["query", "links", str(root), "pages/a.md", "--count-only", "--json"], capsys
+        ["query", "links", "--root", str(root), "pages/a.md", "--count-only", "--json"], capsys
     )
 
     assert counted["items"] == []
@@ -239,7 +265,7 @@ def test_query_recoverable_lists_only_in_window(
     retained = trash_page(root, Path("pages/orphan.md"), now=datetime(2026, 8, 20, tzinfo=UTC))
     capsys.readouterr()
 
-    code, payload = run_json(["query", "recoverable", str(root), "--json"], capsys)
+    code, payload = run_json(["query", "recoverable", "--root", str(root), "--json"], capsys)
 
     assert code == 0
     assert payload["result_type"] == "query.recoverable"
@@ -255,7 +281,7 @@ def test_query_invalid_pagination_is_exit_two(
     capsys.readouterr()
 
     code, payload = run_json(
-        ["query", "links", str(root), "pages/a.md", "--limit", "101", "--json"], capsys
+        ["query", "links", "--root", str(root), "pages/a.md", "--limit", "101", "--json"], capsys
     )
 
     assert code == 2
@@ -272,7 +298,16 @@ def test_query_inbound_relations_require_existing_page(
     capsys.readouterr()
 
     code, payload = run_json(
-        ["query", "relations", str(root), "pages/nope.md", "--direction", "incoming", "--json"],
+        [
+            "query",
+            "relations",
+            "--root",
+            str(root),
+            "pages/nope.md",
+            "--direction",
+            "incoming",
+            "--json",
+        ],
         capsys,
     )
 
@@ -288,7 +323,7 @@ def test_query_status_invalid_code_is_usage_error(
     """非法状态值由 argparse 拒绝，不泄漏 ValueError。"""
     root = build_query_draft(draft_factory)
     with pytest.raises(SystemExit) as caught:
-        main(["query", "status", str(root), "bogus"])
+        main(["query", "status", "--root", str(root), "bogus"])
     assert caught.value.code == 2
 
 

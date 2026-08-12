@@ -283,7 +283,7 @@ def test_recover_cli_never_exposes_internal_paths(
     acquire_lock(root, pending.operation_id)
     capsys.readouterr()
 
-    code = main(["recover", str(root), "--json"])
+    code = main(["recover", "--root", str(root), "--json"])
     payload = cast("dict[str, object]", json.loads(capsys.readouterr().out))
 
     assert code == 0

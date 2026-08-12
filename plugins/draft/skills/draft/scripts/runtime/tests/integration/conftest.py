@@ -30,7 +30,11 @@ def draft_factory(tmp_path: Path) -> DraftFactory:
             # 所有权状态必须同步为 generated（规格 §12.1/§12.2）。
             from draft.vocabulary import ConclusionsState
 
-            state = ConclusionsState.GENERATED if "conclusions.md" in files else ConclusionsState.NOT_GENERATED
+            state = (
+                ConclusionsState.GENERATED
+                if "conclusions.md" in files
+                else ConclusionsState.NOT_GENERATED
+            )
             (internal / "draft.json").write_text(
                 managed_marker_text(root_state=root_state, conclusions_state=state),
                 encoding="utf-8",

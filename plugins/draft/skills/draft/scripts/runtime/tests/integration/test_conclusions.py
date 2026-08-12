@@ -61,7 +61,7 @@ def test_generate_conclusions_creates_page_and_advances_owner(
     root = build_conc_draft(draft_factory)
     capsys.readouterr()
 
-    code, payload = run_json(["generate-conclusions", str(root), "--json"], capsys)
+    code, payload = run_json(["generate-conclusions", "--root", str(root), "--json"], capsys)
 
     assert code == 0
     assert payload["result_type"] == "generate-conclusions"
@@ -85,10 +85,10 @@ def test_generate_conclusions_idempotent_second_run(
 ) -> None:
     root = build_conc_draft(draft_factory)
     capsys.readouterr()
-    assert main(["generate-conclusions", str(root)]) == 0
+    assert main(["generate-conclusions", "--root", str(root)]) == 0
     capsys.readouterr()
 
-    code, payload = run_json(["generate-conclusions", str(root), "--json"], capsys)
+    code, payload = run_json(["generate-conclusions", "--root", str(root), "--json"], capsys)
 
     assert code == 0
     assert payload["generated"] is True
@@ -105,7 +105,7 @@ def test_generate_conclusions_no_confirmed_is_no_op(
     )
     capsys.readouterr()
 
-    code, payload = run_json(["generate-conclusions", str(root), "--json"], capsys)
+    code, payload = run_json(["generate-conclusions", "--root", str(root), "--json"], capsys)
 
     assert code == 0
     assert payload["generated"] is False
@@ -121,7 +121,9 @@ def test_generate_conclusions_dry_run_does_not_write(
     root = build_conc_draft(draft_factory)
     capsys.readouterr()
 
-    code, payload = run_json(["generate-conclusions", str(root), "--dry-run", "--json"], capsys)
+    code, payload = run_json(
+        ["generate-conclusions", "--root", str(root), "--dry-run", "--json"], capsys
+    )
 
     assert code == 0
     assert payload["result_type"] == "plan"
@@ -144,7 +146,9 @@ def test_generate_conclusions_dry_run_no_confirmed_is_empty_effects(
     )
     capsys.readouterr()
 
-    code, payload = run_json(["generate-conclusions", str(root), "--dry-run", "--json"], capsys)
+    code, payload = run_json(
+        ["generate-conclusions", "--root", str(root), "--dry-run", "--json"], capsys
+    )
 
     assert code == 0
     assert payload["result_type"] == "plan"
@@ -160,10 +164,12 @@ def test_generate_conclusions_dry_run_idempotent_is_empty_effects(
 ) -> None:
     """已生成且无变化时预演成功，返回空 effects，而不是报错。"""
     root = build_conc_draft(draft_factory)
-    assert main(["generate-conclusions", str(root)]) == 0
+    assert main(["generate-conclusions", "--root", str(root)]) == 0
     capsys.readouterr()
 
-    code, payload = run_json(["generate-conclusions", str(root), "--dry-run", "--json"], capsys)
+    code, payload = run_json(
+        ["generate-conclusions", "--root", str(root), "--dry-run", "--json"], capsys
+    )
 
     assert code == 0
     assert payload["generated"] is True
@@ -175,11 +181,13 @@ def test_generate_conclusions_dry_run_matches_real_on_damaged_page(
 ) -> None:
     """已生成态损坏结论页时，预演与正式执行调用同一计划构造边界（规格 §13）。"""
     root = build_conc_draft(draft_factory)
-    assert main(["generate-conclusions", str(root)]) == 0
+    assert main(["generate-conclusions", "--root", str(root)]) == 0
     (root / "conclusions.md").write_text("损坏\n", encoding="utf-8")
     capsys.readouterr()
 
-    code, payload = run_json(["generate-conclusions", str(root), "--dry-run", "--json"], capsys)
+    code, payload = run_json(
+        ["generate-conclusions", "--root", str(root), "--dry-run", "--json"], capsys
+    )
 
     assert code == 0
     assert payload["result_type"] == "plan"
@@ -198,14 +206,26 @@ def test_generate_conclusions_handles_bracket_titles(
     root = build_conc_draft(draft_factory)
     capsys.readouterr()
     code, _ = run_json(
-        ["create", str(root), "pages/br.md", "--title", "甲]乙", "--status", "proposed", "--json"],
+        [
+            "create",
+            "--root",
+            str(root),
+            "pages/br.md",
+            "--title",
+            "甲]乙",
+            "--status",
+            "proposed",
+            "--json",
+        ],
         capsys,
     )
     assert code == 0
-    code, _ = run_json(["status", "set", str(root), "pages/br.md", "confirmed", "--json"], capsys)
+    code, _ = run_json(
+        ["status", "set", "--root", str(root), "pages/br.md", "confirmed", "--json"], capsys
+    )
     assert code == 0
 
-    code, payload = run_json(["generate-conclusions", str(root), "--json"], capsys)
+    code, payload = run_json(["generate-conclusions", "--root", str(root), "--json"], capsys)
 
     assert code == 0
     assert payload["generated"] is True
@@ -238,7 +258,7 @@ def test_generate_conclusions_repairs_noncanonical_nav_label(
     )
     capsys.readouterr()
 
-    code, payload = run_json(["generate-conclusions", str(root), "--json"], capsys)
+    code, payload = run_json(["generate-conclusions", "--root", str(root), "--json"], capsys)
 
     assert code == 0
     assert payload["generated"] is True
@@ -252,12 +272,12 @@ def test_generate_conclusions_rebuilds_damaged_page(
     draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = build_conc_draft(draft_factory)
-    assert main(["generate-conclusions", str(root)]) == 0
+    assert main(["generate-conclusions", "--root", str(root)]) == 0
     # 破坏结论页并漂移根导航链接。
     (root / "conclusions.md").write_text("损坏\n", encoding="utf-8")
     capsys.readouterr()
 
-    code, payload = run_json(["generate-conclusions", str(root), "--json"], capsys)
+    code, payload = run_json(["generate-conclusions", "--root", str(root), "--json"], capsys)
 
     assert code == 0
     assert payload["generated"] is True
@@ -281,7 +301,7 @@ def test_generate_conclusions_follows_navigation_declaration_order(
     )
     capsys.readouterr()
 
-    code, payload = run_json(["generate-conclusions", str(root), "--json"], capsys)
+    code, payload = run_json(["generate-conclusions", "--root", str(root), "--json"], capsys)
 
     assert code == 0
     assert payload["generated"] is True
@@ -306,7 +326,7 @@ def test_generate_conclusions_fails_on_invalid_navigation(
     )
     capsys.readouterr()
 
-    code, payload = run_json(["generate-conclusions", str(root), "--json"], capsys)
+    code, payload = run_json(["generate-conclusions", "--root", str(root), "--json"], capsys)
 
     assert code == 2
     error = payload["error"]
@@ -318,10 +338,12 @@ def test_conclusions_page_queryable_as_managed_page(
     draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = build_conc_draft(draft_factory)
-    assert main(["generate-conclusions", str(root)]) == 0
+    assert main(["generate-conclusions", "--root", str(root)]) == 0
     capsys.readouterr()
 
-    code, payload = run_json(["query", "page", str(root), "conclusions.md", "--json"], capsys)
+    code, payload = run_json(
+        ["query", "page", "--root", str(root), "conclusions.md", "--json"], capsys
+    )
 
     assert code == 0
     assert payload["result_type"] == "query.page"

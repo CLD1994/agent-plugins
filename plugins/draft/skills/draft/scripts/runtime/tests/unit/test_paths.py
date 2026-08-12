@@ -2,7 +2,191 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from draft.paths import physical_parent, relative_markdown_destination
+import pytest
+
+from draft.diagnostic_codes import CheckCode, RootCode
+from draft.errors import DraftError
+from draft.graph import MarkerState
+from draft.models import RootState
+from draft.paths import (
+    RootSource,
+    physical_parent,
+    relative_markdown_destination,
+    select_managed_root,
+)
+
+
+class FakeProbe:
+    """受真实签名约束的根探测 fake：目录、marker 与损坏事实由测试显式提供。"""
+
+    def __init__(self) -> None:
+        self.directories: set[Path] = set()
+        self.managed: dict[Path, MarkerState] = {}
+        self.broken: set[Path] = set()
+        self.inspected: list[Path] = []
+
+    def is_directory(self, path: Path) -> bool:
+        return path in self.directories
+
+    def exists(self, path: Path) -> bool:
+        return path in self.directories
+
+    def managed_at(self, directory: Path) -> MarkerState | None:
+        self.inspected.append(directory)
+        if directory in self.broken:
+            raise DraftError(CheckCode.FORMAT_INVALID.value, directory / ".draft/draft.json")
+        return self.managed.get(directory)
+
+
+def _registered() -> MarkerState:
+    return MarkerState(version=1, root_state=RootState.REGISTERED)
+
+
+@pytest.fixture
+def root_probe() -> FakeProbe:
+    return FakeProbe()
+
+
+# ---------------------------------------------------------------------------
+# select_managed_root：根选择决策表
+# ---------------------------------------------------------------------------
+
+
+def test_cli_root_takes_precedence_over_env_and_pwd(root_probe: FakeProbe) -> None:
+    root_probe.directories.update({Path("/root-a")})
+    root_probe.managed[Path("/root-a")] = _registered()
+
+    managed = select_managed_root(
+        explicit="/root-a",
+        environment_value="/env-b",
+        physical_cwd=Path("/work/inner"),
+        probe=root_probe,
+    )
+
+    assert managed.path == Path("/root-a")
+    assert managed.source is RootSource.CLI
+    assert root_probe.inspected == [Path("/root-a")]
+
+
+def test_higher_priority_invalid_does_not_fall_back_to_lower(
+    root_probe: FakeProbe,
+) -> None:
+    # CLI 存在但指向不存在的路径：不回退到合法的 env/pwd 根。
+    root_probe.managed[Path("/env-b")] = _registered()
+    with pytest.raises(DraftError) as caught:
+        select_managed_root(
+            explicit="/missing-a",
+            environment_value="/env-b",
+            physical_cwd=Path("/work"),
+            probe=root_probe,
+        )
+    assert caught.value.code == RootCode.NOT_FOUND.value
+    assert caught.value.details == ("cli",)
+
+
+def test_invalid_environment_root_does_not_fall_back_to_pwd(
+    root_probe: FakeProbe,
+) -> None:
+    with pytest.raises(DraftError) as caught:
+        select_managed_root(
+            explicit=None,
+            environment_value="relative/root",
+            physical_cwd=Path("/work/inner"),
+            probe=root_probe,
+        )
+    assert caught.value.code == RootCode.INVALID.value
+    assert caught.value.paths == (Path("relative/root"),)
+    assert caught.value.details == ()
+    assert root_probe.inspected == []
+
+
+def test_explicit_relative_root_resolved_against_physical_pwd(
+    root_probe: FakeProbe,
+) -> None:
+    root_probe.directories.add(Path("/work/topic"))
+    root_probe.managed[Path("/work/topic")] = _registered()
+
+    managed = select_managed_root(
+        explicit="topic",
+        environment_value=None,
+        physical_cwd=Path("/work"),
+        probe=root_probe,
+    )
+
+    assert managed.path == Path("/work/topic")
+    assert managed.source is RootSource.CLI
+
+
+def test_environment_root_must_be_absolute(
+    root_probe: FakeProbe,
+) -> None:
+    with pytest.raises(DraftError) as caught:
+        select_managed_root(
+            explicit=None,
+            environment_value="",
+            physical_cwd=Path("/work"),
+            probe=root_probe,
+        )
+    assert caught.value.code == RootCode.INVALID.value
+
+
+def test_nearest_damaged_draft_blocks_outer_root(root_probe: FakeProbe) -> None:
+    root_probe.broken.add(Path("/work/inner"))
+    root_probe.managed[Path("/work")] = _registered()
+
+    with pytest.raises(DraftError) as caught:
+        select_managed_root(
+            explicit=None,
+            environment_value=None,
+            physical_cwd=Path("/work/inner"),
+            probe=root_probe,
+        )
+    assert caught.value.code == CheckCode.FORMAT_INVALID.value
+
+
+def test_two_legal_ancestor_roots_is_ambiguous(root_probe: FakeProbe) -> None:
+    root_probe.managed[Path("/work/a")] = _registered()
+    root_probe.managed[Path("/work")] = _registered()
+
+    with pytest.raises(DraftError) as caught:
+        select_managed_root(
+            explicit=None,
+            environment_value=None,
+            physical_cwd=Path("/work/a/inner"),
+            probe=root_probe,
+        )
+    assert caught.value.code == RootCode.AMBIGUOUS.value
+    assert caught.value.paths == (Path("/work/a/inner"),)
+    assert caught.value.details == ("/work/a", "/work")
+
+
+def test_no_root_reports_not_found_from_pwd(root_probe: FakeProbe) -> None:
+    with pytest.raises(DraftError) as caught:
+        select_managed_root(
+            explicit=None,
+            environment_value=None,
+            physical_cwd=Path("/work/inner"),
+            probe=root_probe,
+        )
+    assert caught.value.code == RootCode.NOT_FOUND.value
+    assert caught.value.paths == (Path("/work/inner"),)
+    assert caught.value.details == (RootSource.PWD.value,)  # type: ignore[arg-type]
+
+
+def test_selected_directory_without_marker_reports_format_missing(
+    root_probe: FakeProbe,
+) -> None:
+    root_probe.directories.add(Path("/plain"))
+
+    with pytest.raises(DraftError) as caught:
+        select_managed_root(
+            explicit="/plain",
+            environment_value=None,
+            physical_cwd=Path("/work"),
+            probe=root_probe,
+        )
+    assert caught.value.code == CheckCode.FORMAT_MISSING.value
+
 
 # ---------------------------------------------------------------------------
 # physical_parent

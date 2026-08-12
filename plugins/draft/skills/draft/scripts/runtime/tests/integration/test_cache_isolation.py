@@ -187,7 +187,7 @@ def test_offline_run_reuses_online_environment_snapshot(tmp_path: Path) -> None:
     for args in (
         ("--version",),
         ("init", str(online_root)),
-        ("check", str(online_root)),
+        ("check", "--root", str(online_root)),
     ):
         result = run_uvx_from(runtime, cache, *args, env=env, cwd=artifact.parent)
         assert result.returncode == 0, result.stderr
@@ -207,7 +207,7 @@ def test_offline_run_reuses_online_environment_snapshot(tmp_path: Path) -> None:
     for args in (
         ("--version",),
         ("init", str(offline_root)),
-        ("check", str(offline_root)),
+        ("check", "--root", str(offline_root)),
     ):
         result = run_uvx_from(
             runtime,

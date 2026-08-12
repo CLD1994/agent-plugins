@@ -120,9 +120,7 @@ def test_registered_diagnostic_codes_have_one_literal_owner() -> None:
 
 def test_root_and_query_codes_have_one_literal_owner() -> None:
     """root.* 与 query.* 协议值只由诊断码权威枚举拥有，不得在 src/tests 出现裸字面量。"""
-    registered = frozenset(
-        code.value for enum in (RootCode, QueryCode) for code in enum
-    )
+    registered = frozenset(code.value for enum in (RootCode, QueryCode) for code in enum)
     assert _literal_owner_offenders(registered) == {}
 
 

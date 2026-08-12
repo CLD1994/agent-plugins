@@ -187,7 +187,7 @@ def test_init_and_check_pass_without_plugin_files_or_repo_parents(
         encoding="utf-8",
     )
 
-    check = run_uvx(artifact, env, cache, "check", str(root))
+    check = run_uvx(artifact, env, cache, "check", "--root", str(root))
     assert check.returncode == 0, check.stderr
     _assert_no_forbidden_outputs(check)
 

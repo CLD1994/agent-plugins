@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
@@ -19,7 +20,14 @@ from draft.models import (
     OperationPhase,
     OperationPlan,
     OperationResult,
+    RootState,
     TrashResult,
+)
+from draft.paths import (
+    FilesystemProbe,
+    ManagedRoot,
+    discover_root_directory,
+    select_managed_root,
 )
 from draft.plan_effects import PlanEffect
 from draft.query import LocalPageSnapshot, SnapshotView
@@ -39,6 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=argparse.SUPPRESS,
         help="以稳定 JSON 信封输出结果",
+    )
+    rooted = argparse.ArgumentParser(add_help=False, parents=[shared])
+    rooted.add_argument(
+        "--root",
+        metavar="ROOT",
+        help="草稿根目录（缺省回退到绝对 DRAFT_ROOT，再回退到 pwd 祖先发现）",
     )
     parser = argparse.ArgumentParser(
         prog="draft",
@@ -61,21 +75,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="创建 root_state=candidate 的候选根（允许渐进整理，adopt 前不登记）",
     )
 
-    adopt = subparsers.add_parser(
+    _adopt = subparsers.add_parser(
         "adopt",
-        parents=[shared],
-        help="接管格式完整的未登记目录",
-        description="把已符合草稿格式的未登记目录登记为草稿（可先用 check --candidate 验证）。",
+        parents=[rooted],
+        help="接管格式完整的候选根",
+        description="把 root_state=candidate 的受管根原子推进为 registered。",
     )
-    adopt.add_argument("root", metavar="ROOT", help="已符合草稿格式的目录")
 
     check = subparsers.add_parser(
         "check",
-        parents=[shared],
+        parents=[rooted],
         help="检查草稿一致性",
         description="按已登记布局检查草稿，报告错误、警告、信息与提醒；默认模式要求存在内部登记。",
     )
-    check.add_argument("root", metavar="ROOT", help="草稿根目录")
     check.add_argument(
         "--candidate",
         action="store_true",
@@ -84,22 +96,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     move = subparsers.add_parser(
         "move",
-        parents=[shared],
+        parents=[rooted],
         help="移动页面",
         description="把 SOURCE 页面连同其子页移动到 TARGET 位置，并更新网络链接。",
     )
-    move.add_argument("root", metavar="ROOT", help="草稿根目录")
     move.add_argument("source", metavar="SOURCE", help="源页面相对路径（如 pages/a.md）")
     move.add_argument("target", metavar="TARGET", help="目标页面相对路径")
     _add_dry_run_args(move)
 
     promote = subparsers.add_parser(
         "promote",
-        parents=[shared],
+        parents=[rooted],
         help="升格页面为枢纽",
         description="把 PAGE 升格为枢纽，将列出的 CHILD 降级为它的子页。",
     )
-    promote.add_argument("root", metavar="ROOT", help="草稿根目录")
     promote.add_argument("page", metavar="PAGE", help="要升格的页面相对路径")
     promote.add_argument(
         "children",
@@ -111,54 +121,49 @@ def build_parser() -> argparse.ArgumentParser:
 
     collapse = subparsers.add_parser(
         "collapse",
-        parents=[shared],
+        parents=[rooted],
         help="降级枢纽为普通页面",
         description="把 HUB 枢纽降级为普通页面并合并回父级，不留空枢纽。",
     )
-    collapse.add_argument("root", metavar="ROOT", help="草稿根目录")
     collapse.add_argument("hub", metavar="HUB", help="枢纽页面相对路径")
     _add_dry_run_args(collapse)
 
     trash = subparsers.add_parser(
         "trash",
-        parents=[shared],
+        parents=[rooted],
         help="回收页面为保留态",
         description=(
             "把 PAGE 及子页回收为 7 天保留态，期间可 restore 恢复；存在未解除的入站引用时拒绝。"
         ),
     )
-    trash.add_argument("root", metavar="ROOT", help="草稿根目录")
     trash.add_argument("page", metavar="PAGE", help="要回收的页面相对路径")
     _add_dry_run_args(trash)
 
     restore = subparsers.add_parser(
         "restore",
-        parents=[shared],
+        parents=[rooted],
         help="恢复被回收的页面",
         description="按 OPERATION_ID 恢复保留期内被回收的操作对应的页面；恢复未完成时退出码为 3。",
     )
-    restore.add_argument("root", metavar="ROOT", help="草稿根目录")
     restore.add_argument(
         "operation_id",
         metavar="OPERATION_ID",
         help="回收操作标识符（trash 返回）",
     )
 
-    recover = subparsers.add_parser(
+    _recover = subparsers.add_parser(
         "recover",
-        parents=[shared],
+        parents=[rooted],
         help="修复中断的写操作",
         description="修复崩溃或中断留下的未完成写操作；回收生命周期推进由所有已登记命令的前置静默完成。",
     )
-    recover.add_argument("root", metavar="ROOT", help="草稿根目录")
 
     create = subparsers.add_parser(
         "create",
-        parents=[shared],
+        parents=[rooted],
         help="创建叶子页面",
         description="在 pages/ 下原子创建新叶子页面并更新父导航。",
     )
-    create.add_argument("root", metavar="ROOT", help="草稿根目录")
     create.add_argument("page", metavar="PAGE", help="新页面相对路径（如 pages/topic.md）")
     create.add_argument("--title", required=True, help="页面标题（单行普通文本）")
     create.add_argument(
@@ -171,13 +176,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_cmd = subparsers.add_parser(
         "status",
-        parents=[shared],
+        parents=[rooted],
         help="修改页面状态",
         description="修改页面讨论状态，只要求最终结构满足不变量。",
     )
     status_sub = status_cmd.add_subparsers(dest="status_command", metavar="SUB")
-    status_set = status_sub.add_parser("set", parents=[shared], help="设置页面状态")
-    status_set.add_argument("root", metavar="ROOT", help="草稿根目录")
+    status_set = status_sub.add_parser("set", parents=[rooted], help="设置页面状态")
     status_set.add_argument("page", metavar="PAGE", help="严格受管理页面路径")
     status_set.add_argument(
         "code",
@@ -191,15 +195,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     relation_cmd = subparsers.add_parser(
         "relation",
-        parents=[shared],
+        parents=[rooted],
         help="修改正式关系",
         description="幂等添加或删除依赖/取代/质疑关系，必要时维护反向与状态。",
     )
     relation_sub = relation_cmd.add_subparsers(dest="relation_command", metavar="SUB")
     relation_choices = tuple(member.value for member in EditableRelationCode)
     for sub_name, sub_help in (("add", "添加关系"), ("remove", "删除关系")):
-        sub = relation_sub.add_parser(sub_name, parents=[shared], help=sub_help)
-        sub.add_argument("root", metavar="ROOT", help="草稿根目录")
+        sub = relation_sub.add_parser(sub_name, parents=[rooted], help=sub_help)
         sub.add_argument("source", metavar="SOURCE", help="来源页面相对路径")
         sub.add_argument("code", metavar="CODE", choices=relation_choices, help="主动关系代码")
         sub.add_argument("target", metavar="TARGET", help="目标页面相对路径")
@@ -215,16 +218,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     generate_conclusions = subparsers.add_parser(
         "generate-conclusions",
-        parents=[shared],
+        parents=[rooted],
         help="按需生成结论页",
         description="从当前已确认页面重建结论汇总并推进所有权状态为 generated。",
     )
-    generate_conclusions.add_argument("root", metavar="ROOT", help="草稿根目录")
     _add_dry_run_args(generate_conclusions)
 
     query = subparsers.add_parser(
         "query",
-        parents=[shared],
+        parents=[rooted],
         help="紧凑结构查询",
         description=(
             "以稳定 JSON 返回页面的结构摘要、正文资源、反向链接、正式关系、状态列表与可恢复项。"
@@ -232,20 +234,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     query_sub = query.add_subparsers(dest="query_command", metavar="QUERY", required=True)
 
-    query_page = query_sub.add_parser("page", parents=[shared], help="页面结构摘要")
-    query_page.add_argument("root", metavar="ROOT", help="草稿根目录")
+    query_page = query_sub.add_parser("page", parents=[rooted], help="页面结构摘要")
     query_page.add_argument("page", metavar="PAGE", help="严格受管理页面路径")
 
-    query_links = query_sub.add_parser("links", parents=[shared], help="页面正文资源")
-    query_links.add_argument("root", metavar="ROOT", help="草稿根目录")
+    query_links = query_sub.add_parser("links", parents=[rooted], help="页面正文资源")
     query_links.add_argument("page", metavar="PAGE", help="严格受管理页面路径")
 
-    query_backlinks = query_sub.add_parser("backlinks", parents=[shared], help="正文反向链接来源")
-    query_backlinks.add_argument("root", metavar="ROOT", help="草稿根目录")
+    query_backlinks = query_sub.add_parser("backlinks", parents=[rooted], help="正文反向链接来源")
     query_backlinks.add_argument("target", metavar="TARGET", help="宽松正文资源身份")
 
-    query_relations = query_sub.add_parser("relations", parents=[shared], help="页面正式关系")
-    query_relations.add_argument("root", metavar="ROOT", help="草稿根目录")
+    query_relations = query_sub.add_parser("relations", parents=[rooted], help="页面正式关系")
     query_relations.add_argument("page", metavar="PAGE", help="严格受管理页面路径")
     query_relations.add_argument(
         "--direction",
@@ -254,8 +252,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="关系方向",
     )
 
-    query_status = query_sub.add_parser("status", parents=[shared], help="按状态列页面")
-    query_status.add_argument("root", metavar="ROOT", help="草稿根目录")
+    query_status = query_sub.add_parser("status", parents=[rooted], help="按状态列页面")
     query_status.add_argument(
         "code",
         metavar="CODE",
@@ -263,8 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="稳定状态代码",
     )
 
-    query_recoverable = query_sub.add_parser("recoverable", parents=[shared], help="可恢复回收项")
-    query_recoverable.add_argument("root", metavar="ROOT", help="草稿根目录")
+    query_recoverable = query_sub.add_parser("recoverable", parents=[rooted], help="可恢复回收项")
 
     for collection in (
         query_links,
@@ -388,9 +384,8 @@ def _query_items_payload(
 
 
 def _dispatch_query(
-    args: argparse.Namespace, *, now: datetime | None = None
+    args: argparse.Namespace, *, root: Path, now: datetime | None = None
 ) -> tuple[dict[str, object], str, int]:
-    root = Path(cast(str, args.root))
     limit = int(getattr(args, "limit", 20))
     offset = int(getattr(args, "offset", 0))
     count_only = bool(getattr(args, "count_only", False))
@@ -608,11 +603,12 @@ def _reject_pagination_without_dry_run(args: argparse.Namespace) -> None:
 
 
 def _dispatch(
-    args: argparse.Namespace, *, now: datetime | None = None
+    args: argparse.Namespace,
+    *,
+    root: Path | None = None,
+    now: datetime | None = None,
 ) -> tuple[dict[str, object], str, int]:
     command = cast(str, args.command)
-    if command == "query":
-        return _dispatch_query(args, now=now)
     if command == "init":
         from draft.lifecycle import initialize
         from draft.models import RootState
@@ -621,16 +617,18 @@ def _dispatch(
         root_state = RootState.CANDIDATE if bool(args.candidate) else RootState.REGISTERED
         initialize(root, root_state=root_state)
         return {"result_type": ResultType.INIT.value, "root": str(root)}, f"已初始化草稿：{root}", 0
+    if command == "query":
+        assert root is not None
+        return _dispatch_query(args, root=root, now=now)
+    assert root is not None
     if command == "adopt":
         from draft.lifecycle import adopt
 
-        root = Path(cast(str, args.root))
         adopt(root)
         return {"result_type": ResultType.ADOPT.value, "root": str(root)}, f"已接管草稿：{root}", 0
     if command == "move":
         from draft.structure import move_page, plan_move
 
-        root = Path(cast(str, args.root))
         source = _page_operand(root, cast(str, args.source))
         target = _page_operand(root, cast(str, args.target))
         if _is_dry_run(args):
@@ -648,7 +646,6 @@ def _dispatch(
     if command == "promote":
         from draft.structure import plan_promote, promote_page
 
-        root = Path(cast(str, args.root))
         page = _page_operand(root, cast(str, args.page))
         children = [_page_operand(root, child) for child in cast(list[str], args.children)]
         if _is_dry_run(args):
@@ -666,7 +663,6 @@ def _dispatch(
     if command == "collapse":
         from draft.structure import collapse_hub, plan_collapse
 
-        root = Path(cast(str, args.root))
         hub = _page_operand(root, cast(str, args.hub))
         if _is_dry_run(args):
             return _dry_run_write(
@@ -683,7 +679,6 @@ def _dispatch(
     if command == "trash":
         from draft.trash import trash_page, trash_plan
 
-        root = Path(cast(str, args.root))
         page = _page_operand(root, cast(str, args.page))
         if _is_dry_run(args):
 
@@ -709,7 +704,6 @@ def _dispatch(
         )
         from draft.vocabulary import StatusCode
 
-        root = Path(cast(str, args.root))
         source = _page_operand(root, cast(str, args.source))
         target = _page_operand(root, cast(str, args.target))
         code = EditableRelationCode(cast(str, args.code))
@@ -751,7 +745,6 @@ def _dispatch(
         from draft.page_metadata import plan_set_status, set_status
         from draft.vocabulary import StatusCode
 
-        root = Path(cast(str, args.root))
         page = _page_operand(root, cast(str, args.page))
         code = StatusCode(cast(str, args.code))
         note = getattr(args, "note", None)
@@ -780,7 +773,6 @@ def _dispatch(
         from draft.page_create import create_page, plan_create_page
         from draft.vocabulary import StatusCode
 
-        root = Path(cast(str, args.root))
         page = _page_operand(root, cast(str, args.page))
         title = cast(str, args.title)
         status = StatusCode(cast(str, args.status))
@@ -807,7 +799,6 @@ def _dispatch(
     if command == "generate-conclusions":
         from draft.conclusions import generate_conclusions
 
-        root = Path(cast(str, args.root))
         if _is_dry_run(args):
             from draft.cli_results import paginate, slice_payload
             from draft.conclusions import load_generation_graph, plan_generation
@@ -869,7 +860,6 @@ def _dispatch(
     if command == "restore":
         from draft.trash import restore_retained_trash
 
-        root = Path(cast(str, args.root))
         operation_id = cast(str, args.operation_id)
         result = restore_retained_trash(root, operation_id)
         if result.phase is OperationPhase.ROLLED_BACK:
@@ -888,7 +878,6 @@ def _dispatch(
     if command == "recover":
         from draft.trash_lifecycle import recover_interrupted_operations
 
-        root = Path(cast(str, args.root))
         results = recover_interrupted_operations(root)
         paths = sorted({path for result in results for path in result.changed_paths})
         payload = {
@@ -906,49 +895,18 @@ def _exit_for_error(error: DraftError) -> int:
     return _EXIT_DOMAIN
 
 
-def _preflight_candidate_root_for(args: argparse.Namespace) -> Path | None:
-    """从命令参数中找出可能需要前置推进的根；不声称该根已经登记。"""
-    command = cast(str, args.command)
-    if command in ("init", "adopt"):
-        return None
-    if command == "check" and bool(getattr(args, "candidate", False)):
-        return None
-    value = getattr(args, "root", None)
-    if value is None:
-        return None
-    return Path(cast(str, value))
-
-
-def _registered_root_for(candidate: Path) -> Path | None:
-    """只读资格判定：只有 root_state=registered 且标记精确有效才返回解析后的根。
-
-    根或标记缺失、无效、不支持、为候选或临时接管形状时不推进，交由命令自身验证。
-    本边界复用共享标记解析语义，不在这里复制登记键集合。
-    """
-    from draft.graph import read_marker
-    from draft.models import RootState
-    from draft.paths import resolve_draft_root
-
-    try:
-        resolved = resolve_draft_root(candidate)
-    except DraftError:
-        return None
-    try:
-        state = read_marker(resolved)
-    except DraftError:
-        return None
-    if state.root_state is not RootState.REGISTERED:
-        return None
-    return resolved
-
-
 def _advance_for_command(root: Path, *, now: datetime | None = None) -> None:
     from draft.trash_lifecycle import prepare_registered_command
 
     prepare_registered_command(root, now=now)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    get_cwd: Callable[[], Path] | None = None,
+) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(arguments)
@@ -963,31 +921,60 @@ def main(argv: Sequence[str] | None = None) -> int:
     from datetime import UTC, datetime
 
     captured_now = datetime.now(UTC)
+    env = os.environ if environ is None else environ
+    cwd = Path(os.getcwd()) if get_cwd is None else get_cwd()
 
-    candidate_root = _preflight_candidate_root_for(args)
-    if candidate_root is not None:
-        registered = _registered_root_for(candidate_root)
-        if registered is not None:
-            try:
-                _advance_for_command(registered, now=captured_now)
-            except DraftError as error:
-                _emit_error(error, json_mode)
-                return _exit_for_error(error)
+    # 只解析一次受管根：init 不用选择器（位置 ROOT）；check/adopt 采用宽松目录发现，
+    # 由各自业务边界按 mode/marker 语义处理；其余命令严格选择并验证 marker。
+    managed: ManagedRoot | None = None
+    root: Path | None = None
+    if command != "init":
+        explicit = getattr(args, "root", None)
+        probe = FilesystemProbe()
+        try:
+            if command in ("check", "adopt"):
+                root = discover_root_directory(
+                    explicit=explicit,
+                    environment_value=env.get("DRAFT_ROOT"),
+                    physical_cwd=cwd,
+                    probe=probe,
+                )
+            else:
+                managed = select_managed_root(
+                    explicit=explicit,
+                    environment_value=env.get("DRAFT_ROOT"),
+                    physical_cwd=cwd,
+                    probe=probe,
+                )
+                root = managed.path
+        except DraftError as error:
+            _emit_error(error, json_mode)
+            return _exit_for_error(error)
+
+    # init/check/adopt 使用宽松目录发现（managed=None），天然不推进；其余受管命令
+    # 仅在 registered 根上前置推进回收生命周期（规格 §8.1）。
+    if managed is not None and managed.marker.root_state is RootState.REGISTERED:
+        try:
+            _advance_for_command(managed.path, now=captured_now)
+        except DraftError as error:
+            _emit_error(error, json_mode)
+            return _exit_for_error(error)
 
     if command == "check":
         from draft.checker import check_draft
         from draft.models import ValidationMode
 
+        assert root is not None
         mode: ValidationMode = "candidate" if bool(args.candidate) else "registered"
         try:
-            report = check_draft(Path(cast(str, args.root)), mode=mode)
+            report = check_draft(root, mode=mode)
         except DraftError as error:
             _emit_error(error, json_mode)
             return _exit_for_error(error)
         code = _render_check(report, json_mode)
         return code
     try:
-        payload, human, code = _dispatch(args, now=captured_now)
+        payload, human, code = _dispatch(args, root=root, now=captured_now)
     except DraftError as error:
         _emit_error(error, json_mode)
         return _exit_for_error(error)

@@ -60,7 +60,17 @@ def test_create_leaf_creates_page_and_updates_navigation(
     capsys.readouterr()
 
     code, payload = run_json(
-        ["create", str(root), "pages/c.md", "--title", "乙：[x]", "--status", "pending", "--json"],
+        [
+            "create",
+            "--root",
+            str(root),
+            "pages/c.md",
+            "--title",
+            "乙：[x]",
+            "--status",
+            "pending",
+            "--json",
+        ],
         capsys,
     )
 
@@ -86,6 +96,7 @@ def test_create_dry_run_does_not_write(
     code, payload = run_json(
         [
             "create",
+            "--root",
             str(root),
             "pages/c.md",
             "--title",
@@ -112,7 +123,18 @@ def test_create_rejects_invalid_operand(
     capsys.readouterr()
 
     code, payload = run_json(
-        ["create", str(root), "../b.md", "--title", "乙", "--status", "pending", "--json"], capsys
+        [
+            "create",
+            "--root",
+            str(root),
+            "../b.md",
+            "--title",
+            "乙",
+            "--status",
+            "pending",
+            "--json",
+        ],
+        capsys,
     )
 
     assert code == 2
@@ -130,7 +152,9 @@ def test_create_rejects_invalid_status(
 
     # argparse choices 拒绝 confirmed：用法错误，不创建文件。
     with pytest.raises(SystemExit):
-        main(["create", str(root), "pages/c.md", "--title", "乙", "--status", "confirmed"])
+        main(
+            ["create", "--root", str(root), "pages/c.md", "--title", "乙", "--status", "confirmed"]
+        )
 
     assert not (root / "pages/c.md").exists()
 
@@ -141,11 +165,21 @@ def test_create_inserts_before_conclusions_link(
     root = build_page_draft(draft_factory)
     # 先把甲设为已确认，使 generate-conclusions 创建结论页与根导航链接。
     (root / "pages/a.md").write_text(PAGE_A.replace("待讨论", "已确认"), encoding="utf-8")
-    assert main(["generate-conclusions", str(root)]) == 0
+    assert main(["generate-conclusions", "--root", str(root)]) == 0
     capsys.readouterr()
 
     code, _payload = run_json(
-        ["create", str(root), "pages/c.md", "--title", "乙", "--status", "proposed", "--json"],
+        [
+            "create",
+            "--root",
+            str(root),
+            "pages/c.md",
+            "--title",
+            "乙",
+            "--status",
+            "proposed",
+            "--json",
+        ],
         capsys,
     )
 
@@ -162,7 +196,7 @@ def test_status_set_changes_and_validates_final_state(
     capsys.readouterr()
 
     code, payload = run_json(
-        ["status", "set", str(root), "pages/a.md", "proposed", "--json"], capsys
+        ["status", "set", "--root", str(root), "pages/a.md", "proposed", "--json"], capsys
     )
 
     assert code == 0
@@ -180,7 +214,7 @@ def test_status_set_rejects_invalid_final_state(
     capsys.readouterr()
 
     code, payload = run_json(
-        ["status", "set", str(root), "pages/a.md", "superseded", "--json"], capsys
+        ["status", "set", "--root", str(root), "pages/a.md", "superseded", "--json"], capsys
     )
 
     assert code == 2
@@ -198,14 +232,24 @@ def test_status_set_note_and_clear_note(
     capsys.readouterr()
 
     code, _payload = run_json(
-        ["status", "set", str(root), "pages/a.md", "proposed", "--note", "新方案", "--json"],
+        [
+            "status",
+            "set",
+            "--root",
+            str(root),
+            "pages/a.md",
+            "proposed",
+            "--note",
+            "新方案",
+            "--json",
+        ],
         capsys,
     )
     assert code == 0
     assert "当前提案：新方案" in (root / "pages/a.md").read_text(encoding="utf-8")
 
     code, _payload = run_json(
-        ["status", "set", str(root), "pages/a.md", "pending", "--clear-note", "--json"],
+        ["status", "set", "--root", str(root), "pages/a.md", "pending", "--clear-note", "--json"],
         capsys,
     )
     assert code == 0
@@ -221,7 +265,7 @@ def test_status_set_missing_page_is_page_not_found(
     capsys.readouterr()
 
     code, payload = run_json(
-        ["status", "set", str(root), "pages/missing.md", "pending", "--json"], capsys
+        ["status", "set", "--root", str(root), "pages/missing.md", "pending", "--json"], capsys
     )
 
     assert code == 2
@@ -240,6 +284,7 @@ def test_status_set_dry_run_does_not_write(
         [
             "status",
             "set",
+            "--root",
             str(root),
             "pages/a.md",
             "proposed",
@@ -262,7 +307,16 @@ def test_relation_add_depends_on_is_single_sided_and_idempotent(
     capsys.readouterr()
 
     code, payload = run_json(
-        ["relation", "add", str(root), "pages/a.md", "depends_on", "pages/b.md", "--json"],
+        [
+            "relation",
+            "add",
+            "--root",
+            str(root),
+            "pages/a.md",
+            "depends_on",
+            "pages/b.md",
+            "--json",
+        ],
         capsys,
     )
     assert code == 0
@@ -274,7 +328,16 @@ def test_relation_add_depends_on_is_single_sided_and_idempotent(
 
     # 幂等：再次添加无变化。
     code, payload2 = run_json(
-        ["relation", "add", str(root), "pages/a.md", "depends_on", "pages/b.md", "--json"],
+        [
+            "relation",
+            "add",
+            "--root",
+            str(root),
+            "pages/a.md",
+            "depends_on",
+            "pages/b.md",
+            "--json",
+        ],
         capsys,
     )
     assert code == 0
@@ -289,7 +352,16 @@ def test_relation_add_supersedes_is_bidirectional_and_sets_status(
     capsys.readouterr()
 
     code, payload = run_json(
-        ["relation", "add", str(root), "pages/a.md", "supersedes", "pages/b.md", "--json"],
+        [
+            "relation",
+            "add",
+            "--root",
+            str(root),
+            "pages/a.md",
+            "supersedes",
+            "pages/b.md",
+            "--json",
+        ],
         capsys,
     )
 
@@ -310,12 +382,24 @@ def test_relation_remove_supersedes_requires_status_for_last(
 ) -> None:
     root = build_page_draft(draft_factory)
     capsys.readouterr()
-    assert main(["relation", "add", str(root), "pages/a.md", "supersedes", "pages/b.md"]) == 0
+    assert (
+        main(["relation", "add", "--root", str(root), "pages/a.md", "supersedes", "pages/b.md"])
+        == 0
+    )
     capsys.readouterr()
 
     # 无 --status 删除最后一条取代关系应失败。
     code, payload = run_json(
-        ["relation", "remove", str(root), "pages/a.md", "supersedes", "pages/b.md", "--json"],
+        [
+            "relation",
+            "remove",
+            "--root",
+            str(root),
+            "pages/a.md",
+            "supersedes",
+            "pages/b.md",
+            "--json",
+        ],
         capsys,
     )
     assert code == 2
@@ -328,6 +412,7 @@ def test_relation_remove_supersedes_requires_status_for_last(
         [
             "relation",
             "remove",
+            "--root",
             str(root),
             "pages/a.md",
             "supersedes",
@@ -353,7 +438,16 @@ def test_relation_remove_nonexistent_is_no_op(
     capsys.readouterr()
 
     code, payload = run_json(
-        ["relation", "remove", str(root), "pages/a.md", "challenges", "pages/b.md", "--json"],
+        [
+            "relation",
+            "remove",
+            "--root",
+            str(root),
+            "pages/a.md",
+            "challenges",
+            "pages/b.md",
+            "--json",
+        ],
         capsys,
     )
 
@@ -369,7 +463,16 @@ def test_relation_self_reference_is_rejected(
     capsys.readouterr()
 
     code, payload = run_json(
-        ["relation", "add", str(root), "pages/a.md", "depends_on", "pages/a.md", "--json"],
+        [
+            "relation",
+            "add",
+            "--root",
+            str(root),
+            "pages/a.md",
+            "depends_on",
+            "pages/a.md",
+            "--json",
+        ],
         capsys,
     )
 
@@ -387,7 +490,16 @@ def test_relation_add_cycle_is_rejected_before_write(
     capsys.readouterr()
 
     code, payload = run_json(
-        ["relation", "add", str(root), "pages/a.md", "depends_on", "pages/b.md", "--json"],
+        [
+            "relation",
+            "add",
+            "--root",
+            str(root),
+            "pages/a.md",
+            "depends_on",
+            "pages/b.md",
+            "--json",
+        ],
         capsys,
     )
     assert code == 0
@@ -398,6 +510,7 @@ def test_relation_add_cycle_is_rejected_before_write(
         [
             "relation",
             "add",
+            "--root",
             str(root),
             "pages/b.md",
             "depends_on",
@@ -414,7 +527,16 @@ def test_relation_add_cycle_is_rejected_before_write(
 
     # 正式执行同样拒绝，且 b.md 未被修改。
     code, payload = run_json(
-        ["relation", "add", str(root), "pages/b.md", "depends_on", "pages/a.md", "--json"],
+        [
+            "relation",
+            "add",
+            "--root",
+            str(root),
+            "pages/b.md",
+            "depends_on",
+            "pages/a.md",
+            "--json",
+        ],
         capsys,
     )
     assert code == 2
