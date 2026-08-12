@@ -2,9 +2,26 @@
 
 ## 状态
 
-本规格已经过逐段讨论确认，定义开发期下一轮实现的行为契约。项目尚未正式发布，
-本次直接重定义当前 `format_version=1`，不提供旧 marker、旧命令形态或开发数据的
-兼容读取与升级路径。
+核心方案已经过逐段讨论确认；本版纳入对抗性评审修订，正在等待书面规格复审。项目尚未
+正式发布，本次直接重定义当前 `format_version=1`，不提供旧 marker、旧命令形态或开发
+数据的兼容读取与升级路径。
+
+## 0. 与既有规格的关系
+
+本规格是
+[`2026-08-10-draft-agent-cli-capabilities-design.md`](./2026-08-10-draft-agent-cli-capabilities-design.md)
+的后续修订。发生冲突时，以本规格为准；未被下列事项改变的查询、页面、关系、回收、
+结论和公开输出语义继续沿用前一份规格：
+
+- 各命令的 `ROOT` 位置参数由第 7 节的统一根定位取代；
+- 前一份规格第 3 节“不支持候选模式结构修改”的非目标被第 8、9 节取代；
+- 第 8.1、8.3、8.4、8.5 节“全局扫描失败则整体失败”的规则，只在 `registered`
+  根中继续成立；候选根按本规格第 11 节返回明确的不完整结果或拒绝不可靠的单页摘要；
+- 第 12.2 节的正式 marker、provisional marker、候选结论限制，由本规格第 5、12 节
+  整体取代；正式 marker 也增加 `root_state`，不是只删除 provisional marker；
+- 第 15 节的 registered-only 生命周期推进资格，由本规格第 8.1 节的受管根资格取代；
+  同时 `check` 改为严格只读，不再参加静默推进；
+- 前一份规格中的 `check --candidate` 由本规格第 10 节取代。
 
 ## 1. 目标
 
@@ -57,7 +74,8 @@
 
 - 程序缺少当前操作所需事实时拒绝本次操作，并只报告直接阻碍；
 - 与当前操作无关的候选诊断不阻止操作；
-- 不能证明查询结果完整时返回 `complete=false`，不得把未知解释为空集合；
+- 候选集合查询不能证明结果完整时按第 11 节返回 `complete=false`；`query page` 的全根
+  计数不能证明时明确拒绝；两者都不得把未知解释为空集合或精确计数；
 - 不能证明结构写操作已找到全部相关页面或引用时拒绝写入；
 - 外部修改使事务无法安全继续或回滚时保留锁、日志和诊断现场；
 - marker、日志、锁或版本非法时停止写入，不根据目录形状猜测状态。
@@ -138,7 +156,12 @@ skill 要求 Agent 通过 CLI 修改路径、机器块、正式关系和父导�
 正交。候选根也可以生成结论页；`adopt` 保留当前结论所有权状态。
 
 缺少 `root_state`、存在未知字段、字段类型错误或值非法时统一报告 `format.invalid`。
-不再使用 `draft.provisional.json`，也不定义 `root_state="adopting"`。
+`format_version` 不是整数（布尔值也不算整数）时同样报告 `format.invalid`；它是整数但
+不等于 `1` 时保留并报告 `format.unsupported`，不得把未知版本按当前格式解析。
+
+不再使用 `draft.provisional.json`，也不定义 `root_state="adopting"`。旧候选加载器专用的
+`candidate.already_registered` 和 `candidate.internal_state` 从稳定检查码中删除：根身份由
+marker 直接表达，内部状态按第 5.4 节的受管根共同协议检查。
 
 ### 5.2 状态转换
 
@@ -153,13 +176,38 @@ candidate       ── adopt 事务提交   ──> registered
 
 ### 5.3 根状态决策表
 
-| marker 事实 | 根身份 | 普通写命令 | `check` | `adopt` |
-|---|---|---|---|---|
-| 无 marker | 未受管理 | 拒绝 | `root.not_found` | 拒绝 |
-| 合法 `candidate`，无未完成操作 | 候选 | 采用候选操作级门禁 | 候选完整检查 | 允许 |
-| 合法 `registered`，无未完成操作 | 正式 | 采用严格健康门禁 | 正式完整检查 | 已登记错误 |
-| 任一合法状态，有未完成操作 | 恢复未决 | 拒绝 | 只读报告恢复事实 | 拒绝，先恢复 |
-| marker 非法或版本未知 | 无法安全解释 | 拒绝 | 格式错误 | 拒绝 |
+根定位失败和已选根的 marker 缺失是不同事实，不能合并：
+
+| 根定位与 marker 事实 | 根身份 | 普通业务写命令 | `check` | `adopt` | `recover` |
+|---|---|---|---|---|---|
+| 找不到所选目录，或 `pwd` 祖先链没有根 | 未定位 | `root.not_found` | `root.not_found` | `root.not_found` | `root.not_found` |
+| 所选路径存在但不是合法目录 | 无法定位 | `root.invalid` | `root.invalid` | `root.invalid` | `root.invalid` |
+| 已选目录中 marker 缺失 | 未受管理 | `format.missing` | `format.missing` | `format.missing` | `format.missing` |
+| marker JSON、键、字段类型或字段值非法 | 无法安全解释 | `format.invalid` | `format.invalid` | `format.invalid` | `format.invalid` |
+| `format_version` 是未知整数 | 无法安全解释 | `format.unsupported` | `format.unsupported` | `format.unsupported` | `format.unsupported` |
+| 合法 `candidate`，无未完成操作 | 候选 | 采用候选操作级门禁 | 完整扫描 | 允许 | 无操作成功 |
+| 合法 `registered`，无未完成操作 | 正式 | 采用严格健康门禁 | 完整扫描 | `adopt.already_registered` | 无操作成功 |
+| 任一合法根，有未完成操作 | 恢复未决 | 拒绝并要求恢复 | 完整扫描并包含恢复事实 | 拒绝并要求恢复 | 按日志恢复 |
+
+表中的“普通业务写命令”不包括 `recover`。`check` 在恢复未决时仍扫描能够安全读取的完整
+根并报告页面、关系、链接和内部恢复事实；它不把“有锁”解释为只报告一条错误后停止扫描。
+
+### 5.4 候选根内部状态规则
+
+`candidate` 和 `registered` 使用同一套 `.draft/` 内部命名空间和完整性规则，只有
+`draft.json.root_state` 与普通业务写门禁不同。允许的内部条目是：
+
+- 必须存在的 `.draft/draft.json`；
+- 仅在活动操作期间存在的 `.draft/operation.lock`；
+- 按需存在的 `.draft/operations/`，其中保存活动操作的日志、暂存内容、恢复副本，或
+  已完成、已回滚、保留回收等协议允许的终态审计记录；
+- 按需存在的 `.draft/trash/outgoing/`，其中保存仍由 Draft 持有的权威删除包。
+
+`draft.provisional.json` 和其他未登记的 `.draft/` 顶层条目不合法，统一报告新的稳定检查码
+`internal.unexpected_entry`；已知目录内部的非法形状继续使用最具体的
+`operation.journal_corrupt`、`operation.inconsistent_state`、`trash.package_corrupt`、
+`path.symlink_escape` 等现有代码。候选检查必须与正式检查一样读取操作日志、锁、删除包和
+`conclusions_state`，不能再通过“候选根拒绝一切内部状态”的旧分支短路。
 
 ## 6. 初始化
 
@@ -227,7 +275,9 @@ draft move --root /work/drafts/topic pages/a.md pages/topic/a.md
 3. marker 必须是非符号链接的普通文件；
 4. 祖先链没有根时报告 `root.not_found`；
 5. 祖先链出现多个合法 Draft 根时报告 `root.ambiguous`，要求显式 `--root`；
-6. 最近的 `.draft/` 存在但 marker 损坏时立即报告损坏，不越过它选择外层根。
+6. 最近的 `.draft/` 存在但 marker 缺失、是符号链接、是其他非普通文件/内容损坏，或版本
+   不支持时，分别报告 `format.missing`、`path.symlink_escape`、`format.invalid` 或
+   `format.unsupported`，不越过它选择外层根。
 
 ## 8. 候选根复用普通命令
 
@@ -268,6 +318,24 @@ check
 候选阶段执行 `generate-conclusions` 时，程序必须能够证明所有受管理页面已经发现、
 状态可解析且导航顺序足以确定。缺少这些事实时只拒绝生成，不隐式输出完整检查。
 
+### 8.1 受管根的生命周期前置推进
+
+回收到期、系统回收站移交和清理是受管根协议，不是 registered 专属能力。命令在进入
+自身业务逻辑前是否推进生命周期，按下表决定：
+
+| 根与命令 | 是否推进 | 原因 |
+|---|---|---|
+| 合法 `candidate` 或 `registered`；`query`、业务写命令及其 `--dry-run`、`restore`、`recover`、`generate-conclusions` | 是，恰好一次 | 两种受管根共享回收期限和权威删除包协议 |
+| `check` | 否 | 检查必须严格只读，并报告推进前的实际持久化事实 |
+| `adopt` | 否 | 登记事务只验证和转换根身份，不夹带生命周期副作用 |
+| `init`、帮助、版本 | 否 | 没有可推进的已选受管根 |
+| 根未找到，或 marker 缺失、非法、不支持 | 否 | 不根据残留内部目录猜测所有权 |
+
+推进资格只取决于精确有效的受管根 marker，不能仅凭 `.draft/`、操作目录或命令名称推测。
+生命周期损坏时继续沿用前一份规格的硬失败语义。实现中的 registered-only 名称、注释和
+资格判断必须泛化为“受管根”；不能让新 marker 因为“可读”而偶然放行，却仍把行为描述为
+只适用于正式根。
+
 ## 9. 候选操作级门禁
 
 候选根允许积累全局协议错误。单条命令只加载完成本操作所需的最小事实闭包，并保证
@@ -284,6 +352,28 @@ check
 | `candidate` | 有未完成操作 | 任意 | 任意 | 拒绝，要求 `recover` |
 | `registered` | 无未完成操作 | 全局检查通过 | 可证明 | 执行事务 |
 | `registered` | 无未完成操作 | 全局存在错误 | 任意 | 拒绝并要求修复损坏 |
+
+### 9.1 各写命令的事实闭包与自有不变量
+
+下表是候选门禁的规范性逻辑闭包。实现可以为减少重复 I/O 读取更多文件，但不得把额外
+读到的无关诊断变成执行门禁；`--dry-run` 与正式执行使用同一闭包和同一最终不变量。
+
+| 命令 | 必须能够证明的事实闭包 | 本命令直接拥有的最终不变量 |
+|---|---|---|
+| `create` | 目标规范路径与不存在事实；由路径推导的父页存在且其机器块、标题和子主题导航可编辑；结论导航若存在则可识别 | 新页模板、父关系和父导航相互一致；不覆盖文件；结论链接仍唯一且位于末尾 |
+| `move` | 被移动页或子树完整；来源与目标父页可解析；目标均不存在；全根中每个可能包含指向被移动集合的正文链接、正式关系或父导航的页面都可判定 | 路径、父关系、父导航和全部可受影响链接一致；没有目标冲突、路径逃逸或移动后空枢纽 |
+| `promote` | 目标叶页、指定子页、其父页和新枢纽路径完整；全根中所有可能指向受影响页面身份的页面都可判定 | 叶页到枢纽的确定映射、子页归属、父导航、父关系和全部受影响链接一致；不遗漏或吸收未指定子页 |
+| `collapse` | 枢纽、唯一可折叠内容及父页完整；不存在阻止降级的其他子页；全根中所有可能指向受影响页面身份的页面都可判定 | 枢纽到叶页的确定映射、父导航、父关系和全部受影响链接一致；不丢失子页或留下空枢纽 |
+| `status set` | 目标页机器块和当前状态可解析；目标页自己的 `superseded_by` 声明可判定；若目标是结论页，marker 所有权状态可判定 | 写入合法状态与说明；目标页满足“`superseded` 当且仅当至少声明一个 `superseded_by`”；不自动猜测或改写关系 |
+| `relation add/remove` | 来源、目标及待修改关系行可解析；双向关系的两端可解析；依赖或取代操作还必须完整发现相应关系图以判环；删除最后一条取代关系时可判定目标剩余声明与显式恢复状态 | 触及的正反关系配对、自引用规则、依赖/取代无环，以及取代目标的状态同步全部成立；幂等调用不制造重复关系 |
+| `trash` | 目标页或子树、父页与导航完整；除允许过时的机器结论列表外，全根所有可能入站引用均可判定；操作日志、期限和删除包目标可安全创建 | 没有未授权入站引用；页面、父导航和必要结构修改原子完成；权威删除包、期限和日志互相锚定 |
+| `restore` | 指定回收日志、期限、双向恢复关联和权威删除包完整；全部待恢复路径及受影响当前文件可按记录摘要分类；目标未被占用 | 只恢复由该删除包授权的内容；日志关联、页面、父导航和包所有权保持一致；失败不删除唯一权威包 |
+| `recover` | 活动锁、对应日志、日志阶段、全部 before/after 摘要、恢复副本及关联包可判定；无锁残留按既有孤儿规则分类 | 只继续或回滚日志已经授权的变更；无法证明时保留现场；恢复完成后的根满足该日志记录的操作级验证契约，而不是当前全根必须无错 |
+| `generate-conclusions` | marker 所有权；全部受管理页面的路径、标题和状态；完整且唯一的父导航顺序；当前结论产物和根导航可判定 | 结论页、根导航和 `conclusions_state` 作为一个事务更新；输出覆盖全部 confirmed 页面且顺序确定；无 confirmed 页时遵守既有 no-op 规则 |
+
+“完整发现相应关系图”不等于所有页面必须全协议健康。例如依赖判环要求每个可能声明
+依赖边的机器块可判定，但某个无关页面的普通正文断链不阻止关系操作。反过来，只要一个
+不可解析页面可能隐藏相关边或入站链接，就不能把它当成“不存在”。
 
 典型行为：
 
@@ -321,55 +411,135 @@ draft check --root ROOT
 - `--limit`、`--offset` 分页；
 - `--count-only` 只返回计数和分页事实。
 
-`--limit` 默认 100，合法范围为 1 到 100。过滤先于分页；分页只限制公开结果，不限制
-实际扫描。结构化结果在保留现有 `errors`、`warnings`、`infos`、`reviews` 分组的同时，
-增加完整扫描是否存在错误、各严重级别和错误码总数、过滤后总数、分页位置、返回数量
-和 `has_more`。退出码和 `ok` 根据未过滤的完整扫描决定，不能因为当前页没有错误而
-声称根已通过。
+过滤组合固定为：重复的 `--code` 取并集，重复的 `--path-prefix` 取并集，代码集合与路径
+集合之间取交集。`--path-prefix` 必须是规范的根内 POSIX 相对路径，按路径段匹配：前缀
+`pages/a` 匹配 `pages/a` 及其后代，不匹配 `pages/ab.md`；没有 `path` 的根级诊断不匹配
+任何路径前缀。重复值不改变结果。
+
+每个 `--code` 都必须是错误码权威来源中已登记的检查码；未知值是参数错误并在扫描根前
+以退出码 2 拒绝，不能把拼写错误静默解释为“过滤后没有结果”。
+
+`--limit` 与现有集合查询统一：默认 20，合法范围为 1 到 100；`--offset` 为非负整数。
+检查器先形成唯一的规范诊断流，再过滤、分页，最后把当前页按严重级别放回 `errors`、
+`warnings`、`infos`、`reviews` 分组。不能分别分页四个分组，否则同一 `offset` 会有四种
+含义。`--count-only` 保留与普通请求相同的全部计数和分页事实，但四个条目数组为空。
+
+分页只限制公开结果，不限制实际扫描。结构化结果同时包含：未过滤完整扫描的 `ok`、各
+严重级别和错误码计数；过滤后的 `filtered_total`；当前 `offset`、`limit`、
+`returned_count`、`has_more` 和 `next_offset`。退出码和 `ok` 只根据未过滤完整扫描决定，
+不能因为过滤后或当前页没有错误而声称根已通过。
 
 ## 11. 查询完整性
 
-候选根的集合查询可能只能解析部分页面。此时返回值必须显式包含：
+所有成功查询都显式返回 `complete`；集合查询还返回 `blocking_paths`：
 
 ```json
 {
   "complete": false,
   "items": [],
-  "blocking_paths": ["pages/broken.md"]
+  "total": 0,
+  "blocking_paths": ["pages/broken.md"],
+  "blocking_total": 1,
+  "blocking_has_more": false,
+  "blocking_next_offset": null
 }
 ```
 
 - `complete=true` 表示程序能够证明结果集合完整；
 - `complete=false` 是候选期合法的只读结果，不等于空集合；
-- `blocking_paths` 使用稳定排序，并受现有查询分页协议约束；
+- `complete=false` 仍是成功结果并使用退出码 0；
+- `items` 中的每一项都是已经证明存在的准确事实，但 `complete=false` 时不能据此证明
+  未返回的事实不存在；
 - 写命令不得使用 `complete=false` 的查询结果证明没有入站引用、没有环或没有冲突；
 - 正式根无法产生完整查询时，应报告正式根损坏。
+
+各查询的完整性语义固定如下：
+
+| 查询 | 所需扫描 | candidate 遇到无关页面不可解析 | registered 遇到同一事实 |
+|---|---|---|---|
+| `query page` | 目标页加全根计数 | 不返回含不可靠计数的摘要；以 `query.incomplete` 拒绝并给出有界阻碍事实 | 失败并报告根损坏 |
+| `query links` | 仅目标页 | 无关页面不影响，成功为 `complete=true`；目标页本身不可解析则失败 | 相同 |
+| `query backlinks` | 全根 | 返回已证明的来源和 `complete=false` | 失败并报告根损坏 |
+| `query relations --direction outgoing` | 仅目标页 | 无关页面不影响，成功为 `complete=true`；目标页本身不可解析则失败 | 相同 |
+| `query relations --direction incoming` | 全根 | 返回已证明的入站关系和 `complete=false` | 失败并报告根损坏 |
+| `query status` | 全根 | 返回已证明的页面和 `complete=false` | 失败并报告根损坏 |
+| `query recoverable` | 操作日志、期限和权威删除包 | 页面解析错误无关；相关内部证据损坏时整体失败，不返回部分项；成功为 `complete=true` | 相同 |
+
+`query page` 成功时返回 `complete=true` 和 `blocking_paths=[]`；目标页能解析但全根计数不能
+证明时，不得返回猜测值、下界或 `null` 与整数混合的摘要。`query.incomplete` 的阻碍详情
+按第 14.1 节保持有界，Agent 需要完整修复清单时运行可过滤、可分页的 `check`。
+
+允许部分结果的三个集合查询使用双集合分页。现有 `offset`、`limit` 分别对稳定排序后的
+`items` 和去重后的 `blocking_paths` 应用同一个窗口；原有 `total`、`has_more`、
+`next_offset` 只描述 `items`，并新增 `blocking_total`、`blocking_has_more`、
+`blocking_next_offset` 描述阻碍路径。这样两个集合都能有界遍历，不会让一个巨大
+`blocking_paths` 绕过分页限制。`complete=true` 时后三个阻碍字段分别为 `0`、`false`、
+`null`。
 
 ## 12. `adopt` 状态转换
 
 `adopt` 只接受 `candidate`：
 
 1. 解析根并拒绝已有未完成操作；
-2. 运行无过滤、无分页的完整候选检查；
-3. 检查通过后捕获全部受管理 Markdown、marker 和协议相关文件摘要；
-4. 创建耐久操作日志并取得排他锁；
-5. 锁内重新核对 `root_state`、完整文件集合和摘要；
-6. 把 `draft.json` 从 `candidate` 原子替换为 `registered`；
-7. 验证最终 marker 和协议状态；
-8. 提交日志并释放锁。
+2. 运行无过滤、无分页的完整候选检查；只有 `errors` 为空才继续；
+3. 捕获第 12.1 节定义的观察清单；
+4. 预分配 `kind="adopt"` 的普通操作日志。日志必须保存 marker 的 before/after 摘要与
+   staged bytes、观察清单摘要以及“marker 是提交变更”的事实，然后取得排他锁；
+5. 锁内排除本次 adopt 自己新建的日志和锁，重新核对 `root_state`、观察清单的完整路径
+   集合、文件类型和摘要；任一差异都在 marker 替换前终止，并只清理本次准备状态；
+6. 把日志推进到已经完成全部可失败业务验证、可以提交的阶段；
+7. 作为最后一项受管根变更，把 `draft.json` 从 `candidate` 原子替换为 `registered`；
+8. 只核对 marker 当前字节/摘要恰好等于日志的 after 状态，然后提交日志、清理恢复材料并
+   释放锁。生效点之后不再运行会以“业务校验失败”为理由把 marker 回滚成 candidate 的
+   全根检查。
 
 `draft.json` 原子替换为 `registered` 是登记生效点。`adopt` 不修改来源，不重写
-Markdown，也不清除已有结论所有权或回收生命周期状态。
+Markdown，也不清除已有结论所有权或回收生命周期状态。marker 的 after 语义只能把
+`root_state` 从 `candidate` 改为 `registered`，必须保留同一个 `format_version` 和
+`conclusions_state`。
 
-| 现场 | marker | `recover` 结果 |
+步骤 4 在取得锁之前若遇到锁竞争，必须安全清理或终态化本次刚预分配且尚未授权任何
+根变更的日志；不得遗留一个无锁中段 adopt 日志。步骤 5 发现差异时同样只放弃并清理本次
+准备状态，不回写或覆盖发生变化的业务文件。
+
+### 12.1 观察清单边界
+
+观察清单记录所有会影响锁前完整检查或根内协议状态的根内事实：
+
+- `index.md`、当前受管理的 `pages/**/*.md`，以及所有权为 `generated` 时的
+  `conclusions.md`；
+- `.draft/draft.json`；
+- adopt 开始前已经存在的操作日志、日志恢复材料、权威删除包和其他合法内部协议文件；
+- 上述目录的成员集合、每个观察路径的普通文件/目录/符号链接类型，以及普通文件摘要；
+- 完整检查实际观察到的根内本地资源目标的存在性、类型和内容摘要。
+
+根外资源不被纳入持久摘要，避免把来源或任意外部目录变成 Draft 的写入/锁定对象；但锁内
+复核仍重新读取完整检查所需的根外存在性事实。步骤 5 的集合比较只排除本次 adopt 自己的
+操作目录和 `operation.lock`，不能笼统排除整个 `.draft/operations/` 或
+`.draft/trash/`，否则并发生命周期变化会被漏掉。
+
+### 12.2 统一恢复中的 adopt 提交点
+
+`recover` 仍是唯一公开恢复入口，也继续复用普通锁、操作日志、staged bytes 和恢复副本；
+但统一恢复器必须识别 `journal.kind="adopt"` 及其 marker 提交点。这里允许统一状态机按操作
+kind 分派收敛规则；“不建立专用恢复状态机”只表示不增加第二套 marker、日志目录或公开
+命令，不能解释为忽略 adopt 的单向根状态转换。
+
+| 锁与日志事实 | marker 当前摘要 | `recover` 结果 |
 |---|---|---|
-| marker 替换前崩溃 | `candidate` | 回滚或完成准备清理，保持候选 |
-| marker 替换后崩溃 | `registered` | 完成日志提交与清理，保持正式 |
-| 外部修改使继续和回滚都无法证明安全 | 任一 | 保留锁和现场，报告外部修改 |
-| 日志、锁或恢复副本损坏 | 任一 | 保留现场，报告不一致状态 |
+| 匹配锁和合法 adopt 中段日志，观察清单仍匹配 | before（`candidate`） | staged after 完整时优先前向完成并在替换瞬间登记；前向材料不完整但 before 可证明时放弃本次准备并保持候选 |
+| 匹配锁和合法 adopt 中段日志，观察清单已变化但 marker 未变 | before（`candidate`） | 不覆盖外部变化；把本次 adopt 终态化为已回滚并清理自己的材料、释放锁，报告外部修改 |
+| 匹配锁和合法 adopt 中段或已提交待清理日志 | after（`registered`） | 只完成日志提交、恢复材料清理和解锁；不得回滚根身份；其他业务文件后来变化也不反转已经生效的登记 |
+| 匹配锁和合法 adopt 终态日志 | `completed` 对应 after；`rolled_back` 对应 before | 验证后清理和解锁；反向组合报告 `operation.inconsistent_state` |
+| marker 既不是日志 before 也不是 after | 任意 | 保留锁和现场，报告 `operation.external_change` |
+| 中段 adopt 日志没有匹配锁，或锁指向别的操作 | 任一 | 保留现场，报告 `operation.inconsistent_state` |
+| 日志、锁或内部路径形状损坏 | 任一 | 保留现场，报告最具体的损坏代码 |
 
-`adopt` 使用普通操作日志和统一 `recover`，不建立 provisional marker 或接管专用
-恢复状态机。
+marker 已是 after 状态时，日志阶段落后只表示“登记已生效、审计提交待完成”，不能因阶段
+仍是 `applying` 或 `validating` 而退回 candidate。marker 仍是 before 状态时，恢复可以按
+普通操作规则安全前向完成；这会在恢复期间产生新的登记生效点，并不表示崩溃前已经登记。
+marker 已是 after 时，staged bytes 或 before 恢复副本已经不再是证明提交所需的权威材料；
+它们缺失不能阻止终态清理，但符号链接、日志无法解析或 after 摘要无法从日志证明仍须停止。
 
 ## 13. 端到端数据流
 
@@ -397,6 +567,25 @@ Agent 选择检查点并运行 check
 的控制流。
 
 ## 14. 错误、重试与恢复闭合
+
+### 14.1 新增和退役的稳定代码
+
+本规格使用的新代码必须登记在生产代码的单一错误码权威来源中，CLI、渲染器、测试和文档
+从该来源引用，不在各层维护平行清单：
+
+| 代码 | `path` | `details` 协议 |
+|---|---|---|
+| `root.not_found` | `--root`/`DRAFT_ROOT` 解析后的目标，或祖先发现起点的物理 `pwd` | 恰好一个来源代码：`cli`、`env` 或 `pwd` |
+| `root.ambiguous` | 祖先发现起点的物理 `pwd` | 两个或更多合法根的规范绝对路径，按离 `pwd` 由近到远排列 |
+| `internal.unexpected_entry` | 非法条目的根内 POSIX 相对路径 | 空 |
+| `query.incomplete` | `query page` 请求的规范页面路径 | 第一项是十进制阻碍路径总数，后续最多 20 项是按路径排序的根内 POSIX 路径 |
+
+`root.not_found` 只表示目标目录不存在或祖先发现没有得到根；已选目录存在但 marker 缺失
+必须使用 `format.missing`。`query.incomplete` 的详情若总数大于实际携带路径数，即表示输出
+已截断；完整清单通过 `check` 获取。
+
+旧 `candidate.already_registered`、`candidate.internal_state` 退役且不保留别名。正式根再次
+执行 `adopt` 使用既有 `adopt.already_registered`。
 
 - 参数或根定位错误发生在读取页面前，不创建内部状态；
 - 候选操作缺少事实时不创建操作日志、不产生部分写入；
@@ -426,16 +615,23 @@ Agent 选择检查点并运行 check
 受真实接口约束的替身验证：
 
 - marker 对两个 `root_state`、两个 `conclusions_state` 和精确键集合的解析矩阵；
+- candidate 与 registered 共享内部条目分类，旧 `candidate.*` 检查码不可达；
 - 根选择优先级，以及高优先级非法时不回退；
 - `--root`、`DRAFT_ROOT` 和 `pwd` 发现事实的分类；
+- `root.not_found`、`root.ambiguous`、`internal.unexpected_entry` 和 `query.incomplete` 的
+  精确 `path`/`details` 协议；
+- 生命周期资格对两种受管根成立，同时排除 `check` 和 `adopt`；
 - 候选操作门禁决策表；
 - 无关诊断不阻止操作，相关事实未知时拒绝；
 - 每类写命令声明并验证自己拥有的不变量；
 - 候选写命令不调用完整检查协作者；
-- 查询 `complete` 与 `blocking_paths` 的状态分类；
-- 检查过滤、稳定排序、计数、分页和 `ok`/退出码不受当前页误导；
+- 七种查询分支的 `complete`/拒绝分类，以及部分 `items` 与 `blocking_paths` 的独立分页
+  事实；
+- 检查过滤的并集/交集和路径段语义、稳定排序、统一分页、计数，以及 `ok`/退出码不受
+  当前页误导；
 - `adopt` 只在完整候选检查通过并且摘要复核一致时生成 marker 状态转换计划；
-- marker 状态、日志阶段和文件摘要组合的恢复决策表。
+- marker 状态、日志阶段和文件摘要组合的恢复决策表，特别是 after marker 不可回滚和
+  after 状态不依赖已无用途的 staged/before 副本。
 
 交互断言只用于“不得隐式运行完整检查”“必须取得锁”“必须复核摘要”等协议和安全
 契约，不复制内部辅助函数调用图。
@@ -451,9 +647,14 @@ Agent 选择检查点并运行 check
 - 一次检查汇总多个错误，按同类批量修复后通过；
 - 候选存在无关错误时局部命令成功，缺少相关事实时同一命令拒绝且文件不变；
 - 候选 `trash`、`restore`、`generate-conclusions` 和普通结构操作；
-- 查询在候选损坏时返回明确不完整结果；
+- 候选普通操作产生合法日志后，`check` 不报告旧 `candidate.internal_state`，并能报告
+  与正式根相同的操作、trash 和结论事实；
+- 候选业务命令会推进回收生命周期，`check` 与 `adopt` 保持只读/无夹带推进；
+- `query page` 在全局计数不可靠时拒绝，backlinks/incoming relations/status 返回可分页的
+  明确不完整结果，recoverable 不受页面解析错误影响；
 - `adopt` 把同一目录从 `candidate` 推进为 `registered`；
-- 在 marker 替换前后注入故障，`recover` 分别收敛到正确稳定状态；
+- 在 marker 替换前后注入故障，覆盖锁丢失、观察清单变化和恢复材料缺失；after marker
+  始终收敛到 registered，before marker 只在重新证明安全后前向完成；
 - 外部并发修改、锁竞争、日志损坏和恢复副本损坏；
 - 来源目录在完整端到端迁移试验前后字节摘要一致。
 
@@ -498,11 +699,15 @@ draft check
 模块边界：
 
 - marker 模型和解析器增加受约束的根状态；
+- 删除候选内部状态拒绝分支和两个旧 `candidate.*` 检查码，候选与正式根共享内部检查；
 - 生命周期入口重构 `init` 和 `adopt`，删除 provisional marker 协议；
+- 生命周期前置资格从 registered 泛化为受管根，同时让 `check` 保持严格只读；
 - CLI 统一根解析、`--root`、`DRAFT_ROOT` 和 `pwd` 发现；
 - `check` 删除 `--candidate`，增加过滤、分页和计数事实；
 - 图加载与命令规划分离“完整健康加载”和“操作所需事实加载”；
-- 查询结果增加完整性事实；
-- 操作日志允许 candidate 根并承载 `adopt` 状态转换；
+- 查询结果增加按查询类型区分的完整性事实和阻碍路径分页；
+- 操作日志允许 candidate 根并承载 `adopt` 状态转换；统一恢复器增加 marker 提交点的
+  单向收敛规则；
+- 新增/退役错误码通过生产代码单一权威来源同步；
 - skill、格式参考、迁移参考和正式设计同步新工作流；
 - 现有测试夹具直接更新到新的开发期 `format_version=1` marker 形状。

@@ -4,6 +4,12 @@
 
 状态：已批准
 
+后续修订：
+[`2026-08-12-draft-candidate-root-incremental-migration-design.md`](./2026-08-12-draft-candidate-root-incremental-migration-design.md)
+已经取代本文的 `ROOT` 位置参数、candidate 非目标与查询失败边界、第 12.2 节 marker 形状，
+以及第 15 节 registered-only 生命周期资格和 `check` 前置推进规则。其余行为继续有效；
+发生冲突时以后续规格为准。
+
 ## 1. 背景
 
 Draft runtime 当前能够初始化、接管、检查和调整草稿结构，但 Agent 仍需直接读取大量
