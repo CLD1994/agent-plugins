@@ -114,15 +114,16 @@ def _collapse_empty_hubs(
 
 
 def _conclusions_owned_generated(root: Path) -> bool:
-    """结论所有权是否为 generated；标记缺失/无效时视为未生成。"""
+    """结论所有权是否为 generated；仅正式根有效，标记缺失/无效/候选时视为未生成。"""
     from draft.graph import read_marker
+    from draft.models import RootState
     from draft.vocabulary import ConclusionsState
 
     try:
         state = read_marker(root)
     except DraftError:
         return False
-    if state.provisional_manifest is not None:
+    if state.root_state is not RootState.REGISTERED:
         return False
     return state.conclusions_state is ConclusionsState.GENERATED
 

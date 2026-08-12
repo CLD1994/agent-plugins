@@ -9,9 +9,13 @@ from draft.checker import check_draft
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.lifecycle import adopt, initialize
-from tests.integration.support import add_valid_child, build_valid_candidate
+from tests.integration.support import (
+    add_valid_child,
+    build_legacy_unmarked_candidate,
+    managed_marker_text,
+)
 
-FINAL_MARKER_BYTES = b'{"format_version":1,"conclusions_state":"not_generated"}\n'
+FINAL_MARKER_BYTES = managed_marker_text().encode("utf-8")
 
 
 class SimulatedCrash(BaseException):
@@ -77,29 +81,57 @@ def test_initialize_rejects_nonempty_directory(tmp_path: Path) -> None:
     assert (root / "notes.md").read_text(encoding="utf-8") == "keep"
 
 
-def test_initialize_finalize_crash_is_cleaned_by_retry(
+def test_initialize_rejects_file_target(tmp_path: Path) -> None:
+    from draft.diagnostic_codes import RootCode
+
+    root = tmp_path / "occupied"
+    root.write_text("file", encoding="utf-8")
+
+    with pytest.raises(DraftError, match=RootCode.INVALID.value):
+        initialize(root)
+
+
+def test_initialize_marker_publish_failure_rolls_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """init 在「正式标记已写、临时标记未删」中断时，重跑应清理临时标记并完成登记。"""
+    """marker 耐久发布失败时，回滚协议不得留下看似成功的半初始化根。"""
+    root = tmp_path / "new-topic"
+    original = lifecycle_module.durable_write
+
+    def fail_on_marker(path: Path, value: bytes) -> None:
+        if path.name == "draft.json":
+            raise OSError("disk full")
+        original(path, value)
+
+    monkeypatch.setattr(lifecycle_module, "durable_write", fail_on_marker)
+
+    with pytest.raises(OSError, match="disk full"):
+        initialize(root)
+
+    assert not root.exists()
+
+
+def test_initialize_finalize_crash_leaves_complete_registered_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """init 在「正式标记已写」后中断时，marker 是最后一项变更，根已是完整登记态。
+
+    重跑 init 报告非空；不再存在临时标记清理路径（initialize 不经 provisional）。
+    """
     root = tmp_path / "new-topic"
     _crash_initialize_after_final_marker(root, monkeypatch)
     monkeypatch.undo()
 
     final = root / ".draft/draft.json"
-    provisional = root / ".draft/draft.provisional.json"
     assert final.read_bytes() == FINAL_MARKER_BYTES
-    assert provisional.is_file()
+    assert not (root / ".draft/draft.provisional.json").exists()
 
-    # 中断现场：普通命令被临时标记阻断为恢复需求。
-    with pytest.raises(DraftError, match="adopt.recovery_required"):
-        check_draft(root)
-
-    # 重跑 init 会撞到 init.not_empty；真正解死锁的是 adopt 的已提交待清理路径。
-    with pytest.raises(DraftError, match="adopt.already_registered"):
-        adopt(root)
-    assert not provisional.exists()
-    assert final.read_bytes() == FINAL_MARKER_BYTES
+    # 中断现场：marker 已耐久发布 = 登记完成，普通命令可用且无恢复需求。
     assert check_draft(root).errors == ()
+
+    # 重跑 init 撞到 init.not_empty。
+    with pytest.raises(DraftError, match="init.not_empty"):
+        initialize(root)
 
 
 def test_initialize_accepts_empty_directory_and_keeps_it_on_later_use(
@@ -119,7 +151,7 @@ def test_initialize_accepts_empty_directory_and_keeps_it_on_later_use(
 
 def test_adopt_registers_a_complete_candidate(tmp_path: Path) -> None:
     root = tmp_path / "candidate"
-    build_valid_candidate(root)
+    build_legacy_unmarked_candidate(root)
     before = {
         path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()
     }
@@ -162,7 +194,7 @@ def test_adopt_rejects_malformed_candidate_without_writes(tmp_path: Path) -> Non
 
 def test_adopt_rejects_candidate_with_lock(tmp_path: Path) -> None:
     root = tmp_path / "locked"
-    build_valid_candidate(root)
+    build_legacy_unmarked_candidate(root)
     (root / ".draft").mkdir()
     (root / ".draft/operation.lock").write_text(
         '{"operation_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n', encoding="utf-8"
@@ -178,7 +210,7 @@ def test_adopt_revalidates_content_before_marker_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "candidate"
-    build_valid_candidate(root)
+    build_legacy_unmarked_candidate(root)
     original_hash = lifecycle_module.sha256_file
     calls = 0
 
@@ -207,7 +239,7 @@ def test_adopt_removes_marker_when_recheck_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "candidate"
-    build_valid_candidate(root)
+    build_legacy_unmarked_candidate(root)
     original = lifecycle_module.durable_write
 
     def poisoned_write(path: Path, value: bytes) -> None:
@@ -232,7 +264,7 @@ def test_adopt_rejects_valid_manifest_change_after_marker_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "candidate"
-    build_valid_candidate(root)
+    build_legacy_unmarked_candidate(root)
     original = lifecycle_module.durable_write
 
     injected = False
@@ -260,7 +292,7 @@ def test_adopt_rollback_leaves_no_final_and_retry_succeeds(
 ) -> None:
     """回滚只清理临时文件（不触碰正式标记路径），失败方随后重跑 adopt 能成功登记。"""
     root = tmp_path / "candidate"
-    build_valid_candidate(root)
+    build_legacy_unmarked_candidate(root)
     original = lifecycle_module.durable_write
 
     injected = False
@@ -296,7 +328,7 @@ def test_adopt_cleans_provisional_when_final_already_written(tmp_path: Path) -> 
     from draft.lifecycle import draft_manifest, provisional_marker_bytes
 
     root = tmp_path / "candidate"
-    build_valid_candidate(root)
+    build_legacy_unmarked_candidate(root)
     # 先算候选清单（此时还没有任何内部状态）。
     before = draft_manifest(root, mode="candidate")
     internal = root / ".draft"
@@ -380,7 +412,7 @@ def test_provisional_crash_blocks_ordinary_operations_and_adopt_resumes(
     from draft.trash_lifecycle import recover_draft
 
     root = tmp_path / "candidate"
-    build_valid_candidate(root)
+    build_legacy_unmarked_candidate(root)
     _crash_after_provisional_marker(root, monkeypatch)
     monkeypatch.undo()
 
@@ -415,17 +447,16 @@ def test_provisional_crash_blocks_ordinary_operations_and_adopt_resumes(
 def test_rollback_keeps_final_marker_but_deletes_provisional(tmp_path: Path) -> None:
     """并发 adopt 竞态：回滚时若标记已被他方发布为 final，绝不能删除；临时标记仍正常删除。"""
     from draft.lifecycle import (
-        FINAL_MARKER_BYTES as FINAL,
-    )
-    from draft.lifecycle import (
         draft_manifest,
         provisional_marker_bytes,
         rollback_provisional_marker_durably,
     )
 
+    FINAL = FINAL_MARKER_BYTES
+
     # final 标记（模拟并发 adopt 发布成功）：回滚必须保留（不属于本次临时标记）。
     root = tmp_path / "candidate"
-    build_valid_candidate(root)
+    build_legacy_unmarked_candidate(root)
     before1 = draft_manifest(root, mode="candidate")
     internal = root / ".draft"
     internal.mkdir()
@@ -437,7 +468,7 @@ def test_rollback_keeps_final_marker_but_deletes_provisional(tmp_path: Path) -> 
 
     # 临时标记（本 adopt 自己的，位于独立文件）：回滚仍正常删除。
     root2 = tmp_path / "candidate2"
-    build_valid_candidate(root2)
+    build_legacy_unmarked_candidate(root2)
     before = draft_manifest(root2, mode="candidate")
     internal2 = root2 / ".draft"
     internal2.mkdir()
@@ -451,7 +482,7 @@ def test_provisional_crash_then_changed_page_rolls_back_provisional(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "candidate"
-    build_valid_candidate(root)
+    build_legacy_unmarked_candidate(root)
     _crash_after_provisional_marker(root, monkeypatch)
     monkeypatch.undo()
 

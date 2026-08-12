@@ -19,6 +19,7 @@ from draft.models import (
     LifecycleWarning,
     OperationPhase,
     OperationResult,
+    RootState,
     TrashResult,
 )
 from draft.paths import ResolvedPath
@@ -91,6 +92,14 @@ def test_build_parser_parses_init_command() -> None:
     args = cli.build_parser().parse_args(["init", "/draft"])
     assert args.command == "init"
     assert args.root == "/draft"
+    assert args.candidate is False
+
+
+def test_build_parser_parses_init_candidate_command() -> None:
+    args = cli.build_parser().parse_args(["init", "--candidate", "/draft"])
+    assert args.command == "init"
+    assert args.root == "/draft"
+    assert args.candidate is True
 
 
 def test_build_parser_parses_check_with_candidate_flag() -> None:
@@ -127,9 +136,18 @@ def test_dispatch_init_calls_initialize_and_returns_success(mocker: MockerFixtur
     args = cli.build_parser().parse_args(["init", "/draft"])
     initialize = mocker.patch("draft.lifecycle.initialize", autospec=True)
     payload, human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]  # 验证 init 分派到 initialize 并返回成功载荷
-    initialize.assert_called_once_with(Path("/draft"))
+    initialize.assert_called_once_with(Path("/draft"), root_state=RootState.REGISTERED)
     assert payload == {"result_type": "init", "root": "/draft"}
     _assert_human_result(human, Path("/draft"))
+    assert exit_code == 0
+
+
+def test_dispatch_init_candidate_passes_candidate_root_state(mocker: MockerFixture) -> None:
+    args = cli.build_parser().parse_args(["init", "--candidate", "/draft"])
+    initialize = mocker.patch("draft.lifecycle.initialize", autospec=True)
+    payload, _human, exit_code = cli._dispatch(args)  # pyright: ignore[reportPrivateUsage]
+    initialize.assert_called_once_with(Path("/draft"), root_state=RootState.CANDIDATE)
+    assert payload == {"result_type": "init", "root": "/draft"}
     assert exit_code == 0
 
 

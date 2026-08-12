@@ -575,24 +575,20 @@ def _check_conclusions_product(
     return issues
 
 
-def _conclusions_state(
-    resolved: Path, mode: LoadMode, allow_provisional_adopt: bool
-) -> ConclusionsState | None:
+def _conclusions_state(resolved: Path, mode: LoadMode) -> ConclusionsState | None:
     """读取所有权状态；标记缺失/无效/非 registered 时返回 None（不在此处报错）。"""
     if mode != "registered":
         return None
     from draft.graph import read_marker
 
     try:
-        state = read_marker(resolved, allow_provisional_adopt=allow_provisional_adopt)
+        state = read_marker(resolved)
     except DraftError:
-        return None
-    if state.provisional_manifest is not None:
         return None
     return state.conclusions_state
 
 
-def _conclusions_required(resolved: Path, mode: LoadMode, allow_provisional_adopt: bool) -> bool:
+def _conclusions_required(resolved: Path, mode: LoadMode) -> bool:
     """conclusions.md 是否必须存在：registered 且标记有效时由所有权状态决定。
 
     标记缺失/无效/候选模式下不在此处要求；对应诊断由加载期 marker issue 报告。
@@ -602,10 +598,8 @@ def _conclusions_required(resolved: Path, mode: LoadMode, allow_provisional_adop
     from draft.graph import read_marker
 
     try:
-        state = read_marker(resolved, allow_provisional_adopt=allow_provisional_adopt)
+        state = read_marker(resolved)
     except DraftError:
-        return False
-    if state.provisional_manifest is not None:
         return False
     return state.conclusions_state is ConclusionsState.GENERATED
 
@@ -633,7 +627,7 @@ def check_draft(
                 )
             )
     # conclusions.md 只在所有权为 generated 时要求存在；not_generated 允许缺失。
-    conclusions_required = _conclusions_required(resolved, mode, allow_provisional_adopt)
+    conclusions_required = _conclusions_required(resolved, mode)
     if conclusions_required:
         candidate = resolved / CONCLUSIONS_PAGE
         if not candidate.is_file() or candidate.is_symlink():
@@ -675,7 +669,7 @@ def check_draft(
         ordered.extend(sorted(_load_issues_in(result.issues, _LOAD_LINK_ISSUES), key=_sort_key))
     ordered.extend(sorted(_load_issues_in(result.issues, None), key=_sort_key))
     ordered.extend(check_graph(result.graph).issues)
-    conclusions_state = _conclusions_state(resolved, mode, allow_provisional_adopt)
+    conclusions_state = _conclusions_state(resolved, mode)
     if conclusions_state is ConclusionsState.NOT_GENERATED and _conclusions_unexpected(resolved):
         # not_generated 时意外出现的 conclusions.md 不是普通受管理页面：只报告
         # conclusions.unexpected_file，不把它的普通页面诊断（缺父主题/不可达等）当作噪声。

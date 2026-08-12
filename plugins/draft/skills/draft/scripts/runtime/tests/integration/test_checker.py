@@ -1,19 +1,22 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
-import pytest
-
 from draft.checker import check_draft
 from draft.diagnostic_codes import (
     CheckCode,
     LinkEscapeKind,
     ReplacementStatusReason,
 )
-from draft.errors import DraftError
 from draft.models import CheckReport, IssueSeverity
 from draft.operations import JOURNAL_VERSION
 from draft.trash import trash_page
-from tests.integration.support import DraftFactory, snapshot_tree, write_raw_journal
+from draft.vocabulary import ConclusionsState
+from tests.integration.support import (
+    DraftFactory,
+    managed_marker_text,
+    snapshot_tree,
+    write_raw_journal,
+)
 
 ROOT_PAGE = """# Topic
 
@@ -95,7 +98,7 @@ def test_confirmed_page_without_output_is_valid(draft_factory: DraftFactory) -> 
 
 
 def test_missing_marker(draft_factory: DraftFactory) -> None:
-    root = draft_factory(healthy(), registered=False)
+    root = draft_factory(healthy(), root_state=None)
 
     report = check_draft(root)
 
@@ -157,7 +160,7 @@ def test_candidate_mode_reports_final_marker_as_already_registered(
 
 
 def test_candidate_mode_accepts_unregistered_layout(draft_factory: DraftFactory) -> None:
-    root = draft_factory(healthy(), registered=False)
+    root = draft_factory(healthy(), root_state=None)
 
     report = check_draft(root, mode="candidate")
 
@@ -165,7 +168,7 @@ def test_candidate_mode_accepts_unregistered_layout(draft_factory: DraftFactory)
 
 
 def test_candidate_mode_rejects_internal_entries(draft_factory: DraftFactory) -> None:
-    root = draft_factory(healthy(), registered=False)
+    root = draft_factory(healthy(), root_state=None)
     (root / ".draft" / "operations" / ("a" * 32)).mkdir(parents=True)
 
     report = check_draft(root, mode="candidate")
@@ -173,8 +176,11 @@ def test_candidate_mode_rejects_internal_entries(draft_factory: DraftFactory) ->
     assert codes(report) == [CheckCode.CANDIDATE_INTERNAL_STATE.value]
 
 
-def test_candidate_mode_provisional_marker_boundary(draft_factory: DraftFactory) -> None:
-    root = draft_factory(healthy(), registered=False)
+def test_candidate_mode_provisional_shape_in_final_marker_is_invalid(
+    draft_factory: DraftFactory,
+) -> None:
+    """正式 marker 不接受 provisional 键：旧内嵌 provisional 形状现在是 format.invalid。"""
+    root = draft_factory(healthy(), root_state=None)
     internal = root / ".draft"
     internal.mkdir()
     (internal / "draft.json").write_text(
@@ -182,12 +188,9 @@ def test_candidate_mode_provisional_marker_boundary(draft_factory: DraftFactory)
         encoding="utf-8",
     )
 
-    with pytest.raises(DraftError, match="adopt.recovery_required"):
-        check_draft(root, mode="candidate")
+    report = check_draft(root, mode="candidate")
 
-    allowed = check_draft(root, mode="candidate", allow_provisional_adopt=True)
-
-    assert allowed.errors == ()
+    assert CheckCode.FORMAT_INVALID.value in codes(report)
 
 
 def test_marker_with_unknown_fields_is_invalid(draft_factory: DraftFactory) -> None:
@@ -217,7 +220,7 @@ def test_missing_required_files(draft_factory: DraftFactory) -> None:
     root = draft_factory(files)
     # 所有权为 generated 时 conclusions.md 必须存在。
     (root / ".draft/draft.json").write_text(
-        '{"format_version":1,"conclusions_state":"generated"}\n', encoding="utf-8"
+        managed_marker_text(conclusions_state=ConclusionsState.GENERATED), encoding="utf-8"
     )
 
     report = check_draft(root)
@@ -250,7 +253,7 @@ def _generated_conclusions_root(draft_factory: DraftFactory) -> Path:
     )
     root = draft_factory(files)
     (root / ".draft/draft.json").write_text(
-        '{"format_version":1,"conclusions_state":"generated"}\n', encoding="utf-8"
+        managed_marker_text(conclusions_state=ConclusionsState.GENERATED), encoding="utf-8"
     )
     return root
 
@@ -264,9 +267,7 @@ def test_not_generated_unexpected_conclusions_file_is_error(
     files["index.md"] = ROOT_PAGE.replace("- [结论汇总](conclusions.md)\n", "")
     files["conclusions.md"] = CONCLUSIONS
     root = draft_factory(files)
-    (root / ".draft/draft.json").write_text(
-        '{"format_version":1,"conclusions_state":"not_generated"}\n', encoding="utf-8"
-    )
+    (root / ".draft/draft.json").write_text(managed_marker_text(), encoding="utf-8")
 
     report = check_draft(root)
 

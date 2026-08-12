@@ -28,6 +28,7 @@ from draft.models import (
     OperationPlan,
     PageDocument,
     RelationCode,
+    RootState,
     StatusCode,
 )
 from draft.operations import sha256_bytes
@@ -347,9 +348,10 @@ def _ensure_conclusions_nav(index_text: str, root: Path) -> str:
     return append_parent_navigation(index_text, CONCLUSIONS_TITLE, CONCLUSIONS_PAGE.as_posix())
 
 
-def _marker_bytes(state: ConclusionsState) -> bytes:
+def _marker_bytes(root_state: RootState, state: ConclusionsState) -> bytes:
     payload = {
         "format_version": 1,
+        "root_state": root_state.value,
         "conclusions_state": state.value,
     }
     return (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
@@ -362,8 +364,13 @@ class GenerationPlan:
     operation: OperationPlan | None
 
 
-def plan_generation(graph: ConclusionsView, *, state: ConclusionsState) -> GenerationPlan:
-    """构造结论生成计划；不执行写入。"""
+def plan_generation(
+    graph: ConclusionsView,
+    *,
+    state: ConclusionsState,
+    root_state: RootState,
+) -> GenerationPlan:
+    """构造结论生成计划；不执行写入。root_state 必须由调用方从当前 marker 权威读出。"""
     confirmed = _confirmed_pages(graph)
     if state is ConclusionsState.NOT_GENERATED:
         conclusions_path = graph.root / CONCLUSIONS_PAGE
@@ -426,7 +433,7 @@ def plan_generation(graph: ConclusionsView, *, state: ConclusionsState) -> Gener
                 index_text.encode("utf-8"),
             )
         )
-    marker_bytes = _marker_bytes(ConclusionsState.GENERATED)
+    marker_bytes = _marker_bytes(root_state, ConclusionsState.GENERATED)
     marker_path = graph.root / MARKER_PATH
     marker_before = marker_path.read_bytes() if marker_path.is_file() else None
     mutations.append(
@@ -464,9 +471,10 @@ def generate_conclusions(root: Path) -> GenerationPlan:
     from draft.paths import resolve_draft_root
 
     resolved = resolve_draft_root(root)
-    state = read_marker(resolved).conclusions_state
+    marker = read_marker(resolved)
+    state = marker.conclusions_state
     graph = _load_graph_with_conclusions(resolved, state)
-    plan = plan_generation(graph, state=state)
+    plan = plan_generation(graph, state=state, root_state=marker.root_state)
     if plan.operation is not None:
         execute_plan(plan.operation)
     return plan

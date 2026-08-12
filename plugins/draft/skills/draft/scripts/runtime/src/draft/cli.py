@@ -52,9 +52,14 @@ def build_parser() -> argparse.ArgumentParser:
         "init",
         parents=[shared],
         help="初始化新草稿",
-        description="在 ROOT 创建草稿结构并登记，作为后续结构维护的入口。",
+        description="在 ROOT 创建草稿结构并登记；--candidate 创建未登记候选根。",
     )
     init.add_argument("root", metavar="ROOT", help="草稿根目录（将在此创建草稿结构）")
+    init.add_argument(
+        "--candidate",
+        action="store_true",
+        help="创建 root_state=candidate 的候选根（允许渐进整理，adopt 前不登记）",
+    )
 
     adopt = subparsers.add_parser(
         "adopt",
@@ -610,9 +615,11 @@ def _dispatch(
         return _dispatch_query(args, now=now)
     if command == "init":
         from draft.lifecycle import initialize
+        from draft.models import RootState
 
         root = Path(cast(str, args.root))
-        initialize(root)
+        root_state = RootState.CANDIDATE if bool(args.candidate) else RootState.REGISTERED
+        initialize(root, root_state=root_state)
         return {"result_type": ResultType.INIT.value, "root": str(root)}, f"已初始化草稿：{root}", 0
     if command == "adopt":
         from draft.lifecycle import adopt
@@ -814,9 +821,11 @@ def _dispatch(
 
                 raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, resolved)
             # 预演与正式执行调用同一个计划构造器：同一容错加载与 plan_generation。
-            state = read_marker(resolved).conclusions_state
+            marker = read_marker(resolved)
             graph = load_generation_graph(resolved)
-            plan = plan_generation(graph, state=state)
+            plan = plan_generation(
+                graph, state=marker.conclusions_state, root_state=marker.root_state
+            )
             if plan.operation is None:
                 # 无已确认页面或幂等无变化：成功返回空 effects 与业务事实。
                 limit = int(getattr(args, "limit", 20) or 20)
@@ -911,12 +920,13 @@ def _preflight_candidate_root_for(args: argparse.Namespace) -> Path | None:
 
 
 def _registered_root_for(candidate: Path) -> Path | None:
-    """只读资格判定：只有正式登记标记精确有效才返回解析后的根，否则返回 None。
+    """只读资格判定：只有 root_state=registered 且标记精确有效才返回解析后的根。
 
-    根或标记缺失、无效、不支持或为临时接管形状时不推进，交由命令自身验证。
+    根或标记缺失、无效、不支持、为候选或临时接管形状时不推进，交由命令自身验证。
     本边界复用共享标记解析语义，不在这里复制登记键集合。
     """
     from draft.graph import read_marker
+    from draft.models import RootState
     from draft.paths import resolve_draft_root
 
     try:
@@ -924,8 +934,10 @@ def _registered_root_for(candidate: Path) -> Path | None:
     except DraftError:
         return None
     try:
-        read_marker(resolved)
+        state = read_marker(resolved)
     except DraftError:
+        return None
+    if state.root_state is not RootState.REGISTERED:
         return None
     return resolved
 

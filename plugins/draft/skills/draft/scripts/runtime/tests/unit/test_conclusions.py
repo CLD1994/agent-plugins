@@ -13,7 +13,7 @@ from draft.conclusions import (
 )
 from draft.errors import DraftError
 from draft.markdown import parse_page
-from draft.models import PageDocument, RelationCode, StatusCode
+from draft.models import PageDocument, RelationCode, RootState, StatusCode
 from draft.vocabulary import status_label
 
 ROOT = Path("/draft")
@@ -100,7 +100,7 @@ def _draft_generated_with_nav() -> SimpleGraph:
 def test_not_generated_without_confirmed_is_no_op() -> None:
     graph = _draft_with_confirmed(state=ConclusionsState.NOT_GENERATED)
     graph.pages = {p: page for p, page in graph.pages.items() if p != B}
-    plan = plan_generation(graph, state=ConclusionsState.NOT_GENERATED)
+    plan = plan_generation(graph, state=ConclusionsState.NOT_GENERATED, root_state=RootState.REGISTERED)
     assert isinstance(plan, GenerationPlan)
     assert plan.generated is False
     assert plan.reason is GenerationReason.NO_CONFIRMED_PAGES
@@ -109,7 +109,7 @@ def test_not_generated_without_confirmed_is_no_op() -> None:
 
 def test_not_generated_with_confirmed_creates_page_and_marks_owner() -> None:
     graph = _draft_with_confirmed(state=ConclusionsState.NOT_GENERATED)
-    plan = plan_generation(graph, state=ConclusionsState.NOT_GENERATED)
+    plan = plan_generation(graph, state=ConclusionsState.NOT_GENERATED, root_state=RootState.REGISTERED)
     assert plan.generated is True
     assert plan.reason is None
     assert plan.operation is not None
@@ -125,7 +125,7 @@ def test_not_generated_with_confirmed_creates_page_and_marks_owner() -> None:
 
 def test_generated_unchanged_produces_no_effect() -> None:
     graph = _draft_generated_with_nav()
-    plan = plan_generation(graph, state=ConclusionsState.GENERATED)
+    plan = plan_generation(graph, state=ConclusionsState.GENERATED, root_state=RootState.REGISTERED)
     assert plan.generated is True
     assert plan.operation is None or plan.operation.effects == ()
 
@@ -133,7 +133,7 @@ def test_generated_unchanged_produces_no_effect() -> None:
 def test_generated_confirmed_page_is_rebuilt_as_proposed() -> None:
     graph = _draft_with_confirmed(state=ConclusionsState.GENERATED)
     graph.pages[CONCLUSIONS] = _page(CONCLUSIONS, status=StatusCode.CONFIRMED, title="结论汇总")
-    plan = plan_generation(graph, state=ConclusionsState.GENERATED)
+    plan = plan_generation(graph, state=ConclusionsState.GENERATED, root_state=RootState.REGISTERED)
     assert plan.generated is True
     operation = plan.operation
     assert operation is not None
@@ -147,7 +147,7 @@ def test_generated_without_confirmed_keeps_empty_list() -> None:
     graph = _draft_with_confirmed(state=ConclusionsState.GENERATED)
     graph.pages = {p: page for p, page in graph.pages.items() if p != B}
     graph.pages[CONCLUSIONS] = _page(CONCLUSIONS, status=StatusCode.PROPOSED, title="结论汇总")
-    plan = plan_generation(graph, state=ConclusionsState.GENERATED)
+    plan = plan_generation(graph, state=ConclusionsState.GENERATED, root_state=RootState.REGISTERED)
     assert plan.generated is True
     operation = plan.operation
     assert operation is not None
@@ -163,7 +163,7 @@ def test_not_generated_with_unexpected_file_fails() -> None:
     graph = _draft_with_confirmed(state=ConclusionsState.NOT_GENERATED)
     graph.pages[CONCLUSIONS] = _page(CONCLUSIONS, status=StatusCode.PROPOSED, title="结论汇总")
     with pytest.raises(DraftError, match=CheckCode.CONCLUSIONS_UNEXPECTED_FILE.value):
-        plan_generation(graph, state=ConclusionsState.NOT_GENERATED)
+        plan_generation(graph, state=ConclusionsState.NOT_GENERATED, root_state=RootState.REGISTERED)
 
 
 # --- 固定机器形状谓词 is_conclusions_document（规格 §12.4/§12.5） ---

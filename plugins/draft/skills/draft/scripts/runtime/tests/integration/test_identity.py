@@ -61,11 +61,10 @@ def test_core_runtime_owns_no_plugin_responsibilities() -> None:
 
 def test_initialize_writes_only_draft_markers(tmp_path: Path) -> None:
     from draft.lifecycle import initialize
+    from tests.integration.support import managed_marker_text
 
     root = tmp_path / "draft"
     initialize(root)
 
-    assert (root / ".draft/draft.json").read_text(encoding="utf-8") == (
-        '{"format_version":1,"conclusions_state":"not_generated"}\n'
-    )
+    assert (root / ".draft/draft.json").read_text(encoding="utf-8") == managed_marker_text()
     assert not (root / ".draft/draft.provisional.json").exists()

@@ -8,7 +8,12 @@ import pytest
 from draft import __version__
 from draft.cli import main
 from draft.diagnostic_codes import CheckCode
-from tests.integration.support import build_valid_candidate, snapshot_tree
+from draft.vocabulary import ConclusionsState
+from tests.integration.support import (
+    build_legacy_unmarked_candidate,
+    managed_marker_text,
+    snapshot_tree,
+)
 
 
 def test_version_prints_package_version(capsys: pytest.CaptureFixture[str]) -> None:
@@ -58,6 +63,26 @@ def test_init_success_and_not_empty_failure(
     assert error["code"] == "init.not_empty"
 
 
+def test_init_candidate_writes_exact_marker(tmp_path: Path) -> None:
+    root = tmp_path / "candidate"
+    assert main(["init", "--candidate", str(root), "--json"]) == 0
+    assert json.loads((root / ".draft/draft.json").read_text()) == {
+        "format_version": 1,
+        "root_state": "candidate",
+        "conclusions_state": "not_generated",
+    }
+
+
+def test_init_registered_writes_exact_marker(tmp_path: Path) -> None:
+    root = tmp_path / "registered"
+    assert main(["init", str(root), "--json"]) == 0
+    assert json.loads((root / ".draft/draft.json").read_text()) == {
+        "format_version": 1,
+        "root_state": "registered",
+        "conclusions_state": "not_generated",
+    }
+
+
 def test_adopt_success_and_invalid_candidate(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -94,7 +119,7 @@ def test_check_parser_accepts_candidate_flag(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = tmp_path / "candidate"
-    build_valid_candidate(root)
+    build_legacy_unmarked_candidate(root)
 
     code, payload = run_json(["check", str(root), "--candidate", "--json"], capsys)
 
@@ -104,7 +129,7 @@ def test_check_parser_accepts_candidate_flag(
 
 def test_candidate_check_is_read_only(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     root = tmp_path / "candidate"
-    build_valid_candidate(root)
+    build_legacy_unmarked_candidate(root)
     before = snapshot_tree(root)
 
     code, payload = run_json(["check", str(root), "--candidate", "--json"], capsys)
@@ -153,12 +178,14 @@ def test_candidate_check_provisional_marker_is_recovery_required(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = tmp_path / "candidate"
-    build_valid_candidate(root)
+    build_legacy_unmarked_candidate(root)
+    from draft.lifecycle import draft_manifest, provisional_marker_bytes
+
+    before_manifest = draft_manifest(root, mode="candidate")
     internal = root / ".draft"
     internal.mkdir()
-    (internal / "draft.json").write_text(
-        '{"format_version":1,"conclusions_state":"not_generated","adopt_state":"provisional","candidate_manifest":[]}\n',
-        encoding="utf-8",
+    (internal / "draft.provisional.json").write_bytes(
+        provisional_marker_bytes(before_manifest)
     )
     before = snapshot_tree(root)
 
@@ -179,7 +206,7 @@ def test_candidate_check_rejects_internal_state_without_mutation(
     variants: list[str] = ["empty", "operation", "trash"]
     for variant in variants:
         root = tmp_path / variant
-        build_valid_candidate(root)
+        build_legacy_unmarked_candidate(root)
         internal = root / ".draft"
         if variant == "empty":
             internal.mkdir()
@@ -715,7 +742,7 @@ def _trashable_cli_root(tmp_path: Path) -> Path:
     )
     # conclusions.md 是机器所有权下的固定产物：所有权状态必须为 generated（规格 §12.1）。
     (root / ".draft/draft.json").write_text(
-        '{"format_version":1,"conclusions_state":"generated"}\n', encoding="utf-8"
+        managed_marker_text(conclusions_state=ConclusionsState.GENERATED), encoding="utf-8"
     )
     return root
 
@@ -968,7 +995,7 @@ def test_init_and_candidate_check_do_not_preflight(
     calls: list[str] = []
     monkeypatch.setattr("draft.trash_lifecycle._default_handoff", calls.append)
     root = tmp_path / "candidate"
-    build_valid_candidate(root)
+    build_legacy_unmarked_candidate(root)
     capsys.readouterr()
 
     code, _payload = run_json(["check", str(root), "--candidate", "--json"], capsys)

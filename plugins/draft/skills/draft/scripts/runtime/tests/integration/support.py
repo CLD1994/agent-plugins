@@ -2,24 +2,51 @@ import json
 from pathlib import Path
 from typing import Protocol
 
+from draft.models import RootState
+from draft.operations import JOURNAL_VERSION
+from draft.vocabulary import ConclusionsState
+
+
+def managed_marker_text(
+    *,
+    root_state: RootState = RootState.REGISTERED,
+    conclusions_state: ConclusionsState = ConclusionsState.NOT_GENERATED,
+) -> str:
+    """共享正式 marker 构建器：集成夹具统一从权威类型取值，不复制协议字面量。"""
+    return (
+        json.dumps(
+            {
+                "format_version": 1,
+                "root_state": root_state.value,
+                "conclusions_state": conclusions_state.value,
+            }
+        )
+        + "\n"
+    )
+
 
 class DraftFactory(Protocol):
-    def __call__(self, files: dict[str, str], *, registered: bool = True) -> Path:
+    def __call__(
+        self, files: dict[str, str], *, root_state: RootState | None = RootState.REGISTERED
+    ) -> Path:
         raise AssertionError("typing protocol method is not executed")
 
 
 def write_raw_journal(
     root: Path,
     *,
-    version: object,
+    version: object | None = None,
     operation_id: str = "a" * 32,
     directory_id: str | None = None,
 ) -> Path:
-    """写入原始操作日志：调用方显式控制版本与身份，用于版本/身份拒绝测试。"""
+    """写入原始操作日志：默认使用当前权威 JOURNAL_VERSION；调用方仍可显式覆盖版本。
+
+    用于版本/身份拒绝测试时显式传 version；普通夹具不带版本避免复制版本号。
+    """
     directory = root / ".draft" / "operations" / (directory_id or operation_id)
     directory.mkdir(parents=True, exist_ok=True)
     journal: dict[str, object] = {
-        "journal_version": version,
+        "journal_version": JOURNAL_VERSION if version is None else version,
         "operation_id": operation_id,
         "kind": "test",
         "phase": "completed",
@@ -33,7 +60,12 @@ def write_raw_journal(
     return journal_path
 
 
-def build_valid_candidate(root: Path) -> None:
+def build_legacy_unmarked_candidate(root: Path) -> None:
+    """旧 check --candidate / provisional adopt 测试的无 marker 候选目录桥接。
+
+    Task 4 将 build_valid_candidate 重新定义为真正带 candidate marker 的受管根，
+    并删除本条测试桥接；本函数只允许被 Task 4/8 将删除的测试导入。
+    """
     root.mkdir()
     (root / "pages").mkdir()
     # 规格 §12.2：候选目录不允许预先存在 conclusions.md（所有权为 not_generated）。
