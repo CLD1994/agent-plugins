@@ -12,9 +12,10 @@ from draft.errors import DraftError
 from draft.graph import (
     CONCLUSIONS_PAGE,
     INTERNAL_DIR,
+    MARKER_PATH,
+    PROVISIONAL_MARKER_PATH,
     ROOT_PAGE,
     DraftGraph,
-    LoadMode,
     load_graph_tolerant,
     resolve_local_destination,
 )
@@ -71,9 +72,6 @@ def _sort_key(issue: CheckIssue) -> tuple[str, int, str]:
 
 # 加载期（marker 与页面解析）issue 的报告顺序分组；分组顺序即报告顺序，
 # 组内按 _sort_key 排序。未归入任何分组的加载期诊断不丢弃，追加保留在已知分组之后。
-_LOAD_CANDIDATE_ISSUES = frozenset(
-    {CheckCode.CANDIDATE_ALREADY_REGISTERED, CheckCode.CANDIDATE_INTERNAL_STATE}
-)
 _LOAD_MARKER_ISSUES = frozenset(
     {
         CheckCode.FORMAT_MISSING,
@@ -105,7 +103,6 @@ _LOAD_LINK_ISSUES = frozenset(
     }
 )
 _LOAD_ISSUE_GROUPS = (
-    _LOAD_CANDIDATE_ISSUES,
     _LOAD_MARKER_ISSUES,
     _LOAD_PAGE_ISSUES,
     _LOAD_LINK_ISSUES,
@@ -575,10 +572,8 @@ def _check_conclusions_product(
     return issues
 
 
-def _conclusions_state(resolved: Path, mode: LoadMode) -> ConclusionsState | None:
-    """读取所有权状态；标记缺失/无效/非 registered 时返回 None（不在此处报错）。"""
-    if mode != "registered":
-        return None
+def _conclusions_state(resolved: Path) -> ConclusionsState | None:
+    """读取所有权状态；标记缺失/无效时返回 None（不在此处报错）。"""
     from draft.graph import read_marker
 
     try:
@@ -588,13 +583,11 @@ def _conclusions_state(resolved: Path, mode: LoadMode) -> ConclusionsState | Non
     return state.conclusions_state
 
 
-def _conclusions_required(resolved: Path, mode: LoadMode) -> bool:
-    """conclusions.md 是否必须存在：registered 且标记有效时由所有权状态决定。
+def _conclusions_required(resolved: Path) -> bool:
+    """conclusions.md 是否必须存在：标记有效时由所有权状态决定。
 
-    标记缺失/无效/候选模式下不在此处要求；对应诊断由加载期 marker issue 报告。
+    标记缺失/无效时不在此处要求；对应诊断由加载期 marker issue 报告。
     """
-    if mode != "registered":
-        return False
     from draft.graph import read_marker
 
     try:
@@ -604,12 +597,47 @@ def _conclusions_required(resolved: Path, mode: LoadMode) -> bool:
     return state.conclusions_state is ConclusionsState.GENERATED
 
 
+_ALLOWED_INTERNAL_ENTRIES = frozenset(
+    {
+        MARKER_PATH,
+        PROVISIONAL_MARKER_PATH,  # 开发期 adopt 崩溃桥接（Task 8 删除）。
+        Path(INTERNAL_DIR) / "operation.lock",
+        Path(INTERNAL_DIR) / "operations",
+        Path(INTERNAL_DIR) / "trash",
+    }
+)
+
+
+def _check_internal_namespace(resolved: Path) -> list[CheckIssue]:
+    """受管内部命名空间检查：candidate 与 registered 共享同一协议（规格 §5.4）。
+
+    ``.draft/`` 顶层只允许 marker、operation.lock、operations、trash 与开发期
+    provisional 桥接；未登记条目统一报告 internal.unexpected_entry。已知目录内部的
+    非法形状由更具体的检查码报告，不在此处猜测。
+    """
+    issues: list[CheckIssue] = []
+    internal = resolved / INTERNAL_DIR
+    if internal.is_symlink():
+        issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, Path(INTERNAL_DIR)))
+        return issues
+    if not internal.exists():
+        return issues
+    if not internal.is_dir():
+        issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, Path(INTERNAL_DIR)))
+        return issues
+    for entry in sorted(internal.iterdir()):
+        relative = entry.relative_to(resolved)
+        if relative not in _ALLOWED_INTERNAL_ENTRIES:
+            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
+        elif entry.is_symlink():
+            issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, relative))
+    return issues
+
+
 def check_draft(
     root: Path,
-    mode: LoadMode = "registered",
     *,
     include_operation_state: bool = True,
-    allow_provisional_adopt: bool = False,
     exclude_resource_facts: bool = False,
 ) -> CheckReport:
     resolved = resolve_draft_root(root)
@@ -627,7 +655,7 @@ def check_draft(
                 )
             )
     # conclusions.md 只在所有权为 generated 时要求存在；not_generated 允许缺失。
-    conclusions_required = _conclusions_required(resolved, mode)
+    conclusions_required = _conclusions_required(resolved)
     if conclusions_required:
         candidate = resolved / CONCLUSIONS_PAGE
         if not candidate.is_file() or candidate.is_symlink():
@@ -648,13 +676,13 @@ def check_draft(
             )
         )
 
-    result = load_graph_tolerant(resolved, mode, allow_provisional_adopt=allow_provisional_adopt)
+    result = load_graph_tolerant(resolved)
 
     ordered: list[CheckIssue] = []
     ordered.extend(sorted(layout, key=_sort_key))
-    ordered.extend(sorted(_load_issues_in(result.issues, _LOAD_CANDIDATE_ISSUES), key=_sort_key))
     ordered.extend(sorted(_load_issues_in(result.issues, _LOAD_MARKER_ISSUES), key=_sort_key))
-    if include_operation_state and mode == "registered":
+    # candidate 与 registered 共享操作日志、锁、trash 与结论所有权检查。
+    if include_operation_state:
         ordered.extend(sorted(_check_operation_state(resolved), key=_sort_key))
     ordered.extend(sorted(_load_issues_in(result.issues, _LOAD_PAGE_ISSUES), key=_sort_key))
     # 所有权为 generated 时，结论页自身的断链/无效链接是允许过时的机器列表事实，不报错。
@@ -669,7 +697,8 @@ def check_draft(
         ordered.extend(sorted(_load_issues_in(result.issues, _LOAD_LINK_ISSUES), key=_sort_key))
     ordered.extend(sorted(_load_issues_in(result.issues, None), key=_sort_key))
     ordered.extend(check_graph(result.graph).issues)
-    conclusions_state = _conclusions_state(resolved, mode)
+    ordered.extend(sorted(_check_internal_namespace(resolved), key=_sort_key))
+    conclusions_state = _conclusions_state(resolved)
     if conclusions_state is ConclusionsState.NOT_GENERATED and _conclusions_unexpected(resolved):
         # not_generated 时意外出现的 conclusions.md 不是普通受管理页面：只报告
         # conclusions.unexpected_file，不把它的普通页面诊断（缺父主题/不可达等）当作噪声。

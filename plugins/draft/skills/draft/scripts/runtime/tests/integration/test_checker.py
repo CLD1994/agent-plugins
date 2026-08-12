@@ -1,13 +1,15 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from draft.checker import check_draft
 from draft.diagnostic_codes import (
     CheckCode,
     LinkEscapeKind,
     ReplacementStatusReason,
 )
-from draft.models import CheckReport, IssueSeverity
+from draft.models import CheckReport, IssueSeverity, RootState
 from draft.operations import JOURNAL_VERSION
 from draft.trash import trash_page
 from draft.vocabulary import ConclusionsState
@@ -146,49 +148,54 @@ def test_symlinked_marker_reports_symlink_escape(draft_factory: DraftFactory) ->
 
     report = check_draft(root)
 
-    assert codes(report) == [CheckCode.PATH_SYMLINK_ESCAPE.value]
+    assert CheckCode.PATH_SYMLINK_ESCAPE.value in codes(report)
 
 
-def test_candidate_mode_reports_final_marker_as_already_registered(
+@pytest.mark.parametrize("root_state", tuple(RootState))
+def test_managed_roots_share_operation_state_diagnostics(
     draft_factory: DraftFactory,
+    root_state: RootState,
 ) -> None:
-    root = draft_factory(healthy())
+    """candidate 与 registered 共享操作日志、锁与内部命名空间协议（规格 §5.4）。"""
+    root = draft_factory(healthy(), root_state=root_state)
+    journal_path = write_raw_journal(
+        root,
+        version=JOURNAL_VERSION,
+        operation_id="7" * 32,
+        directory_id="8" * 32,
+    )
+    before = journal_path.read_bytes()
 
-    report = check_draft(root, mode="candidate")
+    report = check_draft(root)
 
-    assert codes(report) == [CheckCode.CANDIDATE_ALREADY_REGISTERED.value]
-
-
-def test_candidate_mode_accepts_unregistered_layout(draft_factory: DraftFactory) -> None:
-    root = draft_factory(healthy(), root_state=None)
-
-    report = check_draft(root, mode="candidate")
-
-    assert report.errors == ()
-
-
-def test_candidate_mode_rejects_internal_entries(draft_factory: DraftFactory) -> None:
-    root = draft_factory(healthy(), root_state=None)
-    (root / ".draft" / "operations" / ("a" * 32)).mkdir(parents=True)
-
-    report = check_draft(root, mode="candidate")
-
-    assert codes(report) == [CheckCode.CANDIDATE_INTERNAL_STATE.value]
+    assert CheckCode.OPERATION_JOURNAL_CORRUPT.value in codes(report)
+    assert journal_path.read_bytes() == before
 
 
-def test_candidate_mode_provisional_shape_in_final_marker_is_invalid(
+@pytest.mark.parametrize("root_state", tuple(RootState))
+def test_managed_roots_share_internal_namespace_rules(
+    draft_factory: DraftFactory,
+    root_state: RootState,
+) -> None:
+    root = draft_factory(healthy(), root_state=root_state)
+    (root / ".draft" / "junk.json").write_text("x", encoding="utf-8")
+
+    report = check_draft(root)
+
+    assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
+
+
+def test_provisional_shape_in_final_marker_is_invalid(
     draft_factory: DraftFactory,
 ) -> None:
     """正式 marker 不接受 provisional 键：旧内嵌 provisional 形状现在是 format.invalid。"""
-    root = draft_factory(healthy(), root_state=None)
-    internal = root / ".draft"
-    internal.mkdir()
-    (internal / "draft.json").write_text(
-        '{"format_version":1,"conclusions_state":"not_generated","adopt_state":"provisional","candidate_manifest":[]}\n',
+    root = draft_factory(healthy())
+    (root / ".draft/draft.json").write_text(
+        '{"format_version":1,"root_state":"candidate","conclusions_state":"not_generated","adopt_state":"provisional","candidate_manifest":[]}\n',
         encoding="utf-8",
     )
 
-    report = check_draft(root, mode="candidate")
+    report = check_draft(root)
 
     assert CheckCode.FORMAT_INVALID.value in codes(report)
 
@@ -1312,12 +1319,6 @@ def test_check_does_not_change_due_or_failed_package(
     before = snapshot_tree(root)
     check_draft(root)
     assert snapshot_tree(root) == before
-    # 候选检查对登记根只读拒绝，同样不改动字节。
-    report_candidate = check_draft(root, mode="candidate")
-    assert snapshot_tree(root) == before
-    assert [issue.code for issue in report_candidate.errors] == [
-        CheckCode.CANDIDATE_ALREADY_REGISTERED.value
-    ]
 
 
 def test_checker_retained_with_invalid_deadlines_is_error(

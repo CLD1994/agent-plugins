@@ -10,7 +10,7 @@ from draft.cli import main
 from draft.diagnostic_codes import CheckCode
 from draft.vocabulary import ConclusionsState
 from tests.integration.support import (
-    build_legacy_unmarked_candidate,
+    build_valid_candidate,
     managed_marker_text,
     snapshot_tree,
 )
@@ -87,27 +87,19 @@ def test_adopt_success_and_invalid_candidate(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = tmp_path / "candidate"
-    root.mkdir()
-    (root / "pages").mkdir()
-    (root / "index.md").write_text(
-        "# 主题\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n- [结论汇总](conclusions.md)\n",
-        encoding="utf-8",
-    )
-    (root / "conclusions.md").write_text(
-        "# 结论汇总\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](index.md)\n",
-        encoding="utf-8",
-    )
+    build_valid_candidate(root)
     code, payload = run_json(["adopt", "--root", str(root), "--json"], capsys)
     assert code == 0
     assert "ok" not in payload
 
+    # 未受管目录（无 marker）在根定位阶段就以 format.missing 拒绝。
     broken = tmp_path / "broken"
     broken.mkdir()
     code, payload = run_json(["adopt", "--root", str(broken), "--json"], capsys)
     assert code == 2
     error = payload["error"]
     assert isinstance(error, dict)
-    assert error["code"] == "adopt.invalid_candidate"
+    assert error["code"] == CheckCode.FORMAT_MISSING.value
 
 
 def test_migrate_subcommand_is_removed(tmp_path: Path) -> None:
@@ -115,79 +107,45 @@ def test_migrate_subcommand_is_removed(tmp_path: Path) -> None:
         main(["migrate", str(tmp_path), "--from", "legacy-v0", "--to", str(tmp_path)])
 
 
-def test_check_parser_accepts_candidate_flag(
+def test_check_candidate_root_scans_unified_protocol(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = tmp_path / "candidate"
-    build_legacy_unmarked_candidate(root)
+    build_valid_candidate(root)
 
-    code, payload = run_json(["check", "--root", str(root), "--candidate", "--json"], capsys)
+    code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
 
     assert code == 0
     assert payload["ok"] is True
 
 
-def test_candidate_check_is_read_only(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_check_is_read_only_on_candidate_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     root = tmp_path / "candidate"
-    build_legacy_unmarked_candidate(root)
+    build_valid_candidate(root)
     before = snapshot_tree(root)
 
-    code, payload = run_json(["check", "--root", str(root), "--candidate", "--json"], capsys)
+    code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
 
     assert code == 0
     assert payload["ok"] is True
     assert snapshot_tree(root) == before
-    assert not (root / ".draft").exists()
 
 
-def test_candidate_check_rejects_registered_root_without_mutation(
-    registered_draft: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    before = snapshot_tree(registered_draft)
-    code, payload = run_json(
-        ["check", "--root", str(registered_draft), "--candidate", "--json"],
-        capsys,
-    )
-    assert code == 1
-    assert payload["ok"] is False
-    assert payload["result_type"] == "check"
-    assert [issue["code"] for issue in as_dicts(payload["errors"])] == [
-        CheckCode.CANDIDATE_ALREADY_REGISTERED.value
-    ]
-    assert snapshot_tree(registered_draft) == before
-
-
-def test_candidate_check_registered_root_human_hint(
-    registered_draft: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    code = main(["check", "--root", str(registered_draft), "--candidate"])
-    output = capsys.readouterr().out
-    assert code == 1
-    assert_human_output_facts(
-        output,
-        (
-            (Path(".draft/draft.json"), "--candidate"),
-            (),
-        ),
-    )
-
-
-def test_candidate_check_provisional_marker_is_recovery_required(
+def test_check_provisional_marker_is_recovery_required(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = tmp_path / "candidate"
-    build_legacy_unmarked_candidate(root)
+    build_valid_candidate(root)
     from draft.lifecycle import draft_manifest, provisional_marker_bytes
 
-    before_manifest = draft_manifest(root, mode="candidate")
+    before_manifest = draft_manifest(root)
     internal = root / ".draft"
-    internal.mkdir()
     (internal / "draft.provisional.json").write_bytes(provisional_marker_bytes(before_manifest))
     before = snapshot_tree(root)
 
-    code, payload = run_json(["check", "--root", str(root), "--candidate", "--json"], capsys)
+    code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
 
     assert code == 3
     assert payload["ok"] is False
@@ -198,33 +156,20 @@ def test_candidate_check_provisional_marker_is_recovery_required(
     assert snapshot_tree(root) == before
 
 
-def test_candidate_check_rejects_internal_state_without_mutation(
+def test_check_reports_unexpected_internal_entry(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    variants: list[str] = ["empty", "operation", "trash"]
-    for variant in variants:
-        root = tmp_path / variant
-        build_legacy_unmarked_candidate(root)
-        internal = root / ".draft"
-        if variant == "empty":
-            internal.mkdir()
-        elif variant == "operation":
-            journal_dir = internal / "operations" / ("a" * 32)
-            journal_dir.mkdir(parents=True)
-            (journal_dir / "journal.json").write_text("{}\n", encoding="utf-8")
-        else:
-            package = internal / "trash" / "outgoing" / ("b" * 32)
-            package.mkdir(parents=True)
-            (package / "page.md").write_text("# 回收\n", encoding="utf-8")
-        before = snapshot_tree(root)
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    (root / ".draft" / "junk.json").write_text("x", encoding="utf-8")
 
-        code, payload = run_json(["check", "--root", str(root), "--candidate", "--json"], capsys)
+    code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
 
-        assert code == 1, variant
-        assert payload["ok"] is False
-        codes = [issue["code"] for issue in as_dicts(payload["errors"])]
-        assert codes == [CheckCode.CANDIDATE_INTERNAL_STATE.value], variant
-        assert snapshot_tree(root) == before, variant
+    assert code == 1
+    assert payload["ok"] is False
+    assert [issue["code"] for issue in as_dicts(payload["errors"])] == [
+        CheckCode.INTERNAL_UNEXPECTED_ENTRY.value
+    ]
 
 
 def test_check_clean_and_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1001,16 +946,16 @@ def test_restore_advances_due_package_once(
     assert code == 0
 
 
-def test_init_and_candidate_check_do_not_preflight(
+def test_init_and_check_do_not_preflight(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[str] = []
     monkeypatch.setattr("draft.trash_lifecycle._default_handoff", calls.append)
     root = tmp_path / "candidate"
-    build_legacy_unmarked_candidate(root)
+    build_valid_candidate(root)
     capsys.readouterr()
 
-    code, _payload = run_json(["check", "--root", str(root), "--candidate", "--json"], capsys)
+    code, _payload = run_json(["check", "--root", str(root), "--json"], capsys)
 
     assert code == 0
     assert calls == []

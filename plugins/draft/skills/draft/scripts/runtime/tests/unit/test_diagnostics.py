@@ -62,22 +62,6 @@ def test_catalog_covers_every_typed_check_code() -> None:
 VALID_RENDER_CASES = [
     RenderCase(
         CheckIssue(
-            CheckCode.CANDIDATE_ALREADY_REGISTERED.value,
-            IssueSeverity.ERROR,
-            Path(".draft/draft.json"),
-            None,
-        ),
-    ),
-    RenderCase(
-        CheckIssue(
-            CheckCode.CANDIDATE_INTERNAL_STATE.value,
-            IssueSeverity.ERROR,
-            Path(".draft"),
-            None,
-        ),
-    ),
-    RenderCase(
-        CheckIssue(
             CheckCode.INTERNAL_UNEXPECTED_ENTRY.value,
             IssueSeverity.ERROR,
             Path(".draft/unregistered.json"),

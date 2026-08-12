@@ -14,8 +14,6 @@ class QueryCode(StrEnum):
 
 
 class CheckCode(StrEnum):
-    CANDIDATE_ALREADY_REGISTERED = "candidate.already_registered"
-    CANDIDATE_INTERNAL_STATE = "candidate.internal_state"
     FORMAT_MISSING = "format.missing"
     FORMAT_INVALID = "format.invalid"
     FORMAT_UNSUPPORTED = "format.unsupported"

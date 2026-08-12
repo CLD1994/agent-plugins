@@ -60,17 +60,21 @@ def write_raw_journal(
     return journal_path
 
 
-def build_legacy_unmarked_candidate(root: Path) -> None:
-    """旧 check --candidate / provisional adopt 测试的无 marker 候选目录桥接。
-
-    Task 4 将 build_valid_candidate 重新定义为真正带 candidate marker 的受管根，
-    并删除本条测试桥接；本函数只允许被 Task 4/8 将删除的测试导入。
-    """
+def build_valid_candidate(root: Path) -> None:
+    """构造合法的 candidate-marker 受管根：可被 adopt 接受的候选根。"""
     root.mkdir()
     (root / "pages").mkdir()
     # 规格 §12.2：候选目录不允许预先存在 conclusions.md（所有权为 not_generated）。
     (root / "index.md").write_text(
         "# 主题\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n",
+        encoding="utf-8",
+    )
+    internal = root / ".draft"
+    internal.mkdir()
+    (internal / "operations").mkdir()
+    (internal / "trash" / "outgoing").mkdir(parents=True)
+    (internal / "draft.json").write_text(
+        managed_marker_text(root_state=RootState.CANDIDATE),
         encoding="utf-8",
     )
 

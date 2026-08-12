@@ -23,12 +23,7 @@ from draft.models import (
     RootState,
     TrashResult,
 )
-from draft.paths import (
-    FilesystemProbe,
-    ManagedRoot,
-    discover_root_directory,
-    select_managed_root,
-)
+from draft.paths import FilesystemProbe, ManagedRoot, select_managed_root
 from draft.plan_effects import PlanEffect
 from draft.query import LocalPageSnapshot, SnapshotView
 from draft.vocabulary import EditableRelationCode, StatusCode
@@ -82,16 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="把 root_state=candidate 的受管根原子推进为 registered。",
     )
 
-    check = subparsers.add_parser(
+    _check = subparsers.add_parser(
         "check",
         parents=[rooted],
         help="检查草稿一致性",
-        description="按已登记布局检查草稿，报告错误、警告、信息与提醒；默认模式要求存在内部登记。",
-    )
-    check.add_argument(
-        "--candidate",
-        action="store_true",
-        help="按未登记候选布局检查（只读，要求不存在内部状态）",
+        description="按已登记布局检查草稿；candidate 与 registered 共享同一检查协议。",
     )
 
     move = subparsers.add_parser(
@@ -924,36 +914,32 @@ def main(
     env = os.environ if environ is None else environ
     cwd = Path(os.getcwd()) if get_cwd is None else get_cwd()
 
-    # 只解析一次受管根：init 不用选择器（位置 ROOT）；check/adopt 采用宽松目录发现，
-    # 由各自业务边界按 mode/marker 语义处理；其余命令严格选择并验证 marker。
+    # 只解析一次受管根：init 不用选择器（位置 ROOT）；其余命令统一经 select_managed_root
+    # 定位并验证 marker，规范绝对根传给后续层。
     managed: ManagedRoot | None = None
     root: Path | None = None
     if command != "init":
         explicit = getattr(args, "root", None)
         probe = FilesystemProbe()
         try:
-            if command in ("check", "adopt"):
-                root = discover_root_directory(
-                    explicit=explicit,
-                    environment_value=env.get("DRAFT_ROOT"),
-                    physical_cwd=cwd,
-                    probe=probe,
-                )
-            else:
-                managed = select_managed_root(
-                    explicit=explicit,
-                    environment_value=env.get("DRAFT_ROOT"),
-                    physical_cwd=cwd,
-                    probe=probe,
-                )
-                root = managed.path
+            managed = select_managed_root(
+                explicit=explicit,
+                environment_value=env.get("DRAFT_ROOT"),
+                physical_cwd=cwd,
+                probe=probe,
+            )
+            root = managed.path
         except DraftError as error:
             _emit_error(error, json_mode)
             return _exit_for_error(error)
 
-    # init/check/adopt 使用宽松目录发现（managed=None），天然不推进；其余受管命令
-    # 仅在 registered 根上前置推进回收生命周期（规格 §8.1）。
-    if managed is not None and managed.marker.root_state is RootState.REGISTERED:
+    # check/adopt/init 不推进回收生命周期（规格 §8.1）；其余受管命令仅在 registered
+    # 根上于业务前推进恰好一次。
+    if (
+        command not in ("check", "adopt")
+        and managed is not None
+        and managed.marker.root_state is RootState.REGISTERED
+    ):
         try:
             _advance_for_command(managed.path, now=captured_now)
         except DraftError as error:
@@ -962,12 +948,10 @@ def main(
 
     if command == "check":
         from draft.checker import check_draft
-        from draft.models import ValidationMode
 
         assert root is not None
-        mode: ValidationMode = "candidate" if bool(args.candidate) else "registered"
         try:
-            report = check_draft(root, mode=mode)
+            report = check_draft(root)
         except DraftError as error:
             _emit_error(error, json_mode)
             return _exit_for_error(error)

@@ -165,12 +165,6 @@ _FILE = frozenset({LocationKind.FILE})
 _LINE_OR_FILE = frozenset({LocationKind.LINE, LocationKind.FILE})
 
 _SPECS: dict[CheckCode, DiagnosticSpec] = {
-    CheckCode.CANDIDATE_ALREADY_REGISTERED: DiagnosticSpec(
-        _FILE, _fixed(0), _text("目标已经登记，--candidate 仅适用于未登记候选")
-    ),
-    CheckCode.CANDIDATE_INTERNAL_STATE: DiagnosticSpec(
-        _FILE, _fixed(0), _text("候选目录包含 Draft 内部状态")
-    ),
     CheckCode.INTERNAL_UNEXPECTED_ENTRY: DiagnosticSpec(
         _FILE, _fixed(0), _text("内部命名空间出现未登记条目")
     ),

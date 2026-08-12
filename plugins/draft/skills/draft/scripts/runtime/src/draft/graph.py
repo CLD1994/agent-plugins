@@ -17,7 +17,6 @@ from draft.models import (
     MarkdownLink,
     PageDocument,
     RootState,
-    ValidationMode,
 )
 from draft.paths import resolve_draft_root
 from draft.resources import (
@@ -28,8 +27,6 @@ from draft.resources import (
     resolve_page_resources,
 )
 from draft.vocabulary import ConclusionsState, RelationCode
-
-LoadMode = ValidationMode
 
 ROOT_PAGE = Path("index.md")
 CONCLUSIONS_PAGE = Path("conclusions.md")
@@ -501,23 +498,21 @@ def structural_issues(result: LoadResult) -> list[CheckIssue]:
 
 def load_graph(
     root: Path,
-    mode: LoadMode = "registered",
     *,
     allow_provisional_adopt: bool = False,
 ) -> DraftGraph:
     resolved = resolve_draft_root(root)
-    result = load_graph_tolerant(resolved, mode, allow_provisional_adopt=allow_provisional_adopt)
-    if mode == "registered":
-        try:
-            state = read_marker(resolved)
-        except DraftError:
-            # 无效 marker 已由 tolerant 记录为阻断 issue；由下方 blocking 分支报出。
-            pass
-        else:
-            if state.root_state is not RootState.REGISTERED:
-                # 候选根普通写命令在 Task 9–11 按操作级门禁开放前，注册模式入口
-                # 显式拒绝，不能因为 marker 可读就意外放行。此代码随门禁落地删除。
-                raise DraftError("root.candidate", resolved)
+    result = load_graph_tolerant(resolved, allow_provisional_adopt=allow_provisional_adopt)
+    try:
+        state = read_marker(resolved)
+    except DraftError:
+        # 无效 marker 已由 tolerant 记录为阻断 issue；由下方 blocking 分支报出。
+        pass
+    else:
+        if state.root_state is not RootState.REGISTERED:
+            # 候选根普通写命令在 Task 9–11 按操作级门禁开放前，注册模式入口
+            # 显式拒绝，不能因为 marker 可读就意外放行。此代码随门禁落地删除。
+            raise DraftError("root.candidate", resolved)
     blocking = structural_issues(result)
     if blocking:
         first = blocking[0]
@@ -530,92 +525,35 @@ def load_graph(
     return result.graph
 
 
-def _candidate_internal_issues(
-    resolved: Path, *, allow_provisional_adopt: bool
-) -> list[CheckIssue]:
-    """Candidate mode rejects every pre-existing internal entry.
-
-    The two marker files are the only allowed internal entries: a final marker
-    (draft.json) is already-registered evidence, a provisional marker
-    (draft.provisional.json) is adopt crash evidence readable only by the
-    private adopt recheck that explicitly opts in.
-    """
-    issues: list[CheckIssue] = []
-    internal = resolved / INTERNAL_DIR
-    if internal.is_symlink() or (internal.exists() and not internal.is_dir()):
-        return [error_issue(CheckCode.CANDIDATE_INTERNAL_STATE, Path(INTERNAL_DIR))]
-    if not internal.is_dir():
-        return issues
-    entries = sorted(internal.iterdir())
-    if not entries:
-        issues.append(error_issue(CheckCode.CANDIDATE_INTERNAL_STATE, Path(INTERNAL_DIR)))
-    final = resolved / MARKER_PATH
-    if final.is_file() and not final.is_symlink():
-        try:
-            read_marker(resolved)
-        except DraftError as error:
-            issues.append(
-                CheckIssue(
-                    code=error.code,
-                    severity=IssueSeverity.ERROR,
-                    path=MARKER_PATH,
-                    line=None,
-                )
-            )
-        else:
-            # 已登记（任一 root_state）是终态事实：其余内部条目都是合法登记状态，
-            # 不再逐条报告。legacy `check --candidate` 在 Task 4 随本分支删除。
-            return [error_issue(CheckCode.CANDIDATE_ALREADY_REGISTERED, MARKER_PATH)]
-    provisional = resolved / PROVISIONAL_MARKER_PATH
-    if provisional.is_file() and not provisional.is_symlink():
-        try:
-            read_provisional_marker(resolved)
-        except DraftError as error:
-            issues.append(
-                CheckIssue(
-                    code=error.code,
-                    severity=IssueSeverity.ERROR,
-                    path=PROVISIONAL_MARKER_PATH,
-                    line=None,
-                )
-            )
-        else:
-            if not allow_provisional_adopt:
-                raise DraftError("adopt.recovery_required", provisional)
-    allowed = {MARKER_PATH, PROVISIONAL_MARKER_PATH}
-    for entry in entries:
-        relative = entry.relative_to(resolved)
-        if relative not in allowed or entry.is_symlink() or not entry.is_file():
-            issues.append(error_issue(CheckCode.CANDIDATE_INTERNAL_STATE, relative))
-    return issues
-
-
 def load_graph_tolerant(
     root: Path,
-    mode: LoadMode = "registered",
     *,
     allow_provisional_adopt: bool = False,
 ) -> LoadResult:
+    """容错加载：candidate 与 registered 共享同一页面/关系/链接/路径协议。
+
+    marker 是根身份的唯一权威：``load_graph_tolerant`` 读取并校验 marker，不按外部
+    mode 区分分支。独立临时标记文件（draft.provisional.json）在 Task 8 前仍是
+    adopt 崩溃桥接，两种根一致视为恢复需求。
+    """
     resolved = root if root.is_absolute() else resolve_draft_root(root)
     marker_issues: list[CheckIssue] = []
-    if mode == "registered":
-        # 独立临时标记文件存在即半完成接管现场：registered 一律视为恢复需求。
-        if provisional_marker_path(resolved) is not None:
-            raise DraftError("adopt.recovery_required", resolved / PROVISIONAL_MARKER_PATH)
-        try:
-            read_marker(resolved)
-        except DraftError as error:
-            marker_issues.append(
-                CheckIssue(
-                    code=error.code,
-                    severity=IssueSeverity.ERROR,
-                    path=MARKER_PATH,
-                    line=None,
-                )
+    # 独立临时标记文件存在即半完成接管现场：普通加载一律视为恢复需求；仅 adopt
+    # 私有复核（allow_provisional_adopt=True）可精确排除自己的 provisional 文件。
+    if provisional_marker_path(resolved) is not None and not allow_provisional_adopt:
+        raise DraftError("adopt.recovery_required", resolved / PROVISIONAL_MARKER_PATH)
+    try:
+        read_marker(resolved)
+    except DraftError as error:
+        if error.code == "adopt.recovery_required":
+            raise
+        marker_issues.append(
+            CheckIssue(
+                code=error.code,
+                severity=IssueSeverity.ERROR,
+                path=MARKER_PATH,
+                line=None,
             )
-    else:
-        marker_issues.extend(
-            _candidate_internal_issues(resolved, allow_provisional_adopt=allow_provisional_adopt)
         )
     result = _load(resolved)
     return LoadResult(

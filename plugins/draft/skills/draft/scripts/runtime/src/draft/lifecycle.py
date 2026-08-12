@@ -13,11 +13,10 @@ from draft.graph import (
     INTERNAL_DIR,
     MARKER_PATH,
     PROVISIONAL_MARKER_PATH,
-    load_graph,
     parse_provisional_adopt_value,
     read_marker,
 )
-from draft.models import RootState, ValidationMode
+from draft.models import RootState
 from draft.operations import (
     durable_write,
     fsync_directory,
@@ -49,10 +48,11 @@ class CandidateManifest:
 def draft_manifest(
     root: Path,
     *,
-    mode: ValidationMode,
     allow_provisional_adopt: bool = False,
 ) -> CandidateManifest:
-    graph = load_graph(root, mode=mode, allow_provisional_adopt=allow_provisional_adopt)
+    from draft.graph import load_graph_tolerant
+
+    graph = load_graph_tolerant(root, allow_provisional_adopt=allow_provisional_adopt).graph
     entries: list[tuple[Path, str]] = []
     for path in graph.pages:
         digest = sha256_file(root / path)
@@ -153,13 +153,21 @@ def initialize(root: Path, *, root_state: RootState = RootState.REGISTERED) -> N
 
 
 def adopt(root: Path) -> None:
+    """把 root_state=candidate 的受管根原子推进为 registered。
+
+    只接受 candidate marker：未受管目录（无 marker）与已登记根都拒绝。provisional
+    文件在 Task 8 前仍是开发期崩溃桥接；私有复核用 allow_provisional_adopt 精确排除
+    自己的 provisional 文件。
+    """
     target = resolve_draft_root(root)
     final_marker = target / MARKER_PATH
     provisional_marker = target / PROVISIONAL_MARKER_PATH
     reject_symlink_components(target, MARKER_PATH)
     reject_symlink_components(target, PROVISIONAL_MARKER_PATH)
-    if final_marker.is_file():
-        read_marker(target)
+    if not final_marker.is_file():
+        raise DraftError("adopt.invalid_candidate", target)
+    state = read_marker(target)
+    if state.root_state is not RootState.CANDIDATE:
         # 有效正式标记 + 残留独立临时标记 = 已提交待清理（finalize 两步间中断）。
         # 先耐久清理临时标记，再报告已登记；绝不能留着死锁现场。
         if provisional_marker.is_file():
@@ -174,29 +182,24 @@ def adopt(root: Path) -> None:
     if (target / INTERNAL_DIR / "operation.lock").exists():
         raise DraftError("adopt.locked", target)
     if before is None:
-        report = check_draft(target, mode="candidate")
+        # 完整候选检查（无过滤无分页）：candidate 与 registered 共享检查协议。
+        report = check_draft(target)
         if report.errors:
             raise DraftError(
                 "adopt.invalid_candidate",
                 target,
                 details=tuple(issue.code for issue in report.errors),
             )
-        before = draft_manifest(target, mode="candidate")
+        before = draft_manifest(target)
         create_marker_parent_durably(target)
         durable_write(provisional_marker, provisional_marker_bytes(before))
 
-    after_report = check_draft(
-        target,
-        mode="candidate",
-        allow_provisional_adopt=True,
-    )
-    after = draft_manifest(target, mode="candidate", allow_provisional_adopt=True)
-    if after_report.errors or after != before:
+    after = draft_manifest(target, allow_provisional_adopt=True)
+    if after != before:
         rollback_provisional_marker_durably(target, provisional_marker_bytes(before))
         raise DraftError(
             "adopt.invalid_candidate",
             target,
-            details=tuple(issue.code for issue in after_report.errors),
         )
     # 最终标记写入 draft.json 是登记线性化点；临时状态在独立文件中，先写正式再清理。
     durable_write(final_marker, marker_bytes(RootState.REGISTERED))

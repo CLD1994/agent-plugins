@@ -12,6 +12,7 @@ import draft.cli as cli
 from draft import __version__
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
+from draft.graph import MarkerState
 from draft.models import (
     CheckIssue,
     CheckReport,
@@ -22,7 +23,16 @@ from draft.models import (
     RootState,
     TrashResult,
 )
-from draft.paths import ResolvedPath
+from draft.paths import ManagedRoot, ResolvedPath, RootSource
+
+
+def _managed(path: str = "/draft") -> ManagedRoot:
+    return ManagedRoot(
+        path=Path(path),
+        marker=MarkerState(version=1, root_state=RootState.REGISTERED),
+        source=RootSource.CLI,
+    )
+
 
 # ---------------------------------------------------------------------------
 # 辅助构造器
@@ -102,11 +112,10 @@ def test_build_parser_parses_init_candidate_command() -> None:
     assert args.candidate is True
 
 
-def test_build_parser_parses_check_with_candidate_flag() -> None:
-    args = cli.build_parser().parse_args(["check", "--root", "/draft", "--candidate"])
+def test_build_parser_parses_check_with_root() -> None:
+    args = cli.build_parser().parse_args(["check", "--root", "/draft"])
     assert args.command == "check"
     assert args.root == "/draft"
-    assert args.candidate is True
 
 
 def test_build_parser_parses_promote_with_variable_children() -> None:
@@ -521,9 +530,9 @@ def test_main_version_returns_zero(capsys: pytest.CaptureFixture[str]) -> None:
 
 def _stub_root_discovery(mocker: MockerFixture) -> None:
     mocker.patch(
-        "draft.cli.discover_root_directory",
+        "draft.cli.select_managed_root",
         autospec=True,
-        return_value=Path("/draft"),
+        return_value=_managed(),
     )
 
 
