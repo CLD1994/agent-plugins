@@ -569,21 +569,25 @@ Agent 选择检查点并运行 check
 
 ## 14. 错误、重试与恢复闭合
 
-### 14.1 新增和退役的稳定代码
+### 14.1 新增、统一登记和退役的稳定代码
 
-本规格使用的新代码必须登记在生产代码的单一错误码权威来源中，CLI、渲染器、测试和文档
-从该来源引用，不在各层维护平行清单：
+本规格新增的代码，以及被统一根选择协议纳入同一分支集合的既有 `root.invalid`，必须登记
+在生产代码的单一错误码权威来源中。CLI、渲染器、测试和文档从该来源引用，不在各层维护
+平行清单：
 
 | 代码 | `path` | `details` 协议 |
 |---|---|---|
+| `root.invalid` | `--root` 规范化后的目标、绝对 `DRAFT_ROOT` 目标，或不合法的非绝对 `DRAFT_ROOT` 原始词法路径 | 空 |
 | `root.not_found` | `--root`/`DRAFT_ROOT` 解析后的目标，或祖先发现起点的物理 `pwd` | 恰好一个来源代码：`cli`、`env` 或 `pwd` |
 | `root.ambiguous` | 祖先发现起点的物理 `pwd` | 两个或更多合法根的规范绝对路径，按离 `pwd` 由近到远排列 |
 | `internal.unexpected_entry` | 非法条目的根内 POSIX 相对路径 | 空 |
 | `query.incomplete` | `query page` 请求的规范页面路径 | 第一项是十进制阻碍路径总数，后续最多 20 项是按路径排序的根内 POSIX 路径 |
 
-`root.not_found` 只表示目标目录不存在或祖先发现没有得到根；已选目录存在但 marker 缺失
-必须使用 `format.missing`。`query.incomplete` 的详情若总数大于实际携带路径数，即表示输出
-已截断；完整清单通过 `check` 获取。
+`root.invalid` 表示调用方已经提供了选择值，但它在根目录边界上不合法；例如
+`DRAFT_ROOT` 不是绝对路径，或规范化后的目标存在但不是目录。`root.not_found` 只表示目标
+目录不存在或祖先发现没有得到根；已选目录存在但 marker 缺失必须使用 `format.missing`。
+`query.incomplete` 的详情若总数大于实际携带路径数，即表示输出已截断；完整清单通过
+`check` 获取。
 
 旧 `candidate.already_registered`、`candidate.internal_state` 退役且不保留别名。正式根再次
 执行 `adopt` 使用既有 `adopt.already_registered`。
@@ -619,8 +623,8 @@ Agent 选择检查点并运行 check
 - candidate 与 registered 共享内部条目分类，旧 `candidate.*` 检查码不可达；
 - 根选择优先级，以及高优先级非法时不回退；
 - `--root`、`DRAFT_ROOT` 和 `pwd` 发现事实的分类；
-- `root.not_found`、`root.ambiguous`、`internal.unexpected_entry` 和 `query.incomplete` 的
-  精确 `path`/`details` 协议；
+- `root.invalid`、`root.not_found`、`root.ambiguous`、`internal.unexpected_entry` 和
+  `query.incomplete` 的精确 `path`/`details` 协议；
 - 生命周期资格对两种受管根成立，同时排除 `check` 和 `adopt`；
 - 候选操作门禁决策表；
 - 无关诊断不阻止操作，相关事实未知时拒绝；

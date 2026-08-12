@@ -1,7 +1,8 @@
 # Draft 候选根增量迁移 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
-> (recommended) or superpowers:executing-plans to implement this plan task-by-task.
+> (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use
+> checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 让 Agent 在固定的 `candidate` 根中复用普通 Draft CLI 渐进完成机械迁移，按需
 执行完整检查，并通过同一套日志与恢复协议把该根原子推进为 `registered`。
@@ -42,6 +43,8 @@ marker 原子替换为单向提交点，由统一 `recover` 按 operation kind�
 - 候选写计划必须记录并复核它实际依赖的全部输入事实。不能只校验待写文件的
   `before_sha256`，因为入站链接扫描、判环和页面集合发现还读取了不会被改写的文件与目录
   成员集合。
+- registered 写命令必须在规划前通过完整全局健康门禁；应用后的完整验证是事务提交前的
+  二次确认，不能代替前置门禁。已有全局错误时不得先应用 mutation 再靠回滚拒绝。
 - `adopt` 的 marker 替换是登记生效点。marker 已是 after 时只能完成提交和清理，不能
   回滚为 candidate。
 - CLI 不接受来源路径。端到端测试必须证明来源目录字节不变。
@@ -56,6 +59,10 @@ marker 原子替换为单向提交点，由统一 `recover` 按 operation kind�
 - 新增的有限字符串状态、operation kind 和错误码必须由生产枚举或等价受约束类型统一
   拥有；测试从生产权威来源读取合法集合，不复制清单。
 - 不通过删除测试、放宽静态检查或吞掉错误使门禁变绿。
+- Task 1–13 的每个提交都必须保持完整核心单元测试和核心 Pyright 为绿；任务列出的定向
+  集成测试也必须通过。不得提交已知的悬空导入、属性引用或跨任务红灯，再等待后续任务
+  修复。破坏性协议切换必须在同一任务内更新全部生产消费者和测试夹具；为保持中间提交
+  可验证而暂留的开发期桥接只能有一个明确删除任务，不得成为公开兼容设计。
 - 规格已经批准；以下模块名和内部函数签名是基于当前数据流的实现建议，不是新的外部
   行为限制。若实施时调整边界，必须保留同样的输入、输出、不变量、失败和恢复证据。
 
@@ -67,6 +74,18 @@ marker 原子替换为单向提交点，由统一 `recover` 按 operation kind�
 class RootState(StrEnum):
     CANDIDATE = "candidate"
     REGISTERED = "registered"
+
+
+class RootCode(StrEnum):
+    INVALID = "root.invalid"
+    NOT_FOUND = "root.not_found"
+    AMBIGUOUS = "root.ambiguous"
+
+
+class RootSource(StrEnum):
+    CLI = "cli"
+    ENV = "env"
+    PWD = "pwd"
 
 
 @dataclass(frozen=True)
@@ -91,7 +110,23 @@ class OperationFacts:
   不变量。
 - `OperationPlan` 和 `Journal` 持有 `root_state`、受约束的 `OperationKind` 与观察清单。
   对 candidate，计划器先证明最终语义，执行器再证明“输入未变 + 输出字节等于计划”；
-  对 registered，执行器继续在应用后运行完整健康验证。
+  对 registered，`load_operation_facts` 在规划前要求完整健康，执行器在应用后再运行一次
+  完整验证作为提交前二次确认。
+
+### 每任务提交门禁
+
+Task 1–13 在各自“运行测试并提交”步骤中，必须先运行任务列出的定向测试，再运行以下共同
+门禁，全部成功后才能执行该步骤中的 `git commit`：
+
+```bash
+RUNTIME=plugins/draft/skills/draft/scripts/runtime
+uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit" -q
+uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
+```
+
+修改适配层的任务还要运行适配层单元测试与 Pyright。Task 3 的分发/缓存网络用例和 Task 14
+的全量门禁另按任务命令执行。任何共同门禁失败都属于当前任务未闭合；不得把失败登记成
+“预期跨任务破坏”后提交。
 
 ## 文件映射
 
@@ -116,7 +151,7 @@ class OperationFacts:
   `runtime/tests/unit/test_{graph,paths,checker,cli,query,operations,page_create,page_metadata,relation_edit,structure,trash,conclusions,lifecycle}.py`
 - 核心集成测试：
   `runtime/tests/integration/conftest.py`、`support.py`、
-  `test_{identity,paths,cli,checker,queries,operations,page_commands,structure,trash,trash_lifecycle,conclusions,lifecycle,distribution_contract}.py`
+  `test_{identity,paths,cli,checker,queries,operations,page_commands,structure,trash,trash_package,trash_lifecycle,conclusions,lifecycle,distribution_contract,distribution_smoke,cache_isolation,dependency_bounds,candidate_migration}.py`
 - 适配层：
   `plugins/draft/scripts/tests/unit/test_session_hook.py` 与相关集成/分发测试。
 
@@ -131,7 +166,7 @@ class OperationFacts:
 
 | 批准规格 | 主要任务 | 横切复核 |
 |---|---|---|
-| §5 根状态、marker、内部状态 | Task 1、4 | Task 8、14 |
+| §5 根状态、marker、内部状态 | Task 1、2、4 | Task 8、14 |
 | §6 初始化 | Task 2 | Task 13、14 |
 | §7 根定位与 CLI | Task 3 | Task 12–14 |
 | §8 普通命令与生命周期资格 | Task 9–12 | Task 13、14 |
@@ -144,22 +179,102 @@ class OperationFacts:
 
 ---
 
-## Task 1：建立根状态与错误码权威类型
+## Task 1：非破坏性建立根状态与错误码权威类型
 
 **Files:**
 
 - Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/models.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/diagnostic_codes.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/diagnostics.py`
 - Test: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_graph.py`
 - Test: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_diagnostics.py`
 - Test: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_distribution_contract.py`
 
-- [ ] **Step 1: 写 marker 精确形状和错误码所有权测试**
+- [ ] **Step 1: 写受约束类型和错误码所有权测试**
 
-  覆盖两个 `root_state` × 两个 `conclusions_state`、未知字段、缺字段、布尔版本、未知整数
-  版本。测试必须明确拒绝旧的两键 marker 和把 provisional 字段塞入 `draft.json`：
+  这一步只增加后续任务需要的类型，不改变 `MarkerState`、marker 解析器或现有分支。测试从
+  生产枚举读取合法集合，避免在测试中复制值清单：
+
+  ```python
+  @pytest.mark.parametrize("root_state", tuple(RootState))
+  def test_root_state_round_trips_through_authority(root_state: RootState) -> None:
+      assert RootState(root_state.value) is root_state
+
+
+  @pytest.mark.parametrize("code", tuple(RootCode))
+  def test_root_code_round_trips_through_authority(code: RootCode) -> None:
+      assert RootCode(code.value) is code
+  ```
+
+  同时断言 `CheckCode` 增加 `internal.unexpected_entry`，`QueryCode` 拥有
+  `query.incomplete`。两个旧 `candidate.*` 暂时保留到 Task 4 删除，避免在消费者尚未切换
+  时制造悬空枚举引用。
+
+- [ ] **Step 2: 运行测试并确认按预期失败**
+
+  ```bash
+  RUNTIME=plugins/draft/skills/draft/scripts/runtime
+  uv run --project "$RUNTIME" --locked pytest \
+    "$RUNTIME/tests/unit/test_graph.py" \
+    "$RUNTIME/tests/unit/test_diagnostics.py" \
+    "$RUNTIME/tests/integration/test_distribution_contract.py" -q
+  ```
+
+  预期失败：当前没有 `RootState`、`RootCode`、`QueryCode` 和
+  `CheckCode.INTERNAL_UNEXPECTED_ENTRY`。
+
+- [ ] **Step 3: 实现非破坏性权威类型**
+
+  - 在 `models.py` 定义 `RootState`；不在本任务改动 `MarkerState`。
+  - 在 `diagnostic_codes.py` 定义 `RootCode.INVALID/NOT_FOUND/AMBIGUOUS`、
+    `QueryCode.INCOMPLETE`，并加入 `CheckCode.INTERNAL_UNEXPECTED_ENTRY`。
+  - 更新诊断渲染注册表以识别 `internal.unexpected_entry`；旧 candidate 文案在 Task 4 连同
+    旧检查分支一起删除。
+  - 分发契约用 AST 检查新的已登记字面量仍只有权威枚举拥有，不用源码字符串搜索替代
+    导入/结构检查。
+
+- [ ] **Step 4: 运行定向测试并提交**
+
+  ```bash
+  RUNTIME=plugins/draft/skills/draft/scripts/runtime
+  uv run --project "$RUNTIME" --locked pytest \
+    "$RUNTIME/tests/unit/test_graph.py" \
+    "$RUNTIME/tests/unit/test_diagnostics.py" \
+    "$RUNTIME/tests/integration/test_distribution_contract.py" -q
+  uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit" -q
+  uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
+  git add plugins/draft/skills/draft/scripts/runtime
+  git commit -m "refactor(draft): 建立受管根协议权威类型"
+  ```
+
+## Task 2：闭合切换正式 marker、初始化与直接消费者
+
+**Files:**
+
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/checker.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/structure.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/conclusions.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/lifecycle.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/conftest.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/support.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_graph.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_checker.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_structure.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_conclusions.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_lifecycle.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_checker.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_cli.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_lifecycle.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_identity.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py`
+
+- [ ] **Step 1: 写 marker 精确形状、消费者编译和两种初始化测试**
+
+  marker 测试覆盖两个 `root_state` × 两个 `conclusions_state`、未知字段、缺字段、布尔版本、
+  未知整数版本，并明确拒绝旧两键正式 marker：
 
   ```python
   @pytest.mark.parametrize("root_state", tuple(RootState))
@@ -180,58 +295,6 @@ class OperationFacts:
       assert marker.conclusions_state is conclusions_state
   ```
 
-  同时断言 `CheckCode` 增加 `internal.unexpected_entry`，删除两个 `candidate.*`；新增非检查
-  错误码枚举拥有 `root.not_found`、`root.ambiguous`、`query.incomplete`。
-
-- [ ] **Step 2: 运行测试并确认按预期失败**
-
-  ```bash
-  RUNTIME=plugins/draft/skills/draft/scripts/runtime
-  uv run --project "$RUNTIME" --locked pytest \
-    "$RUNTIME/tests/unit/test_graph.py" \
-    "$RUNTIME/tests/unit/test_diagnostics.py" \
-    "$RUNTIME/tests/integration/test_distribution_contract.py" -q
-  ```
-
-  预期失败：当前 `MarkerState` 没有 `root_state`，旧 candidate 检查码仍已登记。
-
-- [ ] **Step 3: 实现受约束状态和精确 marker 解析**
-
-  - 在 `models.py` 定义 `RootState`；在 `diagnostic_codes.py` 让新错误码各有一个生产字面量
-    所有者。
-  - `MarkerState` 只暴露 `version`、`root_state`、`conclusions_state`。
-  - `parse_marker_value` 只接受三个精确键；版本非整数报 `format.invalid`，未知整数报
-    `format.unsupported`。
-  - 更新诊断渲染注册表，删除旧 candidate 文案并增加未知内部条目文案。
-  - 分发契约用 AST 检查新的已登记字面量仍只有权威枚举拥有，不用源码字符串搜索替代
-    导入/结构检查。
-
-- [ ] **Step 4: 运行定向测试并提交**
-
-  ```bash
-  RUNTIME=plugins/draft/skills/draft/scripts/runtime
-  uv run --project "$RUNTIME" --locked pytest \
-    "$RUNTIME/tests/unit/test_graph.py" \
-    "$RUNTIME/tests/unit/test_diagnostics.py" \
-    "$RUNTIME/tests/integration/test_distribution_contract.py" -q
-  git add plugins/draft/skills/draft/scripts/runtime
-  git commit -m "refactor(draft): 建立受管根状态协议"
-  ```
-
-## Task 2：重写初始化并切换共享测试夹具
-
-**Files:**
-
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/lifecycle.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/conftest.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/support.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_lifecycle.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_lifecycle.py`
-- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_identity.py`
-
-- [ ] **Step 1: 写两种初始化状态和失败原子性测试**
-
   测试 `init ROOT` 写 registered，`init --candidate ROOT` 写 candidate；二者都保留精确
   三键 marker。对非空目录、文件目标、发布前写失败和 marker 发布失败注入故障，断言不会
   留下可被识别为完成根的半初始化目录。
@@ -247,37 +310,82 @@ class OperationFacts:
       }
   ```
 
-- [ ] **Step 2: 运行生命周期用例并确认旧 provisional 流程导致失败**
+- [ ] **Step 2: 运行跨消费者测试并确认旧 marker 形状导致失败**
 
   ```bash
   RUNTIME=plugins/draft/skills/draft/scripts/runtime
   uv run --project "$RUNTIME" --locked pytest \
+    "$RUNTIME/tests/unit/test_graph.py" \
+    "$RUNTIME/tests/unit/test_checker.py" \
+    "$RUNTIME/tests/unit/test_cli.py" \
+    "$RUNTIME/tests/unit/test_structure.py" \
+    "$RUNTIME/tests/unit/test_conclusions.py" \
     "$RUNTIME/tests/unit/test_lifecycle.py" \
     "$RUNTIME/tests/integration/test_lifecycle.py" \
-    "$RUNTIME/tests/integration/test_identity.py" -q -k 'init or initialize'
+    "$RUNTIME/tests/integration/test_identity.py" -q
   ```
 
-- [ ] **Step 3: 实现显式状态初始化**
+  预期失败：当前正式 marker 没有 `root_state`，初始化也没有 `--candidate`；消费者仍直接把
+  `MarkerState.provisional_manifest` 当作正式 marker 状态。
+
+- [ ] **Step 3: 原子切换正式 marker 并更新全部直接消费者**
+
+  - `MarkerState` 只暴露 `version`、`root_state`、`conclusions_state`；
+    `parse_marker_value` 只接受三个精确键。版本非整数报 `format.invalid`，未知整数报
+    `format.unsupported`。
+  - 为当前 public adopt 尚未切换的开发期路径单独定义 `ProvisionalAdoptState` 与私有解析
+    函数；不得让 `read_marker()` 返回该类型，也不得让正式 marker 解析器接受 provisional
+    键。该桥接只服务现有 adopt 测试，并在 Task 8 连同文件协议一起删除。
+  - 同一任务更新 `checker.py`、`structure.py`、`conclusions.py`、`lifecycle.py` 中所有
+    `MarkerState.provisional_manifest` 消费点。结论 marker 重写必须保留 `root_state`；旧
+    正式 marker 字节常量全部替换。
+  - 原先用“marker 非 provisional”推断正式根的 registered-only 业务入口，暂时改为显式
+    要求 `root_state is RootState.REGISTERED`；候选普通写能力只在 Task 9–11 按事实闭包逐类
+    开放，不能因为 marker 变得可读就在 Task 2 意外放行。
+  - 对 `graph.py`、`checker.py`、`structure.py`、`lifecycle.py`、`conclusions.py` 运行
+    Pyright；不允许通过给 `MarkerState` 留一个无语义的 optional 字段掩盖悬空消费者。
+
+- [ ] **Step 4: 实现显式状态初始化**
 
   建议签名为 `initialize(root: Path, *, root_state: RootState) -> None`。用同父目录暂存并
   耐久发布，或保持等价的可证明回滚协议；不得再通过 candidate check + provisional marker
   绕一圈创建正式根。CLI 的 `init` 增加 `--candidate`，仍要求位置 `ROOT`。
 
-- [ ] **Step 4: 把所有真实根夹具切到新 marker**
+- [ ] **Step 5: 切换正式根夹具并隔离临时旧候选夹具**
 
-  - `draft_factory(files, root_state=RootState.REGISTERED)` 取代 `registered: bool`。
-  - `build_valid_candidate` 必须创建 candidate marker，不再表示“没有 `.draft/` 的目录”。
+  - `draft_factory(files, root_state=RootState.REGISTERED)` 取代 `registered: bool`，所有正式根
+    测试立即使用三键 marker。
+  - 把 `test_checker.py`、`test_cli.py`、`test_identity.py`、`test_lifecycle.py`、
+    `test_operations.py` 中代表合法正式根的硬编码 marker 改为共享 marker builder；专门验证
+    非法/旧形状的测试保留各自输入。不能只改 conftest 后假设没有旁路夹具。
+  - 仍服务旧 `check --candidate`/provisional adopt 测试的无 marker helper 明确重命名为
+    `build_legacy_unmarked_candidate`，只允许被 Task 4/8 将删除的测试导入；不得让新测试使用。
+    Task 4 将 `build_valid_candidate` 重新定义为真正带 candidate marker 的受管根并删除这条
+    测试桥接。
   - `write_raw_journal` 使用任务 7 最终日志版本前的当前权威常量，避免夹具复制版本号。
 
-- [ ] **Step 5: 运行定向测试并提交**
+- [ ] **Step 6: 运行定向测试、共同门禁并提交**
 
   ```bash
   RUNTIME=plugins/draft/skills/draft/scripts/runtime
   uv run --project "$RUNTIME" --locked pytest \
+    "$RUNTIME/tests/unit/test_graph.py" \
+    "$RUNTIME/tests/unit/test_checker.py" \
+    "$RUNTIME/tests/unit/test_cli.py" \
+    "$RUNTIME/tests/unit/test_structure.py" \
+    "$RUNTIME/tests/unit/test_conclusions.py" \
+    "$RUNTIME/tests/unit/test_lifecycle.py" \
+    "$RUNTIME/tests/integration/test_checker.py" \
+    "$RUNTIME/tests/integration/test_cli.py" \
     "$RUNTIME/tests/integration/test_lifecycle.py" \
-    "$RUNTIME/tests/integration/test_identity.py" -q -k 'init or initialize'
+    "$RUNTIME/tests/integration/test_identity.py" \
+    "$RUNTIME/tests/integration/test_operations.py" -q
+  uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit" -q
+  uv run --project "$RUNTIME" --locked \
+    pytest "$RUNTIME/tests/integration" -q -m 'not network'
+  uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
   git add plugins/draft/skills/draft/scripts/runtime
-  git commit -m "feat(draft): 初始化候选或正式受管根"
+  git commit -m "feat(draft): 切换受管根 marker 与初始化协议"
   ```
 
 ## Task 3：统一非初始化命令的根选择与 CLI 语法
@@ -290,6 +398,8 @@ class OperationFacts:
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_paths.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_cli.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_distribution_smoke.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_cache_isolation.py`
 
 - [ ] **Step 1: 用纯替身写完整根选择决策表**
 
@@ -308,7 +418,9 @@ class OperationFacts:
               physical_cwd=Path("/work/inner"),
               probe=root_probe,
           )
-      assert caught.value.code == "root.invalid"
+      assert caught.value.code == RootCode.INVALID.value
+      assert caught.value.paths == (Path("relative/root"),)
+      assert caught.value.details == ()
       assert root_probe.inspected == ()
   ```
 
@@ -329,6 +441,8 @@ class OperationFacts:
 
 - [ ] **Step 4: 实现单一 `ManagedRoot` 选择边界**
 
+  - 在 `paths.py` 定义 `RootSource` 和受真实文件系统边界约束的 `RootProbe` protocol；生产
+    probe 使用 `lstat`、物理 cwd 和共享 marker 解析器，单元 fake 实现同一 protocol。
   - `main` 允许注入 `environ: Mapping[str, str]` 和物理 cwd 提供者，生产缺省才读取
     `os.environ`/`os.getcwd()`；单元测试不改进程全局状态。
   - 所有非 init 叶命令删除位置 root 并增加 `--root`。页面操作数保留原相对顺序；
@@ -336,6 +450,8 @@ class OperationFacts:
   - 在分派、生命周期推进和页面操作数解析前只解析一次根，并把规范绝对根传给后续层。
   - `init` 不调用选择器且忽略 `DRAFT_ROOT`；为此增加一个环境中同时存在另一合法根的
     集成用例。帮助、版本不解析根。
+  - 同步修改分发 smoke 与缓存隔离用例中的 `check ROOT` 为 `check --root ROOT`；这些用例
+    实际安装分发物，不能只靠核心 `main()` 测试推断新语法可用。
 
 - [ ] **Step 5: 运行 CLI/路径测试并提交**
 
@@ -344,6 +460,14 @@ class OperationFacts:
   uv run --project "$RUNTIME" --locked pytest \
     "$RUNTIME/tests/unit/test_paths.py" "$RUNTIME/tests/unit/test_cli.py" \
     "$RUNTIME/tests/integration/test_paths.py" "$RUNTIME/tests/integration/test_cli.py" -q
+  uv run --project "$RUNTIME" --locked pytest \
+    "$RUNTIME/tests/integration/test_distribution_smoke.py" \
+    "$RUNTIME/tests/integration/test_cache_isolation.py" -q -m 'not network'
+  uv run --project "$RUNTIME" --locked pytest \
+    "$RUNTIME/tests/integration/test_distribution_smoke.py" \
+    "$RUNTIME/tests/integration/test_cache_isolation.py" -q -m network
+  uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit" -q
+  uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
   git add plugins/draft/skills/draft/scripts/runtime
   git commit -m "feat(draft): 统一受管根定位与命令语法"
   ```
@@ -354,10 +478,20 @@ class OperationFacts:
 
 - Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/checker.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/diagnostic_codes.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/diagnostics.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/lifecycle.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/conftest.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/support.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_checker.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_diagnostics.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_graph.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_lifecycle.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_checker.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_cli.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_lifecycle.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py`
 
 - [ ] **Step 1: 写受管根内部状态分类测试**
@@ -391,7 +525,9 @@ class OperationFacts:
   RUNTIME=plugins/draft/skills/draft/scripts/runtime
   uv run --project "$RUNTIME" --locked pytest \
     "$RUNTIME/tests/unit/test_graph.py" "$RUNTIME/tests/unit/test_checker.py" \
+    "$RUNTIME/tests/unit/test_cli.py" \
     "$RUNTIME/tests/integration/test_checker.py" \
+    "$RUNTIME/tests/integration/test_cli.py" \
     "$RUNTIME/tests/integration/test_operations.py" -q -k 'candidate or internal or readonly'
   ```
 
@@ -400,6 +536,12 @@ class OperationFacts:
   - 删除 `_candidate_internal_issues` 及 `_LOAD_CANDIDATE_ISSUES`。
   - `load_graph_tolerant` 从 marker 得到 `RootState`，页面发现协议保持一致。
   - 抽出受管内部命名空间检查；候选也检查日志、锁、trash、结论所有权。
+  - 删除 `CheckCode.CANDIDATE_ALREADY_REGISTERED/CANDIDATE_INTERNAL_STATE` 及诊断文案；把
+    `build_valid_candidate` 切为真正的 candidate marker 根，并删除 Task 2 的
+    `build_legacy_unmarked_candidate` 测试桥接和无 marker candidate 生产分支。
+  - 在 Task 8 接管日志尚未落地前，`lifecycle.adopt` 只允许 candidate marker，并把现有
+    provisional 文件作为明确的开发期桥接；其私有复核可以精确排除自己的 provisional
+    文件，普通 `check` 不能忽略该文件。Task 8 必须删除这条桥接。
   - `check_draft(root)` 不再接受外部 mode；内部测试若需要纯图检查，继续直接测试
     `check_graph`。
   - `check` 不调用生命周期、恢复或清理函数。
@@ -410,8 +552,16 @@ class OperationFacts:
   RUNTIME=plugins/draft/skills/draft/scripts/runtime
   uv run --project "$RUNTIME" --locked pytest \
     "$RUNTIME/tests/unit/test_graph.py" "$RUNTIME/tests/unit/test_checker.py" \
+    "$RUNTIME/tests/unit/test_cli.py" "$RUNTIME/tests/unit/test_diagnostics.py" \
+    "$RUNTIME/tests/unit/test_lifecycle.py" \
     "$RUNTIME/tests/integration/test_checker.py" \
+    "$RUNTIME/tests/integration/test_cli.py" \
+    "$RUNTIME/tests/integration/test_lifecycle.py" \
     "$RUNTIME/tests/integration/test_operations.py" -q
+  uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit" -q
+  uv run --project "$RUNTIME" --locked \
+    pytest "$RUNTIME/tests/integration" -q -m 'not network'
+  uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
   git add plugins/draft/skills/draft/scripts/runtime
   git commit -m "refactor(draft): 统一候选与正式根检查协议"
   ```
@@ -486,6 +636,8 @@ class OperationFacts:
   uv run --project "$RUNTIME" --locked pytest \
     "$RUNTIME/tests/unit/test_cli.py" "$RUNTIME/tests/integration/test_cli.py" \
     "$RUNTIME/tests/integration/test_checker.py" -q -k 'check and (filter or page or count or code)'
+  uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit" -q
+  uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
   git add plugins/draft/skills/draft/scripts/runtime
   git commit -m "feat(draft): 为完整检查增加有界结果投影"
   ```
@@ -557,6 +709,8 @@ class OperationFacts:
   uv run --project "$RUNTIME" --locked pytest \
     "$RUNTIME/tests/unit/test_query.py" "$RUNTIME/tests/unit/test_cli.py" \
     "$RUNTIME/tests/integration/test_queries.py" -q
+  uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit" -q
+  uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
   git add plugins/draft/skills/draft/scripts/runtime
   git commit -m "feat(draft): 显式表达候选查询完整性"
   ```
@@ -568,10 +722,24 @@ class OperationFacts:
 - Create: `plugins/draft/skills/draft/scripts/runtime/src/draft/observations.py`
 - Create: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_observations.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/models.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/operations.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/page_create.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/page_metadata.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/structure.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/trash.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/conclusions.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_operations.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_page_create.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_page_metadata.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_relation_edit.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_structure.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_trash.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_conclusions.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/support.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash_lifecycle.py`
 
 - [ ] **Step 1: 写观察清单纯模型和比较矩阵**
 
@@ -589,6 +757,10 @@ class OperationFacts:
           Path("pages"),
       )
   ```
+
+  再用受真实接口约束的 spy 证明：已经由图/页面加载器读取的 bytes 直接交给 observation
+  builder 计算摘要，不为捕获观察而二次读取文件；每个用于集合发现的目录在一次计划中最多
+  枚举一次。
 
 - [ ] **Step 2: 写 journal 新形状和恢复证据测试**
 
@@ -611,8 +783,12 @@ class OperationFacts:
 
 - [ ] **Step 4: 实现观察捕获与事务复核**
 
-  - `OperationPlan` 增加 `root_state` 和 `observations`，删除字符串
-    `validation_mode`；`Journal` 同步。
+  - `OperationPlan` 增加必填 `root_state` 和 `observations`，删除字符串
+    `validation_mode`；`Journal` 同步。这个签名变化必须在本任务内更新 create、metadata、
+    structure、trash/restore、conclusions 的全部生产构造点和对应测试，不能留给 Task 9–11
+    修复；`test_trash.py`、`test_trash_lifecycle.py` 等手写 journal JSON 的集成夹具也要在同一
+    任务切换。当前仍只允许 registered 的计划器显式写入 `RootState.REGISTERED`；后续任务
+    再从 `OperationFacts` 传入实际状态，不允许用 dataclass 默认值掩盖遗漏。
   - mutation 的 `before_sha256` 继续拥有待改路径（包括不存在的新目标）的并发分类；
     observations 记录实际读过的其他文件和用于发现集合的目录成员。每个计划还必须观察
     当前 marker；会改 marker 的结论生成/adopt 则由 marker mutation 的 before 摘要拥有。
@@ -622,9 +798,13 @@ class OperationFacts:
     自己的准备日志并报告 `operation.external_change`。
   - 恢复时把当前 mutation 的 before/after 分类作为“本操作可解释变化”，再复核其余文件
     和目录成员；不能解释的差异保留锁、日志和恢复材料。
+  - 图/页面加载边界在第一次读取时产出可复用的 bytes 摘要和目录成员观察；观察捕获复杂度
+    必须为 O(观察文件总字节数 + 目录条目数)，不得在逐页循环中重复全根扫描或再次读取同一
+    文件。Task 10 的全根结构命令直接复用这些摘要。
   - candidate 计划器必须在生成计划前解析 staged 文本并证明操作自有不变量；执行后只需
     核对所有 mutation 等于计划 after 及未改观察仍成立，不调用完整 checker。registered
-    保留应用后的完整检查。
+    继续保留现有规划前完整健康门禁，并在应用后运行完整检查作为二次确认；后者不是唯一
+    门禁。
 
 - [ ] **Step 5: 跑事务测试并提交**
 
@@ -633,6 +813,10 @@ class OperationFacts:
   uv run --project "$RUNTIME" --locked pytest \
     "$RUNTIME/tests/unit/test_observations.py" "$RUNTIME/tests/unit/test_operations.py" \
     "$RUNTIME/tests/integration/test_operations.py" -q
+  uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit" -q
+  uv run --project "$RUNTIME" --locked \
+    pytest "$RUNTIME/tests/integration" -q -m 'not network'
+  uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
   git add plugins/draft/skills/draft/scripts/runtime
   git commit -m "refactor(draft): 在操作日志中固化完整输入观察"
   ```
@@ -644,11 +828,16 @@ class OperationFacts:
 - Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/lifecycle.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/operations.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/graph.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/trash_lifecycle.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_cli.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_graph.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_lifecycle.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_operations.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_cli.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_lifecycle.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash_lifecycle.py`
 
 - [ ] **Step 1: 写 adopt 计划边界测试**
 
@@ -661,7 +850,9 @@ class OperationFacts:
 
   用参数化单元测试逐格覆盖规格 12.2：before+证据匹配前向、before+staged 缺失放弃、
   before+外部变化只清理自己、after 只提交清理、终态反向组合不一致、未知 marker 外部
-  变化、无匹配锁中段不一致、损坏材料使用最具体代码。
+  变化、无匹配锁中段不一致、损坏材料使用最具体代码。`OperationDoubles` 是
+  `test_operations.py` 内的测试专用 dataclass，字段是按真实操作接口 `autospec` 创建的
+  marker 摘要读取和恢复副本读取 mock；它不是生产接口。
 
   ```python
   def test_recover_adopt_after_marker_never_reads_before_or_staged_bytes(
@@ -686,9 +877,13 @@ class OperationFacts:
   ```bash
   RUNTIME=plugins/draft/skills/draft/scripts/runtime
   uv run --project "$RUNTIME" --locked pytest \
-    "$RUNTIME/tests/unit/test_lifecycle.py" "$RUNTIME/tests/unit/test_operations.py" \
+    "$RUNTIME/tests/unit/test_cli.py" "$RUNTIME/tests/unit/test_graph.py" \
+    "$RUNTIME/tests/unit/test_lifecycle.py" \
+    "$RUNTIME/tests/unit/test_operations.py" \
+    "$RUNTIME/tests/integration/test_cli.py" \
     "$RUNTIME/tests/integration/test_lifecycle.py" \
-    "$RUNTIME/tests/integration/test_operations.py" -q -k 'adopt or recover'
+    "$RUNTIME/tests/integration/test_operations.py" \
+    "$RUNTIME/tests/integration/test_trash_lifecycle.py" -q -k 'adopt or recover or provisional'
   ```
 
   预期失败：当前 adopt 不写普通日志，且无锁/中段恢复不能按 marker before/after 收敛。
@@ -703,16 +898,30 @@ class OperationFacts:
   - `operations.recover` 按 `OperationKind.ADOPT` 分派上述单向规则；
     `trash_lifecycle.recover_interrupted_operations` 仍调用这一个恢复入口。
   - 删除 `PROVISIONAL_MARKER_PATH`、所有 provisional manifest 解析/写入/清理函数与
-    `adopt.recovery_required` 分支，不保留死代码。
+    `adopt.recovery_required` 分支，不保留死代码。同步删除 `trash_lifecycle.py` 对
+    `provisional_marker_path` 的 import，以及 `recover_draft`、
+    `recover_interrupted_operations` 开头的两处 provisional 检查；恢复只按 marker、锁和
+    `OperationKind.ADOPT` 日志判定。删除或改写 `test_graph.py` 中只验证 provisional marker
+    解析的用例，保留的 marker 测试只验证当前三键协议。
+  - 删除 CLI 对 `adopt.recovery_required` 的特殊退出码映射及对应测试；无未完成日志时不再
+    存在这个错误状态。
 
 - [ ] **Step 6: 运行生命周期和恢复测试并提交**
 
   ```bash
   RUNTIME=plugins/draft/skills/draft/scripts/runtime
   uv run --project "$RUNTIME" --locked pytest \
-    "$RUNTIME/tests/unit/test_lifecycle.py" "$RUNTIME/tests/unit/test_operations.py" \
+    "$RUNTIME/tests/unit/test_cli.py" "$RUNTIME/tests/unit/test_graph.py" \
+    "$RUNTIME/tests/unit/test_lifecycle.py" \
+    "$RUNTIME/tests/unit/test_operations.py" \
+    "$RUNTIME/tests/integration/test_cli.py" \
     "$RUNTIME/tests/integration/test_lifecycle.py" \
-    "$RUNTIME/tests/integration/test_operations.py" -q
+    "$RUNTIME/tests/integration/test_operations.py" \
+    "$RUNTIME/tests/integration/test_trash_lifecycle.py" -q
+  uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit" -q
+  uv run --project "$RUNTIME" --locked \
+    pytest "$RUNTIME/tests/integration" -q -m 'not network'
+  uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
   git add plugins/draft/skills/draft/scripts/runtime
   git commit -m "feat(draft): 以普通日志原子接管候选根"
   ```
@@ -736,6 +945,8 @@ class OperationFacts:
   `load_operation_facts` 至少提供三种规范能力：registered 全局健康、candidate 指定页局部
   可判定、candidate 全受管页可判定。测试 A 页坏状态不阻止 B 的 status set，坏页不阻止
   无关 create；但目标/父页坏时拒绝。用 spy 断言 candidate 路径未调用 `check_draft`。
+  registered 根存在任一完整检查错误时，`load_operation_facts` 在调用业务计划器或
+  `execute_plan` 前拒绝；spy 必须断言两者均未调用。
 
 - [ ] **Step 2: 写 create 与 status 自有不变量测试**
 
@@ -769,9 +980,12 @@ class OperationFacts:
 
 - [ ] **Step 5: 实现 operation facts 与局部计划验证**
 
-  重构计划器从 `OperationFacts` 取得 root state 与 observations；删除
-  `_validate_final_graph` 的全根健康依赖。无变化的幂等计划也必须携带正确 root state；它不
-  创建日志。
+  - `load_operation_facts` 先读 marker。registered 分支运行无过滤完整健康检查，只有全绿
+    才返回 facts；candidate 分支按命令闭包加载，不调用完整 checker。
+  - 重构计划器从 `OperationFacts` 取得 root state 与 observations；删除 candidate 路径中
+    `_validate_final_graph` 的全根健康依赖，改为验证 status/relation 自有最终不变量。不能
+    删除 registered 的规划前完整健康门禁。
+  - 无变化的幂等计划也必须携带正确 root state；它不创建日志。
 
 - [ ] **Step 6: 运行同一组测试并提交**
 
@@ -783,6 +997,8 @@ class OperationFacts:
     "$RUNTIME/tests/unit/test_page_metadata.py" \
     "$RUNTIME/tests/unit/test_relation_edit.py" \
     "$RUNTIME/tests/integration/test_page_commands.py" -q
+  uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit" -q
+  uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
   git add plugins/draft/skills/draft/scripts/runtime
   git commit -m "feat(draft): 以局部事实执行候选页面命令"
   ```
@@ -827,11 +1043,15 @@ class OperationFacts:
 - [ ] **Step 4: 把结构规划限定到受影响结构子图**
 
   - 删除 `_load_clean_graph` 对完整 checker 的依赖。
+  - 入口改用 Task 9 的 `load_operation_facts`：registered 仍先通过完整健康门禁；只有
+    candidate 分支才使用下述“全根可解析但允许无关协议错误”的闭包。
   - 全根加载只要求受管理页面集合与每页可解析，从而能证明引用扫描完整；普通正文断链是
     已知资源事实，不是缺失输入。
   - 重构 `_final_parents`、空枢纽折叠和最终验证，不要求无关页面已经满足全部父/关系/容量
     规则；只验证映射集合、受影响父子、受影响导航和所有重写目标。
   - 观察清单包含全部被扫描页面及受管理目录成员，确保恢复可证明没有遗漏并发新增引用。
+    摘要必须复用本次图加载已经读取的 bytes，目录成员也复用同一次发现结果；用 spy 断言
+    N 个页面只发生 N 次内容读取和一次受管目录遍历，禁止逐页重新哈希全根形成 O(n²)。
 
 - [ ] **Step 5: 运行测试并提交**
 
@@ -841,6 +1061,8 @@ class OperationFacts:
     "$RUNTIME/tests/unit/test_structure.py" \
     "$RUNTIME/tests/unit/test_operation_facts.py" \
     "$RUNTIME/tests/integration/test_structure.py" -q
+  uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit" -q
+  uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
   git add plugins/draft/skills/draft/scripts/runtime
   git commit -m "feat(draft): 以相关事实闭包执行候选结构变换"
   ```
@@ -856,13 +1078,15 @@ class OperationFacts:
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_trash.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/unit/test_conclusions.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash.py`
+- Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash_package.py`
 - Modify: `plugins/draft/skills/draft/scripts/runtime/tests/integration/test_conclusions.py`
 
 - [ ] **Step 1: 写 candidate trash/restore 事务测试**
 
   trash 必须完整发现目标、父导航和所有可能入站引用，忽略允许过时的机器结论列表；创建的
-  包、期限和日志与 registered 完全同形。restore 从指定日志和包构造事实闭包，不要求页面
-  全根健康；目标占用、过期、关联不对称和包损坏均保持既有硬失败与唯一包所有权。
+  包、期限和日志与 registered 完全同形。candidate restore 从指定日志和包构造操作级事实
+  闭包，不要求页面全根健康；registered restore 仍在规划前要求完整检查通过。目标占用、
+  过期、关联不对称和包损坏均保持既有硬失败与唯一包所有权。
 
 - [ ] **Step 2: 写 candidate 结论生成测试**
 
@@ -877,6 +1101,7 @@ class OperationFacts:
   uv run --project "$RUNTIME" --locked pytest \
     "$RUNTIME/tests/unit/test_trash.py" "$RUNTIME/tests/unit/test_conclusions.py" \
     "$RUNTIME/tests/integration/test_trash.py" \
+    "$RUNTIME/tests/integration/test_trash_package.py" \
     "$RUNTIME/tests/integration/test_conclusions.py" -q
   ```
 
@@ -897,7 +1122,10 @@ class OperationFacts:
   uv run --project "$RUNTIME" --locked pytest \
     "$RUNTIME/tests/unit/test_trash.py" "$RUNTIME/tests/unit/test_conclusions.py" \
     "$RUNTIME/tests/integration/test_trash.py" \
+    "$RUNTIME/tests/integration/test_trash_package.py" \
     "$RUNTIME/tests/integration/test_conclusions.py" -q
+  uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit" -q
+  uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
   git add plugins/draft/skills/draft/scripts/runtime
   git commit -m "feat(draft): 在候选根复用回收与结论事务"
   ```
@@ -954,6 +1182,8 @@ class OperationFacts:
     "$RUNTIME/tests/integration/test_cli.py" \
     "$RUNTIME/tests/integration/test_trash_lifecycle.py" \
     "$RUNTIME/tests/integration/test_queries.py" -q
+  uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit" -q
+  uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
   git add plugins/draft/skills/draft/scripts/runtime
   git commit -m "refactor(draft): 对所有受管根推进回收生命周期"
   ```
@@ -995,14 +1225,21 @@ class OperationFacts:
 - [ ] **Step 2: 写文档/适配层可观察契约测试**
 
   session hook 生成 `draft check --root <bound-root>`，不再生成位置 root。分发契约读取并
-  验证实际 CLI parser/help 或执行 smoke，不用关键词搜索代替行为验证。
+  验证实际 CLI parser/help 或执行 smoke，不用关键词搜索代替行为验证。增加两个明确测试：
+
+  - `test_runtime_source_has_no_retired_candidate_protocol_symbols` 用 AST 检查 import、
+    `Name` 和 `Attribute`，拒绝 `PROVISIONAL_MARKER_PATH`、`provisional_marker_path`、两个
+    `candidate.*` 枚举成员和 `prepare_registered_command` 的生产引用；注释与字符串不参与。
+  - `test_only_init_has_positional_root_operand` 直接遍历 `build_parser()` 的 parser/action
+    结构并执行代表命令，证明只有 init 暴露位置 root，不能只搜索 `add_argument("root")`。
 
 - [ ] **Step 3: 运行新增验收并确认旧适配提示契约失败**
 
   ```bash
   RUNTIME=plugins/draft/skills/draft/scripts/runtime
   uv run --project "$RUNTIME" --locked pytest \
-    "$RUNTIME/tests/integration/test_candidate_migration.py" \
+    "$RUNTIME/tests/integration/test_candidate_migration.py" -q
+  uv run --project "$RUNTIME" --locked pytest \
     plugins/draft/scripts/tests/unit/test_session_hook.py -q
   ```
 
@@ -1036,18 +1273,31 @@ class OperationFacts:
 - [ ] **Step 6: 执行旧协议残留审计**
 
   ```bash
-  rg -n 'check --candidate|draft\.provisional\.json|candidate\.already_registered|candidate\.internal_state|prepare_registered_command' \
-    plugins/draft docs/design.md
-  rg -n 'add_argument\("root"' \
-    plugins/draft/skills/draft/scripts/runtime/src/draft/cli.py
+  RUNTIME=plugins/draft/skills/draft/scripts/runtime
+  uv run --project "$RUNTIME" --locked pytest \
+    "$RUNTIME/tests/integration/test_distribution_contract.py" \
+    "$RUNTIME/tests/unit/test_cli.py" -q \
+    -k 'retired_candidate_protocol_symbols or only_init_has_positional_root_operand'
+  rg -n 'draft check .*--candidate|draft\.provisional\.json|draft (check|adopt) ROOT' \
+    plugins/draft/skills/draft/SKILL.md \
+    plugins/draft/skills/draft/references/draft-format.md \
+    plugins/draft/skills/draft/references/migration.md \
+    docs/design.md
   ```
 
-  第一条预期无结果。第二条只允许 `init` 的位置 `ROOT`；如果输出包含其他命令，必须回到
-  Task 3 修复，不能把它写成兼容别名。
+  生产代码残留由 AST/parser 测试判定。文档字符串搜索允许命中明确标注为“已退役/不得使用”
+  的历史说明，但不得命中现行命令示例、推荐步骤或当前格式定义；逐项分类命中，不能简单
+  以搜索为空代替语义审查。
 
 - [ ] **Step 7: 提交文档和端到端验收**
 
   ```bash
+  RUNTIME=plugins/draft/skills/draft/scripts/runtime
+  uv run --project "$RUNTIME" --locked pytest "$RUNTIME/tests/unit" -q
+  uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
+  uv run --project "$RUNTIME" --locked pytest plugins/draft/scripts/tests/unit -q
+  uv run --project "$RUNTIME" --locked pyright \
+    -p plugins/draft/scripts/pyrightconfig.json
   git add docs/design.md plugins/draft
   git commit -m "docs(draft): 发布候选根增量迁移工作流"
   ```
@@ -1102,6 +1352,10 @@ class OperationFacts:
   uv run --project "$RUNTIME" --locked \
     pytest plugins/draft/scripts/tests/integration -q -m network
   ```
+
+  这里明确包含 `test_dependency_bounds.py`、`test_cache_isolation.py` 和
+  `test_distribution_smoke.py`：前者在最低/最高依赖窗口重新运行完整核心单元测试，后两者
+  验证 Task 3 的新 CLI 在隔离安装、离线缓存和并发发布环境中仍成立。
 
 - [ ] **Step 5: 运行格式、静态检查和类型检查**
 
