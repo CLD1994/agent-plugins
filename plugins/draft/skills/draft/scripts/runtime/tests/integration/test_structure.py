@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from draft.checker import check_draft
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.operations import recover
 from draft.structure import collapse_hub, move_page, promote_page
@@ -194,14 +195,14 @@ def test_move_overwrite_fails(draft_factory: DraftFactory) -> None:
 
 
 def test_move_with_dirty_graph_fails(draft_factory: DraftFactory) -> None:
-    """结构性脏图（关系目标缺失）阻止移动；正文断链是资源事实，不再阻止。"""
+    """结构性脏图（关系目标缺失）阻止移动，并传播最具体的损坏码。"""
     root = build_two_hub_draft(draft_factory)
     (root / "pages/broken.md").write_text(
         "# 孤儿\n\n> 状态：`待讨论`\n>\n> 父主题：[缺失](../missing.md)\n\n正文。\n",
         encoding="utf-8",
     )
 
-    with pytest.raises(DraftError, match="structure.dirty"):
+    with pytest.raises(DraftError, match=CheckCode.LINK_MISSING.value):
         move_page(root, Path("pages/old/a.md"), Path("pages/new/a.md"))
 
 
@@ -635,7 +636,7 @@ def test_domain_move_corrupt_package_blocks_via_clean_graph(
     )
     before = (root / "pages/a.md").read_bytes()
 
-    with pytest.raises(DraftError, match="structure.dirty"):
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
         move_page(root, Path("pages/a.md"), Path("pages/a2.md"))
 
     assert (root / "pages/a.md").read_bytes() == before

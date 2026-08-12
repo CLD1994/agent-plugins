@@ -6,14 +6,13 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
-from draft.checker import check_draft, check_graph
+from draft.checker import check_graph
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import (
     CONCLUSIONS_PAGE,
     ROOT_PAGE,
     DraftGraph,
-    load_graph,
     resolve_local_destination,
 )
 from draft.markdown import (
@@ -450,23 +449,22 @@ def plan_collapse(graph: DraftGraph, hub: Path) -> OperationPlan:
 
 
 def _load_clean_graph(root: Path, *, allow_empty_hub: Path | None = None) -> DraftGraph:
+    """结构变换的事实加载：registered 全绿；candidate 全受管页可解析即可。
+
+    任一不可解析页面可能隐藏正文链接、正式关系或父导航，因此必须阻止结构变换；
+    已可解析的无关全局错误（依赖环、状态/取代不匹配、容量提醒）不阻止本次操作。
+    ``allow_empty_hub`` 供 collapse 容忍目标枢纽的 HUB_EMPTY。
+    """
+    from draft.operation_facts import load_operation_facts
+
     resolved = resolve_draft_root(root)
     if read_lock(resolved) is not None:
         raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, resolved)
-    report = check_draft(resolved, exclude_resource_facts=True)
-    errors = [
-        issue
-        for issue in report.errors
-        if not (
-            allow_empty_hub is not None
-            and issue.code == CheckCode.HUB_EMPTY.value
-            and issue.path == allow_empty_hub
-        )
-    ]
-    if errors:
-        codes = tuple(issue.code for issue in errors)
-        raise DraftError("structure.dirty", resolved, details=codes)
-    return load_graph(resolved)
+    facts = load_operation_facts(resolved, allow_hub_empty=allow_empty_hub)
+    if facts.blocking_paths:
+        details = tuple(path.as_posix() for path in facts.blocking_paths)
+        raise DraftError("structure.dirty", resolved, details=details)
+    return facts.graph
 
 
 def move_page(
