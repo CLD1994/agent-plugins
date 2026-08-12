@@ -561,15 +561,16 @@ def recover_draft(
     return LifecycleAdvanceReport(results=tuple(results), error=None)
 
 
-def prepare_registered_command(
+def prepare_managed_command(
     root: Path,
     *,
     now: datetime | None = None,
     handoff: Handoff | None = None,
 ) -> None:
-    """已登记命令的业务逻辑前置推进：成功时丢弃推进细节，损坏时以稳定错误阻止命令。
+    """受管根命令的业务逻辑前置推进：成功时丢弃推进细节，损坏时以稳定错误阻止命令。
 
-    调用方必须先确认正式登记标记有效；本边界不重新判定登记状态。
+    candidate 与 registered 共享回收期限和权威删除包协议（规格 §8.1）。调用方必须
+    先确认受管根 marker 有效；本边界不重新判定根状态。
     """
     report = advance_trash_lifecycle(root, now=now, handoff=handoff)
     if report.error is not None:

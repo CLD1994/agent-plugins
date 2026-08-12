@@ -602,11 +602,11 @@ def test_orphan_restore_scan_stops_on_unreadable_sibling_journal(
 # ---------------------------------------------------------------------------
 
 
-def test_prepare_registered_command_advances_but_hides_results(
+def test_prepare_managed_command_advances_but_hides_results(
     draft_factory: DraftFactory, tmp_path: Path
 ) -> None:
     """普通命令的前置推进推进到期项，但成功时返回值不暴露推进细节。"""
-    from draft.trash_lifecycle import prepare_registered_command
+    from draft.trash_lifecycle import prepare_managed_command
 
     root = build_trashable_draft(draft_factory)
     trash_page(root, Path("pages/obsolete.md"), now=CREATED)
@@ -614,19 +614,19 @@ def test_prepare_registered_command_advances_but_hides_results(
     bin_dir.mkdir()
     accepted: list[str] = []
 
-    result = prepare_registered_command(root, now=EXPIRY, handoff=_accept_into(bin_dir, accepted))
+    result = prepare_managed_command(root, now=EXPIRY, handoff=_accept_into(bin_dir, accepted))
 
     assert result is None
     assert len(accepted) == 1
 
 
-def test_prepare_registered_command_corruption_raises_lifecycle_advance_error(
+def test_prepare_managed_command_corruption_raises_lifecycle_advance_error(
     draft_factory: DraftFactory,
 ) -> None:
     """损坏日志以可诊断错误阻止命令，不返回部分推进结果。"""
     import json
 
-    from draft.trash_lifecycle import LifecycleAdvanceError, prepare_registered_command
+    from draft.trash_lifecycle import LifecycleAdvanceError, prepare_managed_command
 
     root = build_trashable_draft(draft_factory)
     pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
@@ -636,7 +636,7 @@ def test_prepare_registered_command_corruption_raises_lifecycle_advance_error(
     broken_path.write_text(json.dumps(data), encoding="utf-8")
 
     try:
-        prepare_registered_command(root, now=EXPIRY)
+        prepare_managed_command(root, now=EXPIRY)
     except LifecycleAdvanceError as error:
         assert error.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
         assert error.report.results == ()

@@ -1050,9 +1050,9 @@ def _exit_for_error(error: DraftError) -> int:
 
 
 def _advance_for_command(root: Path, *, now: datetime | None = None) -> None:
-    from draft.trash_lifecycle import prepare_registered_command
+    from draft.trash_lifecycle import prepare_managed_command
 
-    prepare_registered_command(root, now=now)
+    prepare_managed_command(root, now=now)
 
 
 def main(
@@ -1097,13 +1097,9 @@ def main(
             _emit_error(error, json_mode)
             return _exit_for_error(error)
 
-    # check/adopt/init 不推进回收生命周期（规格 §8.1）；其余受管命令仅在 registered
-    # 根上于业务前推进恰好一次。
-    if (
-        command not in ("check", "adopt")
-        and managed is not None
-        and managed.marker.root_state is RootState.REGISTERED
-    ):
+    # check/adopt/init 不推进回收生命周期（规格 §8.1）；其余受管命令在任一受管根上
+    # 于业务前推进恰好一次。
+    if command not in ("check", "adopt") and managed is not None:
         try:
             _advance_for_command(managed.path, now=captured_now)
         except DraftError as error:
