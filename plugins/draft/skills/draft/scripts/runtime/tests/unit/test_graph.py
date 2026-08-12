@@ -11,7 +11,6 @@ from draft.graph import (
     MarkerState,
     is_external_destination,
     parse_marker_value,
-    parse_provisional_adopt_value,
     resolve_local_destination,
 )
 from draft.models import RootState
@@ -172,90 +171,6 @@ def test_parse_marker_value_rejects_unsupported_version() -> None:
     with pytest.raises(DraftError) as caught:
         parse_marker_value({"format_version": FORMAT_VERSION + 1}, MARKER)
     assert caught.value.code == CheckCode.FORMAT_UNSUPPORTED.value
-
-
-# ---------------------------------------------------------------------------
-# parse_provisional_adopt_value（开发期 adopt 桥接，Task 8 删除）
-# ---------------------------------------------------------------------------
-
-
-def test_parse_provisional_adopt_value_round_trips_manifest() -> None:
-    state = parse_provisional_adopt_value(
-        {
-            "format_version": FORMAT_VERSION,
-            "conclusions_state": "not_generated",
-            "adopt_state": "provisional",
-            "candidate_manifest": [["pages/b.md", "d2"], ["pages/a.md", "d1"]],
-        },
-        MARKER,
-    )
-    assert state.manifest == (("pages/b.md", "d2"), ("pages/a.md", "d1"))
-
-
-def test_parse_provisional_adopt_value_accepts_empty_manifest() -> None:
-    state = parse_provisional_adopt_value(
-        {
-            "format_version": FORMAT_VERSION,
-            "conclusions_state": "not_generated",
-            "adopt_state": "provisional",
-            "candidate_manifest": [],
-        },
-        MARKER,
-    )
-    assert state.manifest == ()
-
-
-def test_parse_provisional_adopt_value_rejects_wrong_adopt_state() -> None:
-    with pytest.raises(DraftError) as caught:
-        parse_provisional_adopt_value(
-            {
-                "format_version": FORMAT_VERSION,
-                "conclusions_state": "not_generated",
-                "adopt_state": "final",
-                "candidate_manifest": [],
-            },
-            MARKER,
-        )
-    assert caught.value.code == CheckCode.FORMAT_INVALID.value
-
-
-def test_parse_provisional_adopt_value_rejects_missing_manifest_field() -> None:
-    with pytest.raises(DraftError) as caught:
-        parse_provisional_adopt_value(
-            {
-                "format_version": FORMAT_VERSION,
-                "conclusions_state": "not_generated",
-                "adopt_state": "provisional",
-            },
-            MARKER,
-        )
-    assert caught.value.code == CheckCode.FORMAT_INVALID.value
-
-
-@pytest.mark.parametrize(
-    "manifest",
-    [
-        "not-a-list",
-        [["pages/a.md"]],
-        [["pages/a.md", "sha256:abc", "extra"]],
-        [[1, "sha256:abc"]],
-        [["pages/a.md", 1]],
-        ["/abs/a.md", "sha256:abc"],
-        [["../escape.md", "sha256:abc"]],
-    ],
-)
-def test_parse_provisional_adopt_value_rejects_malformed_manifest(manifest: object) -> None:
-    with pytest.raises(DraftError) as caught:
-        parse_provisional_adopt_value(
-            {
-                "format_version": FORMAT_VERSION,
-                "conclusions_state": "not_generated",
-                "adopt_state": "provisional",
-                "candidate_manifest": manifest,
-            },
-            MARKER,
-        )
-    assert caught.value.code == CheckCode.FORMAT_INVALID.value
 
 
 # ---------------------------------------------------------------------------

@@ -33,7 +33,6 @@ CONCLUSIONS_PAGE = Path("conclusions.md")
 PAGES_DIR = Path("pages")
 INTERNAL_DIR = ".draft"
 MARKER_PATH = Path(INTERNAL_DIR) / "draft.json"
-PROVISIONAL_MARKER_PATH = Path(INTERNAL_DIR) / "draft.provisional.json"
 FORMAT_VERSION = 1
 
 _SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
@@ -85,38 +84,6 @@ class MarkerState:
     conclusions_state: ConclusionsState = ConclusionsState.NOT_GENERATED
 
 
-@dataclass(frozen=True)
-class ProvisionalAdoptState:
-    """开发期 adopt 桥接：独立临时标记文件（draft.provisional.json）的解析结果。
-
-    Task 8 把 adopt 切换到普通操作日志后随文件协议一起删除；正式 marker 解析器
-    不接受 provisional 键，read_marker 也绝不返回本类型。
-    """
-
-    version: int
-    manifest: tuple[tuple[str, str], ...]
-
-
-def _parse_manifest_entries(value: object, marker: Path) -> tuple[tuple[str, str], ...]:
-    if not isinstance(value, list):
-        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
-    entries: list[tuple[str, str]] = []
-    for item in cast("list[object]", value):
-        if not isinstance(item, list):
-            raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
-        pair = cast("list[object]", item)
-        if len(pair) != 2:
-            raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
-        path_text, digest = pair
-        if not isinstance(path_text, str) or not isinstance(digest, str):
-            raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
-        posix = PurePosixPath(path_text)
-        if posix.is_absolute() or ".." in posix.parts:
-            raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
-        entries.append((path_text, digest))
-    return tuple(entries)
-
-
 def _parse_conclusions_state(value: object, marker: Path) -> ConclusionsState:
     if not isinstance(value, str):
         raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
@@ -155,30 +122,6 @@ def parse_marker_value(decoded: object, marker: Path) -> MarkerState:
     )
 
 
-def parse_provisional_adopt_value(decoded: object, marker: Path) -> ProvisionalAdoptState:
-    """私有桥接解析：只接受开发期 provisional adopt 文件的精确形状。"""
-    if not isinstance(decoded, dict):
-        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
-    data = cast("dict[str, object]", decoded)
-    version = data.get("format_version")
-    if not isinstance(version, int) or isinstance(version, bool):
-        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
-    if version != FORMAT_VERSION:
-        raise DraftError(CheckCode.FORMAT_UNSUPPORTED.value, marker)
-    keys = set(data)
-    if keys != {"format_version", "conclusions_state", "adopt_state", "candidate_manifest"}:
-        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
-    if _expect_marker_string(data.get("adopt_state"), marker) != "provisional":
-        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
-    state = _parse_conclusions_state(data.get("conclusions_state"), marker)
-    if state is not ConclusionsState.NOT_GENERATED:
-        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
-    return ProvisionalAdoptState(
-        version=version,
-        manifest=_parse_manifest_entries(data.get("candidate_manifest"), marker),
-    )
-
-
 def _read_marker_file(path: Path) -> MarkerState:
     if path.is_symlink():
         raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, path)
@@ -198,44 +141,9 @@ def read_marker(root: Path) -> MarkerState:
     """Read and validate .draft/draft.json, raising stable codes.
 
     The formal marker carries exactly ``format_version`` / ``root_state`` /
-    ``conclusions_state``; provisional adopt evidence lives only in the
-    separate draft.provisional.json bridge file.
+    ``conclusions_state``.
     """
     return _read_marker_file(root / MARKER_PATH)
-
-
-def read_provisional_marker(root: Path) -> ProvisionalAdoptState:
-    """Read and validate the dev-bridge .draft/draft.provisional.json file."""
-    marker = root / PROVISIONAL_MARKER_PATH
-    if marker.is_symlink():
-        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, marker)
-    if not marker.exists():
-        raise DraftError(CheckCode.FORMAT_MISSING.value, marker)
-    if not marker.is_file():
-        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
-    try:
-        decoded = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise DraftError(CheckCode.FORMAT_INVALID.value, marker) from exc
-    return parse_provisional_adopt_value(decoded, marker)
-
-
-def provisional_marker_path(root: Path) -> Path | None:
-    """Return the provisional marker path iff it holds a valid provisional adopt state.
-
-    只有路径确实不存在才返回 None；存在但无效（符号链接、损坏、非临时格式）一律
-    传播稳定错误——不得把异常内部状态折叠为不存在而让 registered 检查放行。
-    """
-    marker = root / PROVISIONAL_MARKER_PATH
-    if marker.is_symlink():
-        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, marker)
-    if not marker.exists():
-        return None
-    if not marker.is_file():
-        # 已存在但不是普通文件（目录/FIFO 等）：异常内部状态，必须报错而非折叠为不存在。
-        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
-    read_provisional_marker(root)
-    return marker
 
 
 def _normalize_relative(decoded: str) -> PurePosixPath | None:
@@ -496,13 +404,9 @@ def structural_issues(result: LoadResult) -> list[CheckIssue]:
     return [issue for issue in result.issues if issue not in facts]
 
 
-def load_graph(
-    root: Path,
-    *,
-    allow_provisional_adopt: bool = False,
-) -> DraftGraph:
+def load_graph(root: Path) -> DraftGraph:
     resolved = resolve_draft_root(root)
-    result = load_graph_tolerant(resolved, allow_provisional_adopt=allow_provisional_adopt)
+    result = load_graph_tolerant(resolved)
     try:
         state = read_marker(resolved)
     except DraftError:
@@ -525,28 +429,17 @@ def load_graph(
     return result.graph
 
 
-def load_graph_tolerant(
-    root: Path,
-    *,
-    allow_provisional_adopt: bool = False,
-) -> LoadResult:
+def load_graph_tolerant(root: Path) -> LoadResult:
     """容错加载：candidate 与 registered 共享同一页面/关系/链接/路径协议。
 
     marker 是根身份的唯一权威：``load_graph_tolerant`` 读取并校验 marker，不按外部
-    mode 区分分支。独立临时标记文件（draft.provisional.json）在 Task 8 前仍是
-    adopt 崩溃桥接，两种根一致视为恢复需求。
+    mode 区分分支。
     """
     resolved = root if root.is_absolute() else resolve_draft_root(root)
     marker_issues: list[CheckIssue] = []
-    # 独立临时标记文件存在即半完成接管现场：普通加载一律视为恢复需求；仅 adopt
-    # 私有复核（allow_provisional_adopt=True）可精确排除自己的 provisional 文件。
-    if provisional_marker_path(resolved) is not None and not allow_provisional_adopt:
-        raise DraftError("adopt.recovery_required", resolved / PROVISIONAL_MARKER_PATH)
     try:
         read_marker(resolved)
     except DraftError as error:
-        if error.code == "adopt.recovery_required":
-            raise
         marker_issues.append(
             CheckIssue(
                 code=error.code,

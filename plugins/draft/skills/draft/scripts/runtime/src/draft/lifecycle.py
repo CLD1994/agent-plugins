@@ -2,26 +2,29 @@ from __future__ import annotations
 
 import json
 from contextlib import suppress
-from dataclasses import dataclass
 from pathlib import Path
 
 from draft.checker import check_draft
-from draft.diagnostic_codes import CheckCode, RootCode
+from draft.diagnostic_codes import RootCode
 from draft.errors import DraftError
 from draft.graph import (
     FORMAT_VERSION,
     INTERNAL_DIR,
     MARKER_PATH,
-    PROVISIONAL_MARKER_PATH,
-    parse_provisional_adopt_value,
     read_marker,
 )
-from draft.models import RootState
+from draft.models import (
+    FileMutation,
+    MutationKind,
+    OperationPlan,
+    OperationResult,
+    RootState,
+)
+from draft.observations import graph_observations
 from draft.operations import (
     durable_write,
     fsync_directory,
     reject_symlink_components,
-    sha256_file,
 )
 from draft.paths import resolve_draft_root
 from draft.vocabulary import ConclusionsState
@@ -40,70 +43,8 @@ def marker_bytes(
     return (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
 
 
-@dataclass(frozen=True)
-class CandidateManifest:
-    entries: tuple[tuple[Path, str], ...]
-
-
-def draft_manifest(
-    root: Path,
-    *,
-    allow_provisional_adopt: bool = False,
-) -> CandidateManifest:
-    from draft.graph import load_graph_tolerant
-
-    graph = load_graph_tolerant(root, allow_provisional_adopt=allow_provisional_adopt).graph
-    entries: list[tuple[Path, str]] = []
-    for path in graph.pages:
-        digest = sha256_file(root / path)
-        if digest is None:
-            raise DraftError("adopt.invalid_candidate", root / path)
-        entries.append((path, digest))
-    return CandidateManifest(entries=tuple(sorted(entries)))
-
-
-def provisional_marker_bytes(manifest: CandidateManifest) -> bytes:
-    payload = {
-        "format_version": FORMAT_VERSION,
-        "conclusions_state": ConclusionsState.NOT_GENERATED.value,
-        "adopt_state": "provisional",
-        "candidate_manifest": [[path.as_posix(), digest] for path, digest in manifest.entries],
-    }
-    return (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
-
-
-def read_provisional_adopt_manifest(marker: Path) -> CandidateManifest:
-    """Resume evidence for adopt: provisional manifest or format error."""
-    if marker.is_symlink():
-        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, marker)
-    try:
-        decoded = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise DraftError(CheckCode.FORMAT_INVALID.value, marker) from exc
-    state = parse_provisional_adopt_value(decoded, marker)
-    entries = tuple(sorted((Path(path_text), digest) for path_text, digest in state.manifest))
-    return CandidateManifest(entries=entries)
-
-
 def create_marker_parent_durably(root: Path) -> None:
     (root / INTERNAL_DIR).mkdir(exist_ok=True)
-    fsync_directory(root)
-
-
-def rollback_provisional_marker_durably(root: Path, expected_bytes: bytes) -> None:
-    internal = root / INTERNAL_DIR
-    provisional = root / PROVISIONAL_MARKER_PATH
-    # 回滚只清理本次 adopt 的临时状态（draft.provisional.json），绝不触碰正式
-    # 标记 draft.json。重读并完整比对临时标记身份：只有仍等于本次 adopt 发布的
-    # 临时标记才删除；他方覆盖的另一临时标记一律保留。
-    if provisional.is_file():
-        if provisional.read_bytes() != expected_bytes:
-            return
-        provisional.unlink(missing_ok=True)
-    fsync_directory(internal)
-    # 内部目录仅在为“空”时移除：并发方创建的内容必须保留。
-    with suppress(OSError):
-        internal.rmdir()
     fsync_directory(root)
 
 
@@ -152,56 +93,50 @@ def initialize(root: Path, *, root_state: RootState = RootState.REGISTERED) -> N
         raise
 
 
-def adopt(root: Path) -> None:
+def adopt(root: Path) -> OperationResult:
     """把 root_state=candidate 的受管根原子推进为 registered。
 
-    只接受 candidate marker：未受管目录（无 marker）与已登记根都拒绝。provisional
-    文件在 Task 8 前仍是开发期崩溃桥接；私有复核用 allow_provisional_adopt 精确排除
-    自己的 provisional 文件。
+    只接受 candidate marker：未受管目录（无 marker）与已登记根都拒绝。完整候选检查
+    通过后以 kind="adopt" 的普通计划执行，marker 的 candidate→registered 替换作为
+    唯一受管根 mutation 原子提交；恢复按 OperationKind.ADOPT 单向收敛。
     """
+    from draft.graph import load_graph_tolerant
+    from draft.operations import execute_plan, sha256_bytes
+
     target = resolve_draft_root(root)
     final_marker = target / MARKER_PATH
-    provisional_marker = target / PROVISIONAL_MARKER_PATH
     reject_symlink_components(target, MARKER_PATH)
-    reject_symlink_components(target, PROVISIONAL_MARKER_PATH)
     if not final_marker.is_file():
         raise DraftError("adopt.invalid_candidate", target)
     state = read_marker(target)
     if state.root_state is not RootState.CANDIDATE:
-        # 有效正式标记 + 残留独立临时标记 = 已提交待清理（finalize 两步间中断）。
-        # 先耐久清理临时标记，再报告已登记；绝不能留着死锁现场。
-        if provisional_marker.is_file():
-            provisional_marker.unlink(missing_ok=True)
-            fsync_directory(target / INTERNAL_DIR)
         raise DraftError("adopt.already_registered", target)
-    before = (
-        read_provisional_adopt_manifest(provisional_marker)
-        if provisional_marker.is_file()
-        else None
-    )
     if (target / INTERNAL_DIR / "operation.lock").exists():
         raise DraftError("adopt.locked", target)
-    if before is None:
-        # 完整候选检查（无过滤无分页）：candidate 与 registered 共享检查协议。
-        report = check_draft(target)
-        if report.errors:
-            raise DraftError(
-                "adopt.invalid_candidate",
-                target,
-                details=tuple(issue.code for issue in report.errors),
-            )
-        before = draft_manifest(target)
-        create_marker_parent_durably(target)
-        durable_write(provisional_marker, provisional_marker_bytes(before))
-
-    after = draft_manifest(target, allow_provisional_adopt=True)
-    if after != before:
-        rollback_provisional_marker_durably(target, provisional_marker_bytes(before))
+    # 完整候选检查（无过滤无分页）：candidate 与 registered 共享检查协议。
+    report = check_draft(target)
+    if report.errors:
         raise DraftError(
             "adopt.invalid_candidate",
             target,
+            details=tuple(issue.code for issue in report.errors),
         )
-    # 最终标记写入 draft.json 是登记线性化点；临时状态在独立文件中，先写正式再清理。
-    durable_write(final_marker, marker_bytes(RootState.REGISTERED))
-    provisional_marker.unlink(missing_ok=True)
-    fsync_directory(target / INTERNAL_DIR)
+    before_bytes = final_marker.read_bytes()
+    after_bytes = marker_bytes(RootState.REGISTERED, state.conclusions_state)
+    graph = load_graph_tolerant(target).graph
+    plan = OperationPlan(
+        kind="adopt",
+        root=target,
+        mutations=(
+            FileMutation(
+                MARKER_PATH,
+                MutationKind.WRITE,
+                sha256_bytes(before_bytes),
+                sha256_bytes(after_bytes),
+                after_bytes,
+            ),
+        ),
+        root_state=RootState.CANDIDATE,
+        observations=graph_observations(graph),
+    )
+    return execute_plan(plan)

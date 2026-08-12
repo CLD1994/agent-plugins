@@ -13,7 +13,6 @@ from draft.graph import (
     CONCLUSIONS_PAGE,
     INTERNAL_DIR,
     MARKER_PATH,
-    PROVISIONAL_MARKER_PATH,
     ROOT_PAGE,
     DraftGraph,
     load_graph_tolerant,
@@ -600,7 +599,6 @@ def _conclusions_required(resolved: Path) -> bool:
 _ALLOWED_INTERNAL_ENTRIES = frozenset(
     {
         MARKER_PATH,
-        PROVISIONAL_MARKER_PATH,  # 开发期 adopt 崩溃桥接（Task 8 删除）。
         Path(INTERNAL_DIR) / "operation.lock",
         Path(INTERNAL_DIR) / "operations",
         Path(INTERNAL_DIR) / "trash",
@@ -611,9 +609,9 @@ _ALLOWED_INTERNAL_ENTRIES = frozenset(
 def _check_internal_namespace(resolved: Path) -> list[CheckIssue]:
     """受管内部命名空间检查：candidate 与 registered 共享同一协议（规格 §5.4）。
 
-    ``.draft/`` 顶层只允许 marker、operation.lock、operations、trash 与开发期
-    provisional 桥接；未登记条目统一报告 internal.unexpected_entry。已知目录内部的
-    非法形状由更具体的检查码报告，不在此处猜测。
+    ``.draft/`` 顶层只允许 marker、operation.lock、operations 与 trash；未登记条目
+    统一报告 internal.unexpected_entry。已知目录内部的非法形状由更具体的检查码报告，
+    不在此处猜测。
     """
     issues: list[CheckIssue] = []
     internal = resolved / INTERNAL_DIR

@@ -133,26 +133,22 @@ def test_check_is_read_only_on_candidate_root(
     assert snapshot_tree(root) == before
 
 
-def test_check_provisional_marker_is_recovery_required(
+def test_check_reports_retired_provisional_entry_as_unexpected(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """provisional 协议已退役：残留 draft.provisional.json 是未登记内部条目。"""
     root = tmp_path / "candidate"
     build_valid_candidate(root)
-    from draft.lifecycle import draft_manifest, provisional_marker_bytes
-
-    before_manifest = draft_manifest(root)
-    internal = root / ".draft"
-    (internal / "draft.provisional.json").write_bytes(provisional_marker_bytes(before_manifest))
+    (root / ".draft" / "draft.provisional.json").write_text("{}", encoding="utf-8")
     before = snapshot_tree(root)
 
     code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
 
-    assert code == 3
+    assert code == 1
     assert payload["ok"] is False
-    assert payload["result_type"] == "error"
-    error = payload["error"]
-    assert isinstance(error, dict)
-    assert error["code"] == "adopt.recovery_required"
+    assert [issue["code"] for issue in as_dicts(payload["errors"])] == [
+        CheckCode.INTERNAL_UNEXPECTED_ENTRY.value
+    ]
     assert snapshot_tree(root) == before
 
 

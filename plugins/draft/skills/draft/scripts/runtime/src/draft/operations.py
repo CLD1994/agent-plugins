@@ -10,7 +10,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import Protocol, cast
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
@@ -25,6 +25,12 @@ from draft.models import (
 from draft.observations import ObservationManifest
 from draft.paths import resolve_draft_root
 from draft.plan_effects import public_changed_paths
+
+
+class _MutationLike(Protocol):
+    @property
+    def path(self) -> Path: ...
+
 
 JOURNAL_VERSION = 3
 LOCK_RELATIVE = Path(INTERNAL_DIR) / "operation.lock"
@@ -515,9 +521,12 @@ def _validate_plan_paths(plan: OperationPlan) -> None:
         if relative.is_absolute() or ".." in relative.parts:
             raise DraftError("path.escape", relative)
         if relative.parts and relative.parts[0] == INTERNAL_DIR:
-            generate_marker = plan.kind == "generate-conclusions" and relative == MARKER_PATH
+            marker_mutation = relative == MARKER_PATH and plan.kind in (
+                "generate-conclusions",
+                "adopt",
+            )
             trash_package = plan.kind == "trash" and relative.is_relative_to(trash_outgoing)
-            if not (trash_package or generate_marker):
+            if not (trash_package or marker_mutation):
                 raise DraftError("path.escape", relative)
         cursor = plan.root
         for part in relative.parts:
@@ -844,21 +853,7 @@ def validate_preallocated_journal(plan: OperationPlan, journal: Journal) -> None
 
 def _verify_plan_observations(root: Path, plan: OperationPlan, journal: Journal) -> None:
     """锁内、首次业务变更前复核观察清单；差异即外部变化，不应用 mutation。"""
-    from draft.observations import FilesystemObservationProbe, verify_observations
-
-    excluded = {journal.directory.relative_to(root), LOCK_RELATIVE}
-    entries = tuple(
-        observation
-        for observation in journal.observations.entries
-        if observation.path not in excluded
-    )
-    from draft.observations import ObservationManifest
-
-    changed = verify_observations(
-        FilesystemObservationProbe(root),
-        ObservationManifest(entries=entries),
-        explained_mutations=(),
-    )
+    changed = _verify_observations_for_recovery(root, journal, explained_mutations=())
     if changed:
         raise DraftError("operation.external_change", root / changed[0])
 
@@ -1118,10 +1113,89 @@ def _recover_terminal(root: Path, journal: Journal, operation_id: str) -> Operat
     )
 
 
+def _verify_observations_for_recovery(
+    root: Path, journal: Journal, explained_mutations: tuple[_MutationLike, ...]
+) -> tuple[Path, ...]:
+    """恢复时复核观察：只排除本操作目录、锁与 explained mutation 路径。"""
+    from draft.observations import (
+        FilesystemObservationProbe,
+        ObservationManifest,
+        verify_observations,
+    )
+
+    excluded = {journal.directory.relative_to(root), LOCK_RELATIVE}
+    entries = tuple(
+        observation
+        for observation in journal.observations.entries
+        if observation.path not in excluded
+    )
+    return verify_observations(
+        FilesystemObservationProbe(root),
+        ObservationManifest(entries=entries),
+        explained_mutations=explained_mutations,
+    )
+
+
+def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> OperationResult:
+    """按 marker before/after 单向收敛 adopt 登记事务（规格 §12.2）。
+
+    adopt 日志只有 marker 一项 mutation：before=candidate、after=registered。
+    marker 已是 after 时只完成提交与清理，绝不回滚根身份。
+    """
+    marker_mutations = [mutation for mutation in journal.mutations if mutation.path == MARKER_PATH]
+    if len(marker_mutations) != 1:
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal.directory)
+    marker = marker_mutations[0]
+    current = _classify(root, marker)
+
+    if journal.phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
+        expected = "after" if journal.phase is OperationPhase.COMPLETED else "before"
+        if current != expected:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+        _clean_recovery_copies(journal)
+        release_lock(root, operation_id)
+        return OperationResult(
+            operation_id=operation_id,
+            kind=journal.kind,
+            phase=journal.phase,
+            changed_paths=(MARKER_PATH,),
+        )
+    if current == "unknown":
+        raise DraftError("operation.external_change", root / MARKER_PATH)
+    if current == "after":
+        # 登记已生效（marker 已是 registered）：只完成日志提交、清理并解锁。
+        committed = _with_phase(journal, OperationPhase.COMPLETED)
+        write_journal(committed)
+        _clean_recovery_copies(journal)
+        release_lock(root, operation_id)
+        return OperationResult(
+            operation_id=operation_id,
+            kind=journal.kind,
+            phase=OperationPhase.COMPLETED,
+            changed_paths=(MARKER_PATH,),
+        )
+    # marker 仍是 before（candidate）：复核观察清单；未变则前向完成，变化则放弃本次 adopt。
+    changed = _verify_observations_for_recovery(root, journal, explained_mutations=(marker,))
+    if changed:
+        rolled = _with_phase(journal, OperationPhase.ROLLED_BACK)
+        write_journal(rolled)
+        _clean_recovery_copies(journal)
+        release_lock(root, operation_id)
+        return OperationResult(
+            operation_id=operation_id,
+            kind=journal.kind,
+            phase=OperationPhase.ROLLED_BACK,
+            changed_paths=(),
+        )
+    return _finish_forward(root, journal, changed_paths=(MARKER_PATH,))
+
+
 def _recover_locked(root: Path, operation_id: str) -> OperationResult:
     journal = read_journal(operation_journal_path(root, operation_id))
     if journal.operation_id != operation_id:
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal.directory)
+    if journal.kind == "adopt":
+        return _recover_adopt(root, journal, operation_id)
     if journal.phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
         return _recover_terminal(root, journal, operation_id)
     if journal.phase is OperationPhase.ALLOCATING:

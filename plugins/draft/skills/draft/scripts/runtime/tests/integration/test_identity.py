@@ -31,7 +31,7 @@ def test_root_domain_exports_use_draft() -> None:
     assert hasattr(checker, "check_draft")
     assert hasattr(trash_lifecycle, "recover_draft")
     assert hasattr(paths, "resolve_draft_root")
-    assert hasattr(lifecycle, "draft_manifest")
+    assert hasattr(lifecycle, "initialize")
 
 
 def test_core_runtime_owns_no_plugin_responsibilities() -> None:

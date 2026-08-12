@@ -13,7 +13,6 @@ from pathlib import Path
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
-from draft.graph import provisional_marker_path
 from draft.models import (
     LifecycleWarning,
     OperationPhase,
@@ -489,9 +488,6 @@ def recover_draft(
 ) -> LifecycleAdvanceReport:
     """恢复全部崩溃现场并推进到期删除包；首个损坏项停止并保留前项结果。"""
     resolved = resolve_draft_root(root)
-    provisional = provisional_marker_path(resolved)
-    if provisional is not None:
-        raise DraftError("adopt.recovery_required", provisional)
     normalized_now = normalize_utc(now)
     active_handoff = handoff if handoff is not None else _default_handoff
     results: list[LifecycleResult] = []
@@ -624,9 +620,6 @@ def recover_interrupted_operations(
     由 ``prepare_registered_command`` 在命令前置统一完成。
     """
     resolved = resolve_draft_root(root)
-    provisional = provisional_marker_path(resolved)
-    if provisional is not None:
-        raise DraftError("adopt.recovery_required", provisional)
     normalized_now = normalize_utc(now)
     active_handoff = handoff if handoff is not None else _default_handoff
     results: list[LifecycleResult] = []
