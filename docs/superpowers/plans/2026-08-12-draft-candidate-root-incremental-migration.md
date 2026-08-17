@@ -1360,15 +1360,19 @@ uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
 - [ ] **Step 5: 运行格式、静态检查和类型检查**
 
   ```bash
-  RUNTIME=plugins/draft/skills/draft/scripts/runtime
+  RUNTIME=$PWD/plugins/draft/skills/draft/scripts/runtime
   uv run --project "$RUNTIME" --locked ruff format --check \
-    "$RUNTIME/src" "$RUNTIME/tests"
+    plugins/draft/skills/draft/scripts/runtime/src \
+    plugins/draft/skills/draft/scripts/runtime/tests
   uv run --project "$RUNTIME" --locked ruff check \
-    "$RUNTIME/src" "$RUNTIME/tests"
+    plugins/draft/skills/draft/scripts/runtime/src \
+    plugins/draft/skills/draft/scripts/runtime/tests
   uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
-  uv run --project "$RUNTIME" --locked ruff format --check plugins/draft/scripts
-  uv run --project "$RUNTIME" --locked ruff check \
-    --config plugins/draft/scripts/ruff.toml plugins/draft/scripts
+  # 适配层 ruff 唯一权威入口：cd 到配置目录后自动发现 ruff.toml。
+  # 不得从仓库根用 --config 指定（src=["."] 相对 CWD 解析会把 adapter 误判为
+  # 第三方、mask 掉 I001，两条入口结果相反）。
+  (cd plugins/draft/scripts && uv run --project "$RUNTIME" --locked ruff format --check .)
+  (cd plugins/draft/scripts && uv run --project "$RUNTIME" --locked ruff check .)
   uv run --project "$RUNTIME" --locked pyright \
     -p plugins/draft/scripts/pyrightconfig.json
   ```
