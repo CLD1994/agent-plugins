@@ -548,6 +548,16 @@ VALID_RENDER_CASES = [
     ),
     RenderCase(
         CheckIssue(
+            CheckCode.OPERATION_DURABILITY_FAILED.value,
+            IssueSeverity.ERROR,
+            Path(_JOURNAL),
+            None,
+            (str(Path(_JOURNAL).parent),),
+        ),
+        (0,),
+    ),
+    RenderCase(
+        CheckIssue(
             CheckCode.TRASH_DEADLINES_INVALID.value,
             IssueSeverity.ERROR,
             Path(_JOURNAL),

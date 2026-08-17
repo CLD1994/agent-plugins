@@ -53,6 +53,7 @@ from draft.operations import (
     read_journal,
     read_lock,
     release_lock,
+    resolve_journal_pending,
     sha256_bytes,
     sha256_file,
     validate_operation_id,
@@ -325,6 +326,7 @@ def abandon_unlinked_restore(
 ) -> None:
     """把调用方尚未关联的 R=allocating 耐久转为 rolled_back，清理分配材料。"""
     journal_path = operation_journal_path(root, restore_id)
+    resolve_journal_pending(journal_path)
     if journal_path.is_file():
         journal = read_journal(journal_path)
         if (
@@ -864,6 +866,7 @@ def resolve_restore_execution(
     execution_error: DraftError | None,
 ) -> OperationResult:
     """同一终态解决器：重读 R 与 T，证明终态后再解关联、清理、释放。"""
+    resolve_journal_pending(operation_journal_path(root, restore_id))
     terminal_restore = read_journal(operation_journal_path(root, restore_id))
     current_trash = validate_restore_link(root, terminal_restore)
     changed = tuple(mutation.path for mutation in terminal_restore.mutations)

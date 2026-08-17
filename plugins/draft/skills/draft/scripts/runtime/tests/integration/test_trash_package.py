@@ -522,3 +522,38 @@ def test_cleanup_preserves_full_evidence_when_unknown_present(
 
     # 完整证据保留：package.json、payload 与全部摘要不变。
     assert _leaf_snapshot(package) == {**before, "intruder.txt": b"\xe5\x85\xa5\xe4\xbe\xb5\n"}
+
+
+def test_cleanup_evidence_dir_fsync_failure_does_not_delete_leaves(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """证据写目录同步失败：报 durability_failed，不得继续删除权威叶（回归 H1）。"""
+    import os as os_module
+
+    from draft.operations import operation_journal_path
+    from draft.trash_package import clean_authoritative_package
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    before = _leaf_snapshot(package)
+
+    real_fsync = os_module.fsync
+    calls = {"n": 0}
+
+    def fail_evidence_dir_fsync(fd: int) -> None:
+        # durable_write(证据) 的 fsync 序列：file(1) → pending dir(2) → final dir(3)。
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise OSError("injected evidence final dir fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os_module, "fsync", fail_evidence_dir_fsync)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_DURABILITY_FAILED.value):
+        clean_authoritative_package(root, journal)
+    monkeypatch.undo()
+
+    # 权威叶一个未删：耐久失败后调用方不得继续删除。
+    assert _leaf_snapshot(package) == before
+    assert (package / "package.json").is_file()

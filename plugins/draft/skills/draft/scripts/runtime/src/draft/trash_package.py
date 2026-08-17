@@ -539,16 +539,22 @@ def _restore_missing_leaves_from_evidence(root: Path, journal: Journal, code_pat
 
     只恢复 classify 为 MISSING 的授权叶，且证据叶的 relative/sha256 必须与日志授权
     一致；现存叶保持不动（类型/摘要问题由预检拒绝）。恢复写入与验证/删除共用锚定
-    句柄，不按绝对路径重新解析。
+    句柄，不按绝对路径重新解析。恢复前先收敛崩溃遗留的叶 pending（回归 H2）。
     """
     import base64
 
+    from draft.operations import recover_digest_pending
+
     auth = parse_package_authorization(journal, code_path)
-    expected = {auth.package_json_path, auth.payload_path}
+    authorized_digest = {
+        auth.package_json_path: auth.package_json_digest,
+        auth.payload_path: auth.payload_digest,
+    }
+    expected = set(authorized_digest)
     evidence = _cleanup_evidence_path(journal)
     try:
         data = json.loads(evidence.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path) from exc
     if not isinstance(data, dict):
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
@@ -563,20 +569,32 @@ def _restore_missing_leaves_from_evidence(root: Path, journal: Journal, code_pat
             raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
         item = cast("dict[str, object]", entry)
         relative_raw = item.get("relative")
-        digest = item.get("sha256")
+        self_digest = item.get("sha256")
         b64 = item.get("b64")
         if (
             not isinstance(relative_raw, str)
-            or not isinstance(digest, str)
+            or not isinstance(self_digest, str)
             or not isinstance(b64, str)
         ):
             raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
         relative = Path(relative_raw)
         if relative not in expected:
             raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        digest = authorized_digest[relative]
+        # 交叉校验：证据自报摘要必须等于 T 授权摘要（回归 H4）。
+        if self_digest != digest:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
         content = base64.b64decode(b64)
         if sha256_bytes(content) != digest:
             raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        # 先收敛崩溃遗留 pending（发布已同步的待发布叶），再补写仍缺失的叶。
+        recover_digest_pending(
+            root,
+            relative,
+            digest,
+            code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+            code_path=code_path,
+        )
         with anchored_leaf(
             root, relative, code=CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path=code_path
         ) as leaf:

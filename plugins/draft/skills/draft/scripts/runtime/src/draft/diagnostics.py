@@ -298,6 +298,13 @@ _SPECS: dict[CheckCode, DiagnosticSpec] = {
         _fixed(1),
         lambda details: f"操作处于无锁不一致阶段：{_safe(details[0])}；完整上下文请使用 --json",
     ),
+    CheckCode.OPERATION_DURABILITY_FAILED: DiagnosticSpec(
+        _FILE,
+        _fixed(1),
+        lambda details: (
+            f"持久状态同步失败，未确认耐久提交：{_safe(details[0])}；保留锁与现场，请勿继续删除或释放"
+        ),
+    ),
     CheckCode.TRASH_DEADLINES_INVALID: DiagnosticSpec(
         _FILE, _fixed(1), lambda details: f"回收操作 {_safe(details[0])} 的期限字段无效"
     ),

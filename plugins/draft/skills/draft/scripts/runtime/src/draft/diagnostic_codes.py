@@ -53,6 +53,7 @@ class CheckCode(StrEnum):
     OPERATION_RECOVERY_REQUIRED = "operation.recovery_required"
     OPERATION_ORPHAN_ALLOCATING = "operation.orphan_allocating"
     OPERATION_INCONSISTENT_STATE = "operation.inconsistent_state"
+    OPERATION_DURABILITY_FAILED = "operation.durability_failed"
     TRASH_DEADLINES_INVALID = "trash.deadlines_invalid"
     TRASH_PACKAGE_MISSING = "trash.package_missing"
     TRASH_PACKAGE_CORRUPT = "trash.package_corrupt"

@@ -37,8 +37,10 @@ from draft.operations import (
     read_journal,
     read_lock,
     recover,
+    recover_digest_pending,
     reject_symlink_components,
     release_lock,
+    resolve_journal_pending,
     sha256_bytes,
     validate_operation_id,
     validate_restore_link,
@@ -166,6 +168,16 @@ def _clean_attempt_tree(attempt: Path, authorized: list[tuple[Path, str]], code_
             cursor = cursor.parent
     allowed_leaves = {leaf for leaf, _ in authorized}
     digest_by_path = dict(authorized)
+    # 先收敛崩溃遗留的 attempt 叶 pending（回归 H2）：发布/消费后才做未知成员检查，
+    # 否则 .pending 会被当作未知内容拒绝且无法重建投递副本。
+    for leaf, digest in authorized:
+        recover_digest_pending(
+            attempt,
+            leaf.relative_to(attempt),
+            digest,
+            code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+            code_path=code_path,
+        )
     for dirpath, dirnames, filenames in os.walk(attempt, followlinks=False):
         directory = Path(dirpath)
         if directory.is_symlink() or directory not in allowed_dirs:
@@ -301,6 +313,8 @@ def require_no_restore_claim_for_expiry(root: Path, journal: Journal) -> None:
 
 
 def reread_matching_trash_journal(root: Path, operation_id: str) -> Journal:
+    # 先发布崩溃遗留的 journal pending（回归 H2）：持锁推进从最新日志状态继续。
+    resolve_journal_pending(operation_journal_path(root, operation_id))
     journal = read_journal(operation_journal_path(root, operation_id))
     if journal.operation_id != operation_id or journal.kind is not OperationKind.TRASH:
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
@@ -533,10 +547,14 @@ def _handle_no_lock_dir(
         raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, entry)
     journal_path = operation_journal_path(root, entry.name)
     if not journal_path.is_file():
+        # 无 journal 且无 pending：空目录可回收，否则按非空现场保留。
         if not any(entry.iterdir()):
             entry.rmdir()
             return None
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
+        # 只有崩溃遗留 pending：发布有效日志后继续，非法 pending 报损坏（回归 H2）。
+        resolve_journal_pending(journal_path)
+    else:
+        resolve_journal_pending(journal_path)
     journal = read_journal(journal_path)
     if journal.kind is OperationKind.RESTORE:
         # 孤儿未关联 R（allocating、无 mutation、无 T 反向关联）：安全放弃为 rolled_back。

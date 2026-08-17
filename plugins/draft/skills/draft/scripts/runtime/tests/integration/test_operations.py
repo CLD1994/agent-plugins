@@ -1048,7 +1048,7 @@ def test_recover_uses_live_file_state_not_stale_applied(
         target: Path,
         content: bytes,
         *,
-        temporary: Path | None = None,
+        temporary: Path,
     ) -> None:
         original_apply_write(root_path, target, content, temporary=temporary)
         raise RuntimeError("injected crash after file lands")
@@ -1510,3 +1510,351 @@ def test_no_lock_allocating_with_unknown_content_is_inconsistent(
         recover(root)
 
     assert unknown.is_file()
+
+
+# ---------------------------------------------------------------------------
+# 第八轮 H1/H2：严格耐久发布状态机（确定名 pending + 不吞同步失败）
+# ---------------------------------------------------------------------------
+
+
+def _valid_journal_bytes(op_id: str, phase: str = "allocating") -> bytes:
+    """构造 _parse_journal 接受的最小合法日志 bytes（operation_id 与目录名匹配）。"""
+    import json as json_module
+
+    payload: dict[str, object] = {
+        "journal_version": JOURNAL_VERSION,
+        "operation_id": op_id,
+        "kind": OperationKind.CREATE.value,
+        "phase": phase,
+        "root_state": "registered",
+        "observations": [],
+        "mutations": [],
+        "remove_empty_directories": [],
+        "metadata": {},
+    }
+    return (json_module.dumps(payload) + "\n").encode("utf-8")
+
+
+def _fail_fsync_at(monkeypatch: pytest.MonkeyPatch, fail_at: frozenset[int]) -> None:
+    """让第 N 次 os.fsync 抛 OSError（file fsync 1 / pending dir 2 / final dir 3）。"""
+    import os as os_module
+
+    real_fsync = os_module.fsync
+    calls = {"n": 0}
+
+    def flaky_fsync(fd: int) -> None:
+        calls["n"] += 1
+        if calls["n"] in fail_at:
+            raise OSError(f"injected fsync failure #{calls['n']}")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os_module, "fsync", flaky_fsync)
+
+
+def test_pending_decision_matrix() -> None:
+    """恢复期 pending 收敛决策表：publish/delete/ignore/external（回归 H2）。"""
+    from draft.observations import EntryKind
+    from draft.operations import _pending_decision
+
+    F, M, D, S = (
+        EntryKind.FILE,
+        EntryKind.MISSING,
+        EntryKind.DIRECTORY,
+        EntryKind.SYMLINK,
+    )
+    expected = "a" * 64
+    other = "0" * 64
+
+    # 目标缺失 + pending 授权精确 → 发布 pending。
+    assert (
+        _pending_decision(
+            target_kind=M,
+            pending_kind=F,
+            target_digest=None,
+            pending_digest=expected,
+            expected_digest=expected,
+        )
+        == "publish"
+    )
+    # 目标与 pending 都是授权精确 → pending 已消费，只删 pending。
+    assert (
+        _pending_decision(
+            target_kind=F,
+            pending_kind=F,
+            target_digest=expected,
+            pending_digest=expected,
+            expected_digest=expected,
+        )
+        == "delete"
+    )
+    # 目标已是授权精确且无 pending → 已发布。
+    assert (
+        _pending_decision(
+            target_kind=F,
+            pending_kind=M,
+            target_digest=expected,
+            pending_digest=None,
+            expected_digest=expected,
+        )
+        == "ignore"
+    )
+    # 目标与 pending 都缺失 → 无可收敛。
+    assert (
+        _pending_decision(
+            target_kind=M,
+            pending_kind=M,
+            target_digest=None,
+            pending_digest=None,
+            expected_digest=expected,
+        )
+        == "ignore"
+    )
+    # pending 摘要不符 / 类型错误（目录、符号链接）→ external，保留现场。
+    assert (
+        _pending_decision(
+            target_kind=M,
+            pending_kind=F,
+            target_digest=None,
+            pending_digest=other,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    assert (
+        _pending_decision(
+            target_kind=M,
+            pending_kind=D,
+            target_digest=None,
+            pending_digest=None,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    assert (
+        _pending_decision(
+            target_kind=M,
+            pending_kind=S,
+            target_digest=None,
+            pending_digest=None,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    # 目标被外部替换（摘要不符）→ external，不得删除/覆盖。
+    assert (
+        _pending_decision(
+            target_kind=F,
+            pending_kind=F,
+            target_digest=other,
+            pending_digest=expected,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    assert (
+        _pending_decision(
+            target_kind=F,
+            pending_kind=M,
+            target_digest=other,
+            pending_digest=None,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    # 目标类型错误（目录）+ 无 pending → external。
+    assert (
+        _pending_decision(
+            target_kind=D,
+            pending_kind=M,
+            target_digest=None,
+            pending_digest=None,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+
+
+def test_durable_write_file_fsync_failure_leaves_pending_scene(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """文件 fsync 失败：报 durability_failed，目标未发布，pending 保留（回归 H1）。"""
+    from draft.operations import durable_write
+
+    target = operation_draft / ".draft/operations/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/journal.json"
+    target.parent.mkdir(parents=True)
+    _fail_fsync_at(monkeypatch, frozenset({1}))
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_DURABILITY_FAILED.value):
+        durable_write(target, _valid_journal_bytes("a" * 32))
+    monkeypatch.undo()
+    assert not target.exists()
+    assert (target.parent / "journal.json.pending").is_file()
+
+
+def test_durable_write_pending_dir_fsync_failure_then_resolve_converges(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pending 目录项 fsync 失败（已同步、发布前）：报错保留 pending，随后收敛（回归 H1/H2）。"""
+    from draft.operations import durable_write, read_journal, resolve_journal_pending
+
+    target = operation_draft / ".draft/operations/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/journal.json"
+    target.parent.mkdir(parents=True)
+    _fail_fsync_at(monkeypatch, frozenset({2}))
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_DURABILITY_FAILED.value):
+        durable_write(target, _valid_journal_bytes("b" * 32))
+    monkeypatch.undo()
+    assert not target.exists()
+    pending = target.parent / "journal.json.pending"
+    assert pending.is_file()
+    assert pending.read_bytes() == _valid_journal_bytes("b" * 32)
+    # 恢复：发布有效 pending 后日志可读。
+    resolve_journal_pending(target)
+    assert target.is_file()
+    assert read_journal(target).operation_id == "b" * 32
+    assert not pending.exists()
+
+
+def test_durable_write_final_dir_fsync_failure_reports_not_durable(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """最终目录 fsync 失败：发布已发生但报 durability_failed，调用方不得视为耐久（回归 H1）。"""
+    from draft.operations import durable_write
+
+    target = operation_draft / ".draft/operations/cccccccccccccccccccccccccccccccc/journal.json"
+    target.parent.mkdir(parents=True)
+    _fail_fsync_at(monkeypatch, frozenset({3}))
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_DURABILITY_FAILED.value):
+        durable_write(target, _valid_journal_bytes("c" * 32))
+    monkeypatch.undo()
+    assert target.is_file()
+    assert target.read_bytes() == _valid_journal_bytes("c" * 32)
+    assert not (target.parent / "journal.json.pending").exists()
+
+
+def test_resolve_journal_pending_invalid_preserves_scene(operation_draft: Path) -> None:
+    """非法 pending：报 journal_corrupt，保留现场，绝不按文件名删除（回归 H2）。"""
+    from draft.operations import resolve_journal_pending
+
+    target = operation_draft / ".draft/operations/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/journal.json"
+    target.parent.mkdir(parents=True)
+    pending = target.parent / "journal.json.pending"
+    pending.write_bytes(b'{"journal_version": 3, "partial')
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        resolve_journal_pending(target)
+    assert pending.is_file()
+    assert not target.exists()
+
+
+def test_recover_publishes_bootstrap_pending_and_cleans_allocating(
+    operation_draft: Path,
+) -> None:
+    """仅剩崩溃遗留的 bootstrap pending：recover 发布后按 allocating 放弃并清理目录（回归 H2）。"""
+    from draft.operations import recover
+
+    root = operation_draft
+    op_id = "0" * 32
+    journal_dir = root / ".draft/operations" / op_id
+    journal_dir.mkdir(parents=True)
+    (journal_dir / "journal.json.pending").write_bytes(_valid_journal_bytes(op_id, "allocating"))
+
+    recover(root)
+
+    assert not journal_dir.exists()
+
+
+def test_clean_recovery_copies_converges_with_copy_pending(
+    operation_draft: Path,
+) -> None:
+    """登记叶缺失但 .pending 为授权内容：发布后清理收敛，不把 pending 当未知成员（回归 H2）。"""
+    from draft.operations import clean_recovery_copies, read_journal
+
+    root = operation_draft
+    op_id = "d" * 32
+    journal_path = _write_journal_with_originals_and_staged(root, op_id, extra_sub=None)
+    journal_dir = root / ".draft/operations" / op_id
+    # 模拟崩溃：original 叶未发布，仅剩已同步 pending。
+    (journal_dir / "originals" / "0000.bin").unlink()
+    (journal_dir / "originals" / "0000.bin.pending").write_bytes(b"original")
+
+    clean_recovery_copies(read_journal(journal_path))
+
+    assert not (journal_dir / "originals").exists()
+    assert not (journal_dir / "staged").exists()
+
+
+def test_subprocess_kill_leaves_synced_pending_then_resolve_converges(
+    operation_draft: Path,
+) -> None:
+    """真实子进程在发布前被 SIGKILL：已同步 pending 保留，新进程 resolve 后收敛（回归 H2）。"""
+    import signal
+    import subprocess
+    import sys
+
+    root = operation_draft
+    op_id = "f" * 32
+    journal_dir = root / ".draft/operations" / op_id
+    journal_dir.mkdir(parents=True)
+    target = journal_dir / "journal.json"
+    payload = _valid_journal_bytes(op_id)
+
+    script = (
+        "import os, signal, sys\n"
+        "from pathlib import Path\n"
+        "os.replace = lambda *a, **k: os.kill(os.getpid(), signal.SIGKILL)\n"
+        "from draft.operations import durable_write\n"
+        f"durable_write(Path({str(target)!r}), {payload!r})\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, timeout=60)
+    assert proc.returncode == -signal.SIGKILL
+
+    # 崩溃现场：目标未发布、已同步 pending 保留。
+    assert not target.exists()
+    pending = journal_dir / "journal.json.pending"
+    assert pending.is_file()
+    assert pending.read_bytes() == payload
+
+    # 新进程收敛：发布 pending 后日志可读，pending 已消费。
+    from draft.operations import read_journal, resolve_journal_pending
+
+    resolve_journal_pending(target)
+    assert read_journal(target).operation_id == op_id
+    assert not pending.exists()
+
+
+def test_resolve_journal_pending_with_old_journal_publishes_newer(
+    operation_draft: Path,
+) -> None:
+    """旧 journal 与有效 pending 并存：发布较新的 pending（回归 H2 决策表"完整发布新"）。"""
+    from draft.operations import read_journal, resolve_journal_pending
+
+    op_id = "9" * 32
+    journal_dir = operation_draft / ".draft/operations" / op_id
+    journal_dir.mkdir(parents=True)
+    target = journal_dir / "journal.json"
+    target.write_bytes(_valid_journal_bytes(op_id, "prepared"))
+    (journal_dir / "journal.json.pending").write_bytes(_valid_journal_bytes(op_id, "applying"))
+
+    resolve_journal_pending(target)
+
+    assert read_journal(target).phase.value == "applying"
+    assert not (journal_dir / "journal.json.pending").exists()
+
+
+def test_resolve_journal_pending_with_old_journal_keeps_old_on_invalid(
+    operation_draft: Path,
+) -> None:
+    """旧 journal 存在 + pending 半写无效：保留旧 journal，不报错（回归 H2 决策表"选择旧"）。"""
+    from draft.operations import read_journal, resolve_journal_pending
+
+    op_id = "8" * 32
+    journal_dir = operation_draft / ".draft/operations" / op_id
+    journal_dir.mkdir(parents=True)
+    target = journal_dir / "journal.json"
+    target.write_bytes(_valid_journal_bytes(op_id, "prepared"))
+    pending = journal_dir / "journal.json.pending"
+    pending.write_bytes(b'{"journal_version": 3, "partial')
+
+    resolve_journal_pending(target)
+
+    assert read_journal(target).phase.value == "prepared"
+    # 非法 pending 不删除，留作 checker 可见残留。
+    assert pending.is_file()

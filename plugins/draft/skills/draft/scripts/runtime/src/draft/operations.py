@@ -168,16 +168,191 @@ def replace_file(source: Path, target: Path) -> None:
 
 
 def fsync_directory(path: Path) -> None:
+    """严格同步目录：打开或 fsync 失败都映射为 operation.durability_failed。
+
+    曾经静默吞掉 OSError（回归 H1）：调用方会把"日志/证据已耐久"的结论建立在未同步
+    的目录项上，崩溃后可能同时失去内容与重建证据。作为提交点前置的同步必须可失败。
+    """
     try:
-        descriptor = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, path) from exc
     try:
         os.fsync(descriptor)
-    except OSError:
-        pass
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, path) from exc
     finally:
         os.close(descriptor)
+
+
+def _fsync_dir_fd(parent_fd: int, code_path: Path) -> None:
+    """严格同步已打开的目录句柄：失败映射为 operation.durability_failed（回归 H1）。"""
+    try:
+        os.fsync(parent_fd)
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+
+
+_PENDING_SUFFIX = ".pending"
+
+
+def _pending_name(name: str) -> str:
+    """确定名 pending：目标名 + '.pending'，可由授权源决定的目标路径派生（回归 H2）。
+
+    禁止随机 uuid 临时路径：崩溃遗留的 pending 必须能被恢复按精确名字、类型与摘要
+    分类收敛，而不是按文件名形状批量猜测归属。
+    """
+    return f"{name}{_PENDING_SUFFIX}"
+
+
+def _publish_via_pending(
+    parent_fd: int,
+    name: str,
+    content: bytes,
+    *,
+    no_clobber: bool,
+    code_path: Path,
+) -> None:
+    """在父目录句柄内把 content 耐久发布为 name（确定名 pending + 严格同步，回归 H1/H2）。
+
+    顺序：截断创建 pending → 写入 → fsync 文件 → 严格 fsync 父目录（pending 目录项
+    耐久，崩溃时恢复可按授权源分类）→ 发布 → 严格 fsync 父目录（目标目录项耐久）。
+    任一步失败保留 pending/旧目标现场并抛 operation.durability_failed；调用方不得
+    把该写入当作已耐久，也不得继续删除权威叶或释放锁。
+
+    no_clobber=True：link 无覆盖发布，发布瞬间目标已出现即外部变化（恢复写不覆盖）。
+    """
+    pending = _pending_name(name)
+    # 打开 pending：O_NOFOLLOW 拒绝符号链接；持锁写无并发，已有崩溃遗留 pending 由
+    # 当前拥有者重写。
+    try:
+        descriptor = os.open(
+            pending,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            0o644,
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+    _fsync_dir_fd(parent_fd, code_path)
+    if no_clobber:
+        try:
+            os.link(pending, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        except FileExistsError as exc:
+            raise DraftError("operation.external_change", code_path) from exc
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+        try:
+            os.unlink(pending, dir_fd=parent_fd)
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+    else:
+        try:
+            os.replace(pending, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+    _fsync_dir_fd(parent_fd, code_path)
+
+
+def _open_parent_dir(path: Path, *, code: str, code_path: Path) -> int:
+    """no-follow 打开目录句柄：符号链接/类型错误映射为调用方稳定领域错误。"""
+    try:
+        return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise DraftError(code, code_path) from exc
+
+
+def _pending_decision(
+    *,
+    target_kind: EntryKind,
+    pending_kind: EntryKind,
+    target_digest: str | None,
+    pending_digest: str | None,
+    expected_digest: str,
+) -> str:
+    """恢复期 pending 收敛决策（纯函数）：publish / delete / ignore / external。
+
+    授权源是调用方给出的 expected_digest（日志登记摘要或 T 授权摘要）。目标与 pending
+    都必须为普通文件且摘要等于授权才可动作；类型/摘要不符一律保留现场报 external，
+    绝不按文件名形状删除（回归 H2）。
+    """
+    if pending_kind is EntryKind.MISSING:
+        if target_kind is EntryKind.FILE and target_digest == expected_digest:
+            return "ignore"  # 已发布且无 pending。
+        if target_kind is EntryKind.MISSING:
+            return "ignore"  # 从未开始或已幂等缺失：无 pending 可收敛。
+        return "external"
+    if pending_kind is not EntryKind.FILE or pending_digest != expected_digest:
+        return "external"
+    if target_kind is EntryKind.MISSING:
+        return "publish"  # pending 已耐久、目标未发布：发布它。
+    if target_kind is EntryKind.FILE and target_digest == expected_digest:
+        return "delete"  # 目标已发布且 pending 是同一授权内容：pending 已消费，删除。
+    return "external"
+
+
+def recover_digest_pending(
+    root: Path,
+    relative: Path,
+    expected_digest: str,
+    *,
+    code: str,
+    code_path: Path,
+) -> None:
+    """把崩溃遗留的 ``<目标>.pending`` 收敛为已发布/已消费状态（回归 H2）。
+
+    授权源是 expected_digest。只处理精确授权 pending：目标与 pending 在同一锚定父目录
+    内分类复核，类型/摘要不符即外部改写，保留现场报错，不按文件名形状批量删除。
+    发布用 no-clobber link（目标在发布瞬间出现即外部变化，保留两者）。
+    """
+    with anchored_leaf(root, relative, code=code, code_path=code_path) as target:
+        if isinstance(target, _MissingLeaf):
+            return  # 中间父组件缺失：目标与 pending 都必然缺失，无可收敛。
+        parent_fd = target.parent_fd
+        pending_name = _pending_name(target.name)
+        pending = _AnchoredLeaf(parent_fd, pending_name, relative, code, code_path)
+        target_kind = target.classify()
+        pending_kind = pending.classify()
+        decision = _pending_decision(
+            target_kind=target_kind,
+            pending_kind=pending_kind,
+            target_digest=sha256_bytes(target.read()) if target_kind is EntryKind.FILE else None,
+            pending_digest=sha256_bytes(pending.read()) if pending_kind is EntryKind.FILE else None,
+            expected_digest=expected_digest,
+        )
+        if decision == "external":
+            raise DraftError(code, code_path)
+        if decision == "publish":
+            # 目标此刻仍缺失，link 无覆盖发布；EEXIST 说明发布瞬间被外部占用。
+            try:
+                os.link(
+                    pending_name,
+                    target.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            except FileExistsError as exc:
+                raise DraftError("operation.external_change", code_path) from exc
+            except OSError as exc:
+                raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+            try:
+                os.unlink(pending_name, dir_fd=parent_fd)
+            except OSError as exc:
+                raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+            _fsync_dir_fd(parent_fd, code_path)
+        elif decision == "delete":
+            try:
+                os.unlink(pending_name, dir_fd=parent_fd)
+            except OSError as exc:
+                raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+            _fsync_dir_fd(parent_fd, code_path)
 
 
 def reject_symlink_components(root: Path, relative: Path) -> None:
@@ -269,33 +444,15 @@ class _AnchoredLeaf:
             raise self._io_error(exc) from exc
 
     def write(self, content: bytes) -> None:
-        """原子写入叶文件：临时文件经同一父目录句柄创建，replace 也在句柄内完成。
+        """no-clobber 耐久发布叶文件（restore 恢复缺失叶，回归 H1/H2/H3）。
 
-        供清理证据恢复使用：目标可能已被部分删除或替换，绝不按绝对路径重新解析。
+        确定名 pending（``<名>.pending``）+ link 无覆盖发布：发布瞬间目标已出现即
+        外部变化，保留 pending 与新目标并报错，绝不覆盖。严格同步父目录，失败映射
+        operation.durability_failed。供清理证据恢复使用：绝不按绝对路径重新解析。
         """
-        temporary = f".{self.name}.restore-{uuid.uuid4().hex}"
-        try:
-            descriptor = os.open(
-                temporary,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o644,
-                dir_fd=self.parent_fd,
-            )
-        except OSError as exc:
-            raise self._io_error(exc) from exc
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-        except OSError as exc:
-            raise self._io_error(exc) from exc
-        try:
-            os.replace(temporary, self.name, src_dir_fd=self.parent_fd, dst_dir_fd=self.parent_fd)
-        except OSError as exc:
-            raise self._io_error(exc) from exc
-        with suppress(OSError):
-            os.fsync(self.parent_fd)
+        _publish_via_pending(
+            self.parent_fd, self.name, content, no_clobber=True, code_path=self.code_path
+        )
 
 
 @dataclass(frozen=True)
@@ -339,35 +496,55 @@ def anchored_leaf(
     """
     if not relative.parts:
         raise ValueError("relative must be non-empty")
-    parent_fd = os.open(root, os.O_RDONLY)
+    # 根以 no-follow 目录方式打开（回归 H3）：跟根本身是符号链接时稳定领域错误，
+    # 不跟随链接解析到其他目录。
+    try:
+        parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise DraftError(code, code_path) from exc
+    closed = False
     try:
         for part in relative.parts[:-1]:
             try:
-                parent_fd = os.open(
+                next_fd = os.open(
                     part,
                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                     dir_fd=parent_fd,
                 )
             except FileNotFoundError:
+                os.close(parent_fd)
+                closed = True
                 yield _MissingLeaf(relative, code, code_path)
                 return
             except OSError as exc:
+                os.close(parent_fd)
+                closed = True
                 raise DraftError(code, code_path) from exc
+            # 每打开下一层立即关闭上一层（回归 M2）：成功、中间缺失与异常分支都保证
+            # fd 数量回到调用前，避免大 mutation/深路径耗尽描述符。
+            os.close(parent_fd)
+            parent_fd = next_fd
         yield _AnchoredLeaf(parent_fd, relative.name, relative, code, code_path)
     finally:
-        os.close(parent_fd)
+        if not closed:
+            os.close(parent_fd)
 
 
 def durable_write(path: Path, value: bytes) -> None:
-    """Durable write for internal state (journal, lock, copies); not the managed-page seam."""
+    """内部状态（日志、锁、恢复副本、清理证据）的严格耐久写：确定名 pending + 原子发布。
+
+    崩溃遗留为 ``<目标名>.pending`` 而非随机 uuid 临时文件（回归 H2）：恢复按授权源
+    精确分类收敛。父目录以 no-follow 打开（发布边界不重新解析路径）；严格同步失败
+    映射 operation.durability_failed（回归 H1）。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex}")
-    with temporary.open("xb") as handle:
-        handle.write(value)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
-    fsync_directory(path.parent)
+    parent_fd = _open_parent_dir(
+        path.parent, code=CheckCode.OPERATION_DURABILITY_FAILED.value, code_path=path.parent
+    )
+    try:
+        _publish_via_pending(parent_fd, path.name, value, no_clobber=False, code_path=path)
+    finally:
+        os.close(parent_fd)
 
 
 def acquire_lock(root: Path, operation_id: str) -> None:
@@ -572,14 +749,71 @@ def _parse_observations(data: object, journal_path: Path) -> ObservationManifest
     return ObservationManifest(entries=tuple(entries))
 
 
+def _parse_journal_bytes(data: bytes, journal_path: Path) -> Journal:
+    """持久 JSON bytes 解码 + 形状验证的单一解析边界（回归 M3）。
+
+    严格 UTF-8 解码、JSON 解析与 journal 形状验证在同一处；``UnicodeDecodeError``、
+    读取错误与 JSON 错误统一映射 operation.journal_corrupt，绝不泄漏原始异常。
+    """
+    try:
+        decoded = json.loads(data.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path) from exc
+    return _parse_journal(decoded, journal_path)
+
+
 def read_journal(journal_path: Path) -> Journal:
     if not journal_path.is_file():
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+    return _parse_journal_bytes(journal_path.read_bytes(), journal_path)
+
+
+def resolve_journal_pending(journal_path: Path) -> None:
+    """把崩溃遗留的 ``journal.json.pending`` 收敛为已发布日志（回归 H2）。
+
+    ``durable_write`` 的 pending 总是比现存 journal 更新（同一写调用里 replace 前
+    崩溃才留下 pending；replace 会消费它），因此有效 pending 发布为新 journal 比回退
+    旧 journal 更忠实。旧 journal 存在且 pending 非法（崩溃半写/类型错误）时保留旧
+    journal 推进，pending 留作 checker 可见的可人工处理残留；旧 journal 缺失且 pending
+    非法时无法继续，报 journal_corrupt。绝不按文件名删除 pending。
+    """
+    pending_path = journal_path.with_name(_pending_name(journal_path.name))
+    pending_kind = classify_node(pending_path)
+    if pending_kind is EntryKind.MISSING:
+        return
+    old_exists = classify_node(journal_path) is EntryKind.FILE
+    if pending_kind is not EntryKind.FILE:
+        if old_exists:
+            return  # 保留旧 journal 推进；类型错误 pending 由 checker 报告。
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, pending_path)
     try:
-        decoded = json.loads(journal_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path) from exc
-    return _parse_journal(decoded, journal_path)
+        journal = _parse_journal_bytes(pending_path.read_bytes(), pending_path)
+    except DraftError:
+        if old_exists:
+            return  # 半写 pending：旧 journal 仍可推进。
+        raise
+    if journal.operation_id != journal_path.parent.name:
+        if old_exists:
+            return
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, pending_path)
+    parent_fd = _open_parent_dir(
+        journal_path.parent,
+        code=CheckCode.OPERATION_DURABILITY_FAILED.value,
+        code_path=journal_path.parent,
+    )
+    try:
+        try:
+            os.replace(
+                pending_path.name,
+                journal_path.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, pending_path) from exc
+        _fsync_dir_fd(parent_fd, journal_path.parent)
+    finally:
+        os.close(parent_fd)
 
 
 def _parse_journal(data: object, journal_path: Path) -> Journal:
@@ -842,9 +1076,7 @@ def _mutation_temporary_path(target: Path, operation_id: str, index: int) -> Pat
     return target.with_name(f"{target.name}.tmp-{digest}")
 
 
-def _apply_write(
-    root: Path, target: Path, content: bytes, *, temporary: Path | None = None
-) -> None:
+def _apply_write(root: Path, target: Path, content: bytes, *, temporary: Path) -> None:
     destination = root / target
     cursor = root
     for part in target.parts[:-1]:
@@ -852,11 +1084,8 @@ def _apply_write(
         if cursor.is_symlink():
             raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, cursor)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if temporary is None:
-        temporary = destination.with_name(f"{destination.name}.tmp-{uuid.uuid4().hex}")
-    else:
-        temporary = root / temporary
-        reject_symlink_components(root, temporary.relative_to(root))
+    temporary = root / temporary
+    reject_symlink_components(root, temporary.relative_to(root))
     if temporary.exists() or temporary.is_symlink():
         # 崩溃遗留的同名精确临时文件：复核普通文件类型与内容后替换，不重复创建。
         if temporary.is_symlink() or not temporary.is_file():
@@ -944,6 +1173,16 @@ def _clean_recovery_copies(journal: Journal) -> None:
         if directory_node is not EntryKind.DIRECTORY:
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, directory)
         allowed = registered[sub]
+        # 先收敛崩溃遗留的登记文件 pending（回归 H2）：发布/消费后才做未知成员检查，
+        # 否则 .pending 会作为未登记成员被拒绝且锁永久保留。
+        for name, digest in sorted(allowed.items()):
+            recover_digest_pending(
+                journal.directory,
+                Path(sub) / name,
+                digest,
+                code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                code_path=journal.directory / sub / name,
+            )
         for entry in directory.iterdir():
             relative = Path(sub) / entry.name
             if entry.name not in allowed:
@@ -1054,7 +1293,15 @@ def _rollback(
             original_hash = sha256_file(original)
             if original_hash != mutation.before_sha256:
                 raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, original)
-            _apply_write(root, mutation.path, original.read_bytes())
+            # 确定性临时路径（回归 H2）：回滚重写也走登记精确临时路径，不用随机 uuid。
+            _apply_write(
+                root,
+                mutation.path,
+                original.read_bytes(),
+                temporary=_mutation_temporary_path(
+                    mutation.path, journal.operation_id, journal.mutations.index(mutation)
+                ),
+            )
     return finalize_operation(
         root,
         journal,
@@ -1103,7 +1350,15 @@ def _apply_one(root: Path, journal: Journal, mutation: JournalMutation) -> Journ
     if mutation.kind is MutationKind.WRITE:
         staged = journal.directory / cast("Path", mutation.staged)
         content = staged.read_bytes()
-        _apply_write(root, mutation.path, content)
+        # 确定性临时路径（回归 H2）：前向恢复重写也走登记精确临时路径，不用随机 uuid。
+        _apply_write(
+            root,
+            mutation.path,
+            content,
+            temporary=_mutation_temporary_path(
+                mutation.path, journal.operation_id, journal.mutations.index(mutation)
+            ),
+        )
     else:
         _apply_delete(root, mutation.path)
     updated = _with_applied(journal, mutation.path)
@@ -1216,7 +1471,9 @@ def validate_restore_link(root: Path, restore_journal: Journal) -> Journal:
     if back_reference is None:
         raise DraftError("operation.plan_invalid", restore_journal.directory)
     back_id = validate_operation_id(back_reference, code="operation.plan_invalid")
-    back_journal = read_journal(operation_journal_path(root, back_id))
+    back_path = operation_journal_path(root, back_id)
+    resolve_journal_pending(back_path)
+    back_journal = read_journal(back_path)
     if (
         back_journal.kind is not OperationKind.TRASH
         or back_journal.metadata.get("restore_operation_id") != restore_journal.operation_id
@@ -1959,6 +2216,8 @@ def _clean_owned_temp_artifacts(
 
 
 def _recover_locked(root: Path, operation_id: str) -> OperationResult:
+    # 先把崩溃遗留的 journal pending 发布为最新日志（回归 H2），再从最新日志恢复。
+    resolve_journal_pending(operation_journal_path(root, operation_id))
     journal = read_journal(operation_journal_path(root, operation_id))
     if journal.operation_id != operation_id:
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal.directory)
@@ -2013,9 +2272,18 @@ def recover(root_path: Path) -> OperationResult:
             operation_id="", kind="recover", phase=OperationPhase.COMPLETED, changed_paths=()
         )
     for entry in sorted(operations.iterdir()):
-        journal_path = entry / "journal.json"
-        if not entry.is_dir() or not journal_path.is_file():
+        if not entry.is_dir():
             continue
+        journal_path = entry / "journal.json"
+        if not journal_path.is_file():
+            # 操作目录无 journal：只剩崩溃遗留 pending 时发布有效日志后继续处理；
+            # 非法 pending 报损坏（不按文件名删除）；既无 journal 也无 pending 跳过。
+            if classify_node(entry / _pending_name("journal.json")) is EntryKind.MISSING:
+                continue
+            resolve_journal_pending(journal_path)
+        else:
+            # journal 与 pending 并存：pending 是更新的完整日志，先发布（回归 H2）。
+            resolve_journal_pending(journal_path)
         journal = read_journal(journal_path)
         if journal.phase is OperationPhase.ALLOCATING:
             if "restores_trash_operation" in journal.metadata:
