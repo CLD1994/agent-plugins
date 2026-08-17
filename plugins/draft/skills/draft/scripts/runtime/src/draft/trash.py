@@ -16,6 +16,7 @@ from draft.graph import (
     ROOT_PAGE,
     DraftGraph,
     load_graph,
+    load_graph_tolerant,
     resolve_local_destination,
 )
 from draft.markdown import (
@@ -356,7 +357,17 @@ def _proven_unapplied_restore(root: Path, journal: Journal) -> bool:
 
 
 def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackage) -> OperationPlan:
-    """构造恢复计划：页面回写、父/枢纽导航恢复；冲突在此以 operation.* 抛出。"""
+    """构造恢复计划：页面回写、父/枢纽导航恢复；冲突在此以 operation.* 抛出。
+
+    registered 根在规划前通过完整健康门禁；candidate 根按操作级契约恢复，不要求
+    全根健康，但折叠恢复需要重写全部指向叶页的入站链接，不可解析页面仍须阻止。
+    """
+    from draft.graph import read_marker
+    from draft.models import RootState
+    from draft.query import load_tolerant_view
+
+    resolved = resolve_draft_root(root)
+    root_state = read_marker(resolved).root_state
     page_path = package.page_path
     parent_path = package.parent_path
     hub_path = package.hub_path
@@ -365,15 +376,23 @@ def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackag
     parent_hash = package.parent_sha256
     page_bytes = package.page_bytes
 
-    if (root / page_path).exists():
+    if (resolved / page_path).exists():
         raise DraftError("operation.validation_failed", page_path, details=("restore_conflict",))
-    if sha256_file(root / parent_path) != parent_hash:
+    if sha256_file(resolved / parent_path) != parent_hash:
         raise DraftError("operation.validation_failed", parent_path, details=("restore_conflict",))
-    report = check_draft(root, include_operation_state=False, exclude_resource_facts=True)
-    if report.errors:
-        codes = tuple(issue.code for issue in report.errors)
-        raise DraftError("operation.validation_failed", root, details=codes)
-    graph = load_graph(root)
+    if root_state is RootState.REGISTERED:
+        report = check_draft(resolved, include_operation_state=False, exclude_resource_facts=True)
+        if report.errors:
+            codes = tuple(issue.code for issue in report.errors)
+            raise DraftError("operation.validation_failed", resolved, details=codes)
+        graph = load_graph(resolved)
+    else:
+        view = load_tolerant_view(resolved)
+        graph = view.graph
+        if view.blocking_paths and collapsed:
+            # 折叠恢复需重写所有指向叶页的入站链接：不可解析页面可能隐藏链接。
+            details = tuple(path.as_posix() for path in view.blocking_paths)
+            raise DraftError("operation.validation_failed", resolved, details=details)
     page_title = parse_page(page_path, page_bytes.decode("utf-8")).title
 
     mutations: list[FileMutation] = []
@@ -449,16 +468,15 @@ def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackag
         (mutation for mutation in mutations if mutation.kind is MutationKind.DELETE),
         key=lambda mutation: str(mutation.path),
     )
-    from draft.models import RootState
     from draft.observations import EMPTY_OBSERVATIONS
 
     # restore 的完整观察闭包在 Task 11 按操作级契约补全；当前恢复复核由
     # verify_restore_after_state 保证原子性。
     return OperationPlan(
         kind=OperationKind.RESTORE,
-        root=root,
+        root=resolved,
         mutations=tuple([*writes, *deletes]),
-        root_state=RootState.REGISTERED,
+        root_state=root_state,
         observations=EMPTY_OBSERVATIONS,
         metadata={"operation_id": restore_id},
     )
@@ -635,8 +653,9 @@ def _prove_parent_restore(
     没有才新建，两种原貌都合法）后重新摘要，必须等于 T 耐久记录的 parent_sha256
     （回收后的父/叶内容）。编辑字节不可逆，所以改为"移除导航后应回到回收后状态"
     这一可证等价式。折叠时被重定向的其他页面则逐页应用 T 的 hub->leaf 逆重定向复核。
+    用容错加载：证明只依赖恢复相关页面，注册门禁已在规划时完成。
     """
-    graph = load_graph(root)
+    graph = load_graph_tolerant(root).graph
     canonical = canonical_parent_navigation(graph, package.page_path)
     if canonical is None:
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, package.parent_path)
@@ -716,14 +735,16 @@ def restore_retained_trash(
     normalized_now = normalize_utc(now)
     validate_operation_id(operation_id, code="operation.invalid_id")
     restore_id = uuid.uuid4().hex
-    from draft.models import RootState
+    from draft.graph import read_marker
     from draft.observations import EMPTY_OBSERVATIONS
 
     preallocate_journal(
         resolved,
         kind=OperationKind.RESTORE,
         operation_id=restore_id,
-        root_state=RootState.REGISTERED,
+        # 恢复日志保留创建时的当前根状态作为审计事实；规划门禁由 build_restore_plan
+        # 重新读取 marker（计划 Task 11 Step 4）。
+        root_state=read_marker(resolved).root_state,
         observations=EMPTY_OBSERVATIONS,
         metadata={"restores_trash_operation": operation_id},
     )

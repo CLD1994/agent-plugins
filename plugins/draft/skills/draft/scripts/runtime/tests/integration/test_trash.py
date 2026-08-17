@@ -6,8 +6,8 @@ import pytest
 from draft.checker import check_draft
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
-from draft.models import OperationPhase
-from draft.operations import JOURNAL_VERSION
+from draft.models import OperationPhase, RootState
+from draft.operations import JOURNAL_VERSION, read_journal
 from draft.trash import restore_retained_trash, trash_page
 from draft.trash_lifecycle import recover_draft
 from tests.integration.support import DraftFactory
@@ -232,6 +232,29 @@ def _other_operation_dirs(root: Path, *exclude: str) -> list[Path]:
         for entry in sorted(operations.iterdir())
         if entry.is_dir() and entry.name not in exclude
     ]
+
+
+def test_candidate_trash_then_restore_roundtrips(draft_factory: DraftFactory) -> None:
+    """候选根复用 trash/restore 生命周期（计划 Task 11）：恢复按当前根状态执行。"""
+    root = draft_factory(
+        {
+            "index.md": TRASH_INDEX,
+            "conclusions.md": TRASH_CONCLUSIONS,
+            "pages/obsolete.md": OBSOLETE,
+            "pages/other.md": OTHER,
+        },
+        root_state=RootState.CANDIDATE,
+    )
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+
+    result = restore_retained_trash(root, pending.operation_id, now=NOW)
+
+    assert result.phase is OperationPhase.COMPLETED
+    assert (root / "pages/obsolete.md").read_text(encoding="utf-8") == OBSOLETE
+    assert not (root / ".draft/operation.lock").exists()
+    # 恢复日志保留创建时的根状态作为审计事实。
+    restore_journal = read_journal(next((root / ".draft/operations").iterdir()) / "journal.json")
+    assert restore_journal.root_state is RootState.CANDIDATE
 
 
 def test_restore_completes_within_window(draft_factory: DraftFactory) -> None:
