@@ -26,6 +26,7 @@ from draft.models import (
     FileMutation,
     MarkdownLink,
     MutationKind,
+    OperationKind,
     OperationPlan,
     OperationResult,
     SourceSpan,
@@ -246,7 +247,7 @@ def plan_path_remap(
     page_map: Mapping[Path, Path],
     parent_changes: Mapping[Path, Path],
     *,
-    kind: str = "move",
+    kind: OperationKind = OperationKind.MOVE,
     allow_empty_hub: Path | None = None,
 ) -> OperationPlan:
     blocking = [
@@ -401,7 +402,7 @@ def plan_move(graph: DraftGraph, source: Path, target: Path) -> OperationPlan:
     new_parent = physical_parent(target)
     if new_parent is not None and new_parent != graph.parents.get(source):
         parent_changes[source] = new_parent
-    return plan_path_remap(graph, {source: target}, parent_changes, kind="move")
+    return plan_path_remap(graph, {source: target}, parent_changes, kind=OperationKind.MOVE)
 
 
 def plan_promote(graph: DraftGraph, page: Path, children: tuple[Path, ...]) -> OperationPlan:
@@ -431,7 +432,7 @@ def plan_promote(graph: DraftGraph, page: Path, children: tuple[Path, ...]) -> O
             raise DraftError("structure.target_exists", target)
         page_map[child] = target
         parent_changes[child] = hub
-    return plan_path_remap(graph, page_map, parent_changes, kind="promote")
+    return plan_path_remap(graph, page_map, parent_changes, kind=OperationKind.PROMOTE)
 
 
 def plan_collapse(graph: DraftGraph, hub: Path) -> OperationPlan:
@@ -445,7 +446,9 @@ def plan_collapse(graph: DraftGraph, hub: Path) -> OperationPlan:
     leaf = hub.parent.parent / f"{hub.parent.name}.md"
     if leaf in graph.pages:
         raise DraftError("structure.target_exists", leaf)
-    return plan_path_remap(graph, {hub: leaf}, {}, kind="collapse", allow_empty_hub=hub)
+    return plan_path_remap(
+        graph, {hub: leaf}, {}, kind=OperationKind.COLLAPSE, allow_empty_hub=hub
+    )
 
 
 def _load_clean_graph(root: Path, *, allow_empty_hub: Path | None = None) -> DraftGraph:

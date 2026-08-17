@@ -15,6 +15,27 @@ class RootState(StrEnum):
     REGISTERED = "registered"
 
 
+class OperationKind(StrEnum):
+    """操作种类的唯一权威来源：计划、日志与恢复分派共享同一枚举。
+
+    日志只接受这些值；未知 kind 在读取时报 ``operation.journal_corrupt``
+    （规格 §5.4、实施计划 Task 7 Step 2）。
+    """
+
+    CREATE = "create"
+    MOVE = "move"
+    PROMOTE = "promote"
+    COLLAPSE = "collapse"
+    STATUS_SET = "status.set"
+    RELATION_ADD = "relation.add"
+    RELATION_REMOVE = "relation.remove"
+    TRASH = "trash"
+    RESTORE = "restore"
+    RECOVER = "recover"
+    GENERATE_CONCLUSIONS = "generate-conclusions"
+    ADOPT = "adopt"
+
+
 class IssueSeverity(StrEnum):
     ERROR = "error"
     WARNING = "warning"
@@ -129,7 +150,7 @@ class FileMutation:
 
 @dataclass(frozen=True)
 class OperationPlan:
-    kind: str
+    kind: OperationKind
     root: Path
     mutations: tuple[FileMutation, ...]
     root_state: RootState

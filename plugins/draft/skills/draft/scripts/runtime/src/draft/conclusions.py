@@ -25,6 +25,7 @@ from draft.models import (
     FileMutation,
     MarkdownLink,
     MutationKind,
+    OperationKind,
     OperationPlan,
     PageDocument,
     RelationCode,
@@ -458,7 +459,7 @@ def plan_generation(
     from draft.observations import graph_observations
 
     plan = OperationPlan(
-        kind="generate-conclusions",
+        kind=OperationKind.GENERATE_CONCLUSIONS,
         root=graph.root,
         mutations=tuple(mutations),
         root_state=RootState.REGISTERED,

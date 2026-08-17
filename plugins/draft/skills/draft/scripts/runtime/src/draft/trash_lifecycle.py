@@ -15,6 +15,7 @@ from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import (
     LifecycleWarning,
+    OperationKind,
     OperationPhase,
     OperationResult,
     TrashResult,
@@ -181,14 +182,14 @@ def require_no_restore_claim_for_expiry(root: Path, journal: Journal) -> None:
     if not r1_path.is_file():
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     r1 = read_journal(r1_path)
-    if r1.kind != "restore" or r1.metadata.get("restores_trash_operation") != journal.operation_id:
+    if r1.kind is not OperationKind.RESTORE or r1.metadata.get("restores_trash_operation") != journal.operation_id:
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, journal.directory)
 
 
 def reread_matching_trash_journal(root: Path, operation_id: str) -> Journal:
     journal = read_journal(operation_journal_path(root, operation_id))
-    if journal.operation_id != operation_id or journal.kind != "trash":
+    if journal.operation_id != operation_id or journal.kind is not OperationKind.TRASH:
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     return journal
 
@@ -355,7 +356,7 @@ def advance_trash_lifecycle(
         operation_id = journal_path.parent.name
         try:
             journal = read_journal(journal_path)
-            if journal.kind != "trash":
+            if journal.kind is not OperationKind.TRASH:
                 continue
             if journal.phase not in (
                 OperationPhase.TRASH_RETAINED,
@@ -419,7 +420,7 @@ def _handle_no_lock_dir(
             return None
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
     journal = read_journal(journal_path)
-    if journal.kind == "restore":
+    if journal.kind is OperationKind.RESTORE:
         # 孤儿未关联 R（allocating、无 mutation、无 T 反向关联）：安全放弃为 rolled_back。
         if (
             journal.phase is OperationPhase.ALLOCATING
@@ -436,7 +437,7 @@ def _handle_no_lock_dir(
             )
         # 其余无锁 restore（被 T 关联或处于中间阶段）一律保留现场。
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-    if journal.kind == "trash":
+    if journal.kind is OperationKind.TRASH:
         if journal.phase in (
             OperationPhase.TRASH_HANDOFF_SUCCEEDED,
             OperationPhase.TRASH_PURGE_COMMITTED,
@@ -473,7 +474,7 @@ def _restore_linked_back(root: Path, restore_journal: Journal) -> bool:
         # 证据，吞掉错误会把证据缺失误判为无关联，进而把 R 错误写成 rolled_back。
         candidate = read_journal(back_path)
         if (
-            candidate.kind == "trash"
+            candidate.kind is OperationKind.TRASH
             and candidate.metadata.get("restore_operation_id") == restore_journal.operation_id
         ):
             return True
@@ -497,7 +498,7 @@ def recover_draft(
         journal = read_journal(operation_journal_path(resolved, locked))
         if journal.operation_id != locked:
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-        if journal.kind == "restore":
+        if journal.kind is OperationKind.RESTORE:
             trash_journal = validate_restore_link(resolved, journal)
             package = load_verified_package(resolved, trash_journal)
             results.append(
@@ -510,7 +511,7 @@ def recover_draft(
                     execution_error=None,
                 )
             )
-        elif journal.kind == "trash":
+        elif journal.kind is OperationKind.TRASH:
             result = _recover_locked_trash(
                 resolved, journal, now=normalized_now, handoff=active_handoff
             )
@@ -543,7 +544,7 @@ def recover_draft(
         operation_id = journal_path.parent.name
         try:
             journal = read_journal(journal_path)
-            if journal.kind != "trash":
+            if journal.kind is not OperationKind.TRASH:
                 continue
             if journal.phase not in (
                 OperationPhase.TRASH_RETAINED,
@@ -591,7 +592,7 @@ def list_recoverable(
     items: list[RecoverableItem] = []
     for journal_path in _iter_trash_journals(resolved):
         journal = read_journal(journal_path)
-        if journal.kind != "trash":
+        if journal.kind is not OperationKind.TRASH:
             continue
         if journal.phase is not OperationPhase.TRASH_RETAINED:
             continue
@@ -630,7 +631,7 @@ def recover_interrupted_operations(
         journal = read_journal(operation_journal_path(resolved, locked))
         if journal.operation_id != locked:
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-        if journal.kind == "restore":
+        if journal.kind is OperationKind.RESTORE:
             trash_journal = validate_restore_link(resolved, journal)
             package = load_verified_package(resolved, trash_journal)
             results.append(
@@ -643,7 +644,7 @@ def recover_interrupted_operations(
                     execution_error=None,
                 )
             )
-        elif journal.kind == "trash":
+        elif journal.kind is OperationKind.TRASH:
             result = _recover_locked_trash(
                 resolved, journal, now=normalized_now, handoff=active_handoff
             )

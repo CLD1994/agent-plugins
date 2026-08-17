@@ -17,6 +17,7 @@ from draft.errors import DraftError
 from draft.graph import INTERNAL_DIR, MARKER_PATH
 from draft.models import (
     MutationKind,
+    OperationKind,
     OperationPhase,
     OperationPlan,
     OperationResult,
@@ -266,7 +267,7 @@ class JournalMutation:
 @dataclass(frozen=True)
 class Journal:
     operation_id: str
-    kind: str
+    kind: OperationKind
     phase: OperationPhase
     root_state: RootState
     observations: ObservationManifest
@@ -280,7 +281,7 @@ def _journal_to_json(journal: Journal) -> bytes:
     payload = {
         "journal_version": JOURNAL_VERSION,
         "operation_id": journal.operation_id,
-        "kind": journal.kind,
+        "kind": journal.kind.value,
         "phase": journal.phase.value,
         "root_state": journal.root_state.value,
         "observations": [
@@ -377,6 +378,7 @@ def read_journal(journal_path: Path) -> Journal:
             details=(str(version), str(JOURNAL_VERSION)),
         )
     try:
+        kind = OperationKind(_expect_str(data.get("kind"), journal_path))
         phase = OperationPhase(_expect_str(data.get("phase"), journal_path))
         root_state = RootState(_expect_str(data.get("root_state"), journal_path))
         observations = _parse_observations(data.get("observations"), journal_path)
@@ -422,7 +424,7 @@ def read_journal(journal_path: Path) -> Journal:
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
     return Journal(
         operation_id=operation_id,
-        kind=_expect_str(data.get("kind"), journal_path),
+        kind=kind,
         phase=phase,
         root_state=root_state,
         observations=observations,
@@ -522,10 +524,12 @@ def _validate_plan_paths(plan: OperationPlan) -> None:
             raise DraftError("path.escape", relative)
         if relative.parts and relative.parts[0] == INTERNAL_DIR:
             marker_mutation = relative == MARKER_PATH and plan.kind in (
-                "generate-conclusions",
-                "adopt",
+                OperationKind.GENERATE_CONCLUSIONS,
+                OperationKind.ADOPT,
             )
-            trash_package = plan.kind == "trash" and relative.is_relative_to(trash_outgoing)
+            trash_package = plan.kind is OperationKind.TRASH and relative.is_relative_to(
+                trash_outgoing
+            )
             if not (trash_package or marker_mutation):
                 raise DraftError("path.escape", relative)
         cursor = plan.root
@@ -604,7 +608,7 @@ def finalize_operation(
     root: Path,
     journal: Journal,
     phase: OperationPhase,
-    plan_kind: str,
+    plan_kind: OperationKind,
     *,
     retain_terminal_lock: bool = False,
     changed_paths: tuple[Path, ...] | None = None,
@@ -627,7 +631,7 @@ def finalize_operation(
         changed_paths = tuple(mutation.path for mutation in journal.mutations)
     return OperationResult(
         operation_id=journal.operation_id,
-        kind=plan_kind,
+        kind=plan_kind.value,
         phase=phase,
         changed_paths=changed_paths,
     )
@@ -749,7 +753,7 @@ def _validate_and_complete(
         for mutation in current.mutations:
             if sha256_file(root / mutation.path) != mutation.after_sha256:
                 raise DraftError("operation.external_change", root / mutation.path)
-    if current.kind == "trash":
+    if current.kind is OperationKind.TRASH:
         # 回收以待恢复为耐久终态：写 trash_retained、释放写锁、清理恢复副本；
         # 权威删除包原样保留，到期推进与系统回收站移交由 trash_lifecycle 子系统驱动。
         return finalize_operation(
@@ -772,7 +776,7 @@ def _validate_and_complete(
 def preallocate_journal(
     root: Path,
     *,
-    kind: str,
+    kind: OperationKind,
     operation_id: str,
     root_state: RootState,
     observations: ObservationManifest,
@@ -784,7 +788,7 @@ def preallocate_journal(
     已存在的操作目录绝不复用：直接报 operation.id_conflict，不打开也不改写其内容。
     """
     validate_operation_id(operation_id, code="operation.plan_invalid")
-    if kind == "restore":
+    if kind is OperationKind.RESTORE:
         back_reference = metadata.get("restores_trash_operation")
         if back_reference is None:
             raise DraftError("operation.plan_invalid", root / OPERATIONS_RELATIVE / operation_id)
@@ -818,7 +822,7 @@ def preallocate_journal(
 
 def validate_restore_link(root: Path, restore_journal: Journal) -> Journal:
     """唯一双向关联验证：恢复日志必须指向回收日志，且回收日志必须回指本恢复操作。"""
-    if restore_journal.kind != "restore":
+    if restore_journal.kind is not OperationKind.RESTORE:
         raise DraftError("operation.plan_invalid", restore_journal.directory)
     back_reference = restore_journal.metadata.get("restores_trash_operation")
     if back_reference is None:
@@ -826,7 +830,7 @@ def validate_restore_link(root: Path, restore_journal: Journal) -> Journal:
     back_id = validate_operation_id(back_reference, code="operation.plan_invalid")
     back_journal = read_journal(operation_journal_path(root, back_id))
     if (
-        back_journal.kind != "trash"
+        back_journal.kind is not OperationKind.TRASH
         or back_journal.metadata.get("restore_operation_id") != restore_journal.operation_id
     ):
         raise DraftError("operation.plan_invalid", restore_journal.directory)
@@ -1116,7 +1120,7 @@ def _recover_terminal(root: Path, journal: Journal, operation_id: str) -> Operat
     release_lock(root, operation_id)
     return OperationResult(
         operation_id=operation_id,
-        kind=journal.kind,
+        kind=journal.kind.value,
         phase=journal.phase,
         changed_paths=_recover_changed_paths(journal),
     )
@@ -1165,7 +1169,7 @@ def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> Operation
         release_lock(root, operation_id)
         return OperationResult(
             operation_id=operation_id,
-            kind=journal.kind,
+            kind=journal.kind.value,
             phase=journal.phase,
             changed_paths=(MARKER_PATH,),
         )
@@ -1179,7 +1183,7 @@ def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> Operation
         release_lock(root, operation_id)
         return OperationResult(
             operation_id=operation_id,
-            kind=journal.kind,
+            kind=journal.kind.value,
             phase=OperationPhase.COMPLETED,
             changed_paths=(MARKER_PATH,),
         )
@@ -1192,7 +1196,7 @@ def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> Operation
         release_lock(root, operation_id)
         return OperationResult(
             operation_id=operation_id,
-            kind=journal.kind,
+            kind=journal.kind.value,
             phase=OperationPhase.ROLLED_BACK,
             changed_paths=(),
         )
@@ -1203,7 +1207,7 @@ def _recover_locked(root: Path, operation_id: str) -> OperationResult:
     journal = read_journal(operation_journal_path(root, operation_id))
     if journal.operation_id != operation_id:
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal.directory)
-    if journal.kind == "adopt":
+    if journal.kind is OperationKind.ADOPT:
         return _recover_adopt(root, journal, operation_id)
     if journal.phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
         return _recover_terminal(root, journal, operation_id)
@@ -1215,7 +1219,7 @@ def _recover_locked(root: Path, operation_id: str) -> OperationResult:
         release_lock(root, operation_id)
         return OperationResult(
             operation_id=operation_id,
-            kind=journal.kind,
+            kind=journal.kind.value,
             phase=OperationPhase.ROLLED_BACK,
             changed_paths=(),
         )

@@ -16,6 +16,7 @@ from draft.models import (
     FileMutation,
     MarkdownLink,
     MutationKind,
+    OperationKind,
     OperationPlan,
     PageDocument,
     RootState,
@@ -138,7 +139,7 @@ def _delete(path: Path, before_text: str) -> FileMutation:
 
 
 def _plan(
-    kind: str,
+    kind: OperationKind,
     mutations: list[FileMutation],
     *,
     remove_empty: tuple[Path, ...] = (),
@@ -351,7 +352,7 @@ def test_plan_move_leaf_rewrites_inbound_links() -> None:
     expected_index = _INDEX_WITH_B.replace("pages/a.md", "pages/c.md")
     expected_b = _B_LINKS_A.replace("](a.md)", "](c.md)")
     expected = _plan(
-        "move",
+        OperationKind.MOVE,
         [
             _write(Path("index.md"), _INDEX_WITH_B, expected_index),
             _write(Path("pages/b.md"), _B_LINKS_A, expected_b),
@@ -384,7 +385,7 @@ def test_plan_move_leaf_to_same_directory_omits_unchanged_pages() -> None:
 
     expected_index = _INDEX.replace("pages/a.md", "pages/b.md")
     expected = _plan(
-        "move",
+        OperationKind.MOVE,
         [
             _write(Path("index.md"), _INDEX, expected_index),
             _write(Path("pages/b.md"), None, _A),
@@ -630,7 +631,7 @@ def test_plan_collapse_empty_hub_produces_leaf() -> None:
     expected_index = _EMPTY_HUB_INDEX.replace("pages/sub/index.md", "pages/sub.md")
     expected_leaf = _EMPTY_HUB.replace("(../../index.md)", "(../index.md)")
     expected = _plan(
-        "collapse",
+        OperationKind.COLLAPSE,
         [
             _write(Path("index.md"), _EMPTY_HUB_INDEX, expected_index),
             _write(Path("pages/sub.md"), None, expected_leaf),
@@ -709,7 +710,7 @@ def test_plan_path_remap_orders_writes_before_deletes_by_path() -> None:
         graph,
         {Path("pages/a.md"): Path("pages/z.md")},
         {},
-        kind="move",
+        kind=OperationKind.MOVE,
     )
 
     kinds = [m.kind for m in plan.mutations]
@@ -738,7 +739,7 @@ def test_plan_path_remap_omits_unchanged_pages() -> None:
         graph,
         {Path("pages/a.md"): Path("pages/b.md")},
         {},
-        kind="move",
+        kind=OperationKind.MOVE,
     )
 
     mutation_paths = {m.path for m in plan.mutations}
@@ -762,7 +763,7 @@ def test_plan_path_remap_dirty_graph_raises() -> None:
             graph,
             {Path("pages/sub/index.md"): Path("pages/sub.md")},
             {},
-            kind="collapse",
+            kind=OperationKind.COLLAPSE,
         )
     assert caught.value.code == "structure.dirty"
 

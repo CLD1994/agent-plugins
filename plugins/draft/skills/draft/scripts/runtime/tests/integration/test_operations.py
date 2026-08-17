@@ -5,7 +5,13 @@ import pytest
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
-from draft.models import FileMutation, MutationKind, OperationPlan, RootState
+from draft.models import (
+    FileMutation,
+    MutationKind,
+    OperationKind,
+    OperationPlan,
+    RootState,
+)
 from draft.observations import EMPTY_OBSERVATIONS
 from draft.operations import (
     JOURNAL_VERSION,
@@ -77,7 +83,7 @@ def two_write_plan(root: Path) -> tuple[OperationPlan, bytes, bytes, bytes, byte
     new_a = old_a + b"\nforward-a\n"
     new_b = old_b + b"\nforward-b\n"
     plan = OperationPlan(
-        kind="test",
+        kind=OperationKind.CREATE,
         root=root,
         root_state=RootState.REGISTERED,
         observations=EMPTY_OBSERVATIONS,
@@ -120,7 +126,7 @@ def write_journal(root: Path, operation_id: str, phase: str) -> Path:
     journal: dict[str, object] = {
         "journal_version": JOURNAL_VERSION,
         "operation_id": operation_id,
-        "kind": "test",
+        "kind": OperationKind.CREATE.value,
         "phase": phase,
         "root_state": "registered",
         "observations": [],
@@ -190,7 +196,7 @@ def test_preallocated_restore_requires_reverse_reference(
     with pytest.raises(DraftError, match="operation.plan_invalid"):
         preallocate_journal(
             root,
-            kind="restore",
+            kind=OperationKind.RESTORE,
             operation_id=restore_id,
             root_state=RootState.REGISTERED,
             observations=EMPTY_OBSERVATIONS,
@@ -209,7 +215,7 @@ def test_preallocated_restore_rejects_invalid_back_reference(
     with pytest.raises(DraftError, match="operation.plan_invalid"):
         preallocate_journal(
             root,
-            kind="restore",
+            kind=OperationKind.RESTORE,
             operation_id=restore_id,
             root_state=RootState.REGISTERED,
             observations=EMPTY_OBSERVATIONS,
@@ -228,14 +234,14 @@ def test_preallocated_restore_requires_forward_reference_before_execution(
     write_trash_journal(root, trash_id, phase="trash_handoff_pending", metadata={})
     preallocate_journal(
         root,
-        kind="restore",
+        kind=OperationKind.RESTORE,
         operation_id=restore_id,
         root_state=RootState.REGISTERED,
         observations=EMPTY_OBSERVATIONS,
         metadata={"restores_trash_operation": trash_id},
     )
     plan = OperationPlan(
-        kind="restore",
+        kind=OperationKind.RESTORE,
         root=root,
         mutations=(),
         root_state=RootState.REGISTERED,
@@ -265,7 +271,7 @@ def test_preallocate_never_reuses_existing_operation_directory(
     with pytest.raises(DraftError, match="operation.id_conflict"):
         preallocate_journal(
             root,
-            kind="test",
+            kind=OperationKind.CREATE,
             operation_id=operation_id,
             root_state=RootState.REGISTERED,
             observations=EMPTY_OBSERVATIONS,
@@ -426,7 +432,7 @@ def test_completed_operation_releases_lock_and_cleans_copies(operation_draft: Pa
 def test_mutation_path_escape_rejected_before_allocation(operation_draft: Path) -> None:
     root = operation_draft
     plan = OperationPlan(
-        kind="test",
+        kind=OperationKind.CREATE,
         root=root,
         root_state=RootState.REGISTERED,
         observations=EMPTY_OBSERVATIONS,
@@ -456,7 +462,7 @@ def test_mutation_through_symlink_rejected_before_allocation(
     outside.mkdir()
     (root / "pages/sub").symlink_to(outside, target_is_directory=True)
     plan = OperationPlan(
-        kind="test",
+        kind=OperationKind.CREATE,
         root=root,
         root_state=RootState.REGISTERED,
         observations=EMPTY_OBSERVATIONS,
@@ -636,7 +642,7 @@ def test_rolled_back_journal_with_matching_lock_releases_lock(
     # 让验证失败：计划把 a.md 改坏，使检查后存在结构错误。
     broken = (root / "pages/a.md").read_bytes().replace(b"(../index.md)", b"(../missing.md)")
     plan = OperationPlan(
-        kind="test",
+        kind=OperationKind.CREATE,
         root=root,
         root_state=RootState.REGISTERED,
         observations=EMPTY_OBSERVATIONS,
@@ -745,7 +751,7 @@ def test_internal_state_symlink_escape_rejected(operation_draft: Path, tmp_path:
     with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
         preallocate_journal(
             root,
-            kind="test",
+            kind=OperationKind.CREATE,
             operation_id="a" * 32,
             root_state=RootState.REGISTERED,
             observations=EMPTY_OBSERVATIONS,

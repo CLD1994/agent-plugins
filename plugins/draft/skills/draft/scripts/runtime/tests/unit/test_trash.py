@@ -20,6 +20,7 @@ from draft.markdown import parse_page
 from draft.models import (
     MarkdownLink,
     MutationKind,
+    OperationKind,
     OperationPhase,
     OperationPlan,
     PageDocument,
@@ -287,7 +288,7 @@ def _trash_journal(
     *,
     created_at: datetime,
     phase: OperationPhase = OperationPhase.TRASH_RETAINED,
-    kind: str = "trash",
+    kind: OperationKind = OperationKind.TRASH,
     operation_id: str = "a" * 32,
 ) -> Journal:
     deadlines = TrashDeadlines.from_created_at(created_at)
@@ -334,7 +335,7 @@ def test_trash_plan_valid_leaf_produces_complete_plan(mocker: MockerFixture) -> 
     mocker.patch("draft.trash.uuid.uuid4", autospec=True, return_value=FIXED_UUID)
     plan, package_relative = _trash_plan(graph, Path("pages/a.md"))
 
-    assert plan.kind == "trash"
+    assert plan.kind is OperationKind.TRASH
     assert plan.root == ROOT
     assert plan.root_state is RootState.REGISTERED
     assert plan.metadata == {"operation_id": FIXED_OPERATION_ID}
@@ -713,7 +714,7 @@ def test_require_retained_restore_window_wrong_phase_raises() -> None:
 
 def test_require_retained_restore_window_wrong_kind_raises() -> None:
     """非 trash 类型日志：拒绝恢复。"""
-    journal = _trash_journal(created_at=CREATED, kind="restore")
+    journal = _trash_journal(created_at=CREATED, kind=OperationKind.RESTORE)
     with pytest.raises(DraftError) as caught:
         require_retained_restore_window(journal, CREATED)
     assert caught.value.code == "trash.restore_expired"

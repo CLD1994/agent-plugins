@@ -19,6 +19,7 @@ from draft.markdown import (
 from draft.models import (
     FileMutation,
     MutationKind,
+    OperationKind,
     OperationPlan,
     OperationResult,
     RootState,
@@ -126,7 +127,7 @@ def plan_create_page(
     )
     observations = ObservationManifest(entries=(*observations.entries, missing_observation(path)))
     return OperationPlan(
-        kind="create",
+        kind=OperationKind.CREATE,
         root=graph.root,
         mutations=tuple(mutations),
         root_state=root_state,

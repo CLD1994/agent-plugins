@@ -30,6 +30,7 @@ from draft.models import (
     FileMutation,
     MarkdownLink,
     MutationKind,
+    OperationKind,
     OperationPhase,
     OperationPlan,
     OperationResult,
@@ -274,7 +275,7 @@ def trash_plan(
     for path, _text in sorted(extra_writes.items()):
         effects.append(PlanEffect(action=PlanAction.MODIFY, path=path))
     plan = OperationPlan(
-        kind="trash",
+        kind=OperationKind.TRASH,
         root=graph.root,
         mutations=tuple([*writes, *deletes]),
         root_state=root_state,
@@ -454,7 +455,7 @@ def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackag
     # restore 的完整观察闭包在 Task 11 按操作级契约补全；当前恢复复核由
     # verify_restore_after_state 保证原子性。
     return OperationPlan(
-        kind="restore",
+        kind=OperationKind.RESTORE,
         root=root,
         mutations=tuple([*writes, *deletes]),
         root_state=RootState.REGISTERED,
@@ -720,7 +721,7 @@ def restore_retained_trash(
 
     preallocate_journal(
         resolved,
-        kind="restore",
+        kind=OperationKind.RESTORE,
         operation_id=restore_id,
         root_state=RootState.REGISTERED,
         observations=EMPTY_OBSERVATIONS,

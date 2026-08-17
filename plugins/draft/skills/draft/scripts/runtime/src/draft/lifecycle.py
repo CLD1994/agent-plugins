@@ -16,6 +16,7 @@ from draft.graph import (
 from draft.models import (
     FileMutation,
     MutationKind,
+    OperationKind,
     OperationPlan,
     OperationResult,
     RootState,
@@ -125,7 +126,7 @@ def adopt(root: Path) -> OperationResult:
     after_bytes = marker_bytes(RootState.REGISTERED, state.conclusions_state)
     graph = load_graph_tolerant(target).graph
     plan = OperationPlan(
-        kind="adopt",
+        kind=OperationKind.ADOPT,
         root=target,
         mutations=(
             FileMutation(

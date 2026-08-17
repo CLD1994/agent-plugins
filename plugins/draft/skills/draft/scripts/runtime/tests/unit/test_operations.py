@@ -9,7 +9,7 @@ import pytest
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
-from draft.models import MutationKind, OperationPhase, RootState
+from draft.models import MutationKind, OperationKind, OperationPhase, RootState
 from draft.observations import EMPTY_OBSERVATIONS
 from draft.operations import (
     HANDOFF_ATTEMPTED_AT_KEY,
@@ -222,7 +222,7 @@ def test_validate_operation_id_uses_custom_code() -> None:
 def _journal() -> Journal:
     return Journal(
         operation_id="a" * 32,
-        kind="move",
+        kind=OperationKind.MOVE,
         phase=OperationPhase.PREPARED,
         root_state=RootState.REGISTERED,
         observations=EMPTY_OBSERVATIONS,
@@ -349,7 +349,7 @@ def test_handoff_failure_metadata_records_structured_fields() -> None:
 def _journal_with_metadata(metadata: dict[str, str]) -> Journal:
     return Journal(
         operation_id="a" * 32,
-        kind="generate-conclusions",
+        kind=OperationKind.GENERATE_CONCLUSIONS,
         phase=OperationPhase.COMPLETED,
         root_state=RootState.REGISTERED,
         observations=EMPTY_OBSERVATIONS,

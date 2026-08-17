@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from typing import Protocol
 
-from draft.models import RootState
+from draft.models import OperationKind, RootState
 from draft.operations import JOURNAL_VERSION
 from draft.vocabulary import ConclusionsState
 
@@ -38,6 +38,7 @@ def write_raw_journal(
     version: object | None = None,
     operation_id: str = "a" * 32,
     directory_id: str | None = None,
+    kind: OperationKind = OperationKind.CREATE,
 ) -> Path:
     """写入原始操作日志：默认使用当前权威 JOURNAL_VERSION；调用方仍可显式覆盖版本。
 
@@ -48,7 +49,7 @@ def write_raw_journal(
     journal: dict[str, object] = {
         "journal_version": JOURNAL_VERSION if version is None else version,
         "operation_id": operation_id,
-        "kind": "test",
+        "kind": kind.value,
         "phase": "completed",
         "root_state": "registered",
         "observations": [],

@@ -15,7 +15,7 @@ from typing import cast
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import INTERNAL_DIR
-from draft.models import MutationKind
+from draft.models import MutationKind, OperationKind
 from draft.operations import (
     Journal,
     JournalMutation,
@@ -147,7 +147,7 @@ def load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashPa
     package_id = validate_operation_id(trash_journal.operation_id)
     package_relative = OUTGOING_RELATIVE / package_id
     package_dir = root / package_relative
-    if trash_journal.kind != "trash":
+    if trash_journal.kind is not OperationKind.TRASH:
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, package_dir)
 
     reject_symlink_components(root, OUTGOING_RELATIVE)
