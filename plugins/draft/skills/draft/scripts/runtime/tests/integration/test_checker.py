@@ -1544,6 +1544,50 @@ def test_evidence_node_as_directory_is_reported(
 
 
 @pytest.mark.parametrize("root_state", tuple(RootState))
+def test_checker_reports_invalid_evidence_names_without_mutating(
+    draft_factory: DraftFactory, root_state: RootState
+) -> None:
+    """checker 对 final/pending/quarantine 内容损坏可见且始终只读（回归 H1）。"""
+    import json as json_module
+
+    root = draft_factory(healthy(), root_state=root_state)
+    op_id = "b" * 32
+    op_dir = root / ".draft/operations" / op_id
+    op_dir.mkdir(parents=True)
+    journal: dict[str, object] = {
+        "journal_version": JOURNAL_VERSION,
+        "operation_id": op_id,
+        "kind": "trash",
+        "phase": "trash_handoff_succeeded",
+        "root_state": "registered",
+        "observations": [],
+        "mutations": [],
+        "remove_empty_directories": [],
+        "metadata": {},
+    }
+    (op_dir / "journal.json").write_text(json_module.dumps(journal), encoding="utf-8")
+    garbage = b'{"not": "evidence"}'
+    for name in (
+        "cleanup-evidence.json",
+        "cleanup-evidence.json.pending",
+        "cleanup-evidence.json.quarantine",
+    ):
+        (op_dir / name).write_bytes(garbage)
+
+    report = check_draft(root)
+
+    corrupt = codes(report).count(CheckCode.TRASH_PACKAGE_CORRUPT.value)
+    assert corrupt >= 3
+    # checker 只读：三名 bytes 完全不变。
+    for name in (
+        "cleanup-evidence.json",
+        "cleanup-evidence.json.pending",
+        "cleanup-evidence.json.quarantine",
+    ):
+        assert (op_dir / name).read_bytes() == garbage
+
+
+@pytest.mark.parametrize("root_state", tuple(RootState))
 def test_clean_terminal_operation_is_not_reported(
     draft_factory: DraftFactory,
     root_state: RootState,

@@ -925,6 +925,12 @@ def test_cleanup_evidence_lstat_permission_error_is_stable(
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
     package = root / ".draft/trash/outgoing" / pending.operation_id
+    # 先提交清理 phase，再按已提交 T 授权写证据：证据的 cleanup_phase 必须与授权
+    # journal 当前 phase 匹配，否则按协议损坏处理（回归 H1）。
+    from draft.operations import acquire_lock
+
+    acquire_lock(root, pending.operation_id)
+    _commit_phase(root, pending.operation_id, "trash_handoff_succeeded")
     journal = read_journal(operation_journal_path(root, pending.operation_id))
     evidence = journal.directory / "cleanup-evidence.json"
     payload = _valid_evidence_payload(root, pending.operation_id)
@@ -952,6 +958,121 @@ def test_cleanup_evidence_lstat_permission_error_is_stable(
 
     assert evidence.read_bytes() == json.dumps(payload, ensure_ascii=False).encode("utf-8")
     assert _leaf_snapshot(package) == before
+
+
+def _committed_evidence(root: Path, operation_id: str) -> Path:
+    """持锁、提交清理 phase 并写入合法证据，返回证据路径（回归 H1 场景构造）。"""
+    from draft.operations import acquire_lock
+    from draft.trash_package import _cleanup_evidence_path  # pyright: ignore[reportPrivateUsage]
+
+    acquire_lock(root, operation_id)
+    _commit_phase(root, operation_id, "trash_handoff_succeeded")
+    journal = read_journal(operation_journal_path(root, operation_id))
+    payload = _valid_evidence_payload(root, operation_id)
+    _write_evidence(root, operation_id, payload)
+    return _cleanup_evidence_path(journal)
+
+
+def test_cleanup_evidence_pending_publish_converges_and_continues(
+    draft_factory: DraftFactory,
+) -> None:
+    """final 缺失 + 合法 pending：KEEP 发布 pending 为 final，清理继续并收敛（第十轮 H1）。"""
+    from draft.trash_package import clean_authoritative_package, cleanup_authorization
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    evidence = _committed_evidence(root, pending.operation_id)
+    # 发布前崩溃现场：证据只存在于 pending（final 未发布）。
+    evidence_pending = evidence.with_name(evidence.name + ".pending")
+    evidence.rename(evidence_pending)
+
+    clean_authoritative_package(
+        root,
+        cleanup_authorization(root, pending.operation_id, lock_operation_id=pending.operation_id),
+    )
+
+    assert not package.exists()
+    assert not evidence.exists()
+    assert not evidence_pending.exists()
+
+
+def test_cleanup_evidence_invalid_pending_preserves_scene(
+    draft_factory: DraftFactory,
+) -> None:
+    """final 缺失 + 非法 pending：报 corrupt，字节与节点完全不变（第十轮 H1）。"""
+    from draft.trash_package import clean_authoritative_package, cleanup_authorization
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    evidence = _committed_evidence(root, pending.operation_id)
+    evidence.unlink()  # final 缺失（发布前崩溃现场）。
+    evidence_pending = evidence.with_name(evidence.name + ".pending")
+    evidence_pending.write_bytes(b"{\"garbage\": true}")
+    before = _leaf_snapshot(package)
+
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        clean_authoritative_package(
+            root,
+            cleanup_authorization(
+                root, pending.operation_id, lock_operation_id=pending.operation_id
+            ),
+        )
+
+    assert evidence_pending.read_bytes() == b"{\"garbage\": true}"
+    assert not evidence.exists()
+    assert _leaf_snapshot(package) == before
+
+
+def test_cleanup_evidence_quarantine_restore_before_delete(
+    draft_factory: DraftFactory,
+) -> None:
+    """包 exact + final 缺失 + 合法 quarantine：KEEP 恢复 quarantine 为 final 后继续清理。"""
+    from draft.trash_package import clean_authoritative_package, cleanup_authorization
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    evidence = _committed_evidence(root, pending.operation_id)
+    quarantine = evidence.with_name(evidence.name + ".quarantine")
+    evidence.rename(quarantine)  # final 缺失，证据只在 quarantine。
+
+    clean_authoritative_package(
+        root,
+        cleanup_authorization(root, pending.operation_id, lock_operation_id=pending.operation_id),
+    )
+
+    assert not package.exists()
+    assert not evidence.exists()
+    assert not quarantine.exists()
+
+
+def test_cleanup_evidence_remove_consumes_final_and_quarantine(
+    draft_factory: DraftFactory,
+) -> None:
+    """包已缺失 + final+quarantine 精确同节点：REMOVE 先删 final 再消费 quarantine，无孤儿。"""
+    import os as os_module
+
+    from draft.trash_package import clean_authoritative_package, cleanup_authorization
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    evidence = _committed_evidence(root, pending.operation_id)
+    quarantine = evidence.with_name(evidence.name + ".quarantine")
+    os_module.link(evidence, quarantine)  # 同一次隔离的精确节点。
+    import shutil
+
+    shutil.rmtree(package)  # 包已删除：证据必须消失。
+
+    clean_authoritative_package(
+        root,
+        cleanup_authorization(root, pending.operation_id, lock_operation_id=pending.operation_id),
+    )
+
+    assert not evidence.exists()
+    assert not quarantine.exists()
 
 
 def test_cleanup_evidence_already_missing_entry_converges(

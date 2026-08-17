@@ -434,6 +434,7 @@ _OP_DIR_ALLOWED_ENTRIES = frozenset(
         "attempt",
         "cleanup-evidence.json",
         "cleanup-evidence.json.pending",
+        "cleanup-evidence.json.quarantine",
     }
 )
 _OP_DIR_TERMINAL_ALLOWED = frozenset({"journal.json"})
@@ -468,9 +469,10 @@ def _check_operation_directory_entries(
     """按 phase 校验操作目录允许的精确内部条目（随机 pending/错误 evidence/终态残留可见）。
 
     终态（completed/rolled_back）只允许 journal.json，任何 originals/staged/attempt/
-    evidence/pending 都是残留并报告；allocating 只允许 journal 与恢复副本目录；其余
-    阶段允许全部登记内部条目。cleanup-evidence.json 节点必须是精确普通文件，目录/链接
-    是错误 evidence，保留并报告。
+    evidence/pending/quarantine 都是残留并报告；allocating 只允许 journal 与恢复副本
+    目录；其余阶段允许全部登记内部条目。cleanup-evidence.json、其 .pending 与
+    .quarantine 节点必须是精确普通文件，目录/链接是错误 evidence，保留并报告；内容
+    非法同样报告（回归 H5/H1）。checker 始终只读，不发布/恢复/消费任何 evidence 名。
     """
     from draft.observations import EntryKind
     from draft.operations import classify_node
@@ -481,13 +483,18 @@ def _check_operation_directory_entries(
         allowed = _OP_DIR_ALLOCATING_ALLOWED
     else:
         allowed = _OP_DIR_ALLOWED_ENTRIES
+    evidence_names = {
+        "cleanup-evidence.json",
+        "cleanup-evidence.json.pending",
+        "cleanup-evidence.json.quarantine",
+    }
     for child in sorted(entry.iterdir()):
         if child.name not in allowed:
             issues.append(
                 _error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, child.relative_to(entry.parents[1]))
             )
             continue
-        if child.name == "cleanup-evidence.json":
+        if child.name in evidence_names:
             node = classify_node(child)
             if node not in (EntryKind.MISSING, EntryKind.FILE):
                 issues.append(

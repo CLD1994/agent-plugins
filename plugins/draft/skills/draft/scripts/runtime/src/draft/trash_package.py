@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 
@@ -24,6 +26,7 @@ from draft.operations import (
     JournalMutation,
     _name_node,  # pyright: ignore[reportPrivateUsage]
     _pending_name,  # pyright: ignore[reportPrivateUsage]
+    _quarantine_name,  # pyright: ignore[reportPrivateUsage]
     _read_name_bytes,  # pyright: ignore[reportPrivateUsage]
     _same_name_node,  # pyright: ignore[reportPrivateUsage]
     anchored_leaf,
@@ -529,6 +532,165 @@ class CleanupEvidence:
     leaves: tuple[CleanupEvidenceLeaf, ...]
 
 
+class CleanupEvidenceIntent(StrEnum):
+    """证据生命周期意图：包仍存在（必须保留证据）或包已删除（证据必须消失）。"""
+
+    KEEP = "keep"
+    REMOVE = "remove"
+
+
+class EvidenceNodeState(StrEnum):
+    """evidence final/pending/quarantine 单名状态：缺失/合法/内容损坏/非文件。"""
+
+    MISSING = "missing"
+    VALID = "valid"
+    INVALID = "invalid"
+    NON_FILE = "non_file"
+
+
+class _CleanupEvidenceRole(StrEnum):
+    """cleanup evidence 三名（final/pending/quarantine）的内部角色标识。
+
+    不与词汇枚举值重名，避免在源码中散落裸协议值字面量。
+    """
+
+    FINAL = "final_name"
+    PENDING = "pending_name"
+    QUARANTINE = "quarantine_name"
+
+
+class CleanupEvidenceAction(StrEnum):
+    """cleanup evidence 收敛的按序动作：发布/恢复/消费/就绪/完成/损坏。"""
+
+    PUBLISH_PENDING = "publish_pending"
+    CONSUME_PENDING = "consume_pending"
+    RESTORE_QUARANTINE = "restore_quarantine"
+    CONSUME_FINAL = "consume_final"
+    CONSUME_QUARANTINE = "consume_quarantine"
+    READY = "ready"
+    DONE = "done"
+    CORRUPT = "corrupt"
+
+
+def cleanup_evidence_actions(
+    *,
+    intent: CleanupEvidenceIntent,
+    final: EvidenceNodeState,
+    pending: EvidenceNodeState,
+    quarantine: EvidenceNodeState,
+    final_pending_same_node: bool,
+    final_quarantine_same_node: bool,
+) -> tuple[CleanupEvidenceAction, ...]:
+    """cleanup evidence final/pending/quarantine 收敛决策（纯函数，第十轮 H1）。
+
+    KEEP（包 exact/partial，证据必须保留）与 REMOVE（包已删除，证据必须消失）分别按
+    合法组合输出动作；任一 INVALID/NON_FILE 名、同节点证明缺失、或表外多名组合都报
+    CORRUPT（保留现场，绝不"逐个删到干净"）。决策不访问文件系统，checker 与恢复器共用。
+    """
+    for name in (final, pending, quarantine):
+        if name in (EvidenceNodeState.INVALID, EvidenceNodeState.NON_FILE):
+            return (CleanupEvidenceAction.CORRUPT,)
+    if intent is CleanupEvidenceIntent.KEEP:
+        return _keep_evidence_actions(
+            final, pending, quarantine, final_pending_same_node, final_quarantine_same_node
+        )
+    return _remove_evidence_actions(
+        final, pending, quarantine, final_pending_same_node, final_quarantine_same_node
+    )
+
+
+def _keep_evidence_actions(
+    final: EvidenceNodeState,
+    pending: EvidenceNodeState,
+    quarantine: EvidenceNodeState,
+    final_pending_same_node: bool,
+    final_quarantine_same_node: bool,
+) -> tuple[CleanupEvidenceAction, ...]:
+    if (
+        final is EvidenceNodeState.MISSING
+        and pending is EvidenceNodeState.MISSING
+        and quarantine is EvidenceNodeState.MISSING
+    ):
+        # 首次清理、证据尚未写入：无可收敛，等待清理开始后按需写入。
+        return (CleanupEvidenceAction.READY,)
+    if final is EvidenceNodeState.VALID and pending is EvidenceNodeState.MISSING:
+        if quarantine is EvidenceNodeState.MISSING:
+            return (CleanupEvidenceAction.READY,)
+        if (
+            quarantine is EvidenceNodeState.VALID
+            and final_quarantine_same_node
+        ):
+            # 同一次隔离的精确节点：消费陈旧 quarantine，保留 final。
+            return (CleanupEvidenceAction.CONSUME_QUARANTINE, CleanupEvidenceAction.READY)
+        return (CleanupEvidenceAction.CORRUPT,)
+    if final is EvidenceNodeState.MISSING and pending is EvidenceNodeState.VALID:
+        if quarantine is EvidenceNodeState.MISSING:
+            return (CleanupEvidenceAction.PUBLISH_PENDING, CleanupEvidenceAction.READY)
+        return (CleanupEvidenceAction.CORRUPT,)
+    if (
+        final is EvidenceNodeState.VALID
+        and pending is EvidenceNodeState.VALID
+        and final_pending_same_node
+        and quarantine is EvidenceNodeState.MISSING
+    ):
+        # 两个节点/字节与同一 T 授权一致：消费 pending，保留 final。
+        return (CleanupEvidenceAction.CONSUME_PENDING, CleanupEvidenceAction.READY)
+    if (
+        final is EvidenceNodeState.MISSING
+        and pending is EvidenceNodeState.MISSING
+        and quarantine is EvidenceNodeState.VALID
+    ):
+        return (CleanupEvidenceAction.RESTORE_QUARANTINE, CleanupEvidenceAction.READY)
+    return (CleanupEvidenceAction.CORRUPT,)
+
+
+def _remove_evidence_actions(
+    final: EvidenceNodeState,
+    pending: EvidenceNodeState,
+    quarantine: EvidenceNodeState,
+    final_pending_same_node: bool,
+    final_quarantine_same_node: bool,
+) -> tuple[CleanupEvidenceAction, ...]:
+    if (
+        final is EvidenceNodeState.MISSING
+        and pending is EvidenceNodeState.MISSING
+        and quarantine is EvidenceNodeState.MISSING
+    ):
+        return (CleanupEvidenceAction.DONE,)
+    if final is EvidenceNodeState.VALID and pending is EvidenceNodeState.MISSING:
+        if quarantine is EvidenceNodeState.MISSING:
+            return (CleanupEvidenceAction.CONSUME_FINAL, CleanupEvidenceAction.DONE)
+        if quarantine is EvidenceNodeState.VALID and final_quarantine_same_node:
+            # 先完成 final 删除，再消费 quarantine。
+            return (
+                CleanupEvidenceAction.CONSUME_FINAL,
+                CleanupEvidenceAction.CONSUME_QUARANTINE,
+                CleanupEvidenceAction.DONE,
+            )
+        return (CleanupEvidenceAction.CORRUPT,)
+    if final is EvidenceNodeState.MISSING and pending is EvidenceNodeState.VALID:
+        if quarantine is EvidenceNodeState.MISSING:
+            return (CleanupEvidenceAction.CONSUME_PENDING, CleanupEvidenceAction.DONE)
+        return (CleanupEvidenceAction.CORRUPT,)
+    if (
+        final is EvidenceNodeState.VALID
+        and pending is EvidenceNodeState.VALID
+        and final_pending_same_node
+        and quarantine is EvidenceNodeState.MISSING
+    ):
+        # 同一次发布：先消费 pending，再消费 final。
+        return (
+            CleanupEvidenceAction.CONSUME_PENDING,
+            CleanupEvidenceAction.CONSUME_FINAL,
+            CleanupEvidenceAction.DONE,
+        )
+    if final is EvidenceNodeState.MISSING and quarantine is EvidenceNodeState.VALID:
+        if pending is EvidenceNodeState.MISSING:
+            return (CleanupEvidenceAction.CONSUME_QUARANTINE, CleanupEvidenceAction.DONE)
+        return (CleanupEvidenceAction.CORRUPT,)
+    return (CleanupEvidenceAction.CORRUPT,)
+
+
 @dataclass(frozen=True)
 class CleanupAuthorization:
     """已提交的永久删除授权（回归 M1）：锁内重读的已提交 T journal + 已验证处置。
@@ -737,91 +899,206 @@ def _write_cleanup_evidence(
     )
 
 
-def _recover_cleanup_evidence_pending(root: Path, journal: Journal) -> None:
-    """收敛崩溃遗留的 evidence pending（回归 H5）：先按当前 T 授权完整验证，再决定发布/保留。
+def classify_cleanup_evidence_artifacts(
+    journal: Journal,
+) -> tuple[EvidenceNodeState, EvidenceNodeState, EvidenceNodeState, bool, bool] | None:
+    """只读分类 cleanup-evidence final/pending/quarantine 三名（checker 与恢复器共用）。
 
-    证据写是 create-only（O_EXCL pending + link 发布），发布前崩溃留下
-    ``cleanup-evidence.json.pending``。只有完整解析并交叉校验 T 授权的 pending 才可
-    发布/消费；非法 pending 保留现场报 corrupt，绝不按文件名删除。
+    三名都在操作目录同一锚定句柄内分类：MISSING/普通文件解析（VALID/INVALID）/非文件。
+    ``parse_cleanup_evidence`` 完整验证 T 授权；非法字节即 INVALID。返回
+    (final, pending, quarantine, final_pending_same_node, final_quarantine_same_node)；
+    操作目录中间组件缺失（_MissingLeaf）时返回 None（三名单名必然全部缺失）。
+    纯只读，无副作用。
     """
-    evidence_path = _cleanup_evidence_path(journal)
-    pending = evidence_path.with_name(_pending_name(evidence_path.name))
-    pending_kind = classify_node_or_error(
-        pending, code=CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path=pending
-    )
-    if pending_kind is EntryKind.MISSING:
-        return
-    if pending_kind is not EntryKind.FILE:
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, pending)
     from draft.operations import _AnchoredLeaf  # pyright: ignore[reportPrivateUsage]
 
+    evidence_path = _cleanup_evidence_path(journal)
+    names = (
+        (_CleanupEvidenceRole.FINAL, Path(_CLEANUP_EVIDENCE_NAME)),
+        (_CleanupEvidenceRole.PENDING, Path(_pending_name(_CLEANUP_EVIDENCE_NAME))),
+        (_CleanupEvidenceRole.QUARANTINE, Path(_quarantine_name(_CLEANUP_EVIDENCE_NAME))),
+    )
     with anchored_leaf(
         journal.directory,
         Path(_CLEANUP_EVIDENCE_NAME),
-        code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
-        code_path=pending,
-    ) as leaf:
-        if not isinstance(leaf, _AnchoredLeaf):
-            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, pending)
-        if leaf.classify() is not EntryKind.FILE:
-            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, pending)
-        verified = _name_node(leaf.parent_fd, _pending_name(leaf.name))
-        data = _read_name_bytes(
-            leaf.parent_fd,
-            _pending_name(leaf.name),
-            code_path=pending,
-            code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
-        )
-        parse_cleanup_evidence(data, journal, evidence_path)  # 完整验证 T 授权。
-        if not _same_name_node(leaf.parent_fd, _pending_name(leaf.name), verified):
-            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, pending)
-    from draft.operations import recover_digest_pending
-
-    recover_digest_pending(
-        journal.directory,
-        Path(_CLEANUP_EVIDENCE_NAME),
-        sha256_bytes(data),
         code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
         code_path=evidence_path,
-    )
+    ) as leaf:
+        if not isinstance(leaf, _AnchoredLeaf):
+            return None
+        states: dict[_CleanupEvidenceRole, EvidenceNodeState] = {}
+        nodes: dict[_CleanupEvidenceRole, tuple[int, int] | None] = {}
+        for role, relative in names:
+            node = _AnchoredLeaf(
+                leaf.parent_fd,
+                relative.name,
+                journal.directory,
+                CheckCode.TRASH_PACKAGE_CORRUPT.value,
+                evidence_path,
+            )
+            kind = node.classify()
+            nodes[role] = _name_node(leaf.parent_fd, relative.name)
+            if kind is EntryKind.MISSING:
+                states[role] = EvidenceNodeState.MISSING
+            elif kind is not EntryKind.FILE:
+                states[role] = EvidenceNodeState.NON_FILE
+            else:
+                data = _read_name_bytes(
+                    leaf.parent_fd,
+                    relative.name,
+                    code_path=evidence_path,
+                    code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+                )
+                try:
+                    parse_cleanup_evidence(data, journal, evidence_path)
+                    states[role] = EvidenceNodeState.VALID
+                except DraftError:
+                    states[role] = EvidenceNodeState.INVALID
+        final_node = nodes[_CleanupEvidenceRole.FINAL]
+        pending_node = nodes[_CleanupEvidenceRole.PENDING]
+        quarantine_node = nodes[_CleanupEvidenceRole.QUARANTINE]
+        final_pending_same = final_node is not None and final_node == pending_node
+        final_quarantine_same = final_node is not None and final_node == quarantine_node
+        return (
+            states[_CleanupEvidenceRole.FINAL],
+            states[_CleanupEvidenceRole.PENDING],
+            states[_CleanupEvidenceRole.QUARANTINE],
+            final_pending_same,
+            final_quarantine_same,
+        )
 
 
-def _clear_cleanup_evidence(root: Path, journal: Journal) -> None:
-    """清理成功后移除证据：只消费从当前已提交 T 授权完整验证出的精确 evidence 节点（回归 H5）。
+def _consume_cleanup_evidence_name(journal: Journal, relative: Path) -> None:
+    """inode+内容复核后消费（删除）evidence 名；缺失幂等容忍，类型/解析失败保留现场。"""
+    from draft.operations import _AnchoredLeaf, _fsync_dir_fd  # pyright: ignore[reportPrivateUsage]
 
-    存在但非法不等于可清除残留：先以 ``parse_cleanup_evidence`` 完整解析并交叉校验 T
-    授权，验证通过后用节点事务（inode + 摘要复核）消费同一已验证节点；解析/类型/链接
-    /I/O 失败都保留现场报 trash.package_corrupt，绝不按文件名删除未验证证据。
-    缺失幂等容忍。
-    """
-    from draft.operations import _AnchoredLeaf  # pyright: ignore[reportPrivateUsage]
-
-    path = _cleanup_evidence_path(journal)
+    code_path = _cleanup_evidence_path(journal)
     with anchored_leaf(
         journal.directory,
-        Path(_CLEANUP_EVIDENCE_NAME),
+        relative,
         code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
-        code_path=path,
+        code_path=code_path,
     ) as leaf:
         if not isinstance(leaf, _AnchoredLeaf):
             return  # 中间组件缺失：证据必然缺失，幂等。
-        node = leaf.classify()
-        if node is EntryKind.MISSING:
+        verified = _name_node(leaf.parent_fd, leaf.name)
+        if verified is None:
             return
-        if node is not EntryKind.FILE:
-            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, path)
-        # 先捕获 inode 再读取原始 bytes：完整解析后证明消费的是同一已验证节点。
-        verified_node = _name_node(leaf.parent_fd, leaf.name)
+        if leaf.classify() is not EntryKind.FILE:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
         data = _read_name_bytes(
             leaf.parent_fd,
             leaf.name,
-            code_path=path,
+            code_path=code_path,
             code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
         )
-        parse_cleanup_evidence(data, journal, path)
-        if not _same_name_node(leaf.parent_fd, leaf.name, verified_node):
-            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, path)
-        leaf.quarantine_delete(sha256_bytes(data))
+        parse_cleanup_evidence(data, journal, code_path)  # 重新验证后才消费。
+        if not _same_name_node(leaf.parent_fd, leaf.name, verified):
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        try:
+            os.unlink(leaf.name, dir_fd=leaf.parent_fd)
+        except OSError as exc:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path) from exc
+        _fsync_dir_fd(leaf.parent_fd, code_path)
+
+
+def _publish_cleanup_evidence_name(
+    journal: Journal, source: str, *, code_path: Path
+) -> None:
+    """把授权 pending/quarantine（源名）no-clobber 发布为 final 并消费源名（回归 H1/H3）。"""
+    import os as os_module
+
+    from draft.operations import _AnchoredLeaf, _fsync_dir_fd  # pyright: ignore[reportPrivateUsage]
+
+    with anchored_leaf(
+        journal.directory,
+        Path(_CLEANUP_EVIDENCE_NAME),
+        code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+        code_path=code_path,
+    ) as final_leaf:
+        if not isinstance(final_leaf, _AnchoredLeaf):
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        if final_leaf.classify() is not EntryKind.MISSING:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        source_leaf = _AnchoredLeaf(
+            final_leaf.parent_fd,
+            source,
+            journal.directory,
+            CheckCode.TRASH_PACKAGE_CORRUPT.value,
+            code_path,
+        )
+        if source_leaf.classify() is not EntryKind.FILE:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        data = _read_name_bytes(
+            final_leaf.parent_fd,
+            source,
+            code_path=code_path,
+            code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+        )
+        parse_cleanup_evidence(data, journal, code_path)  # 发布前完整验证 T 授权。
+        verified = _name_node(final_leaf.parent_fd, source)
+        try:
+            os_module.link(
+                source,
+                final_leaf.name,
+                src_dir_fd=final_leaf.parent_fd,
+                dst_dir_fd=final_leaf.parent_fd,
+            )
+        except FileExistsError as exc:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path) from exc
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+        _fsync_dir_fd(final_leaf.parent_fd, code_path)
+        if not _same_name_node(final_leaf.parent_fd, source, verified):
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        try:
+            os_module.unlink(source, dir_fd=final_leaf.parent_fd)
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+        _fsync_dir_fd(final_leaf.parent_fd, code_path)
+
+
+def converge_cleanup_evidence(journal: Journal, *, intent: CleanupEvidenceIntent) -> None:
+    """cleanup evidence final/pending/quarantine 的共享收敛边界（第十轮 H1）。
+
+    KEEP：任何包叶删除前把证据收敛为就绪（发布合法 pending / 恢复 quarantine /
+    消费同一次隔离的陈旧名）。REMOVE：包已删除后把证据收敛为空。决策来自纯函数
+    ``cleanup_evidence_actions``，I/O 层只按动作执行；非法类型/内容/多名组合在首次
+    副作用前报 trash.package_corrupt 并保留现场。checker 只调用只读分类与纯决策，
+    不进入本边界。
+    """
+    classified = classify_cleanup_evidence_artifacts(journal)
+    if classified is None:
+        return  # 操作目录缺失：证据必然缺失，无动作。
+    final, pending, quarantine, same_pending, same_quarantine = classified
+    actions = cleanup_evidence_actions(
+        intent=intent,
+        final=final,
+        pending=pending,
+        quarantine=quarantine,
+        final_pending_same_node=same_pending,
+        final_quarantine_same_node=same_quarantine,
+    )
+    if CleanupEvidenceAction.CORRUPT in actions:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, _cleanup_evidence_path(journal))
+    code_path = _cleanup_evidence_path(journal)
+    for action in actions:
+        if action is CleanupEvidenceAction.READY or action is CleanupEvidenceAction.DONE:
+            continue
+        if action is CleanupEvidenceAction.PUBLISH_PENDING:
+            _publish_cleanup_evidence_name(
+                journal, _pending_name(_CLEANUP_EVIDENCE_NAME), code_path=code_path
+            )
+        elif action is CleanupEvidenceAction.RESTORE_QUARANTINE:
+            _publish_cleanup_evidence_name(
+                journal, _quarantine_name(_CLEANUP_EVIDENCE_NAME), code_path=code_path
+            )
+        elif action is CleanupEvidenceAction.CONSUME_PENDING:
+            _consume_cleanup_evidence_name(journal, Path(_pending_name(_CLEANUP_EVIDENCE_NAME)))
+        elif action is CleanupEvidenceAction.CONSUME_FINAL:
+            _consume_cleanup_evidence_name(journal, Path(_CLEANUP_EVIDENCE_NAME))
+        elif action is CleanupEvidenceAction.CONSUME_QUARANTINE:
+            _consume_cleanup_evidence_name(journal, Path(_quarantine_name(_CLEANUP_EVIDENCE_NAME)))
 
 
 def _restore_missing_leaves_from_evidence(root: Path, journal: Journal, code_path: Path) -> None:
@@ -900,8 +1177,9 @@ def clean_authoritative_package(root: Path, authorization: CleanupAuthorization)
     """
     journal = authorization.journal
     reject_symlink_components(root, OUTGOING_RELATIVE)
-    # 先收敛崩溃遗留的 evidence pending（回归 H5）：完整验证 T 授权后才发布/保留。
-    _recover_cleanup_evidence_pending(root, journal)
+    # 任何包叶删除前把 evidence 收敛为 KEEP-ready（发布合法 pending / 恢复 quarantine
+    # / 消费同一次隔离的陈旧名；回归 H1/H5）：完整验证 T 授权后才允许继续。
+    converge_cleanup_evidence(journal, intent=CleanupEvidenceIntent.KEEP)
     package_dir = root / OUTGOING_RELATIVE / journal.operation_id
     # 先验证日志协议再碰包：物理包缺失只是文件系统状态，不能跳过日志语义验证
     # （回归 H6）——空 mutation、缺 package write、第三个包内 WRITE 都必须报损坏。
@@ -912,9 +1190,9 @@ def clean_authoritative_package(root: Path, authorization: CleanupAuthorization)
         package_dir, code=CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path=package_dir
     )
     if package_node is EntryKind.MISSING:
-        # 已提交阶段：包缺失 = 清理已删除全部叶（幂等）。证据必须是可清除的精确
-        # 普通文件；目录/链接/其他类型不是清理成功，保留现场报错（回归 H4）。
-        _clear_cleanup_evidence(root, journal)
+        # 已提交阶段：包缺失 = 清理已删除全部叶（幂等）。evidence 必须按 REMOVE
+        # 意图收敛为空（只消费验证过的精确名）；类型/内容损坏保留现场（回归 H4）。
+        converge_cleanup_evidence(journal, intent=CleanupEvidenceIntent.REMOVE)
         return
     if package_node is not EntryKind.DIRECTORY:
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package_dir)
@@ -951,4 +1229,5 @@ def clean_authoritative_package(root: Path, authorization: CleanupAuthorization)
         reverse=True,
     ):
         _remove_verified_dir(root, directory.relative_to(root), package_dir)
-    _clear_cleanup_evidence(root, journal)
+    # 包目录全部成功移除后：evidence 按 REMOVE 意图收敛为空。
+    converge_cleanup_evidence(journal, intent=CleanupEvidenceIntent.REMOVE)
