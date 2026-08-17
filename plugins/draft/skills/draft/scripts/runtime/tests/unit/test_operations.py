@@ -12,6 +12,8 @@ from draft.errors import DraftError
 from draft.models import MutationKind, OperationKind, OperationPhase, RootState
 from draft.observations import (
     EMPTY_OBSERVATIONS,
+    EntryKind,
+    Observation,
     ObservationManifest,
     directory_observation,
     file_observation,
@@ -23,7 +25,9 @@ from draft.operations import (
     Journal,
     JournalMutation,
     TrashDeadlines,
+    _verify_observations_for_recovery,  # pyright: ignore[reportPrivateUsage]
     adjusted_observation_manifest,
+    explained_directory_deltas,
     format_utc,
     handoff_failure_metadata,
     has_handoff_failure,
@@ -60,6 +64,85 @@ def test_adjusted_observation_manifest_explains_directory_members() -> None:
     assert pages is not None
     # 目录成员 = planned - removed + added。
     assert pages.members == ("c.md",)
+
+
+# ---------------------------------------------------------------------------
+# explained_directory_deltas：纯函数，不访问文件系统
+# ---------------------------------------------------------------------------
+
+
+def test_explained_directory_deltas_creates_ancestor_chain() -> None:
+    """新建文件解释直接父目录与缺失祖先目录；删除只改直接父目录。"""
+    added, removed = explained_directory_deltas(
+        created_paths=frozenset({Path("pages/topic/index.md"), Path(".draft/operations/x")}),
+        deleted_paths=frozenset({Path("pages/topic.md")}),
+    )
+    # 新文件：pages/topic 增 index.md，pages 增 topic（缺失祖先）。
+    assert added[Path("pages/topic")] == {"index.md"}
+    assert added[Path("pages")] == {"topic"}
+    # 操作日志目录链：.draft/operations 增 x，.draft 增 operations。
+    assert added[Path(".draft/operations")] == {"x"}
+    assert added[Path(".draft")] == {"operations"}
+    # 删除只改直接父目录。
+    assert removed[Path("pages")] == {"topic.md"}
+    assert Path("pages/topic") not in removed
+
+
+def test_verify_recovery_uses_probe_not_direct_fs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """注入 fake 探针时，mutation 分类与目录比较都走探针，不访问真实文件系统。"""
+    import draft.operations as ops_module
+
+    class FakeProbe:
+        def __init__(self, states: dict[Path, Observation]) -> None:
+            self.states = states
+
+        def observe(self, path: Path) -> Observation:
+            return self.states.get(path, Observation(path=path, kind=EntryKind.MISSING))
+
+    new_sha = "a" * 64
+    probe = FakeProbe(
+        {
+            Path("pages/new.md"): Observation(Path("pages/new.md"), EntryKind.FILE, sha256=new_sha),
+            Path("pages"): directory_observation(Path("pages"), ("new.md",)),
+        }
+    )
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError("sha256_file must not be called with injected probe")
+
+    monkeypatch.setattr(ops_module, "sha256_file", boom)
+
+    journal = Journal(
+        operation_id="a" * 32,
+        kind=OperationKind.CREATE,
+        phase=OperationPhase.APPLYING,
+        root_state=RootState.REGISTERED,
+        observations=ObservationManifest(entries=(directory_observation(Path("pages"), ()),)),
+        mutations=(
+            JournalMutation(
+                Path("pages/new.md"),
+                MutationKind.WRITE,
+                None,
+                new_sha,
+                None,
+                None,
+                True,
+            ),
+        ),
+        remove_empty_directories=(),
+        metadata={},
+        directory=Path(".draft/operations") / ("a" * 32),
+    )
+    changed = _verify_observations_for_recovery(
+        Path("."),
+        journal,
+        (),
+        probe=probe,  # type: ignore[arg-type]
+    )
+    # 新文件 at after：pages 目录成员变化可解释，无外部变化。
+    assert changed == ()
 
 
 # ---------------------------------------------------------------------------

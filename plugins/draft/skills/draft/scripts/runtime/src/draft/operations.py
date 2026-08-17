@@ -23,7 +23,7 @@ from draft.models import (
     OperationResult,
     RootState,
 )
-from draft.observations import ObservationManifest, ObservationProbe
+from draft.observations import EntryKind, Observation, ObservationManifest, ObservationProbe
 from draft.paths import resolve_draft_root
 from draft.plan_effects import public_changed_paths
 
@@ -1188,7 +1188,6 @@ def adjusted_observation_manifest(
     """
     from draft.observations import (
         EntryKind,
-        Observation,
         ObservationManifest,
         directory_observation,
     )
@@ -1211,6 +1210,45 @@ def adjusted_observation_manifest(
     return ObservationManifest(entries=tuple(adjusted))
 
 
+def explained_directory_deltas(
+    *,
+    created_paths: frozenset[Path],
+    deleted_paths: frozenset[Path],
+) -> tuple[dict[Path, set[str]], dict[Path, set[str]]]:
+    """纯函数：按本操作实际创建/删除的路径推导可解释目录成员增删。
+
+    ``created_paths``（before=None→after 的新建文件、操作日志目录、锁文件）每个路径
+    的完整祖先链都会新增其直接子组件（含实际创建的缺失祖先目录，如 promote 首次创建
+    pages/topic/ 时 pages 新增的 topic）；``deleted_paths`` 只改变直接父目录成员。
+    不访问文件系统，可独立单测。
+    """
+    added: dict[Path, set[str]] = {}
+    removed: dict[Path, set[str]] = {}
+    for path in created_paths:
+        current = path
+        while current.parent != current:
+            added.setdefault(current.parent, set()).add(current.name)
+            current = current.parent
+    for path in deleted_paths:
+        removed.setdefault(path.parent, set()).add(path.name)
+    return added, removed
+
+
+def _classify_observation(mutation: JournalMutation, observed: Observation) -> str:
+    """从探针观察分类 mutation 的活状态（before/after/unknown）。"""
+    if mutation.after_sha256 is None:  # DELETE：文件消失为 after。
+        if observed.kind is EntryKind.MISSING:
+            return "after"
+        if observed.sha256 == mutation.before_sha256:
+            return "before"
+        return "unknown"
+    if observed.sha256 == mutation.after_sha256:
+        return "after"
+    if observed.sha256 == mutation.before_sha256:
+        return "before"
+    return "unknown"
+
+
 def _verify_observations_for_recovery(
     root: Path,
     journal: Journal,
@@ -1220,46 +1258,36 @@ def _verify_observations_for_recovery(
 ) -> tuple[Path, ...]:
     """恢复时复核观察：只排除本操作目录、锁与 explained mutation 路径。
 
-    目录成员变化以活文件 before/after 分类推导，不能信任可能滞后的 applied 标志：
-    文件落盘发生在 applied=true 日志持久化之前，二者之间崩溃时 applied=false 但
-    文件已是 after，仍应解释该成员变化。remove_empty_directories 只在终态推进时
-    执行，中段恢复时对应目录仍存在，不应计入。``probe`` 缺省为文件系统探针，
-    单测可注入 fake 探针。
+    目录成员变化以探针观察的活文件 before/after 分类推导，不能信任可能滞后的
+    applied 标志：文件落盘发生在 applied=true 日志持久化之前，二者之间崩溃时
+    applied=false 但文件已是 after，仍应解释该成员变化。remove_empty_directories
+    只在终态推进时执行，中段恢复时对应目录仍存在，不应计入。``probe`` 缺省为文件
+    系统探针，单测可注入 fake 探针；比较探针统一包装临时文件过滤。
     """
     from draft.observations import (
         EntryKind,
         FilesystemObservationProbe,
-        Observation,
         verify_observations,
     )
 
+    if probe is None:
+        probe = FilesystemObservationProbe(root)
     excluded = {journal.directory.relative_to(root), LOCK_RELATIVE}
     explained = {mutation.path for mutation in explained_mutations}
-    # 目录成员变化以活文件 before/after 分类推导，不能信任可能滞后的 applied 标志。
-    # 可解释的增加 = 本操作创建的全部路径（before=None→after 的新建文件、操作日志目录、
-    # 锁文件）的完整祖先链：每个路径自身进入直接父目录，实际创建的缺失祖先目录
-    # （如 promote 首次创建 pages/topic/ 时 pages 新增的 topic）逐层解释。删除只改变
-    # 直接父目录成员；remove_empty_directories 只在终态推进时执行，中段恢复时对应
-    # 目录仍存在，不应计入。
-    added: dict[Path, set[str]] = {}
-    removed: dict[Path, set[str]] = {}
     created_paths = {journal.directory.relative_to(root), LOCK_RELATIVE}
     deleted_paths: set[Path] = set()
     for mutation in journal.mutations:
-        if _classify(root, mutation) != "after":
+        state = _classify_observation(mutation, probe.observe(mutation.path))
+        if state != "after":
             continue
         if mutation.kind is MutationKind.WRITE and mutation.before_sha256 is None:
             created_paths.add(mutation.path)
         elif mutation.kind is MutationKind.DELETE:
             deleted_paths.add(mutation.path)
-    for path in created_paths:
-        current = path
-        while current.parent != current:
-            added.setdefault(current.parent, set()).add(current.name)
-            current = current.parent
-    for path in deleted_paths:
-        removed.setdefault(path.parent, set()).add(path.name)
-
+    added, removed = explained_directory_deltas(
+        created_paths=frozenset(created_paths),
+        deleted_paths=frozenset(deleted_paths),
+    )
     adjusted = adjusted_observation_manifest(
         journal.observations,
         excluded=frozenset(excluded),
@@ -1269,7 +1297,7 @@ def _verify_observations_for_recovery(
     )
 
     class _RecoveryProbe:
-        """复核探针：忽略本操作崩溃遗留的 .tmp-<hex> 瞬态文件（可解释残留）。"""
+        """比较探针：统一忽略本操作崩溃遗留的 .tmp-<hex> 瞬态文件（默认与注入一致）。"""
 
         def __init__(self, inner: ObservationProbe) -> None:
             self._inner = inner
@@ -1283,9 +1311,7 @@ def _verify_observations_for_recovery(
                 return Observation(path=path, kind=EntryKind.DIRECTORY, members=members)
             return observed
 
-    if probe is None:
-        probe = _RecoveryProbe(FilesystemObservationProbe(root))
-    return verify_observations(probe, adjusted, explained_mutations=())
+    return verify_observations(_RecoveryProbe(probe), adjusted, explained_mutations=())
 
 
 def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> OperationResult:
