@@ -12,6 +12,7 @@ from draft.observations import (
     file_observation,
     graph_observations,
     missing_observation,
+    observation_shape_error,
     verify_observations,
 )
 from draft.operations import sha256_bytes
@@ -151,3 +152,31 @@ def test_filesystem_probe_observes_actual_state(tmp_path: Path) -> None:
 
 def test_empty_manifest_is_defined() -> None:
     assert EMPTY_OBSERVATIONS.entries == ()
+
+
+def test_observation_shape_error_accepts_canonical_shapes() -> None:
+    """合法组合：FILE 带摘要无成员；DIRECTORY 无摘要（成员可为空）；其余无摘要无成员。"""
+    assert observation_shape_error(_file("pages/a.md", "甲")) is None
+    assert observation_shape_error(directory_observation(PAGES, ())) is None
+    assert observation_shape_error(directory_observation(PAGES, ("a.md",))) is None
+    assert observation_shape_error(missing_observation(Path("pages/a.md"))) is None
+
+
+def test_observation_shape_error_rejects_illegal_combinations() -> None:
+    """非法组合：FILE 缺摘要/带成员、DIRECTORY 带摘要、MISSING/SYMLINK 带摘要或成员。"""
+    path = Path("pages/a.md")
+    assert observation_shape_error(Observation(path, EntryKind.FILE, sha256=None)) is not None
+    assert (
+        observation_shape_error(Observation(path, EntryKind.FILE, sha256="x", members=("a.md",)))
+        is not None
+    )
+    assert (
+        observation_shape_error(Observation(path, EntryKind.DIRECTORY, sha256="x")) is not None
+    )
+    assert (
+        observation_shape_error(Observation(path, EntryKind.MISSING, sha256="x")) is not None
+    )
+    assert (
+        observation_shape_error(Observation(path, EntryKind.SYMLINK, members=("a.md",)))
+        is not None
+    )

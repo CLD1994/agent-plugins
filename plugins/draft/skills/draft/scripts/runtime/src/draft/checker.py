@@ -446,6 +446,11 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
             )
         return issues
     if not operations.is_dir():
+        if operations.exists():
+            # .draft/operations 本身是普通文件：内部命名空间形状非法，不能当作空目录。
+            issues.append(
+                _error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, Path(INTERNAL_DIR) / "operations")
+            )
         return issues
     reject_symlink_components(root, Path(INTERNAL_DIR) / "operations")
     for entry in sorted(operations.iterdir()):
@@ -453,14 +458,20 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
             # 链接条目必须报告，不能静默跳过（否则可能漏报反向关联或误判孤儿）。
             issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, entry.relative_to(root)))
             continue
-        if not entry.is_dir() or not (entry / "journal.json").is_file():
+        if not entry.is_dir():
+            # 非目录条目不是合法操作目录：不能静默跳过。
+            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, entry.relative_to(root)))
             continue
-        journal_path = operation_journal_path(root, entry.name)
         try:
+            journal_path = operation_journal_path(root, entry.name)
             journal = read_journal(journal_path)
         except DraftError:
+            # 目录无 journal、名称非法或日志损坏统一报 operation.journal_corrupt，
+            # 检查保持只报告、不抛异常。
             issues.append(
-                _error(CheckCode.OPERATION_JOURNAL_CORRUPT, journal_path.relative_to(root))
+                _error(
+                    CheckCode.OPERATION_JOURNAL_CORRUPT, entry.relative_to(root) / "journal.json"
+                )
             )
             continue
         relative = journal_path.relative_to(root)

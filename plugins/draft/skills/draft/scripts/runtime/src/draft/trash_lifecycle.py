@@ -182,7 +182,9 @@ def require_no_restore_claim_for_expiry(root: Path, journal: Journal) -> None:
     if not r1_path.is_file():
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     r1 = read_journal(r1_path)
-    if r1.kind is not OperationKind.RESTORE or r1.metadata.get("restores_trash_operation") != journal.operation_id:
+    if r1.kind is not OperationKind.RESTORE or (
+        r1.metadata.get("restores_trash_operation") != journal.operation_id
+    ):
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, journal.directory)
 

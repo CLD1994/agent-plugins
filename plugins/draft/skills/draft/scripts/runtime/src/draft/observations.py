@@ -84,6 +84,25 @@ def missing_observation(path: Path) -> Observation:
     return Observation(path=path, kind=EntryKind.MISSING)
 
 
+def observation_shape_error(entry: Observation) -> str | None:
+    """返回非法 kind/字段组合的说明；合法组合返回 None。
+
+    FILE 必须携带摘要且无成员；DIRECTORY 不得携带摘要（成员可为空）；其余种类
+    不得携带摘要或成员。这是日志观察清单的闭合校验（规格 §5.4、实施计划 Task 7
+    Step 2），由日志读取边界拒绝非法形状。
+    """
+    if entry.kind is EntryKind.FILE:
+        if entry.sha256 is None or entry.members:
+            return "file must carry sha256 and no members"
+    elif entry.kind is EntryKind.DIRECTORY:
+        if entry.sha256 is not None:
+            return "directory must not carry sha256"
+    else:
+        if entry.sha256 is not None or entry.members:
+            return f"{entry.kind.value} must carry neither sha256 nor members"
+    return None
+
+
 class ObservationProbe(Protocol):
     """受真实文件系统边界约束的观察探针：单元 fake 与生产实现共享同一协议。"""
 

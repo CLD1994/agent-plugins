@@ -188,6 +188,59 @@ def test_journal_operation_id_must_match_directory(operation_draft: Path) -> Non
         read_journal(journal / "journal.json")
 
 
+def _write_journal_with_observations(
+    root: Path, operation_id: str, observations: list[dict[str, object]]
+) -> Path:
+    directory = root / ".draft" / "operations" / operation_id
+    directory.mkdir(parents=True, exist_ok=True)
+    journal: dict[str, object] = {
+        "journal_version": JOURNAL_VERSION,
+        "operation_id": operation_id,
+        "kind": OperationKind.CREATE.value,
+        "phase": "completed",
+        "root_state": "registered",
+        "observations": observations,
+        "mutations": [],
+        "remove_empty_directories": [],
+        "metadata": {},
+    }
+    journal_path = directory / "journal.json"
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    return journal_path
+
+
+def test_read_journal_rejects_duplicate_observation_paths(operation_draft: Path) -> None:
+    digest = "a" * 64
+    duplicate: list[dict[str, object]] = [
+        {"path": "pages/a.md", "kind": "file", "sha256": digest, "members": []},
+        {"path": "pages/a.md", "kind": "file", "sha256": digest, "members": []},
+    ]
+    path = _write_journal_with_observations(operation_draft, "9" * 32, duplicate)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        read_journal(path)
+
+
+@pytest.mark.parametrize(
+    "bad_observation",
+    [
+        # 目录带摘要：sha256 与 members 互斥。
+        {"path": "pages", "kind": "directory", "sha256": "a" * 64, "members": ["a.md"]},
+        # 文件带成员：FILE 只允许摘要。
+        {"path": "pages/a.md", "kind": "file", "sha256": "a" * 64, "members": ["b.md"]},
+        # 文件缺摘要：FILE 必须携带摘要。
+        {"path": "pages/a.md", "kind": "file", "sha256": None, "members": []},
+        # 缺失条目带摘要：MISSING 不得携带摘要或成员。
+        {"path": "pages/a.md", "kind": "missing", "sha256": "a" * 64, "members": []},
+    ],
+)
+def test_read_journal_rejects_illegal_observation_shapes(
+    operation_draft: Path, bad_observation: dict[str, object]
+) -> None:
+    path = _write_journal_with_observations(operation_draft, "9" * 32, [bad_observation])
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        read_journal(path)
+
+
 def test_preallocated_restore_requires_reverse_reference(
     operation_draft: Path,
 ) -> None:

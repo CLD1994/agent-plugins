@@ -331,11 +331,12 @@ def _validate_journal_path(value: str, journal_path: Path) -> Path:
 
 
 def _parse_observations(data: object, journal_path: Path) -> ObservationManifest:
-    from draft.observations import EntryKind, Observation
+    from draft.observations import EntryKind, Observation, observation_shape_error
 
     if not isinstance(data, list):
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
     entries: list[Observation] = []
+    seen: set[Path] = set()
     for raw in cast("list[object]", data):
         if not isinstance(raw, dict):
             raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
@@ -347,16 +348,19 @@ def _parse_observations(data: object, journal_path: Path) -> ObservationManifest
             isinstance(member, str) for member in cast("list[object]", members_raw)
         ):
             raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
-        entries.append(
-            Observation(
-                path=_validate_journal_path(
-                    _expect_str(item.get("path"), journal_path), journal_path
-                ),
-                kind=kind,
-                sha256=sha256,
-                members=tuple(cast("list[str]", members_raw)),
-            )
+        path = _validate_journal_path(_expect_str(item.get("path"), journal_path), journal_path)
+        if path in seen:
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+        seen.add(path)
+        entry = Observation(
+            path=path,
+            kind=kind,
+            sha256=sha256,
+            members=tuple(cast("list[str]", members_raw)),
         )
+        if observation_shape_error(entry) is not None:
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+        entries.append(entry)
     return ObservationManifest(entries=tuple(entries))
 
 
