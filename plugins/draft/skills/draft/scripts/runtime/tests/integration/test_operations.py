@@ -2229,3 +2229,72 @@ def test_resolve_journal_pending_rejects_identity_rewrite(operation_draft: Path)
 
     assert target.read_bytes() == old_bytes
     assert (journal_dir / "journal.json.pending").read_bytes() == pending_bytes
+
+
+def test_acquire_lock_file_fsync_failure_is_durability_failed(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """lock 文件 fsync 失败：映射 operation.durability_failed，锁文件保留现场（回归 M3）。"""
+    import os as os_module
+
+    from draft.operations import acquire_lock
+
+    root = operation_draft
+    (root / ".draft").mkdir(parents=True, exist_ok=True)
+
+    def failing_fsync(fd: int) -> None:
+        raise OSError("injected lock fsync failure")
+
+    monkeypatch.setattr(os_module, "fsync", failing_fsync)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_DURABILITY_FAILED.value):
+        acquire_lock(root, "a" * 32)
+    monkeypatch.undo()
+
+    # 锁文件已创建但未证明耐久：下一次命令按实际锁存在分类（存在→recovery_required）。
+    lock = root / ".draft/operation.lock"
+    assert lock.is_file()
+    from draft.operations import read_lock
+
+    assert read_lock(root) == "a" * 32
+
+
+def test_acquire_lock_dir_fsync_failure_is_durability_failed(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """lock 父目录 fsync 失败：映射 operation.durability_failed（回归 M3）。"""
+    import os as os_module
+
+    from draft.operations import acquire_lock
+
+    root = operation_draft
+    (root / ".draft").mkdir(parents=True, exist_ok=True)
+    real_fsync = os_module.fsync
+    calls = {"n": 0}
+
+    def failing_dir_fsync(fd: int) -> None:
+        calls["n"] += 1
+        if calls["n"] >= 2:  # 第一次是 lock 文件 fsync，第二次是父目录 fsync。
+            raise OSError("injected dir fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os_module, "fsync", failing_dir_fsync)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_DURABILITY_FAILED.value):
+        acquire_lock(root, "a" * 32)
+    monkeypatch.undo()
+
+
+def test_read_lock_symlink_is_corrupt_not_followed(operation_draft: Path) -> None:
+    """lock 是符号链接：no-follow 读取报损坏，绝不跟随链接读取目标（回归 M3）。"""
+    from draft.operations import read_lock
+
+    root = operation_draft
+    (root / ".draft").mkdir(parents=True, exist_ok=True)
+    external = operation_draft / "external-lock-target"
+    external.write_text('{"operation_id": "' + "c" * 32 + '"}\n', encoding="utf-8")
+    (root / ".draft/operation.lock").symlink_to(external)
+
+    # reject_symlink_components 先于分类拒绝路径组件符号链接（稳定领域错误）。
+    from draft.diagnostic_codes import CheckCode as _CheckCode
+
+    with pytest.raises(DraftError, match=_CheckCode.PATH_SYMLINK_ESCAPE.value):
+        read_lock(root)

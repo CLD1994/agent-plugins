@@ -748,18 +748,32 @@ def durable_write(path: Path, value: bytes) -> None:
 
 
 def acquire_lock(root: Path, operation_id: str) -> None:
+    """排他创建写锁。锁创建的各步失败都在最窄边界映射稳定领域错误（回归 M3）。
+
+    write/file-fsync/parent-fsync 任一失败都映射 operation.durability_failed：锁文件
+    可能已存在但未耐久，下一次命令按实际锁存在分类（存在→recovery_required，丢失→
+    继续）；绝不泄漏原始 OSError 到 CLI。锁文件路径不得为符号链接。
+    """
     reject_symlink_components(root, LOCK_RELATIVE)
     lock = root / LOCK_RELATIVE
-    lock.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, lock.parent) from exc
     payload = json.dumps({"operation_id": operation_id}) + "\n"
     try:
         descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError as exc:
         raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, lock) from exc
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, lock) from exc
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, lock) from exc
     fsync_directory(lock.parent)
 
 
@@ -778,14 +792,14 @@ def validate_operation_id(
 def read_lock(root: Path) -> str | None:
     reject_symlink_components(root, LOCK_RELATIVE)
     lock = root / LOCK_RELATIVE
-    if not lock.exists():
+    # lstat 分类：缺失→无锁；非普通文件（目录/链接等）→损坏。分类后 no-follow 读取
+    # 一次（回归 M3）：分类与读取之间节点被删除/替换为链接时映射稳定领域错误。
+    node = classify_node(lock)
+    if node is EntryKind.MISSING:
         return None
-    # 共享持久 JSON 解码边界（回归 M3）：非 UTF-8 / 读取失败的 lock 都映射
-    # operation.journal_corrupt，绝不泄漏原始异常。
-    try:
-        data = lock.read_bytes()
-    except OSError as exc:
-        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, lock) from exc
+    if node is not EntryKind.FILE:
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, lock)
+    data = _read_persistent_bytes(lock, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value)
     decoded = _decode_persistent_json(
         data, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value, path=lock
     )
@@ -801,8 +815,13 @@ def release_lock(root: Path, operation_id: str) -> None:
     current = read_lock(root)
     if current != operation_id:
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, root / LOCK_RELATIVE)
-    (root / LOCK_RELATIVE).unlink()
-    fsync_directory(root / LOCK_RELATIVE.parent)
+    lock = root / LOCK_RELATIVE
+    try:
+        lock.unlink()
+    except OSError as exc:
+        # 锁移除失败（已消失/权限/类型变化）：锁状态无法证明，稳定领域错误不泄漏。
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, lock) from exc
+    fsync_directory(lock.parent)
 
 
 @dataclass(frozen=True)
