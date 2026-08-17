@@ -75,7 +75,9 @@ def _retained_trash(root: Path) -> TrashResult:
     return trash_page(root, Path("pages/obsolete.md"), now=datetime(2026, 7, 21, tzinfo=UTC))
 
 
-def _clean_with_authorization(root: Path, operation_id: str, *, phase: str = "rolled_back") -> None:
+def _clean_with_authorization(
+    root: Path, operation_id: str, *, phase: str = "trash_handoff_succeeded"
+) -> None:
     """把 T 日志重写为已提交阶段、幂等持锁后经清理授权清理（M1 门：测试必须用已提交授权）。"""
     import json as json_module
 
@@ -593,7 +595,7 @@ def _valid_evidence_payload(root: Path, operation_id: str) -> dict[str, object]:
     return {
         "version": 2,
         "operation_id": operation_id,
-        "cleanup_phase": "rolled_back",
+        "cleanup_phase": journal.phase.value,
         "leaves": leaves,
     }
 
@@ -631,7 +633,7 @@ def test_cleanup_authorization_requires_matching_lock(
 
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
-    _commit_phase(root, pending.operation_id, "rolled_back")
+    _commit_phase(root, pending.operation_id, "trash_handoff_succeeded")
     other = "a" * 32
     with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
         cleanup_authorization(root, pending.operation_id, lock_operation_id=other)
@@ -733,7 +735,7 @@ def test_parse_cleanup_evidence_rejects_unknown_top_field(
 
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
-    _commit_phase(root, pending.operation_id, "rolled_back")
+    _commit_phase(root, pending.operation_id, "trash_handoff_succeeded")
     payload = _valid_evidence_payload(root, pending.operation_id)
     payload["extra_field"] = "x"
     journal = read_journal(operation_journal_path(root, pending.operation_id))
@@ -750,7 +752,7 @@ def test_parse_cleanup_evidence_rejects_duplicate_relative(
 
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
-    _commit_phase(root, pending.operation_id, "rolled_back")
+    _commit_phase(root, pending.operation_id, "trash_handoff_succeeded")
     payload = _valid_evidence_payload(root, pending.operation_id)
     payload["leaves"] = [payload["leaves"][0], payload["leaves"][0]]  # type: ignore[index]
     journal = read_journal(operation_journal_path(root, pending.operation_id))
@@ -767,7 +769,7 @@ def test_parse_cleanup_evidence_rejects_missing_leaf(
 
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
-    _commit_phase(root, pending.operation_id, "rolled_back")
+    _commit_phase(root, pending.operation_id, "trash_handoff_succeeded")
     payload = _valid_evidence_payload(root, pending.operation_id)
     payload["leaves"] = payload["leaves"][:1]  # type: ignore[index]
     journal = read_journal(operation_journal_path(root, pending.operation_id))
@@ -784,7 +786,7 @@ def test_parse_cleanup_evidence_rejects_self_digest_not_anchored(
 
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
-    _commit_phase(root, pending.operation_id, "rolled_back")
+    _commit_phase(root, pending.operation_id, "trash_handoff_succeeded")
     payload = _valid_evidence_payload(root, pending.operation_id)
     leaves = cast("list[dict[str, object]]", payload["leaves"])
     leaves[0]["sha256"] = "0" * 64
@@ -802,7 +804,7 @@ def test_parse_cleanup_evidence_rejects_invalid_base64(
 
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
-    _commit_phase(root, pending.operation_id, "rolled_back")
+    _commit_phase(root, pending.operation_id, "trash_handoff_succeeded")
     payload = _valid_evidence_payload(root, pending.operation_id)
     leaves = cast("list[dict[str, object]]", payload["leaves"])
     leaves[0]["content"] = "!!! not-base64 !!!"
@@ -820,7 +822,7 @@ def test_parse_cleanup_evidence_rejects_non_utf8(
 
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
-    _commit_phase(root, pending.operation_id, "rolled_back")
+    _commit_phase(root, pending.operation_id, "trash_handoff_succeeded")
     journal = read_journal(operation_journal_path(root, pending.operation_id))
 
     with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
@@ -835,7 +837,7 @@ def test_parse_cleanup_evidence_rejects_wrong_phase_and_operation(
 
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
-    _commit_phase(root, pending.operation_id, "rolled_back")
+    _commit_phase(root, pending.operation_id, "trash_handoff_succeeded")
     journal = read_journal(operation_journal_path(root, pending.operation_id))
 
     payload = _valid_evidence_payload(root, pending.operation_id)
@@ -860,7 +862,7 @@ def test_restore_fails_before_first_leaf_write_on_later_entry_corrupt(
     pending = _retained_trash(root)
     package = root / ".draft/trash/outgoing" / pending.operation_id
     acquire_lock(root, pending.operation_id)
-    _commit_phase(root, pending.operation_id, "rolled_back")
+    _commit_phase(root, pending.operation_id, "trash_handoff_succeeded")
     payload = _valid_evidence_payload(root, pending.operation_id)
     leaves = cast("list[dict[str, object]]", payload["leaves"])
     # 把第一个叶的内容也替换成错误摘要：无论排序，损坏都必须先于任何写入被整体拒绝。
@@ -931,7 +933,7 @@ def test_cleanup_evidence_already_missing_entry_converges(
     pending = _retained_trash(root)
     package = root / ".draft/trash/outgoing" / pending.operation_id
     acquire_lock(root, pending.operation_id)
-    _commit_phase(root, pending.operation_id, "rolled_back")
+    _commit_phase(root, pending.operation_id, "trash_handoff_succeeded")
     journal = read_journal(operation_journal_path(root, pending.operation_id))
     auth = parse_package_authorization(journal, package)
     present_relative, present_digest = auth.package_json_path, auth.package_json_digest
@@ -940,7 +942,7 @@ def test_cleanup_evidence_already_missing_entry_converges(
     payload: dict[str, object] = {
         "version": 2,
         "operation_id": pending.operation_id,
-        "cleanup_phase": "rolled_back",
+        "cleanup_phase": journal.phase.value,
         "leaves": [
             {
                 "relative": present_relative.as_posix(),
@@ -1013,7 +1015,7 @@ def test_package_missing_with_invalid_evidence_is_preserved(
     """包缺失 + 非法证据：保留证据报损坏，绝不按文件名删除（回归 H5）。"""
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
-    _commit_phase(root, pending.operation_id, "rolled_back")
+    _commit_phase(root, pending.operation_id, "trash_handoff_succeeded")
     journal = read_journal(operation_journal_path(root, pending.operation_id))
     evidence = journal.directory / "cleanup-evidence.json"
     evidence.write_bytes(b"\xff not a valid evidence json")
@@ -1034,7 +1036,7 @@ def test_package_missing_with_valid_evidence_is_consumed(
     """包缺失 + 合法证据：节点事务消费证据后幂等完成（回归 H5）。"""
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
-    _commit_phase(root, pending.operation_id, "rolled_back")
+    _commit_phase(root, pending.operation_id, "trash_handoff_succeeded")
     payload = _valid_evidence_payload(root, pending.operation_id)
     evidence = _write_evidence(root, pending.operation_id, payload)
     _remove_package(root, pending.operation_id)
@@ -1062,3 +1064,86 @@ def test_checker_reports_corrupt_evidence_content(
     report = check_draft(root)
 
     assert any(issue.code == CheckCode.TRASH_PACKAGE_CORRUPT.value for issue in report.errors)
+
+
+def test_cleanup_authorization_handoff_purge_require_t_lock(
+    draft_factory: DraftFactory,
+) -> None:
+    """handoff_succeeded/purge_committed 阶段持无关锁：拒绝授权，包/证据不动（回归 M1）。"""
+    from draft.operations import acquire_lock
+    from draft.trash_package import cleanup_authorization
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    foreign_id = "f" * 32
+    for phase in ("trash_handoff_succeeded", "trash_purge_committed"):
+        _commit_phase(root, pending.operation_id, phase)
+        acquire_lock(root, foreign_id)
+        with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+            cleanup_authorization(root, pending.operation_id, lock_operation_id=foreign_id)
+        from draft.operations import release_lock
+
+        release_lock(root, foreign_id)
+    # 拒绝时包与证据字节不变。
+    package = root / OUTGOING_RELATIVE / pending.operation_id
+    assert (package / "package.json").is_file()
+
+
+def test_cleanup_authorization_rolled_back_requires_matching_restore(
+    draft_factory: DraftFactory,
+) -> None:
+    """rolled_back 阶段：无关锁 / 非 completed restore / 单向关联都拒绝授权（回归 M1）。"""
+    from draft.operations import JOURNAL_VERSION, acquire_lock, write_journal
+    from draft.trash_package import cleanup_authorization
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    r_id = "b" * 32
+    foreign_id = "d" * 32  # 合法 hex，但与 T/R 无关。
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+
+    # 无关锁 + rolled_back：拒绝（无任何 restore 关联证明）。
+    _commit_phase(root, pending.operation_id, "rolled_back")
+    acquire_lock(root, foreign_id)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        cleanup_authorization(root, pending.operation_id, lock_operation_id=foreign_id)
+    from draft.operations import release_lock
+
+    release_lock(root, foreign_id)
+
+    # T 认领了 R 但 R 非 completed restore / 关联不匹配：拒绝。
+    # 先在 trash_retained 合法转换写入认领，再 commit 到 rolled_back。
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+    journal_dir = root / OPERATIONS_RELATIVE / r_id
+    journal_dir.mkdir(parents=True)
+    r_journal: dict[str, object] = {
+        "journal_version": JOURNAL_VERSION,
+        "operation_id": r_id,
+        "kind": "restore",
+        "phase": "prepared",
+        "root_state": "registered",
+        "observations": [],
+        "mutations": [],
+        "remove_empty_directories": [],
+        "metadata": {"restores_trash_operation": pending.operation_id},
+    }
+    (journal_dir / "journal.json").write_text(json.dumps(r_journal), encoding="utf-8")
+    _commit_phase(root, pending.operation_id, "trash_retained")
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+    from draft.operations import with_metadata
+
+    linked = with_metadata(journal, {"restore_operation_id": r_id})
+    write_journal(linked)
+    _commit_phase(root, pending.operation_id, "rolled_back")
+    acquire_lock(root, r_id)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        cleanup_authorization(root, pending.operation_id, lock_operation_id=r_id)
+    release_lock(root, r_id)
+
+    # 合法：R=completed restore、T↔R 双向关联精确 → 授权。
+    r_journal["phase"] = "completed"
+    (journal_dir / "journal.json").write_text(json.dumps(r_journal), encoding="utf-8")
+    acquire_lock(root, r_id)
+    auth = cleanup_authorization(root, pending.operation_id, lock_operation_id=r_id)
+    assert auth.cleanup_kind == "restore"
+    release_lock(root, r_id)

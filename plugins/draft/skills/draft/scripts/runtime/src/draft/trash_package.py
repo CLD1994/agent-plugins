@@ -19,6 +19,7 @@ from draft.models import MutationKind, OperationKind, OperationPhase
 from draft.observations import EntryKind, ObservationManifest
 from draft.operations import (
     LOCK_RELATIVE,
+    RESTORE_OPERATION_ID_KEY,
     Journal,
     JournalMutation,
     _name_node,  # pyright: ignore[reportPrivateUsage]
@@ -530,32 +531,34 @@ class CleanupEvidence:
 
 @dataclass(frozen=True)
 class CleanupAuthorization:
-    """已提交的永久删除授权（回归 M1）：锁内重读的已提交 T journal + 当前锁所有者。
+    """已提交的永久删除授权（回归 M1）：锁内重读的已提交 T journal + 已验证处置。
 
-    由 ``cleanup_authorization`` 从锁内重读构造，绝不使用调用方手中的旧 journal 对象；
-    调用方只传递 operation_id 与锁所有者，授权内容以磁盘最新日志为准。
+    由 ``cleanup_authorization`` 从锁内重读构造并证明（绝不使用调用方手中的旧 journal
+    对象；调用方只传递 operation_id 与锁所有者，授权内容以磁盘最新日志为准）：
+    - handoff/purge：当前锁必须属于 T 本身；
+    - restore：当前锁必须属于匹配的已 completed restore R，且 T↔R 双向关联精确匹配。
+    构造边界已证明的处置种类，不再保存未经约束的锁所有者字符串。
     """
 
     journal: Journal
-    lock_operation_id: str
-
-
-_COMMITTED_CLEANUP_PHASES = frozenset(
-    {
-        OperationPhase.ROLLED_BACK,
-        OperationPhase.TRASH_HANDOFF_SUCCEEDED,
-        OperationPhase.TRASH_PURGE_COMMITTED,
-    }
-)
+    cleanup_kind: Literal["handoff", "purge", "restore"]
 
 
 def cleanup_authorization(
     root: Path, operation_id: str, *, lock_operation_id: str
 ) -> CleanupAuthorization:
-    """锁内重读当前 T journal，验证已提交阶段与匹配锁后构造清理授权（回归 M1）。
+    """锁内重读当前 T journal，验证已提交阶段与 phase 对应的锁所有者后构造清理授权（回归 M1）。
 
-    允许清理的提交状态精确限定为：rolled_back（restore 已完成证明 + R 锁双向关联）、
-    trash_handoff_succeeded（+ T 锁）、trash_purge_committed（+ T 锁）。
+    永久删除授权不能由"某个锁存在 + T phase 字符串"拼出，必须证明是谁完成了哪个提交点：
+
+    | T phase | 当前锁 | 关联证明 | 处置 |
+    |---|---|---|---|
+    | trash_handoff_succeeded | T.operation_id | 不需要 R | handoff |
+    | trash_purge_committed | T.operation_id | 不需要 R | purge |
+    | rolled_back | R.operation_id | R.kind=restore、R.phase=completed、
+    |             |                | R→T 与 T→R 精确匹配 | restore |
+    | 任意其他组合 | 任意 | 任意 | 拒绝 |
+
     trash_retained/trash_handoff_pending 无论包状态都不得进入删除；completed 只能按
     disposition 与既有终态证据审计，不能重新授权删除。
     """
@@ -564,9 +567,28 @@ def cleanup_authorization(
     journal = read_journal(operation_journal_path(root, operation_id))
     if journal.operation_id != operation_id or journal.kind is not OperationKind.TRASH:
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-    if journal.phase not in _COMMITTED_CLEANUP_PHASES:
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-    return CleanupAuthorization(journal=journal, lock_operation_id=lock_operation_id)
+    if journal.phase is OperationPhase.TRASH_HANDOFF_SUCCEEDED:
+        if lock_operation_id != journal.operation_id:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+        return CleanupAuthorization(journal=journal, cleanup_kind="handoff")
+    if journal.phase is OperationPhase.TRASH_PURGE_COMMITTED:
+        if lock_operation_id != journal.operation_id:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+        return CleanupAuthorization(journal=journal, cleanup_kind="purge")
+    if journal.phase is OperationPhase.ROLLED_BACK:
+        # restore 清理：锁必须属于匹配的已 completed restore R，T↔R 双向关联精确匹配。
+        r_id = journal.metadata.get(RESTORE_OPERATION_ID_KEY)
+        if r_id is None or r_id != lock_operation_id:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+        restore = read_journal(operation_journal_path(root, r_id))
+        if (
+            restore.kind is not OperationKind.RESTORE
+            or restore.phase is not OperationPhase.COMPLETED
+            or restore.metadata.get("restores_trash_operation") != journal.operation_id
+        ):
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+        return CleanupAuthorization(journal=journal, cleanup_kind="restore")
+    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
 
 
 def _cleanup_evidence_path(journal: Journal) -> Path:
