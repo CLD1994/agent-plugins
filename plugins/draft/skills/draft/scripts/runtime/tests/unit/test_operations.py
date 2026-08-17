@@ -66,6 +66,184 @@ def test_adjusted_observation_manifest_explains_directory_members() -> None:
     assert pages.members == ("c.md",)
 
 
+def test_adjusted_observation_manifest_synthesizes_created_directory() -> None:
+    """计划期缺失（父目录观察未列出）且本操作实际创建的目录，必须合成精确成员期望。
+
+    回归 P1：promote 首次创建 pages/topic 时，恢复若跳过该目录内部验证，
+    外部注入的页面会被静默吸收。
+    """
+    manifest = ObservationManifest(
+        entries=(
+            directory_observation(Path("pages"), ("a.md", "topic.md")),
+            file_observation(Path("pages/a.md"), b"a"),
+        )
+    )
+    adjusted = adjusted_observation_manifest(
+        manifest,
+        excluded=frozenset({Path(".draft/operations/x")}),
+        explained=frozenset({Path("pages/topic.md")}),
+        added={Path("pages/topic"): frozenset({"index.md"}), Path("pages"): frozenset({"topic"})},
+        removed={Path("pages"): frozenset({"topic.md"})},
+    )
+    pages = adjusted.for_path(Path("pages"))
+    assert pages is not None
+    assert pages.members == ("a.md", "topic")
+    topic = adjusted.for_path(Path("pages/topic"))
+    assert topic is not None
+    assert topic.kind is EntryKind.DIRECTORY
+    assert topic.members == ("index.md",)
+
+
+def test_adjusted_observation_manifest_does_not_synthesize_existing_directory() -> None:
+    """父目录观察已列出该目录（计划期已存在）时不得合成"只含本操作成员"期望。"""
+    manifest = ObservationManifest(
+        entries=(
+            directory_observation(Path("pages"), ("a.md", "topic")),
+            file_observation(Path("pages/a.md"), b"a"),
+        )
+    )
+    adjusted = adjusted_observation_manifest(
+        manifest,
+        excluded=frozenset({Path(".draft/operations/x")}),
+        explained=frozenset(),
+        added={Path("pages/topic"): frozenset({"index.md"}), Path("pages"): frozenset({"topic"})},
+        removed={},
+    )
+    # pages/topic 已存在：合成必须跳过，否则预存成员会被误判为外部变化。
+    assert adjusted.for_path(Path("pages/topic")) is None
+
+
+def test_adjusted_observation_manifest_converts_missing_observation_to_directory() -> None:
+    """计划期显式 MISSING 的目录被本操作创建时，转换为精确成员期望。"""
+    from draft.observations import missing_observation
+
+    manifest = ObservationManifest(
+        entries=(missing_observation(Path("pages/topic")), directory_observation(Path("pages"), ("a.md",)))
+    )
+    adjusted = adjusted_observation_manifest(
+        manifest,
+        excluded=frozenset({Path(".draft/operations/x")}),
+        explained=frozenset(),
+        added={Path("pages/topic"): frozenset({"index.md"}), Path("pages"): frozenset({"topic"})},
+        removed={},
+    )
+    topic = adjusted.for_path(Path("pages/topic"))
+    assert topic is not None
+    assert topic.kind is EntryKind.DIRECTORY
+    assert topic.members == ("index.md",)
+
+
+def test_adjusted_observation_manifest_skips_synthesis_without_evidence() -> None:
+    """没有任何存在性证据时保守不合成：已存在但未观察的共享目录不被误判。"""
+    adjusted = adjusted_observation_manifest(
+        EMPTY_OBSERVATIONS,
+        excluded=frozenset({Path(".draft/operations/x")}),
+        explained=frozenset(),
+        added={Path(".draft"): frozenset({"operations", "operation.lock"})},
+        removed={},
+    )
+    assert adjusted.for_path(Path(".draft")) is None
+
+
+# ---------------------------------------------------------------------------
+# _classify_observation：按 EntryKind 区分，不依赖 sha256=None
+# ---------------------------------------------------------------------------
+
+
+def _journal_mutation(
+    path: Path, kind: MutationKind, before: str | None, after: str | None
+) -> JournalMutation:
+    return JournalMutation(
+        path=path,
+        kind=kind,
+        before_sha256=before,
+        after_sha256=after,
+        original=None,
+        staged=None,
+        applied=False,
+    )
+
+
+def test_classify_observation_new_file_requires_missing_not_sha256_none() -> None:
+    """新建文件（before=None）只有 MISSING 才是 before；目录/符号链接等 sha256=None
+    的路径类型变化必须分类为 unknown，不能被误当成本操作创建的文件前态。"""
+    from draft.operations import _classify_observation  # pyright: ignore[reportPrivateUsage]
+
+    mutation = _journal_mutation(Path("pages/new.md"), MutationKind.WRITE, None, "after")
+    assert (
+        _classify_observation(
+            mutation, Observation(path=Path("pages/new.md"), kind=EntryKind.MISSING)
+        )
+        == "before"
+    )
+    assert (
+        _classify_observation(
+            mutation,
+            Observation(path=Path("pages/new.md"), kind=EntryKind.DIRECTORY, members=()),
+        )
+        == "unknown"
+    )
+    assert (
+        _classify_observation(
+            mutation, Observation(path=Path("pages/new.md"), kind=EntryKind.SYMLINK)
+        )
+        == "unknown"
+    )
+
+
+def test_classify_observation_delete_requires_file_before() -> None:
+    """DELETE 的 before 态必须是 FILE 摘要匹配；目录占位为 unknown。"""
+    from draft.operations import _classify_observation  # pyright: ignore[reportPrivateUsage]
+
+    mutation = _journal_mutation(Path("pages/a.md"), MutationKind.DELETE, "before", None)
+    assert (
+        _classify_observation(
+            mutation,
+            Observation(path=Path("pages/a.md"), kind=EntryKind.FILE, sha256="before"),
+        )
+        == "before"
+    )
+    assert (
+        _classify_observation(
+            mutation, Observation(path=Path("pages/a.md"), kind=EntryKind.MISSING)
+        )
+        == "after"
+    )
+    assert (
+        _classify_observation(
+            mutation, Observation(path=Path("pages/a.md"), kind=EntryKind.DIRECTORY, members=())
+        )
+        == "unknown"
+    )
+
+
+def test_classify_observation_write_distinguishes_by_digest_on_file() -> None:
+    from draft.operations import _classify_observation  # pyright: ignore[reportPrivateUsage]
+
+    mutation = _journal_mutation(Path("pages/a.md"), MutationKind.WRITE, "before", "after")
+    assert (
+        _classify_observation(
+            mutation,
+            Observation(path=Path("pages/a.md"), kind=EntryKind.FILE, sha256="after"),
+        )
+        == "after"
+    )
+    assert (
+        _classify_observation(
+            mutation,
+            Observation(path=Path("pages/a.md"), kind=EntryKind.FILE, sha256="before"),
+        )
+        == "before"
+    )
+    assert (
+        _classify_observation(
+            mutation,
+            Observation(path=Path("pages/a.md"), kind=EntryKind.DIRECTORY, members=()),
+        )
+        == "unknown"
+    )
+
+
 # ---------------------------------------------------------------------------
 # explained_directory_deltas：纯函数，不访问文件系统
 # ---------------------------------------------------------------------------

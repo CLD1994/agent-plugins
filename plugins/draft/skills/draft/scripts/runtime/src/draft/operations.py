@@ -1177,6 +1177,22 @@ def _recover_terminal(root: Path, journal: Journal, operation_id: str) -> Operat
     )
 
 
+def _plan_time_missing(observations: ObservationManifest, directory: Path) -> bool:
+    """观察清单是否证明该目录在计划期缺失。
+
+    只有正向证据才成立：目录自身是 MISSING 观察，或其父目录观察明确未列出该名字。
+    没有任何存在性证据时保守判定为已存在（不合成），避免把已存在但未观察的共享
+    目录（如 EMPTY_OBSERVATIONS 夹具下的 .draft）误判为"只含本操作成员"。
+    """
+    for entry in observations.entries:
+        if entry.path == directory:
+            return entry.kind is EntryKind.MISSING
+    for entry in observations.entries:
+        if entry.kind is EntryKind.DIRECTORY and entry.path == directory.parent:
+            return directory.name not in entry.members
+    return False
+
+
 def adjusted_observation_manifest(
     observations: ObservationManifest,
     *,
@@ -1189,6 +1205,10 @@ def adjusted_observation_manifest(
 
     只排除本操作目录/锁与 explained mutation 路径；目录成员调整为"若只发生本操作
     mutation 应有的成员"，再与当前状态比较，避免把操作自身副作用误判为外部修改。
+
+    计划期不存在的目录没有观察基线：本操作实际创建时按"只含本操作创建成员"
+    合成精确期望（MISSING 观察转换或未观察目录补建），恢复才能证明新目录内部
+    只含本操作条目、不吸收外部注入（如 promote 首次创建 pages/topic/）。
     不访问文件系统，可独立单测。
     """
     from draft.observations import (
@@ -1210,8 +1230,23 @@ def adjusted_observation_manifest(
                 )
             )
             adjusted.append(directory_observation(observation.path, expected))
+        elif observation.kind is EntryKind.MISSING and observation.path in added:
+            # 计划期缺失的目录被本操作创建：期望恰好是操作创建的成员集合。
+            adjusted.append(
+                directory_observation(
+                    observation.path, tuple(sorted(added[observation.path]))
+                )
+            )
         else:
             adjusted.append(observation)
+    for directory, members in sorted(added.items()):
+        if directory in excluded or directory in explained:
+            continue
+        if any(entry.path == directory for entry in observations.entries):
+            continue  # 已有观察：DIRECTORY 已在上方调整，MISSING 已在上方转换。
+        if not _plan_time_missing(observations, directory):
+            continue  # 无法证明计划期缺失：保守不合成（避免误判已存在共享目录）。
+        adjusted.append(directory_observation(directory, tuple(sorted(members))))
     return ObservationManifest(entries=tuple(adjusted))
 
 
@@ -1240,17 +1275,31 @@ def explained_directory_deltas(
 
 
 def _classify_observation(mutation: JournalMutation, observed: Observation) -> str:
-    """从探针观察分类 mutation 的活状态（before/after/unknown）。"""
+    """从探针观察按 EntryKind 分类 mutation 的活状态（before/after/unknown）。
+
+    sha256=None 对 MISSING/DIRECTORY/SYMLINK/OTHER 都成立，不能仅凭摘要判断：
+    - DELETE（after=None）：MISSING 为 after；FILE 摘要匹配 before 为 before；
+      目录/符号链接等路径类型变化均为 unknown。
+    - WRITE（after!=None）：FILE 摘要匹配 after/before；新建文件（before=None）
+      只在 MISSING（文件不存在）时为 before，目录/符号链接等均为 unknown。
+    """
     if mutation.after_sha256 is None:  # DELETE：文件消失为 after。
         if observed.kind is EntryKind.MISSING:
+            return "after"
+        if observed.kind is EntryKind.FILE and observed.sha256 == mutation.before_sha256:
+            return "before"
+        return "unknown"
+    if observed.kind is EntryKind.FILE:
+        if observed.sha256 == mutation.after_sha256:
             return "after"
         if observed.sha256 == mutation.before_sha256:
             return "before"
         return "unknown"
-    if observed.sha256 == mutation.after_sha256:
-        return "after"
-    if observed.sha256 == mutation.before_sha256:
-        return "before"
+    if mutation.before_sha256 is None:
+        # 新建文件：文件不存在为 before；目录/符号链接/其他不可解释为该文件的前态。
+        if observed.kind is EntryKind.MISSING:
+            return "before"
+        return "unknown"
     return "unknown"
 
 

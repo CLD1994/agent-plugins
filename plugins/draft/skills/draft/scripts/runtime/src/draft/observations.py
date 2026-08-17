@@ -166,7 +166,7 @@ def graph_observations(graph: _GraphLike) -> ObservationManifest:
     ``graph`` 需提供 ``root`` 与 ``pages``（path → 带 ``text`` 的页面对象）。
     复杂度 O(页面字节总数 + 受管理目录条目数 + marker 一次读取)。
     """
-    from draft.graph import MARKER_PATH, PAGES_DIR
+    from draft.graph import INTERNAL_DIR, MARKER_PATH, PAGES_DIR
     from draft.operations import sha256_bytes
 
     entries: list[Observation] = []
@@ -205,6 +205,13 @@ def graph_observations(graph: _GraphLike) -> ObservationManifest:
     marker = root / MARKER_PATH
     if marker.is_file() and not marker.is_symlink():
         entries.append(file_digest_observation(MARKER_PATH, sha256_bytes(marker.read_bytes())))
+    # 内部命名空间目录基线：操作会在其中按需创建 operations/operation.lock，
+    # 恢复时据此可证明首次创建的 .draft/operations 等在计划期缺失（与 pages
+    # 子树对称，只观察成员，不逐个观察内部文件）。
+    internal = root / INTERNAL_DIR
+    if internal.is_dir() and not internal.is_symlink():
+        members = tuple(sorted(entry.name for entry in internal.iterdir()))
+        entries.append(directory_observation(Path(INTERNAL_DIR), members))
     return ObservationManifest(entries=tuple(entries))
 
 

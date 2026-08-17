@@ -431,6 +431,41 @@ def test_adopt_recover_with_observation_change_raises_external_change(
     assert read_lock(root) is None
 
 
+def test_adopt_recover_rejects_intruder_in_created_operations_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """adopt 首次创建 .draft/operations 后，目录内混入未指定条目时恢复必须拒绝。
+
+    回归 P1：计划期 .draft/operations 不存在、没有观察基线；若恢复不验证该新
+    目录内部，外部文件会被静默吸收并前向完成登记（规格 §12.2 外部变化分区）。
+    """
+    from draft.operations import operation_journal_path, read_journal, read_lock
+    from draft.trash_lifecycle import recover_draft
+
+    root = tmp_path / "candidate"
+    # 默认最小根：.draft/operations 由本次 adopt 首次创建。
+    build_valid_candidate(root)
+    _crash_during_adopt(root, monkeypatch, on_verify=True)
+    adopt_id = read_lock(root)
+    assert adopt_id is not None
+    assert (root / ".draft/operations").is_dir()
+
+    # 外部向本操作新建的内部协议目录注入未指定文件。
+    (root / ".draft/operations/intruder.json").write_text("x", encoding="utf-8")
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        recover_draft(root)
+
+    # 已安全放弃：外部文件保留、marker 仍 candidate、日志终态化、锁释放。
+    assert (root / ".draft/operations/intruder.json").is_file()
+    assert (root / ".draft/draft.json").read_text(encoding="utf-8") == managed_marker_text(
+        root_state=RootState.CANDIDATE
+    )
+    journal = read_journal(operation_journal_path(root, adopt_id))
+    assert journal.phase is OperationPhase.ROLLED_BACK
+    assert read_lock(root) is None
+
+
 def test_adopt_crash_after_marker_never_rolls_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
