@@ -2298,3 +2298,154 @@ def test_read_lock_symlink_is_corrupt_not_followed(operation_draft: Path) -> Non
 
     with pytest.raises(DraftError, match=_CheckCode.PATH_SYMLINK_ESCAPE.value):
         read_lock(root)
+
+
+def test_quarantine_delete_replaced_quarantine_name_preserves_both(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """隔离 link 后、unlink 原名前替换 quarantine 名：inode 复核拒绝，两个节点都保留（回归 H3）。"""
+    import os as os_module
+
+    from draft.operations import (
+        _AnchoredLeaf,  # pyright: ignore[reportPrivateUsage]
+        anchored_leaf,
+        sha256_bytes,
+    )
+
+    root = operation_draft
+    sub = root / "managed"
+    sub.mkdir()
+    leaf = sub / "leaf.txt"
+    leaf.write_bytes(b"authorized")
+    digest = sha256_bytes(b"authorized")
+    real_link = os_module.link
+    calls = {"n": 0}
+
+    def swap_quarantine(
+        src: str | bytes | os_module.PathLike[str],
+        dst: str | bytes | os_module.PathLike[str],
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        calls["n"] += 1
+        real_link(
+            src,
+            dst,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+        if calls["n"] == 1:
+            # 第一个 link 即隔离 link：随后替换 quarantine 名称为新节点。
+            quarantine = sub / "leaf.txt.quarantine"
+            quarantine.unlink()
+            quarantine.write_bytes(b"replacement")
+
+    monkeypatch.setattr(os_module, "link", swap_quarantine)
+    with (
+        anchored_leaf(root, Path("managed/leaf.txt"), code="x", code_path=leaf) as target,
+        pytest.raises(DraftError, match="operation.external_change"),
+    ):
+        assert isinstance(target, _AnchoredLeaf)
+        target.quarantine_delete(digest)
+    monkeypatch.undo()
+
+    # 原名（授权节点）与 quarantine（替换节点）都未被删除。
+    assert leaf.read_bytes() == b"authorized"
+    assert (sub / "leaf.txt.quarantine").read_bytes() == b"replacement"
+
+
+def test_create_only_publish_replaced_pending_between_link_and_consume(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """create-only 发布后、消费 pending 前替换 pending：inode 复核拒绝，两节点保留（回归 H3）。"""
+    import os as os_module
+
+    from draft.operations import durable_write
+
+    root = operation_draft
+    target = root / "out.txt"
+    pending = root / "out.txt.pending"
+    real_link = os_module.link
+    calls = {"n": 0}
+
+    def swap_pending(
+        src: str | bytes | os_module.PathLike[str],
+        dst: str | bytes | os_module.PathLike[str],
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        calls["n"] += 1
+        real_link(
+            src,
+            dst,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+        if calls["n"] == 1:
+            pending.unlink()
+            pending.write_bytes(b"replacement")
+
+    monkeypatch.setattr(os_module, "link", swap_pending)
+    with pytest.raises(DraftError, match="operation.external_change"):
+        durable_write(target, b"authorized")
+    monkeypatch.undo()
+
+    assert target.read_bytes() == b"authorized"
+    assert pending.read_bytes() == b"replacement"
+
+
+def test_subprocess_kill_after_quarantine_link_preserves_both_and_converges(
+    operation_draft: Path,
+) -> None:
+    """隔离 link 已同步、unlink 原名前崩溃：原名与隔离名同时存在，恢复收敛（回归 H3）。"""
+    import signal
+    import subprocess
+    import sys
+
+    from draft.operations import sha256_bytes
+
+    root = operation_draft
+    sub = root / "managed"
+    sub.mkdir()
+    leaf = sub / "leaf.txt"
+    leaf.write_bytes(b"authorized")
+    digest = sha256_bytes(b"authorized")
+
+    script = (
+        "import os, signal, sys\n"
+        "from pathlib import Path\n"
+        f"ROOT = {str(root)!r}\n"
+        f"LEAF = {str(leaf)!r}\n"
+        "real_fsync = os.fsync\n"
+        "calls = {'n': 0}\n"
+        "def flaky(fd):\n"
+        "    calls['n'] += 1\n"
+        "    if calls['n'] == 1:  # 隔离 link 后的目录 fsync：原名未删，崩溃。\n"
+        "        os.kill(os.getpid(), signal.SIGKILL)\n"
+        "    real_fsync(fd)\n"
+        "os.fsync = flaky\n"
+        "from draft.operations import anchored_leaf\n"
+        "with anchored_leaf(Path(ROOT), Path('managed/leaf.txt'),\n"
+        "                    code='x', code_path=Path(LEAF)) as target:\n"
+        f"    target.quarantine_delete({digest!r})\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, timeout=60)
+    assert proc.returncode == -signal.SIGKILL
+
+    # 原名与隔离名同时存在：两个授权名都可诊断，绝不出现同时缺失。
+    assert leaf.read_bytes() == b"authorized"
+    quarantine = sub / "leaf.txt.quarantine"
+    assert quarantine.read_bytes() == b"authorized"
+
+    # 新进程收敛：recover_quarantine 判 delete_stale，消费 quarantine。
+    from draft.operations import recover_quarantine
+
+    recover_quarantine(root, Path("managed/leaf.txt"), digest, code="x", code_path=leaf)
+    assert leaf.read_bytes() == b"authorized"
+    assert not quarantine.exists()

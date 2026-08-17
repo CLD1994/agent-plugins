@@ -276,7 +276,14 @@ def _publish_pending(
             raise DraftError("operation.external_change", code_path) from exc
         except OSError as exc:
             raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
-        _fsync_dir_fd(parent_fd, code_path)  # 新名字耐久：至少一个授权名字可证明存在。
+        # 新名字耐久后（至少一个授权名字可证明存在），复核发布内容仍是我们写入的
+        # 授权字节，且 pending 仍指向同一节点（回归 H3）：任一被替换都拒绝消费，
+        # 绝不删除未知节点。
+        _fsync_dir_fd(parent_fd, code_path)
+        if _read_name_bytes(parent_fd, name, code_path=code_path) != content or not _same_name_node(
+            parent_fd, pending, _name_node(parent_fd, name)
+        ):
+            raise DraftError("operation.external_change", code_path)
         try:
             os.unlink(pending, dir_fd=parent_fd)
         except OSError as exc:
@@ -393,12 +400,29 @@ def recover_digest_pending(
                 raise DraftError("operation.external_change", code_path) from exc
             except OSError as exc:
                 raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+            # 新名字耐久后，复核发布内容仍是授权内容且 pending 未被替换（回归 H3）。
+            _fsync_dir_fd(parent_fd, code_path)
+            try:
+                published = _read_name_bytes(parent_fd, target.name, code_path=code_path)
+            except DraftError:
+                raise
+            if sha256_bytes(published) != expected_digest or not _same_name_node(
+                parent_fd, pending_name, _name_node(parent_fd, target.name)
+            ):
+                raise DraftError("operation.external_change", code_path)
             try:
                 os.unlink(pending_name, dir_fd=parent_fd)
             except OSError as exc:
                 raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
             _fsync_dir_fd(parent_fd, code_path)
         elif decision == "delete":
+            # 消费前复核 pending 仍是授权内容（决策与删除之间被替换则拒绝）。
+            try:
+                pending_live = _read_name_bytes(parent_fd, pending_name, code_path=code_path)
+            except DraftError:
+                raise
+            if sha256_bytes(pending_live) != expected_digest:
+                raise DraftError("operation.external_change", code_path)
             try:
                 os.unlink(pending_name, dir_fd=parent_fd)
             except OSError as exc:
@@ -478,6 +502,16 @@ def recover_quarantine(
                 raise DraftError("operation.external_change", code_path) from None
             except OSError as exc:
                 raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+            # 新名字耐久后，复核恢复内容仍是授权内容且 quarantine 未被替换（回归 H3）。
+            _fsync_dir_fd(parent_fd, code_path)
+            try:
+                restored = _read_name_bytes(parent_fd, target.name, code_path=code_path)
+            except DraftError:
+                raise
+            if sha256_bytes(restored) != expected_digest or not _same_name_node(
+                parent_fd, quarantine.name, _name_node(parent_fd, target.name)
+            ):
+                raise DraftError("operation.external_change", code_path)
             try:
                 os.unlink(quarantine.name, dir_fd=parent_fd)
             except OSError as exc:
@@ -485,6 +519,13 @@ def recover_quarantine(
             _fsync_dir_fd(parent_fd, code_path)
             raise DraftError(code, code_path)
         if decision in ("complete", "delete_stale"):
+            # 消费前复核 quarantine 仍是授权内容（决策与删除之间被替换则拒绝）。
+            try:
+                quarantined_live = _read_name_bytes(parent_fd, quarantine.name, code_path=code_path)
+            except DraftError:
+                raise
+            if sha256_bytes(quarantined_live) != expected_digest:
+                raise DraftError("operation.external_change", code_path)
             try:
                 os.unlink(quarantine.name, dir_fd=parent_fd)
             except OSError as exc:
@@ -521,6 +562,43 @@ def classify_node(path: Path) -> EntryKind:
     if stat.S_ISDIR(mode):
         return EntryKind.DIRECTORY
     return EntryKind.OTHER
+
+
+def _name_node(parent_fd: int, name: str) -> tuple[int, int] | None:
+    """no-follow stat 返回 (st_ino, st_dev)；缺失/失败返回 None。"""
+    try:
+        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_dev)
+
+
+def _same_name_node(parent_fd: int, name: str, node: tuple[int, int] | None) -> bool:
+    """name 当前是否仍指向 node（删除前 inode 复核，回归 H3）。
+
+    命名动作之间名字被外部替换时，绝不能按名字删除未知节点：只有名字仍指向
+    我们验证过的同一 inode 才允许消费。
+    """
+    return node is not None and _name_node(parent_fd, name) == node
+
+
+def _read_name_bytes(parent_fd: int, name: str, *, code_path: Path) -> bytes:
+    """在父目录句柄内 no-follow 读取名字内容；失败映射 operation.durability_failed。"""
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+    try:
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1 << 16)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+    finally:
+        os.close(descriptor)
 
 
 @dataclass(frozen=True)
@@ -593,16 +671,25 @@ class _AnchoredLeaf:
         _create_only_publish(self.parent_fd, self.name, content, code_path=self.code_path)
 
     def quarantine_delete(self, expected_digest: str) -> None:
-        """先原子隔离、后验证、再删除（回归 H3）。
+        """先隔离、后验证、再删除（回归 H3）。
 
-        在同一父目录句柄内把授权名字以 no-replace 语义移动到确定名 quarantine
-        （``{name}.quarantine``，由授权源决定的目标名派生）；验证隔离节点的类型与
-        摘要后才删除，绝不删除"验证后同名被替换"的节点。验证不符（摘要/类型被外部
-        替换后隔离）时保留节点并尝试 no-replace 恢复原名；原名已被占用时同时保留
-        两者并报告外部变化。
+        节点事务（每个命名动作后严格 fsync，新名字耐久后才允许删旧名字）：
+        1. no-clobber 快照：link 原子捕获当前节点到确定名 quarantine（EEXIST→外部变化）；
+        2. fsync 父目录：quarantine 名字耐久后，才允许删除原名；
+        3. inode 复核：原名仍指向刚隔离的同一节点，否则不触碰未知节点；
+        4. unlink 原名 + fsync；
+        5. 验证隔离节点类型与摘要：先捕获 inode，再读内容验摘要；不符则 no-replace
+           恢复原名（原名占用时同时保留两者）并报告外部变化；
+        6. 消费前 inode 复核：quarantine 名仍指向刚验证的同一节点，否则不删除未知节点；
+        7. unlink quarantine + fsync。
+
+        POSIX link+unlink 无法消除系统调用间隙的改名（renameat2 RENAME_NOREPLACE
+        本分支 stdlib 未暴露，不支持即定义为稳定失败）；本实现通过每步 fsync 与
+        inode 复核保证：任何可检测的替换点都不删除未知节点，冲突时两份内容均可诊断，
+        且任一命名点崩溃后至少一个授权名字可证明存在。
         """
         quarantine = _quarantine_name(self.name)
-        # no-replace 移动：硬链接（EEXIST 说明 quarantine 已被占用）后 unlink 原名。
+        # 1. no-clobber 快照：link 原子捕获当前节点。
         try:
             os.link(
                 self.name,
@@ -615,34 +702,54 @@ class _AnchoredLeaf:
             raise DraftError("operation.external_change", self.code_path) from exc
         except OSError as exc:
             raise self._io_error(exc) from exc
+        # 2. quarantine 名字耐久后，才允许删除原名。
+        _fsync_dir_fd(self.parent_fd, self.code_path)
+        # 3. inode 复核：原名仍指向刚隔离的同一节点。
+        snapshot = _name_node(self.parent_fd, quarantine)
+        if not _same_name_node(self.parent_fd, self.name, snapshot):
+            raise DraftError("operation.external_change", self.code_path)
+        # 4. 删除原名。
         try:
             os.unlink(self.name, dir_fd=self.parent_fd)
         except OSError as exc:
             raise self._io_error(exc) from exc
+        _fsync_dir_fd(self.parent_fd, self.code_path)
+        # 5. 验证隔离节点：先捕获 inode，再分类与读内容验摘要。
+        verified_node = _name_node(self.parent_fd, quarantine)
         quarantined = _AnchoredLeaf(
             self.parent_fd, quarantine, self.display, self.code, self.code_path
         )
         node = quarantined.classify()
-        if node is not EntryKind.FILE or sha256_bytes(quarantined.read()) != expected_digest:
-            # 验证不符：保留节点并尝试 no-replace 恢复原名。
-            try:
-                os.link(
-                    quarantine,
-                    self.name,
-                    src_dir_fd=self.parent_fd,
-                    dst_dir_fd=self.parent_fd,
-                    follow_symlinks=False,
-                )
-            except FileExistsError:
-                # 原名已被占用：同时保留两者，报告外部变化。
-                raise DraftError("operation.external_change", self.code_path) from None
-            except OSError as exc:
-                raise self._io_error(exc) from exc
-            try:
-                os.unlink(quarantine, dir_fd=self.parent_fd)
-            except OSError as exc:
-                raise self._io_error(exc) from exc
+        if node is not EntryKind.FILE:
+            self._restore_quarantined(quarantine)
             raise DraftError("operation.external_change", self.code_path)
+        if sha256_bytes(quarantined.read()) != expected_digest:
+            self._restore_quarantined(quarantine)
+            raise DraftError("operation.external_change", self.code_path)
+        # 6. 消费前 inode 复核：quarantine 名仍指向刚验证的同一节点。
+        if not _same_name_node(self.parent_fd, quarantine, verified_node):
+            raise DraftError("operation.external_change", self.code_path)
+        # 7. 消费（删除）quarantine。
+        try:
+            os.unlink(quarantine, dir_fd=self.parent_fd)
+        except OSError as exc:
+            raise self._io_error(exc) from exc
+        _fsync_dir_fd(self.parent_fd, self.code_path)
+
+    def _restore_quarantined(self, quarantine: str) -> None:
+        """no-clobber 恢复 quarantine→原名：原名占用时同时保留两者并报告外部变化。"""
+        try:
+            os.link(
+                quarantine,
+                self.name,
+                src_dir_fd=self.parent_fd,
+                dst_dir_fd=self.parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            raise DraftError("operation.external_change", self.code_path) from None
+        except OSError as exc:
+            raise self._io_error(exc) from exc
         try:
             os.unlink(quarantine, dir_fd=self.parent_fd)
         except OSError as exc:
