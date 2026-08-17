@@ -425,6 +425,59 @@ def _trash_package_issue(root: Path, journal_path: Path, journal: Journal) -> Ch
     return None
 
 
+_OP_DIR_ALLOWED_ENTRIES = frozenset(
+    {
+        "journal.json",
+        "journal.json.pending",
+        "originals",
+        "staged",
+        "attempt",
+        "cleanup-evidence.json",
+        "cleanup-evidence.json.pending",
+    }
+)
+_OP_DIR_TERMINAL_ALLOWED = frozenset({"journal.json"})
+_OP_DIR_ALLOCATING_ALLOWED = frozenset(
+    {"journal.json", "journal.json.pending", "originals", "staged"}
+)
+
+
+def _check_operation_directory_entries(
+    entry: Path, phase: OperationPhase, issues: list[CheckIssue]
+) -> None:
+    """按 phase 校验操作目录允许的精确内部条目（随机 pending/错误 evidence/终态残留可见）。
+
+    终态（completed/rolled_back）只允许 journal.json，任何 originals/staged/attempt/
+    evidence/pending 都是残留并报告；allocating 只允许 journal 与恢复副本目录；其余
+    阶段允许全部登记内部条目。cleanup-evidence.json 节点必须是精确普通文件，目录/链接
+    是错误 evidence，保留并报告。
+    """
+    from draft.observations import EntryKind
+    from draft.operations import classify_node
+
+    if phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
+        allowed = _OP_DIR_TERMINAL_ALLOWED
+    elif phase is OperationPhase.ALLOCATING:
+        allowed = _OP_DIR_ALLOCATING_ALLOWED
+    else:
+        allowed = _OP_DIR_ALLOWED_ENTRIES
+    for child in sorted(entry.iterdir()):
+        if child.name not in allowed:
+            issues.append(
+                _error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, child.relative_to(entry.parents[1]))
+            )
+            continue
+        if child.name == "cleanup-evidence.json":
+            node = classify_node(child)
+            if node not in (EntryKind.MISSING, EntryKind.FILE):
+                issues.append(
+                    _error(
+                        CheckCode.INTERNAL_UNEXPECTED_ENTRY,
+                        child.relative_to(entry.parents[1]),
+                    )
+                )
+
+
 def _check_operation_state(root: Path) -> list[CheckIssue]:
     """Read-only diagnostics for lock and journal states; never mutates anything."""
     from draft.operations import read_journal, read_lock
@@ -439,10 +492,14 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
         locked_operation = None
     if locked_operation is not None:
         try:
-            read_journal(operation_journal_path(root, locked_operation))
+            journal = read_journal(operation_journal_path(root, locked_operation))
         except DraftError:
             issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, lock_path))
         else:
+            # 有锁操作目录仍校验内部条目形状（回归 H4）：持锁时完成清理前可能有
+            # originals/staged/attempt/evidence，但未知条目与错误 evidence 必须可见。
+            locked_entry = operations / locked_operation
+            _check_operation_directory_entries(locked_entry, journal.phase, issues)
             issues.append(
                 _error(CheckCode.OPERATION_RECOVERY_REQUIRED, lock_path, None, locked_operation)
             )
@@ -479,6 +536,8 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
             continue
         relative = journal_path.relative_to(root)
         phase = journal.phase
+        # 无锁操作目录也按 phase 校验内部条目：终态残留/随机 pending/错误 evidence 可见（回归 H4）。
+        _check_operation_directory_entries(entry, phase, issues)
         if phase is OperationPhase.ALLOCATING:
             issues.append(_review(CheckCode.OPERATION_ORPHAN_ALLOCATING, relative))
         elif phase in _MID_WRITE_PHASES:

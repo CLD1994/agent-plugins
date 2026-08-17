@@ -499,7 +499,7 @@ def test_promote_crash_after_first_new_hub_write_recovers(
         target: Path,
         content: bytes,
         *,
-        temporary: Path | None = None,
+        temporary: Path,
     ) -> None:
         original_apply_write(root_path, target, content, temporary=temporary)
         if str(target).startswith("pages/topic/"):
@@ -573,7 +573,7 @@ def test_promote_crash_recovery_rejects_intruder_in_created_directory(
         target: Path,
         content: bytes,
         *,
-        temporary: Path | None = None,
+        temporary: Path,
     ) -> None:
         original_apply_write(root_path, target, content, temporary=temporary)
         if str(target).startswith("pages/topic/"):
@@ -702,7 +702,7 @@ def test_promote_crash_recovery_rejects_same_basename_unregistered_temp(
         target: Path,
         content: bytes,
         *,
-        temporary: Path | None = None,
+        temporary: Path,
     ) -> None:
         original_apply_write(root_path, target, content, temporary=temporary)
         if str(target).startswith("pages/topic/"):
@@ -766,7 +766,7 @@ def test_promote_crash_recovery_rejects_intruder_in_nested_created_directory(
         target: Path,
         content: bytes,
         *,
-        temporary: Path | None = None,
+        temporary: Path,
     ) -> None:
         original_apply_write(root_path, target, content, temporary=temporary)
         if str(target).startswith("pages/topic/sub/"):

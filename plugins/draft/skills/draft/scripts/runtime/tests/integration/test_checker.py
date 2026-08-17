@@ -1496,3 +1496,62 @@ def test_checker_retained_with_invalid_deadlines_is_error(
         CheckCode.TRASH_DEADLINES_INVALID.value
     ]
     assert _codes_for(report, operation_id, IssueSeverity.INFO) == []
+
+
+@pytest.mark.parametrize("root_state", tuple(RootState))
+def test_terminal_operation_residual_pending_is_reported(
+    draft_factory: DraftFactory,
+    root_state: RootState,
+) -> None:
+    """终态操作目录残留崩溃 pending：check 必须报告，不得当作无痕（回归 H4）。"""
+    root = draft_factory(healthy(), root_state=root_state)
+    journal_path = write_raw_journal(root, version=JOURNAL_VERSION)
+    (journal_path.parent / "journal.json.pending").write_text("stale\n", encoding="utf-8")
+
+    report = check_draft(root)
+
+    assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
+
+
+@pytest.mark.parametrize("root_state", tuple(RootState))
+def test_terminal_operation_leftover_originals_is_reported(
+    draft_factory: DraftFactory,
+    root_state: RootState,
+) -> None:
+    """终态操作目录残留恢复副本：check 必须报告（回归 H4 终态残留可见）。"""
+    root = draft_factory(healthy(), root_state=root_state)
+    journal_path = write_raw_journal(root, version=JOURNAL_VERSION)
+    (journal_path.parent / "originals").mkdir()
+
+    report = check_draft(root)
+
+    assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
+
+
+@pytest.mark.parametrize("root_state", tuple(RootState))
+def test_evidence_node_as_directory_is_reported(
+    draft_factory: DraftFactory,
+    root_state: RootState,
+) -> None:
+    """cleanup-evidence.json 节点是目录：check 报告错误 evidence（回归 H4）。"""
+    root = draft_factory(healthy(), root_state=root_state)
+    journal_path = write_raw_journal(root, version=JOURNAL_VERSION)
+    (journal_path.parent / "cleanup-evidence.json").mkdir()
+
+    report = check_draft(root)
+
+    assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
+
+
+@pytest.mark.parametrize("root_state", tuple(RootState))
+def test_clean_terminal_operation_is_not_reported(
+    draft_factory: DraftFactory,
+    root_state: RootState,
+) -> None:
+    """终态操作目录只含 journal.json：不报告内部条目残留（回归 H4 不误报）。"""
+    root = draft_factory(healthy(), root_state=root_state)
+    write_raw_journal(root, version=JOURNAL_VERSION)
+
+    report = check_draft(root)
+
+    assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value not in codes(report)

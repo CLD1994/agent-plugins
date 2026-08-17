@@ -12,7 +12,7 @@ import pytest
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import TrashResult
-from draft.operations import read_journal
+from draft.operations import operation_journal_path, read_journal
 from draft.trash import (
     OPERATIONS_RELATIVE,
     OUTGOING_RELATIVE,
@@ -73,6 +73,24 @@ def build_trashable_draft(draft_factory: DraftFactory) -> Path:
 
 def _retained_trash(root: Path) -> TrashResult:
     return trash_page(root, Path("pages/obsolete.md"), now=datetime(2026, 7, 21, tzinfo=UTC))
+
+
+def _clean_with_authorization(root: Path, operation_id: str, *, phase: str = "rolled_back") -> None:
+    """把 T 日志重写为已提交阶段、幂等持锁后经清理授权清理（M1 门：测试必须用已提交授权）。"""
+    import json as json_module
+
+    from draft.operations import acquire_lock, read_lock
+    from draft.trash_package import clean_authoritative_package, cleanup_authorization
+
+    journal_path = root / OPERATIONS_RELATIVE / operation_id / "journal.json"
+    raw = json_module.loads(journal_path.read_text(encoding="utf-8"))
+    raw["phase"] = phase
+    journal_path.write_text(json_module.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    if read_lock(root) != operation_id:
+        acquire_lock(root, operation_id)
+    clean_authoritative_package(
+        root, cleanup_authorization(root, operation_id, lock_operation_id=operation_id)
+    )
 
 
 def _verify_package(root: Path, operation_id: str) -> None:
@@ -349,9 +367,6 @@ def test_cleanup_rejects_payload_intermediate_symlink(
     """payload 中间父目录被替换为符号链接：清理不得跟随链接访问根外节点（回归 H1）。"""
     import shutil
 
-    from draft.operations import operation_journal_path
-    from draft.trash_package import clean_authoritative_package
-
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
     package = root / ".draft/trash/outgoing" / pending.operation_id
@@ -363,9 +378,8 @@ def test_cleanup_rejects_payload_intermediate_symlink(
     (package / level).parent.mkdir(parents=True, exist_ok=True)
     (package / level).symlink_to(external / "payload")
 
-    journal = read_journal(operation_journal_path(root, pending.operation_id))
     with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
-        clean_authoritative_package(root, journal)
+        _clean_with_authorization(root, pending.operation_id)
 
     # 根外节点完全不变：符号链接未被跟随，外部文件仍存在、权威包现场保留。
     external_leaf = external / "payload" / "pages" / "obsolete.md"
@@ -378,7 +392,6 @@ def test_cleanup_rejects_third_package_write(
 ) -> None:
     """T 日志出现第三个包内 WRITE：清理必须判损坏，不得删除任何授权叶节点（回归 H1）。"""
     from draft.operations import operation_journal_path
-    from draft.trash_package import clean_authoritative_package
 
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
@@ -403,7 +416,7 @@ def test_cleanup_rejects_third_package_write(
     journal_path.write_text(json_module.dumps(raw, ensure_ascii=False), encoding="utf-8")
 
     with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
-        clean_authoritative_package(root, read_journal(journal_path))
+        _clean_with_authorization(root, pending.operation_id)
 
     # 合法叶节点与未知内容都保留。
     before = _leaf_snapshot(package)
@@ -416,12 +429,8 @@ def test_cleanup_leaf_removal_is_anchored_to_dir_fd(
     """叶节点验证与删除通过同一锚定目录句柄（dir_fd），绝不按绝对路径二次解析（回归 H1）。"""
     import os as os_module
 
-    from draft.operations import operation_journal_path
-    from draft.trash_package import clean_authoritative_package
-
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
-    journal = read_journal(operation_journal_path(root, pending.operation_id))
 
     unlink_calls: list[tuple[str, int | None]] = []
     original_unlink = os_module.unlink
@@ -434,7 +443,7 @@ def test_cleanup_leaf_removal_is_anchored_to_dir_fd(
             original_unlink(path)
 
     monkeypatch.setattr(os_module, "unlink", spy_unlink)
-    clean_authoritative_package(root, journal)
+    _clean_with_authorization(root, pending.operation_id)
 
     # 授权叶必须经 dir_fd 锚定删除（基础名 + 句柄），绝不以绝对路径 unlink。
     assert any(path == "package.json" and dir_fd is not None for path, dir_fd in unlink_calls)
@@ -447,7 +456,6 @@ def test_cleanup_mid_delete_extra_preserves_evidence_and_converges(
 ) -> None:
     """删除期间出现晚到 extra：失败保留证据与未知内容，移除后从证据收敛（回归 H2）。"""
     from draft.operations import operation_journal_path
-    from draft.trash_package import clean_authoritative_package
 
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
@@ -466,7 +474,7 @@ def test_cleanup_mid_delete_extra_preserves_evidence_and_converges(
 
     monkeypatch.setattr(trash_package_module, "_precheck_package_tree", precheck_then_inject)
     with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
-        clean_authoritative_package(root, journal)
+        _clean_with_authorization(root, pending.operation_id)
 
     # 未知内容保留，且耐久证据在锁所属操作目录中（可重建合法包，不只剩未知内容）。
     assert (package / "late.txt").read_text(encoding="utf-8") == "late\n"
@@ -476,7 +484,7 @@ def test_cleanup_mid_delete_extra_preserves_evidence_and_converges(
     # 停止注入后移除未知条目，再次清理：从证据重建缺失叶并完成收敛。
     monkeypatch.undo()
     (package / "late.txt").unlink()
-    clean_authoritative_package(root, journal)
+    _clean_with_authorization(root, pending.operation_id)
     assert not package.exists()
     assert not evidence.exists()
 
@@ -487,18 +495,14 @@ def test_cleanup_dangling_package_dir_symlink_is_corrupt(
     """权威包目录是悬空符号链接：按 link 处理为损坏，不折叠成幂等缺失（回归 M2）。"""
     import shutil
 
-    from draft.operations import operation_journal_path
-    from draft.trash_package import clean_authoritative_package
-
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
     package = root / ".draft/trash/outgoing" / pending.operation_id
     shutil.rmtree(package)
     package.symlink_to(tmp_path / "nowhere", target_is_directory=True)
 
-    journal = read_journal(operation_journal_path(root, pending.operation_id))
     with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
-        clean_authoritative_package(root, journal)
+        _clean_with_authorization(root, pending.operation_id)
 
     assert package.is_symlink()
 
@@ -507,8 +511,6 @@ def test_cleanup_preserves_full_evidence_when_unknown_present(
     draft_factory: DraftFactory,
 ) -> None:
     """清理前存在未知成员：预检必须在第一次删除前失败，完整证据保留（回归 H2）。"""
-    from draft.operations import operation_journal_path
-    from draft.trash_package import clean_authoritative_package
 
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
@@ -516,9 +518,8 @@ def test_cleanup_preserves_full_evidence_when_unknown_present(
     before = _leaf_snapshot(package)
     (package / "intruder.txt").write_text("入侵\n", encoding="utf-8")
 
-    journal = read_journal(operation_journal_path(root, pending.operation_id))
     with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
-        clean_authoritative_package(root, journal)
+        _clean_with_authorization(root, pending.operation_id)
 
     # 完整证据保留：package.json、payload 与全部摘要不变。
     assert _leaf_snapshot(package) == {**before, "intruder.txt": b"\xe5\x85\xa5\xe4\xbe\xb5\n"}
@@ -530,12 +531,8 @@ def test_cleanup_evidence_dir_fsync_failure_does_not_delete_leaves(
     """证据写目录同步失败：报 durability_failed，不得继续删除权威叶（回归 H1）。"""
     import os as os_module
 
-    from draft.operations import operation_journal_path
-    from draft.trash_package import clean_authoritative_package
-
     root = build_trashable_draft(draft_factory)
     pending = _retained_trash(root)
-    journal = read_journal(operation_journal_path(root, pending.operation_id))
     package = root / ".draft/trash/outgoing" / pending.operation_id
     before = _leaf_snapshot(package)
 
@@ -551,9 +548,424 @@ def test_cleanup_evidence_dir_fsync_failure_does_not_delete_leaves(
 
     monkeypatch.setattr(os_module, "fsync", fail_evidence_dir_fsync)
     with pytest.raises(DraftError, match=CheckCode.OPERATION_DURABILITY_FAILED.value):
-        clean_authoritative_package(root, journal)
+        _clean_with_authorization(root, pending.operation_id)
     monkeypatch.undo()
 
     # 权威叶一个未删：耐久失败后调用方不得继续删除。
     assert _leaf_snapshot(package) == before
     assert (package / "package.json").is_file()
+
+
+# ---------------------------------------------------------------------------
+# 第八轮 M1/H4：清理授权门 + 受约束清理证据模式
+# ---------------------------------------------------------------------------
+
+
+def _commit_phase(root: Path, operation_id: str, phase: str) -> None:
+    """把 T 日志 phase 直接重写为给定阶段（测试用；不涉及锁）。"""
+    import json as json_module
+
+    journal_path = root / OPERATIONS_RELATIVE / operation_id / "journal.json"
+    raw = json_module.loads(journal_path.read_text(encoding="utf-8"))
+    raw["phase"] = phase
+    journal_path.write_text(json_module.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+
+def _valid_evidence_payload(root: Path, operation_id: str) -> dict[str, object]:
+    """构造与已提交 T 授权一致的合法证据 payload（两叶 present）。"""
+    import base64
+
+    from draft.trash_package import parse_package_authorization
+
+    journal = read_journal(operation_journal_path(root, operation_id))
+    auth = parse_package_authorization(journal, root / OUTGOING_RELATIVE / operation_id)
+    leaves: list[dict[str, object]] = []
+    for relative, digest in auth.leaves():
+        content = (root / relative).read_bytes()
+        leaves.append(
+            {
+                "relative": relative.as_posix(),
+                "sha256": digest,
+                "state": "present",
+                "content": base64.b64encode(content).decode("ascii"),
+            }
+        )
+    return {
+        "version": 2,
+        "operation_id": operation_id,
+        "cleanup_phase": "rolled_back",
+        "leaves": leaves,
+    }
+
+
+def _write_evidence(root: Path, operation_id: str, payload: dict[str, object]) -> Path:
+    journal = read_journal(operation_journal_path(root, operation_id))
+    evidence = journal.directory / "cleanup-evidence.json"
+    evidence.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return evidence
+
+
+def test_cleanup_authorization_rejects_non_committed_phases(
+    draft_factory: DraftFactory,
+) -> None:
+    """retained/handoff_pending 一律拒绝清理授权，即使已持锁（回归 M1）。"""
+    from draft.operations import acquire_lock
+    from draft.trash_package import cleanup_authorization
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    acquire_lock(root, pending.operation_id)
+    for phase in ("trash_retained", "trash_handoff_pending"):
+        _commit_phase(root, pending.operation_id, phase)
+        with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+            cleanup_authorization(
+                root, pending.operation_id, lock_operation_id=pending.operation_id
+            )
+
+
+def test_cleanup_authorization_requires_matching_lock(
+    draft_factory: DraftFactory,
+) -> None:
+    """清理授权必须匹配当前锁所有者：不持锁/锁不匹配一律拒绝（回归 M1）。"""
+    from draft.trash_package import cleanup_authorization
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    _commit_phase(root, pending.operation_id, "rolled_back")
+    other = "a" * 32
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        cleanup_authorization(root, pending.operation_id, lock_operation_id=other)
+
+
+def test_cleanup_authorization_rereads_committed_journal(
+    draft_factory: DraftFactory,
+) -> None:
+    """授权从锁内重读的磁盘 journal 派生，不接受调用方手中的旧对象（回归 M1）。"""
+    from draft.operations import acquire_lock
+    from draft.trash_package import cleanup_authorization
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    acquire_lock(root, pending.operation_id)
+    # 磁盘上已推进到提交阶段；任何"旧对象"都无法绕过该重读。
+    _commit_phase(root, pending.operation_id, "trash_purge_committed")
+    authorization = cleanup_authorization(
+        root, pending.operation_id, lock_operation_id=pending.operation_id
+    )
+    assert authorization.journal.phase.value == "trash_purge_committed"
+    assert authorization.journal.operation_id == pending.operation_id
+
+
+def test_clean_retained_never_deletes_package(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """retained journal + 持锁：清理授权拒绝，删除调用次数必须为零，锁/包不变（回归 M1）。"""
+    import os as os_module
+
+    from draft.operations import acquire_lock, read_lock
+    from draft.trash_package import cleanup_authorization
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    before = _leaf_snapshot(package)
+    acquire_lock(root, pending.operation_id)
+
+    unlink_calls: list[tuple[str, int | None]] = []
+    original_unlink = os_module.unlink
+
+    def spy_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        unlink_calls.append((path, dir_fd))
+        if dir_fd is not None:
+            original_unlink(path, dir_fd=dir_fd)
+        else:
+            original_unlink(path)
+
+    monkeypatch.setattr(os_module, "unlink", spy_unlink)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        cleanup_authorization(root, pending.operation_id, lock_operation_id=pending.operation_id)
+    monkeypatch.undo()
+
+    assert not unlink_calls
+    assert _leaf_snapshot(package) == before
+    assert read_lock(root) == pending.operation_id
+
+
+def test_clean_handoff_pending_never_deletes_package(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """handoff_pending journal + 持锁：清理授权拒绝，删除次数为零（回归 M1）。"""
+    import os as os_module
+
+    from draft.operations import acquire_lock
+    from draft.trash_package import cleanup_authorization
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    acquire_lock(root, pending.operation_id)
+    _commit_phase(root, pending.operation_id, "trash_handoff_pending")
+
+    unlink_calls: list[tuple[str, int | None]] = []
+    original_unlink = os_module.unlink
+
+    def spy_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        unlink_calls.append((path, dir_fd))
+        if dir_fd is not None:
+            original_unlink(path, dir_fd=dir_fd)
+        else:
+            original_unlink(path)
+
+    monkeypatch.setattr(os_module, "unlink", spy_unlink)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        cleanup_authorization(root, pending.operation_id, lock_operation_id=pending.operation_id)
+    monkeypatch.undo()
+
+    assert not unlink_calls
+    assert (package / "package.json").is_file()
+
+
+def test_parse_cleanup_evidence_rejects_unknown_top_field(
+    draft_factory: DraftFactory,
+) -> None:
+    """未知顶层字段：证据损坏，拒绝（回归 H4 精确字段集合）。"""
+    from draft.trash_package import parse_cleanup_evidence
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    _commit_phase(root, pending.operation_id, "rolled_back")
+    payload = _valid_evidence_payload(root, pending.operation_id)
+    payload["extra_field"] = "x"
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        parse_cleanup_evidence(json.dumps(payload).encode("utf-8"), journal, root / "outgoing")
+
+
+def test_parse_cleanup_evidence_rejects_duplicate_relative(
+    draft_factory: DraftFactory,
+) -> None:
+    """重复 relative 或缺叶：证据损坏，拒绝（回归 H4）。"""
+    from draft.trash_package import parse_cleanup_evidence
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    _commit_phase(root, pending.operation_id, "rolled_back")
+    payload = _valid_evidence_payload(root, pending.operation_id)
+    payload["leaves"] = [payload["leaves"][0], payload["leaves"][0]]  # type: ignore[index]
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        parse_cleanup_evidence(json.dumps(payload).encode("utf-8"), journal, root / "outgoing")
+
+
+def test_parse_cleanup_evidence_rejects_missing_leaf(
+    draft_factory: DraftFactory,
+) -> None:
+    """只记录一个叶：证据损坏（回归 H4 恰好两个授权叶）。"""
+    from draft.trash_package import parse_cleanup_evidence
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    _commit_phase(root, pending.operation_id, "rolled_back")
+    payload = _valid_evidence_payload(root, pending.operation_id)
+    payload["leaves"] = payload["leaves"][:1]  # type: ignore[index]
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        parse_cleanup_evidence(json.dumps(payload).encode("utf-8"), journal, root / "outgoing")
+
+
+def test_parse_cleanup_evidence_rejects_self_digest_not_anchored(
+    draft_factory: DraftFactory,
+) -> None:
+    """证据自报摘要与 T 授权不符：损坏，拒绝（回归 H4 交叉校验）。"""
+    from draft.trash_package import parse_cleanup_evidence
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    _commit_phase(root, pending.operation_id, "rolled_back")
+    payload = _valid_evidence_payload(root, pending.operation_id)
+    leaves = cast("list[dict[str, object]]", payload["leaves"])
+    leaves[0]["sha256"] = "0" * 64
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        parse_cleanup_evidence(json.dumps(payload).encode("utf-8"), journal, root / "outgoing")
+
+
+def test_parse_cleanup_evidence_rejects_invalid_base64(
+    draft_factory: DraftFactory,
+) -> None:
+    """非法 base64（非严格字符）：损坏，拒绝（回归 H4 严格解码）。"""
+    from draft.trash_package import parse_cleanup_evidence
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    _commit_phase(root, pending.operation_id, "rolled_back")
+    payload = _valid_evidence_payload(root, pending.operation_id)
+    leaves = cast("list[dict[str, object]]", payload["leaves"])
+    leaves[0]["content"] = "!!! not-base64 !!!"
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        parse_cleanup_evidence(json.dumps(payload).encode("utf-8"), journal, root / "outgoing")
+
+
+def test_parse_cleanup_evidence_rejects_non_utf8(
+    draft_factory: DraftFactory,
+) -> None:
+    """非 UTF-8 字节：损坏，拒绝（回归 H4/M3 持久 JSON 解码边界）。"""
+    from draft.trash_package import parse_cleanup_evidence
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    _commit_phase(root, pending.operation_id, "rolled_back")
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        parse_cleanup_evidence(b"\xff\xfe\x00 garbage", journal, root / "outgoing")
+
+
+def test_parse_cleanup_evidence_rejects_wrong_phase_and_operation(
+    draft_factory: DraftFactory,
+) -> None:
+    """cleanup_phase/operation_id 与日志不符：损坏（回归 H4）。"""
+    from draft.trash_package import parse_cleanup_evidence
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    _commit_phase(root, pending.operation_id, "rolled_back")
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+
+    payload = _valid_evidence_payload(root, pending.operation_id)
+    payload["cleanup_phase"] = "trash_purge_committed"
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        parse_cleanup_evidence(json.dumps(payload).encode("utf-8"), journal, root / "outgoing")
+
+    payload = _valid_evidence_payload(root, pending.operation_id)
+    payload["operation_id"] = "1" * 32
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        parse_cleanup_evidence(json.dumps(payload).encode("utf-8"), journal, root / "outgoing")
+
+
+def test_restore_fails_before_first_leaf_write_on_later_entry_corrupt(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """后一个证据条目损坏：首次受管写入前整体失败，不得先恢复前一个叶（回归 H4）。"""
+    from draft.operations import acquire_lock
+    from draft.trash_package import clean_authoritative_package, cleanup_authorization
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    acquire_lock(root, pending.operation_id)
+    _commit_phase(root, pending.operation_id, "rolled_back")
+    payload = _valid_evidence_payload(root, pending.operation_id)
+    leaves = cast("list[dict[str, object]]", payload["leaves"])
+    # 把第一个叶的内容也替换成错误摘要：无论排序，损坏都必须先于任何写入被整体拒绝。
+    leaves[1]["sha256"] = "0" * 64
+    evidence = _write_evidence(root, pending.operation_id, payload)
+    # 删除两个叶：让恢复需要重建。
+    (root / OUTGOING_RELATIVE / pending.operation_id / "package.json").unlink()
+    (root / OUTGOING_RELATIVE / pending.operation_id / "payload" / "pages" / "obsolete.md").unlink()
+
+    write_spy = {"writes": 0}
+    from draft.operations import durable_write
+
+    original_durable = durable_write
+
+    def counting_durable(path: object, value: object) -> None:
+        write_spy["writes"] += 1
+        original_durable(path, value)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("draft.operations.durable_write", counting_durable)
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        clean_authoritative_package(
+            root,
+            cleanup_authorization(
+                root, pending.operation_id, lock_operation_id=pending.operation_id
+            ),
+        )
+    monkeypatch.undo()
+
+    # 证据文件在操作目录中，两个叶都未恢复写入。
+    assert evidence.is_file()
+    assert not (package / "package.json").exists()
+
+
+def test_cleanup_evidence_node_directory_or_link_is_corrupt(
+    draft_factory: DraftFactory,
+) -> None:
+    """证据节点是目录/符号链接：不是"没有证据"，按损坏保留现场（回归 H4）。"""
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+    evidence = journal.directory / "cleanup-evidence.json"
+    evidence.mkdir()  # 证据位置被目录占用。
+    before = _leaf_snapshot(package)
+
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        _clean_with_authorization(root, pending.operation_id)
+
+    assert _leaf_snapshot(package) == before
+    assert evidence.is_dir()
+
+
+def test_cleanup_evidence_already_missing_entry_converges(
+    draft_factory: DraftFactory,
+) -> None:
+    """证据含 already_missing 叶：跳过该叶恢复，其余叶照常，清理收敛（回归 H4）。"""
+    import base64
+
+    from draft.operations import acquire_lock
+    from draft.trash_package import (
+        clean_authoritative_package,
+        cleanup_authorization,
+        parse_package_authorization,
+    )
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    acquire_lock(root, pending.operation_id)
+    _commit_phase(root, pending.operation_id, "rolled_back")
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+    auth = parse_package_authorization(journal, package)
+    present_relative, present_digest = auth.package_json_path, auth.package_json_digest
+    missing_relative, missing_digest = auth.payload_path, auth.payload_digest
+    content = (root / present_relative).read_bytes()
+    payload: dict[str, object] = {
+        "version": 2,
+        "operation_id": pending.operation_id,
+        "cleanup_phase": "rolled_back",
+        "leaves": [
+            {
+                "relative": present_relative.as_posix(),
+                "sha256": present_digest,
+                "state": "present",
+                "content": base64.b64encode(content).decode("ascii"),
+            },
+            {
+                "relative": missing_relative.as_posix(),
+                "sha256": missing_digest,
+                "state": "already_missing",
+            },
+        ],
+    }
+    _write_evidence(root, pending.operation_id, payload)
+    # payload 树已整体缺失：已提交阶段下为幂等状态，证据记录其为 already_missing。
+    import shutil
+
+    shutil.rmtree(package / "payload")
+
+    clean_authoritative_package(
+        root,
+        cleanup_authorization(root, pending.operation_id, lock_operation_id=pending.operation_id),
+    )
+
+    assert not package.exists()
+    evidence = journal.directory / "cleanup-evidence.json"
+    assert not evidence.exists()

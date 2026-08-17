@@ -57,6 +57,7 @@ from draft.trash_package import (
     OUTGOING_RELATIVE,
     VerifiedTrashPackage,
     clean_authoritative_package,
+    cleanup_authorization,
     load_verified_package,
 )
 
@@ -352,7 +353,13 @@ def _attempt_handoff_locked(
                 phase=OperationPhase.TRASH_PURGE_COMMITTED,
             )
             write_journal(failed)
-            clean_authoritative_package(root, journal)
+            # M1：清理授权从锁内重读的已提交 journal 派生（purge_committed 已耐久写入）。
+            clean_authoritative_package(
+                root,
+                cleanup_authorization(
+                    root, journal.operation_id, lock_operation_id=journal.operation_id
+                ),
+            )
             remove_attempt_copy(verified_package, attempt)
             write_journal(
                 with_disposition(failed, EXPIRED_PURGE_DISPOSITION, OperationPhase.COMPLETED)
@@ -389,7 +396,11 @@ def _attempt_handoff_locked(
     # 成功：先耐久 succeeded，再清权威包与副本，最后 completed+disposition。
     succeeded = with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED)
     write_journal(succeeded)
-    clean_authoritative_package(root, journal)
+    # M1：清理授权从锁内重读的已提交 journal 派生（handoff_succeeded 已耐久写入）。
+    clean_authoritative_package(
+        root,
+        cleanup_authorization(root, journal.operation_id, lock_operation_id=journal.operation_id),
+    )
     remove_attempt_copy(verified_package, attempt)
     write_journal(with_disposition(succeeded, SYSTEM_TRASH_DISPOSITION, OperationPhase.COMPLETED))
     release_lock(root, operation_id)
@@ -518,7 +529,12 @@ def _recover_locked_trash(
     ):
         # 提交点已耐久：只完成清理，绝不再调用适配器。清理走统一权威包原语，
         # 从 T 日志派生授权条目逐个复核删除，未知内容使清理拒绝并保留现场。
-        clean_authoritative_package(root, journal)
+        clean_authoritative_package(
+            root,
+            cleanup_authorization(
+                root, journal.operation_id, lock_operation_id=journal.operation_id
+            ),
+        )
         attempt = root / OPERATIONS_RELATIVE / operation_id / "attempt"
         _clean_attempt_tree(attempt, _attempt_authorized_from_journal(journal, attempt), attempt)
         terminal = with_disposition(

@@ -71,6 +71,7 @@ from draft.trash_package import (
     PACKAGE_VERSION,
     VerifiedTrashPackage,
     clean_authoritative_package,
+    cleanup_authorization,
     load_verified_package,
 )
 
@@ -878,7 +879,12 @@ def resolve_restore_execution(
             )
         verify_restore_after_state(root, current_trash, terminal_restore, package)
         write_journal(with_phase(current_trash, OperationPhase.ROLLED_BACK))
-        clean_authoritative_package(root, current_trash)
+        # M1：restore 清理授权从锁内重读的已提交 T journal 派生（rolled_back 已耐久
+        # 写入）；当前锁属于 R 操作（restore_id），双向关联已由 validate_restore_link 证明。
+        clean_authoritative_package(
+            root,
+            cleanup_authorization(root, current_trash.operation_id, lock_operation_id=restore_id),
+        )
         clean_recovery_copies(terminal_restore)
         release_lock(root, restore_id)
         return OperationResult(
