@@ -118,7 +118,10 @@ def test_adjusted_observation_manifest_converts_missing_observation_to_directory
     from draft.observations import missing_observation
 
     manifest = ObservationManifest(
-        entries=(missing_observation(Path("pages/topic")), directory_observation(Path("pages"), ("a.md",)))
+        entries=(
+            missing_observation(Path("pages/topic")),
+            directory_observation(Path("pages"), ("a.md",)),
+        )
     )
     adjusted = adjusted_observation_manifest(
         manifest,

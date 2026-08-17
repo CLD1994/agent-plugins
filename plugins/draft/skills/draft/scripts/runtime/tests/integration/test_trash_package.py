@@ -331,6 +331,4 @@ def test_check_reports_package_json_directory_as_stable_diagnostic(
     package_json.mkdir()
 
     report = check_draft(root)
-    assert CheckCode.TRASH_PACKAGE_CORRUPT.value in tuple(
-        issue.code for issue in report.errors
-    )
+    assert CheckCode.TRASH_PACKAGE_CORRUPT.value in tuple(issue.code for issue in report.errors)

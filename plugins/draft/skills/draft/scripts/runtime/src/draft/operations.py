@@ -1233,9 +1233,7 @@ def adjusted_observation_manifest(
         elif observation.kind is EntryKind.MISSING and observation.path in added:
             # 计划期缺失的目录被本操作创建：期望恰好是操作创建的成员集合。
             adjusted.append(
-                directory_observation(
-                    observation.path, tuple(sorted(added[observation.path]))
-                )
+                directory_observation(observation.path, tuple(sorted(added[observation.path])))
             )
         else:
             adjusted.append(observation)
