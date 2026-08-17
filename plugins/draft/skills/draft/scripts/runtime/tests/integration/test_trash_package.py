@@ -969,3 +969,33 @@ def test_cleanup_evidence_already_missing_entry_converges(
     assert not package.exists()
     evidence = journal.directory / "cleanup-evidence.json"
     assert not evidence.exists()
+
+
+def test_cleanup_quarantine_does_not_delete_swapped_node(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """叶摘要复核后、隔离前替换最终名字：替换内容不被删除，错误稳定（回归 H3）。"""
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+
+    from draft.operations import _AnchoredLeaf  # pyright: ignore[reportPrivateUsage]
+
+    original_qd = _AnchoredLeaf.quarantine_delete
+    swapped = {"content": b"attacker replaced the leaf"}
+
+    def swap_then_quarantine(self: Any, expected_digest: str) -> None:
+        # 在隔离前把最终名字替换为外部内容：quarantine_delete 必须隔离并验证到它，
+        # 摘要不符 → 恢复原名并报告，绝不删除替换内容。第一个被删叶是 package.json。
+        (package / "package.json").write_bytes(swapped["content"])
+        original_qd(self, expected_digest)
+
+    monkeypatch.setattr(_AnchoredLeaf, "quarantine_delete", swap_then_quarantine)
+    with pytest.raises(DraftError, match="operation.external_change"):
+        _clean_with_authorization(root, pending.operation_id)
+    monkeypatch.undo()
+
+    # 替换内容未被删除：恢复后仍占最终路径，且未被当作合法叶删除。
+    package_json = package / "package.json"
+    assert package_json.read_bytes() == swapped["content"]
+    assert package.exists()

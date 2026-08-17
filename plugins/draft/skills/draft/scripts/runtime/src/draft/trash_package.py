@@ -473,7 +473,8 @@ def _remove_verified_leaf(
             raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
         if sha256_bytes(leaf.read()) != expected_digest:
             raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
-        leaf.unlink()
+        # 隔离→验证→删除：验证与删除同一锚定句柄，隔离名由授权目标派生（回归 H3）。
+        leaf.quarantine_delete(expected_digest)
 
 
 def _remove_verified_dir(root: Path, relative: Path, code_path: Path) -> None:
@@ -734,7 +735,7 @@ def _restore_missing_leaves_from_evidence(root: Path, journal: Journal, code_pat
     写入前失败），再逐个收敛 pending 并补写仍缺失的叶（回归 H4）。恢复写入与验证共用
     锚定句柄，不按绝对路径重新解析。
     """
-    from draft.operations import recover_digest_pending
+    from draft.operations import recover_digest_pending, recover_quarantine
 
     evidence_path = _cleanup_evidence_path(journal)
     evidence = parse_cleanup_evidence(evidence_path.read_bytes(), journal, code_path)
@@ -744,8 +745,16 @@ def _restore_missing_leaves_from_evidence(root: Path, journal: Journal, code_pat
         relative = leaf_state.relative
         content = leaf_state.content
         assert content is not None
-        # 先收敛崩溃遗留 pending（发布已同步的待发布叶），再补写仍缺失的叶。
+        # 先收敛崩溃遗留 pending/quarantine（发布待发布叶/完成被中断的删除），再补写
+        # 仍缺失的叶（回归 H2/H3）。
         recover_digest_pending(
+            root,
+            relative,
+            leaf_state.sha256,
+            code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+            code_path=code_path,
+        )
+        recover_quarantine(
             root,
             relative,
             leaf_state.sha256,

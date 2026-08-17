@@ -1554,7 +1554,7 @@ def _fail_fsync_at(monkeypatch: pytest.MonkeyPatch, fail_at: frozenset[int]) -> 
 def test_pending_decision_matrix() -> None:
     """恢复期 pending 收敛决策表：publish/delete/ignore/external（回归 H2）。"""
     from draft.observations import EntryKind
-    from draft.operations import _pending_decision
+    from draft.operations import _pending_decision  # pyright: ignore[reportPrivateUsage]
 
     F, M, D, S = (
         EntryKind.FILE,
@@ -1858,3 +1858,213 @@ def test_resolve_journal_pending_with_old_journal_keeps_old_on_invalid(
     assert read_journal(target).phase.value == "prepared"
     # 非法 pending 不删除，留作 checker 可见残留。
     assert pending.is_file()
+
+
+# ---------------------------------------------------------------------------
+# 第八轮 H3/M2：节点隔离删除 + fd 生命周期
+# ---------------------------------------------------------------------------
+
+
+def test_quarantine_decision_matrix() -> None:
+    """恢复期 quarantine 收敛决策表：complete/restore/delete_stale/external/ignore（回归 H3）。"""
+    from draft.observations import EntryKind
+    from draft.operations import _quarantine_decision  # pyright: ignore[reportPrivateUsage]
+
+    F, M, D, S = (
+        EntryKind.FILE,
+        EntryKind.MISSING,
+        EntryKind.DIRECTORY,
+        EntryKind.SYMLINK,
+    )
+    expected = "a" * 64
+    other = "0" * 64
+
+    # 目标缺失 + quarantine 授权精确 → 完成删除（隔离已通过验证）。
+    assert (
+        _quarantine_decision(
+            target_kind=M,
+            quarantine_kind=F,
+            target_digest=None,
+            quarantine_digest=expected,
+            expected_digest=expected,
+        )
+        == "complete"
+    )
+    # 目标与 quarantine 都是授权精确（同一 inode 中途移动）→ 删除 stale quarantine。
+    assert (
+        _quarantine_decision(
+            target_kind=F,
+            quarantine_kind=F,
+            target_digest=expected,
+            quarantine_digest=expected,
+            expected_digest=expected,
+        )
+        == "delete_stale"
+    )
+    # 目标缺失 + quarantine 摘要不符 → 恢复原名。
+    assert (
+        _quarantine_decision(
+            target_kind=M,
+            quarantine_kind=F,
+            target_digest=None,
+            quarantine_digest=other,
+            expected_digest=expected,
+        )
+        == "restore"
+    )
+    # quarantine 类型错误 / 目标被替换 → external。
+    assert (
+        _quarantine_decision(
+            target_kind=M,
+            quarantine_kind=D,
+            target_digest=None,
+            quarantine_digest=None,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    assert (
+        _quarantine_decision(
+            target_kind=M,
+            quarantine_kind=S,
+            target_digest=None,
+            quarantine_digest=None,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    assert (
+        _quarantine_decision(
+            target_kind=F,
+            quarantine_kind=F,
+            target_digest=other,
+            quarantine_digest=expected,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    # 无 quarantine → ignore。
+    assert (
+        _quarantine_decision(
+            target_kind=F,
+            quarantine_kind=M,
+            target_digest=expected,
+            quarantine_digest=None,
+            expected_digest=expected,
+        )
+        == "ignore"
+    )
+    assert (
+        _quarantine_decision(
+            target_kind=M,
+            quarantine_kind=M,
+            target_digest=None,
+            quarantine_digest=None,
+            expected_digest=expected,
+        )
+        == "ignore"
+    )
+
+
+def test_anchored_leaf_does_not_leak_directory_fds(
+    operation_draft: Path,
+) -> None:
+    """anchored_leaf 每层 fd 及时关闭：成功路径多次调用前后 fd 数量不变（回归 M2）。"""
+    import os as os_module
+
+    from draft.operations import anchored_leaf
+
+    root = operation_draft
+    target = Path("pages/a.md")
+    (root / target).write_text("content", encoding="utf-8")
+
+    def open_fd_count() -> int:
+        return len(os_module.listdir("/proc/self/fd"))
+
+    before = open_fd_count()
+    for _ in range(50):
+        with anchored_leaf(root, target, code="test.code", code_path=root) as leaf:
+            assert leaf.classify().value == "file"
+    assert open_fd_count() == before
+
+
+def test_anchored_leaf_closes_fds_on_missing_intermediate(
+    operation_draft: Path,
+) -> None:
+    """anchored_leaf 中间父组件缺失：fd 不泄漏（回归 M2）。"""
+    import os as os_module
+
+    from draft.operations import anchored_leaf
+
+    root = operation_draft
+    target = Path("missing/deep/leaf.md")
+
+    def open_fd_count() -> int:
+        return len(os_module.listdir("/proc/self/fd"))
+
+    before = open_fd_count()
+    for _ in range(50):
+        with anchored_leaf(root, target, code="test.code", code_path=root) as leaf:
+            assert leaf.classify().value == "missing"
+    assert open_fd_count() == before
+
+
+def test_clean_recovery_copies_converges_with_quarantine(
+    operation_draft: Path,
+) -> None:
+    """登记叶隔离后崩溃：recover_quarantine 完成删除，清理收敛（回归 H3）。"""
+    from draft.operations import clean_recovery_copies, read_journal
+
+    root = operation_draft
+    op_id = "a" * 32
+    journal_path = _write_journal_with_originals_and_staged(root, op_id, extra_sub=None)
+    journal_dir = root / ".draft/operations" / op_id
+    # 模拟：originals/0000.bin 已被隔离（删除中断）。
+    (journal_dir / "originals" / "0000.bin").unlink()
+    (journal_dir / "originals" / "0000.bin.quarantine").write_bytes(b"original")
+
+    clean_recovery_copies(read_journal(journal_path))
+
+    assert not (journal_dir / "originals").exists()
+    assert not (journal_dir / "staged").exists()
+
+
+def test_recover_managed_temp_quarantine_converges(operation_draft: Path) -> None:
+    """managed temp 隔离后崩溃：恢复前收敛 quarantine，不误报（回归 H3）。"""
+    from draft.operations import (
+        _mutation_temporary_path,  # pyright: ignore[reportPrivateUsage]
+        _recover_managed_temp_quarantines,  # pyright: ignore[reportPrivateUsage]
+        read_journal,
+    )
+
+    root = operation_draft
+    op_id = "b" * 32
+    journal_path = _write_journal_with_originals_and_staged(root, op_id, extra_sub=None)
+    journal = read_journal(journal_path)
+    temp = _mutation_temporary_path(Path("pages/old-0.md"), op_id, 0)
+    quarantine = root / temp.with_name(temp.name + ".quarantine")
+    quarantine.write_bytes(b"staged0")
+
+    _recover_managed_temp_quarantines(root, journal)
+
+    assert not quarantine.exists()
+
+
+def test_clean_owned_temp_artifacts_quarantines_exact_temp(operation_draft: Path) -> None:
+    """managed temp 删除走隔离→验证→删除：精确 temp 被隔离删除（回归 H3）。"""
+    from draft.operations import (
+        _clean_owned_temp_artifacts,  # pyright: ignore[reportPrivateUsage]
+        _mutation_temporary_path,  # pyright: ignore[reportPrivateUsage]
+        read_journal,
+    )
+
+    root = operation_draft
+    op_id = "c" * 32
+    journal_path = _write_journal_with_originals_and_staged(root, op_id, extra_sub=None)
+    journal = read_journal(journal_path)
+    temp = _mutation_temporary_path(Path("pages/old-0.md"), op_id, 0)
+    (root / temp).write_bytes(b"staged0")
+
+    _clean_owned_temp_artifacts(root, journal, frozenset({temp}))
+
+    assert not (root / temp).exists()

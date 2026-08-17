@@ -194,6 +194,7 @@ def _fsync_dir_fd(parent_fd: int, code_path: Path) -> None:
 
 
 _PENDING_SUFFIX = ".pending"
+_QUARANTINE_SUFFIX = ".quarantine"
 
 
 def _pending_name(name: str) -> str:
@@ -203,6 +204,16 @@ def _pending_name(name: str) -> str:
     分类收敛，而不是按文件名形状批量猜测归属。
     """
     return f"{name}{_PENDING_SUFFIX}"
+
+
+def _quarantine_name(name: str) -> str:
+    """确定名 quarantine：目标名 + '.quarantine'，由授权源决定的目标路径派生（回归 H3）。
+
+    删除采用"先原子隔离、后验证、再删除"：授权名字被移动到 quarantine 名后才删除，
+    崩溃遗留的 quarantine 必须能被恢复按精确名字、类型与摘要分类收敛，不产生随机
+    孤儿名。
+    """
+    return f"{name}{_QUARANTINE_SUFFIX}"
 
 
 def _publish_via_pending(
@@ -355,6 +366,94 @@ def recover_digest_pending(
             _fsync_dir_fd(parent_fd, code_path)
 
 
+def _quarantine_decision(
+    *,
+    target_kind: EntryKind,
+    quarantine_kind: EntryKind,
+    target_digest: str | None,
+    quarantine_digest: str | None,
+    expected_digest: str,
+) -> str:
+    """恢复期 quarantine 收敛决策（纯函数）：complete / restore / delete_stale / external / ignore。
+
+    授权源是 expected_digest。quarantine 是删除隔离名（``{name}.quarantine``），由
+    确定名派生（回归 H3）。恢复语义：目标缺失 + quarantine 授权精确 → 隔离已通过
+    验证，删除它完成删除；目标与 quarantine 都是授权精确（同一 inode 中途移动）→
+    quarantine 已消费，删除它；目标缺失 + quarantine 摘要不符 → 被隔离的不是授权叶，
+    恢复原名并报告外部变化（原名占用时同时保留两者）；其余类型/摘要不符一律保留现场。
+    """
+    if quarantine_kind is EntryKind.MISSING:
+        return "ignore"
+    if quarantine_kind is not EntryKind.FILE or quarantine_digest != expected_digest:
+        return "restore" if quarantine_kind is EntryKind.FILE else "external"
+    if target_kind is EntryKind.MISSING:
+        return "complete"
+    if target_kind is EntryKind.FILE and target_digest == expected_digest:
+        return "delete_stale"
+    return "external"
+
+
+def recover_quarantine(
+    root: Path,
+    relative: Path,
+    expected_digest: str,
+    *,
+    code: str,
+    code_path: Path,
+) -> None:
+    """把崩溃遗留的 ``<目标>.quarantine`` 收敛为已删除/已恢复状态（回归 H3）。
+
+    授权源是 expected_digest。目标与 quarantine 在同一锚定父目录内分类复核，只处理
+    精确授权 quarantine；类型/摘要不符即外部改写，恢复原名或保留现场报错，不按文件名
+    形状批量删除。
+    """
+    with anchored_leaf(root, relative, code=code, code_path=code_path) as target:
+        if isinstance(target, _MissingLeaf):
+            return
+        parent_fd = target.parent_fd
+        target_kind = target.classify()
+        quarantine = _AnchoredLeaf(
+            parent_fd, _quarantine_name(target.name), relative, code, code_path
+        )
+        quarantine_kind = quarantine.classify()
+        decision = _quarantine_decision(
+            target_kind=target_kind,
+            quarantine_kind=quarantine_kind,
+            target_digest=sha256_bytes(target.read()) if target_kind is EntryKind.FILE else None,
+            quarantine_digest=(
+                sha256_bytes(quarantine.read()) if quarantine_kind is EntryKind.FILE else None
+            ),
+            expected_digest=expected_digest,
+        )
+        if decision == "restore":
+            try:
+                os.link(
+                    quarantine.name,
+                    target.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            except FileExistsError:
+                # 原名已被占用：同时保留两者，报告外部变化。
+                raise DraftError("operation.external_change", code_path) from None
+            except OSError as exc:
+                raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+            try:
+                os.unlink(quarantine.name, dir_fd=parent_fd)
+            except OSError as exc:
+                raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+            _fsync_dir_fd(parent_fd, code_path)
+            raise DraftError(code, code_path)
+        if decision in ("complete", "delete_stale"):
+            try:
+                os.unlink(quarantine.name, dir_fd=parent_fd)
+            except OSError as exc:
+                raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+            _fsync_dir_fd(parent_fd, code_path)
+        elif decision == "external":
+            raise DraftError(code, code_path)
+
+
 def reject_symlink_components(root: Path, relative: Path) -> None:
     """逐组件拒绝内部状态路径上的符号链接，防止 .draft 等中间组件逃逸到根外。"""
     cursor = root
@@ -454,6 +553,63 @@ class _AnchoredLeaf:
             self.parent_fd, self.name, content, no_clobber=True, code_path=self.code_path
         )
 
+    def quarantine_delete(self, expected_digest: str) -> None:
+        """先原子隔离、后验证、再删除（回归 H3）。
+
+        在同一父目录句柄内把授权名字以 no-replace 语义移动到确定名 quarantine
+        （``{name}.quarantine``，由授权源决定的目标名派生）；验证隔离节点的类型与
+        摘要后才删除，绝不删除"验证后同名被替换"的节点。验证不符（摘要/类型被外部
+        替换后隔离）时保留节点并尝试 no-replace 恢复原名；原名已被占用时同时保留
+        两者并报告外部变化。
+        """
+        quarantine = _quarantine_name(self.name)
+        # no-replace 移动：硬链接（EEXIST 说明 quarantine 已被占用）后 unlink 原名。
+        try:
+            os.link(
+                self.name,
+                quarantine,
+                src_dir_fd=self.parent_fd,
+                dst_dir_fd=self.parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError as exc:
+            raise DraftError("operation.external_change", self.code_path) from exc
+        except OSError as exc:
+            raise self._io_error(exc) from exc
+        try:
+            os.unlink(self.name, dir_fd=self.parent_fd)
+        except OSError as exc:
+            raise self._io_error(exc) from exc
+        quarantined = _AnchoredLeaf(
+            self.parent_fd, quarantine, self.display, self.code, self.code_path
+        )
+        node = quarantined.classify()
+        if node is not EntryKind.FILE or sha256_bytes(quarantined.read()) != expected_digest:
+            # 验证不符：保留节点并尝试 no-replace 恢复原名。
+            try:
+                os.link(
+                    quarantine,
+                    self.name,
+                    src_dir_fd=self.parent_fd,
+                    dst_dir_fd=self.parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                # 原名已被占用：同时保留两者，报告外部变化。
+                raise DraftError("operation.external_change", self.code_path) from None
+            except OSError as exc:
+                raise self._io_error(exc) from exc
+            try:
+                os.unlink(quarantine, dir_fd=self.parent_fd)
+            except OSError as exc:
+                raise self._io_error(exc) from exc
+            raise DraftError("operation.external_change", self.code_path)
+        try:
+            os.unlink(quarantine, dir_fd=self.parent_fd)
+        except OSError as exc:
+            raise self._io_error(exc) from exc
+        _fsync_dir_fd(self.parent_fd, self.code_path)
+
 
 @dataclass(frozen=True)
 class _MissingLeaf:
@@ -474,6 +630,9 @@ class _MissingLeaf:
 
     def rmdir(self) -> None:
         raise AssertionError("missing leaf cannot be removed")
+
+    def quarantine_delete(self, _expected_digest: str) -> None:
+        raise AssertionError("missing leaf cannot be quarantined")
 
     def write(self, _content: bytes) -> None:
         # 中间父组件缺失：叶必然缺失，无需恢复（清理可继续，无需重建父链）。
@@ -1173,10 +1332,17 @@ def _clean_recovery_copies(journal: Journal) -> None:
         if directory_node is not EntryKind.DIRECTORY:
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, directory)
         allowed = registered[sub]
-        # 先收敛崩溃遗留的登记文件 pending（回归 H2）：发布/消费后才做未知成员检查，
-        # 否则 .pending 会作为未登记成员被拒绝且锁永久保留。
+        # 先收敛崩溃遗留的登记文件 pending/quarantine（回归 H2/H3）：发布/消费后才做
+        # 未知成员检查，否则 .pending/.quarantine 会作为未登记成员被拒绝且锁永久保留。
         for name, digest in sorted(allowed.items()):
             recover_digest_pending(
+                journal.directory,
+                Path(sub) / name,
+                digest,
+                code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                code_path=journal.directory / sub / name,
+            )
+            recover_quarantine(
                 journal.directory,
                 Path(sub) / name,
                 digest,
@@ -1214,7 +1380,8 @@ def _clean_recovery_copies(journal: Journal) -> None:
                     raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, relative)
                 if sha256_bytes(leaf.read()) != registered[sub][relative.name]:
                     raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, relative)
-                leaf.unlink()
+                # 隔离→验证→删除：验证与删除同一锚定句柄（回归 H3）。
+                leaf.quarantine_delete(registered[sub][relative.name])
         directory = journal.directory / sub
         if classify_node(directory) is EntryKind.DIRECTORY:
             with anchored_leaf(
@@ -2190,6 +2357,29 @@ def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> Operation
     return _finish_forward(root, journal, changed_paths=(MARKER_PATH,))
 
 
+def _recover_managed_temp_quarantines(root: Path, journal: Journal) -> None:
+    """恢复前把崩溃遗留的 managed temp quarantine 收敛（回归 H3）。
+
+    在观察复核之前运行：被中断的 consume 删除留下的 ``{temp}.quarantine`` 会被观察
+    复核当成无法解释的新文件；先按授权摘要精确分类（精确→删除完成，不符→恢复原名
+    并报错），让观察复核在干净树上前进。
+    """
+    for index, mutation in enumerate(journal.mutations):
+        if mutation.kind is not MutationKind.WRITE or mutation.after_sha256 is None:
+            continue
+        relative = _mutation_temporary_path(mutation.path, journal.operation_id, index)
+        quarantine_path = relative.with_name(_quarantine_name(relative.name))
+        if classify_node(root / quarantine_path) is EntryKind.MISSING:
+            continue
+        recover_quarantine(
+            root,
+            relative,
+            mutation.after_sha256,
+            code="operation.external_change",
+            code_path=root / relative,
+        )
+
+
 def _clean_owned_temp_artifacts(
     root: Path, journal: Journal, consume_temps: frozenset[Path]
 ) -> None:
@@ -2207,12 +2397,18 @@ def _clean_owned_temp_artifacts(
         if relative not in consume_temps:
             continue
         temporary = root / relative
-        if classify_node(temporary) is not EntryKind.FILE:
-            raise DraftError("operation.external_change", temporary)
-        if sha256_file(temporary) != mutation.after_sha256:
-            raise DraftError("operation.external_change", temporary)
-        temporary.unlink()
-        fsync_directory(temporary.parent)
+        # 锚定隔离→验证→删除（回归 H3）：不再用普通 Path.unlink 旁路。
+        with anchored_leaf(
+            root,
+            relative,
+            code="operation.external_change",
+            code_path=temporary,
+        ) as leaf:
+            if leaf.classify() is not EntryKind.FILE:
+                raise DraftError("operation.external_change", temporary)
+            if sha256_bytes(leaf.read()) != mutation.after_sha256:
+                raise DraftError("operation.external_change", temporary)
+            leaf.quarantine_delete(mutation.after_sha256)
 
 
 def _recover_locked(root: Path, operation_id: str) -> OperationResult:
@@ -2247,6 +2443,9 @@ def _recover_locked(root: Path, operation_id: str) -> OperationResult:
     for mutation in journal.mutations:
         if _classify(root, mutation) == "unknown":
             raise DraftError("operation.external_change", root / mutation.path)
+    # 先把崩溃遗留的 managed temp quarantine 收敛（回归 H3）：被中断的 consume 删除
+    # 留下的 ``{temp}.quarantine`` 若不在观察复核前处理，会被当成无法解释的新文件。
+    _recover_managed_temp_quarantines(root, journal)
     # 恢复前向完成必须复核观察清单：mutation 的 before/after 分类是可解释变化，
     # 其余被观察文件或目录成员的差异是无法解释的外部修改，保留现场（计划 Task 7
     # Step 4），不能把依赖旧读集语义的结果静默提交。

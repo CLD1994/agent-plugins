@@ -38,6 +38,7 @@ from draft.operations import (
     read_lock,
     recover,
     recover_digest_pending,
+    recover_quarantine,
     reject_symlink_components,
     release_lock,
     resolve_journal_pending,
@@ -169,12 +170,20 @@ def _clean_attempt_tree(attempt: Path, authorized: list[tuple[Path, str]], code_
             cursor = cursor.parent
     allowed_leaves = {leaf for leaf, _ in authorized}
     digest_by_path = dict(authorized)
-    # 先收敛崩溃遗留的 attempt 叶 pending（回归 H2）：发布/消费后才做未知成员检查，
-    # 否则 .pending 会被当作未知内容拒绝且无法重建投递副本。
+    # 先收敛崩溃遗留的 attempt 叶 pending/quarantine（回归 H2/H3）：发布/消费后才做
+    # 未知成员检查，否则 .pending/.quarantine 会被当作未知内容拒绝且无法重建投递副本。
     for leaf, digest in authorized:
+        relative = leaf.relative_to(attempt)
         recover_digest_pending(
             attempt,
-            leaf.relative_to(attempt),
+            relative,
+            digest,
+            code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+            code_path=code_path,
+        )
+        recover_quarantine(
+            attempt,
+            relative,
             digest,
             code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
             code_path=code_path,
@@ -209,7 +218,8 @@ def _clean_attempt_tree(attempt: Path, authorized: list[tuple[Path, str]], code_
                 raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
             if sha256_bytes(anchor.read()) != digest:
                 raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
-            anchor.unlink()
+            # 隔离→验证→删除：验证与删除同一锚定句柄（回归 H3）。
+            anchor.quarantine_delete(digest)
     for directory in sorted(
         allowed_dirs - {attempt}, key=lambda path: len(path.parts), reverse=True
     ):
