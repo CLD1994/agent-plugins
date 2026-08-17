@@ -494,8 +494,14 @@ def test_promote_crash_after_first_new_hub_write_recovers(
     root = build_promote_draft(draft_factory)
     original_apply_write = ops_module._apply_write  # pyright: ignore[reportPrivateUsage]
 
-    def write_then_crash(root_path: Path, target: Path, content: bytes) -> None:
-        original_apply_write(root_path, target, content)
+    def write_then_crash(
+        root_path: Path,
+        target: Path,
+        content: bytes,
+        *,
+        temporary: Path | None = None,
+    ) -> None:
+        original_apply_write(root_path, target, content, temporary=temporary)
         if str(target).startswith("pages/topic/"):
             raise RuntimeError("injected crash after new hub file lands")
 
@@ -562,8 +568,14 @@ def test_promote_crash_recovery_rejects_intruder_in_created_directory(
     root = build_promote_draft(draft_factory)
     original_apply_write = ops_module._apply_write  # pyright: ignore[reportPrivateUsage]
 
-    def write_then_crash(root_path: Path, target: Path, content: bytes) -> None:
-        original_apply_write(root_path, target, content)
+    def write_then_crash(
+        root_path: Path,
+        target: Path,
+        content: bytes,
+        *,
+        temporary: Path | None = None,
+    ) -> None:
+        original_apply_write(root_path, target, content, temporary=temporary)
         if str(target).startswith("pages/topic/"):
             raise RuntimeError("injected crash after new hub file lands")
 
@@ -671,6 +683,53 @@ def test_promote_crash_before_replace_rejects_intruder_in_created_directory(
     assert (root / "pages/topic/intruder.txt").is_file()
 
 
+def test_promote_crash_recovery_rejects_same_basename_unregistered_temp(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """与 WRITE 目标同基础名但未登记的 temp-like 文件必须按外部内容拒绝（回归 H4）。
+
+    临时文件所有权必须绑定精确路径（operation_id + mutation index），文件名形状
+    不是证据：目标已落盘后，同名不同 hex 的未登记 temp-like 文件不得被过滤吸收。
+    """
+    import draft.operations as ops_module
+    from draft.operations import read_lock, recover
+
+    root = build_promote_draft(draft_factory)
+    original_apply_write = ops_module._apply_write  # pyright: ignore[reportPrivateUsage]
+
+    def write_then_crash(
+        root_path: Path,
+        target: Path,
+        content: bytes,
+        *,
+        temporary: Path | None = None,
+    ) -> None:
+        original_apply_write(root_path, target, content, temporary=temporary)
+        if str(target).startswith("pages/topic/"):
+            raise RuntimeError("injected crash after new hub file lands")
+
+    monkeypatch.setattr(ops_module, "_apply_write", write_then_crash)
+    with pytest.raises(RuntimeError, match="injected crash after new hub file lands"):
+        promote_page(
+            root, Path("pages/topic.md"), [Path("pages/child-a.md"), Path("pages/child-b.md")]
+        )
+    monkeypatch.undo()
+    assert read_lock(root) is not None
+    # 崩溃发生在首个 pages/topic 写（child-a.md）：目标已落盘。
+    assert (root / "pages/topic/child-a.md").is_file()
+
+    # 与已落盘目标同基础名、但非本操作登记的精确路径的 temp-like 文件。
+    external_temp = root / "pages/topic" / f"child-a.md.tmp-{'c' * 32}"
+    external_temp.write_text("# 外部\n", encoding="utf-8")
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        recover(root)
+
+    held_id = read_lock(root)
+    assert held_id is not None
+    assert external_temp.is_file()
+
+
 def test_promote_crash_recovery_rejects_intruder_in_nested_created_directory(
     draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -702,8 +761,14 @@ def test_promote_crash_recovery_rejects_intruder_in_nested_created_directory(
     )
     original_apply_write = ops_module._apply_write  # pyright: ignore[reportPrivateUsage]
 
-    def write_then_crash(root_path: Path, target: Path, content: bytes) -> None:
-        original_apply_write(root_path, target, content)
+    def write_then_crash(
+        root_path: Path,
+        target: Path,
+        content: bytes,
+        *,
+        temporary: Path | None = None,
+    ) -> None:
+        original_apply_write(root_path, target, content, temporary=temporary)
         if str(target).startswith("pages/topic/sub/"):
             raise RuntimeError("injected crash after nested hub file lands")
 

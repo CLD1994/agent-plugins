@@ -362,7 +362,7 @@ def _crash_during_adopt(root: Path, monkeypatch: pytest.MonkeyPatch, *, on_verif
 
     if on_verify:
 
-        def crash_before_apply(path: Path, target: Path, content: bytes) -> None:
+        def crash_before_apply(path: Path, target: Path, content: bytes, **kwargs: object) -> None:
             raise SimulatedCrash
 
         monkeypatch.setattr(ops_module, "_apply_write", crash_before_apply)

@@ -413,7 +413,7 @@ def test_cleanup_rejects_third_package_write(
 def test_cleanup_preserves_full_evidence_when_unknown_present(
     draft_factory: DraftFactory,
 ) -> None:
-    """清理前存在未知成员：预检必须在第一次删除前失败，完整证据（含 package.json/payload）保留（回归 H2）。"""
+    """清理前存在未知成员：预检必须在第一次删除前失败，完整证据保留（回归 H2）。"""
     from draft.operations import operation_journal_path
     from draft.trash_package import clean_authoritative_package
 

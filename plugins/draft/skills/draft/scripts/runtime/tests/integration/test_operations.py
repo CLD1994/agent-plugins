@@ -931,8 +931,14 @@ def test_recover_uses_live_file_state_not_stale_applied(
     )
     original_apply_write = ops_module._apply_write  # pyright: ignore[reportPrivateUsage]
 
-    def write_then_crash(root_path: Path, target: Path, content: bytes) -> None:
-        original_apply_write(root_path, target, content)
+    def write_then_crash(
+        root_path: Path,
+        target: Path,
+        content: bytes,
+        *,
+        temporary: Path | None = None,
+    ) -> None:
+        original_apply_write(root_path, target, content, temporary=temporary)
         raise RuntimeError("injected crash after file lands")
 
     monkeypatch.setattr(ops_module, "_apply_write", write_then_crash)

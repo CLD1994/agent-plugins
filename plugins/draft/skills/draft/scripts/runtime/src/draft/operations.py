@@ -56,21 +56,6 @@ _MID_WRITE_PHASES = frozenset(
     }
 )
 
-# _apply_write 先写同名 .tmp-<32hex> 再替换；崩溃可能遗留这些瞬态文件。
-_TEMP_ARTIFACT = re.compile(r"\.tmp-[0-9a-f]{32}$")
-
-
-def _is_owned_temp_artifact(name: str, owned_bases: frozenset[str]) -> bool:
-    """temp-like 成员是否为当前操作崩溃遗留（所有权证据：基础名属于本操作某个 WRITE 目标）。
-
-    文件名形状不是所有权证据：只有基础名恰好是本操作某个 WRITE mutation 的目标名时，
-    才可解释为本操作瞬态副作用；未登记的同名 temp-like 成员一律视为外部内容。
-    """
-    match = _TEMP_ARTIFACT.search(name)
-    if match is None:
-        return False
-    return name[: match.start()] in owned_bases
-
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
@@ -584,7 +569,20 @@ def _check(root: Path) -> None:
         raise DraftError("operation.validation_failed", root, details=(codes,))
 
 
-def _apply_write(root: Path, target: Path, content: bytes) -> None:
+def _mutation_temporary_path(target: Path, operation_id: str, index: int) -> Path:
+    """WRITE 目标的精确临时相对路径：与 operation_id + mutation index 绑定。
+
+    所有权证据是精确路径，不是文件名形状：同名不同目录或未登记的 temp-like 文件
+    一律按普通目录成员处理（恢复时按成员不符拒绝）。崩溃遗留的同名精确临时文件由
+    恢复复核类型与摘要后清理或替换。
+    """
+    digest = hashlib.sha256(f"{operation_id}:{index}".encode()).hexdigest()[:16]
+    return target.with_name(f"{target.name}.tmp-{digest}")
+
+
+def _apply_write(
+    root: Path, target: Path, content: bytes, *, temporary: Path | None = None
+) -> None:
     destination = root / target
     cursor = root
     for part in target.parts[:-1]:
@@ -592,7 +590,20 @@ def _apply_write(root: Path, target: Path, content: bytes) -> None:
         if cursor.is_symlink():
             raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, cursor)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f"{destination.name}.tmp-{uuid.uuid4().hex}")
+    if temporary is None:
+        temporary = destination.with_name(f"{destination.name}.tmp-{uuid.uuid4().hex}")
+    else:
+        temporary = root / temporary
+        reject_symlink_components(root, temporary.relative_to(root))
+    if temporary.exists() or temporary.is_symlink():
+        # 崩溃遗留的同名精确临时文件：复核普通文件类型与内容后替换，不重复创建。
+        if temporary.is_symlink() or not temporary.is_file():
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, temporary)
+        if temporary.read_bytes() != content:
+            raise DraftError("operation.external_change", temporary)
+        replace_file(temporary, destination)
+        fsync_directory(destination.parent)
+        return
     with temporary.open("xb") as handle:
         handle.write(content)
         handle.flush()
@@ -615,6 +626,7 @@ def _execute_apply_phase(root: Path, journal: Journal) -> Journal:
     current = journal
     writes = [m for m in current.mutations if m.kind is MutationKind.WRITE]
     deletes = [m for m in current.mutations if m.kind is MutationKind.DELETE]
+    index_by_path = {m.path: index for index, m in enumerate(current.mutations)}
     for mutation in [*writes, *deletes]:
         if mutation.applied:
             continue
@@ -623,7 +635,10 @@ def _execute_apply_phase(root: Path, journal: Journal) -> Journal:
             staged_hash = sha256_file(staged)
             if staged_hash is None:
                 raise DraftError("operation.staged_missing", staged)
-            _apply_write(root, mutation.path, staged.read_bytes())
+            temporary = _mutation_temporary_path(
+                mutation.path, current.operation_id, index_by_path[mutation.path]
+            )
+            _apply_write(root, mutation.path, staged.read_bytes(), temporary=temporary)
         else:
             _apply_delete(root, mutation.path)
         current = _with_applied(current, mutation.path)
@@ -1415,17 +1430,18 @@ def _verify_observations_for_recovery(
         created_dirs=frozenset(created_dirs),
     )
 
-    owned_temp_bases = frozenset(
-        mutation.path.name for mutation in journal.mutations if mutation.kind is MutationKind.WRITE
+    owned_temp_paths = frozenset(
+        _mutation_temporary_path(mutation.path, journal.operation_id, index)
+        for index, mutation in enumerate(journal.mutations)
+        if mutation.kind is MutationKind.WRITE
     )
 
     class _RecoveryProbe:
-        """比较探针：只忽略本操作 WRITE 目标同名的 .tmp-<hex> 瞬态文件。
+        """比较探针：只忽略本操作日志登记的精确临时路径（operation_id + index 绑定）。
 
-        文件名形状不是所有权证据：预存 temp-like 合法文件不得被过滤（否则计划观察
-        与 live 成员不一致，误报 external_change）；未登记的 temp-like 入侵者必须
-        保留在成员里（否则被静默吸收）。只有基础名属于本操作某个 WRITE 目标、
-        且当前为普通文件的成员才解释为本操作崩溃遗留。
+        所有权证据是精确路径，不是文件名形状：预存 temp-like 合法文件不得被过滤
+        （否则计划观察与 live 成员不一致，误报 external_change）；未登记的 temp-like
+        入侵者（即使与目标同基础名）必须保留在成员里（否则被静默吸收）。
         """
 
         def __init__(self, inner: ObservationProbe) -> None:
@@ -1435,9 +1451,7 @@ def _verify_observations_for_recovery(
             observed = self._inner.observe(path)
             if observed.kind is EntryKind.DIRECTORY:
                 members = tuple(
-                    member
-                    for member in observed.members
-                    if not _is_owned_temp_artifact(member, owned_temp_bases)
+                    member for member in observed.members if (path / member) not in owned_temp_paths
                 )
                 return Observation(path=path, kind=EntryKind.DIRECTORY, members=members)
             return observed
@@ -1501,26 +1515,24 @@ def _clean_owned_temp_artifacts(root: Path, journal: Journal) -> None:
 
     在观察复核通过后调用：前向完成会重新创建目标并替换，旧临时文件是孤儿。临时
     文件必须与对应 mutation 的 after 摘要一致；类型不符或摘要不符即外部篡改，
-    停止并保留现场，不能当作本操作副作用静默清除。
+    停止并保留现场，不能当作本操作副作用静默清除。只处理日志登记的精确临时路径，
+    不扫描父目录猜测候选。
     """
-    for mutation in journal.mutations:
+    for index, mutation in enumerate(journal.mutations):
         if mutation.kind is not MutationKind.WRITE or mutation.after_sha256 is None:
             continue
         target = root / mutation.path
         if target.exists() or target.is_symlink():
             continue  # 目标已就位：临时文件已被 replace 消耗。
-        parent = target.parent
-        if not parent.is_dir() or parent.is_symlink():
+        temporary = root / _mutation_temporary_path(mutation.path, journal.operation_id, index)
+        if not temporary.exists():
             continue
-        for candidate in sorted(parent.iterdir()):
-            if not _is_owned_temp_artifact(candidate.name, frozenset({target.name})):
-                continue
-            if candidate.is_symlink() or not candidate.is_file():
-                raise DraftError("operation.external_change", candidate)
-            if sha256_file(candidate) != mutation.after_sha256:
-                raise DraftError("operation.external_change", candidate)
-            candidate.unlink()
-            fsync_directory(parent)
+        if temporary.is_symlink() or not temporary.is_file():
+            raise DraftError("operation.external_change", temporary)
+        if sha256_file(temporary) != mutation.after_sha256:
+            raise DraftError("operation.external_change", temporary)
+        temporary.unlink()
+        fsync_directory(temporary.parent)
 
 
 def _recover_locked(root: Path, operation_id: str) -> OperationResult:
