@@ -1059,6 +1059,7 @@ def test_recover_mid_write_verifies_observed_inputs_and_keeps_scene(
 def test_abandoned_allocating_cleans_recovery_copies(
     operation_draft: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """allocating 崩溃（prepared 日志写入前）：副本目录尚未创建，无锁放弃并清理（回归 H4）。"""
     root = operation_draft
     plan, old_a, old_b, _new_a, _new_b = two_write_plan(root)
 
@@ -1081,8 +1082,46 @@ def test_abandoned_allocating_cleans_recovery_copies(
     monkeypatch.undo()
 
     journal_dir = next(entry for entry in (root / ".draft/operations").iterdir() if entry.is_dir())
-    assert (journal_dir / "originals").exists()
-    assert (journal_dir / "staged").exists()
+    # prepare 先登记后建文件：崩溃时 originals/staged 尚未创建。
+    assert not (journal_dir / "originals").exists()
+    assert not (journal_dir / "staged").exists()
+
+    result = recover(root)
+
+    assert result.phase == "rolled_back"
+    assert not (journal_dir / "originals").exists()
+    assert not (journal_dir / "staged").exists()
+    assert not (root / ".draft/operation.lock").exists()
+    assert (root / "pages/a.md").read_bytes() == old_a
+    assert (root / "pages/b.md").read_bytes() == old_b
+
+
+def test_crash_during_recovery_copy_creation_is_judgable(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """恢复副本创建中途崩溃：journal 已 PREPARED、副本部分缺失，恢复可判定并回滚（回归 H4）。"""
+    root = operation_draft
+    plan, old_a, old_b, _new_a, _new_b = two_write_plan(root)
+
+    import draft.operations as operations_module
+
+    original_durable = operations_module.durable_write
+    calls = {"n": 0}
+
+    def crash_on_fourth_durable(path: object, value: object) -> None:
+        calls["n"] += 1
+        if calls["n"] == 4:  # 预分配、prepared 日志后第一次 staged 写入处崩溃。
+            raise RuntimeError("injected crash during copy creation")
+        original_durable(path, value)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("draft.operations.durable_write", crash_on_fourth_durable)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        execute_plan(plan)
+    monkeypatch.undo()
+
+    journal_dir = next(entry for entry in (root / ".draft/operations").iterdir() if entry.is_dir())
+    assert (journal_dir / "originals" / "0000.bin").exists()  # 第一个 original 已创建。
+    assert not (journal_dir / "staged" / "0000.bin").exists()  # staged 文件写入处崩溃。
 
     result = recover(root)
 
@@ -1313,6 +1352,67 @@ def testanchored_leaf_rejects_intermediate_symlink(tmp_path: Path) -> None:
     ):
         leaf.unlink()
     assert (external / "payload.txt").read_bytes() == b"external"
+
+
+def _write_journal_with_originals_and_staged(
+    operation_draft: Path, op_id: str, *, extra_sub: str | None
+) -> Path:
+    """写入 H5 合法的 originals+staged 登记日志；可在 originals 或 staged 注入未知成员。"""
+    import json as json_module
+
+    root = operation_draft
+    journal_dir = root / ".draft/operations" / op_id
+    (journal_dir / "originals").mkdir(parents=True)
+    (journal_dir / "staged").mkdir()
+    (journal_dir / "originals" / "0000.bin").write_bytes(b"original")
+    (journal_dir / "staged" / "0000.bin").write_bytes(b"staged0")
+    if extra_sub is not None:
+        (journal_dir / extra_sub / "extra.txt").write_bytes(b"extra")
+    mutations: list[dict[str, object]] = [
+        {
+            "path": "pages/old-0.md",
+            "kind": "write",
+            "before_sha256": sha256_bytes(b"original"),
+            "after_sha256": sha256_bytes(b"staged0"),
+            "original": "originals/0000.bin",
+            "staged": "staged/0000.bin",
+            "applied": False,
+        }
+    ]
+    journal: dict[str, object] = {
+        "journal_version": JOURNAL_VERSION,
+        "operation_id": op_id,
+        "kind": OperationKind.CREATE.value,
+        "phase": OperationPhase.PREPARED.value,
+        "root_state": "registered",
+        "observations": [],
+        "mutations": mutations,
+        "remove_empty_directories": [],
+        "metadata": {},
+    }
+    journal_path = journal_dir / "journal.json"
+    journal_path.write_text(json_module.dumps(journal), encoding="utf-8")
+    return journal_path
+
+
+@pytest.mark.parametrize("extra_sub", ["originals", "staged"])
+def test_clean_recovery_copies_global_precheck_preserves_legal_copies(
+    operation_draft: Path, extra_sub: str
+) -> None:
+    """任一目录含未知成员：全局预检在第一次 unlink 前失败，两边合法副本都保留（回归 M1）。"""
+    from draft.operations import clean_recovery_copies, read_journal
+
+    root = operation_draft
+    op_id = f"{'e' * 32}"
+    journal_dir = root / ".draft/operations" / op_id
+    journal_path = _write_journal_with_originals_and_staged(root, op_id, extra_sub=extra_sub)
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        clean_recovery_copies(read_journal(journal_path))
+
+    assert (journal_dir / "originals" / "0000.bin").read_bytes() == b"original"
+    assert (journal_dir / "staged" / "0000.bin").read_bytes() == b"staged0"
+    assert (journal_dir / extra_sub / "extra.txt").read_bytes() == b"extra"
 
 
 def test_no_lock_allocating_with_unknown_content_is_inconsistent(

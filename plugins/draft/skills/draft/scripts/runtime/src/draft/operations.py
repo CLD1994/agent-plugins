@@ -911,11 +911,30 @@ def _execute_apply_phase(root: Path, journal: Journal) -> Journal:
 def _clean_recovery_copies(journal: Journal) -> None:
     """按日志登记路径精确清理恢复副本（originals/staged）。
 
-    只删除 mutation.original/mutation.staged 登记的文件（复核普通文件类型与锚定
-    摘要）；已知空目录 rmdir。未知成员、符号链接、错误类型或摘要不符以
-    operation.inconsistent_state 停止并保留现场，绝不递归删除恢复目录中的未知
-    内容。已登记文件部分缺失（提交点后幂等清理）容忍。
+    全局无副作用预检两个目录的全部成员：任何未登记成员、符号链接、错误类型或
+    摘要不符都在第一次 unlink 前报 operation.inconsistent_state 并保留（回归 M1）。
+    无登记 mutation（allocating 崩溃）时目录必须为空：prepare 已先登记后建文件
+    （回归 H4），任何内容都不可解释为本操作副作用，一律拒绝。预检通过后按锚定
+    句柄复核并删除登记叶，已知空目录 rmdir；登记叶部分缺失（提交点后幂等清理）
+    容忍。journal.json 不属于本函数清理范围，由调用方按"最后处理 journal"的状态
+    机决定。
     """
+    registered: dict[str, dict[str, str]] = {"originals": {}, "staged": {}}
+    for mutation in journal.mutations:
+        if (
+            mutation.original is not None
+            and mutation.before_sha256 is not None
+            and mutation.original.parent == Path("originals")
+        ):
+            registered["originals"][mutation.original.name] = mutation.before_sha256
+        if (
+            mutation.staged is not None
+            and mutation.after_sha256 is not None
+            and mutation.staged.parent == Path("staged")
+        ):
+            registered["staged"][mutation.staged.name] = mutation.after_sha256
+
+    present: dict[str, list[Path]] = {"originals": [], "staged": []}
     for sub in ("originals", "staged"):
         directory = journal.directory / sub
         # lstat 分类：悬空符号链接是 link 不是 missing，不得折叠成幂等缺失后继续解锁。
@@ -924,43 +943,49 @@ def _clean_recovery_copies(journal: Journal) -> None:
             continue
         if directory_node is not EntryKind.DIRECTORY:
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, directory)
-        registered: dict[str, str] = {}  # 文件名 -> 锚定摘要
-        for mutation in journal.mutations:
-            if sub == "originals":
-                if (
-                    mutation.original is not None
-                    and mutation.before_sha256 is not None
-                    and mutation.original.parent == Path(sub)
-                ):
-                    registered[mutation.original.name] = mutation.before_sha256
-            elif (
-                mutation.staged is not None
-                and mutation.after_sha256 is not None
-                and mutation.staged.parent == Path(sub)
-            ):
-                registered[mutation.staged.name] = mutation.after_sha256
-        if registered:
-            # 有登记 mutation：严格只删登记文件，未知成员/类型/摘要不符拒绝。
-            unknown = {entry.name for entry in directory.iterdir()} - set(registered)
-            if unknown:
-                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, directory)
-            for name in sorted(registered):
-                target = directory / name
-                if not target.exists():
-                    continue  # 提交点后部分清理幂等容忍。
-                if target.is_symlink() or not target.is_file():
-                    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, target)
-                if sha256_bytes(target.read_bytes()) != registered[name]:
-                    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, target)
-                target.unlink()
-        else:
-            # 无登记 mutation（allocating/prepare 崩溃）：目录是协议持有的 prepare
-            # 暂存，删除其全部普通文件；符号链接或目录仍是未知内容，拒绝。
-            for entry in directory.iterdir():
-                if entry.is_symlink() or not entry.is_file():
+        allowed = registered[sub]
+        for entry in directory.iterdir():
+            relative = Path(sub) / entry.name
+            if entry.name not in allowed:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
+            with anchored_leaf(
+                journal.directory,
+                relative,
+                code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                code_path=entry,
+            ) as leaf:
+                if leaf.classify() is not EntryKind.FILE:
                     raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
-                entry.unlink()
-        directory.rmdir()
+                if sha256_bytes(leaf.read()) != allowed[entry.name]:
+                    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
+            present[sub].append(relative)
+
+    for sub in ("originals", "staged"):
+        for relative in sorted(present[sub]):
+            with anchored_leaf(
+                journal.directory,
+                relative,
+                code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                code_path=journal.directory / relative,
+            ) as leaf:
+                node = leaf.classify()
+                if node is EntryKind.MISSING:
+                    continue  # 提交点后部分清理幂等容忍。
+                if node is not EntryKind.FILE:
+                    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, relative)
+                if sha256_bytes(leaf.read()) != registered[sub][relative.name]:
+                    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, relative)
+                leaf.unlink()
+        directory = journal.directory / sub
+        if classify_node(directory) is EntryKind.DIRECTORY:
+            with anchored_leaf(
+                journal.directory,
+                Path(sub),
+                code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                code_path=directory,
+            ) as leaf:
+                if leaf.classify() is EntryKind.DIRECTORY:
+                    leaf.rmdir()
 
 
 def finalize_operation(
@@ -1332,9 +1357,9 @@ def _execute_allocated_plan(
 
     originals = directory / "originals"
     staged = directory / "staged"
-    originals.mkdir(exist_ok=True)
-    staged.mkdir(exist_ok=True)
     mutations: list[JournalMutation] = []
+    original_contents: dict[int, bytes] = {}
+    staged_contents: dict[int, bytes] = {}
     for index, mutation in enumerate(plan.mutations):
         current_hash = sha256_file(root / mutation.path)
         if current_hash != mutation.before_sha256:
@@ -1344,9 +1369,14 @@ def _execute_allocated_plan(
         original_name: Path | None = None
         staged_name: Path | None = None
         if mutation.before_sha256 is not None:
-            # journal 字段只存根内相对路径（解析边界验证形状）；文件写到绝对目录。
+            # 在验证过的 before 状态读取并复核 original 字节；journal 只存根内相对路径。
             original_name = Path("originals") / f"{index:04d}.bin"
-            durable_write(originals / f"{index:04d}.bin", (root / mutation.path).read_bytes())
+            original_bytes = (root / mutation.path).read_bytes()
+            if sha256_bytes(original_bytes) != mutation.before_sha256:
+                if not retain_terminal_lock:
+                    release_lock(root, operation_id)
+                raise DraftError("operation.external_change", root / mutation.path)
+            original_contents[index] = original_bytes
         if mutation.kind is MutationKind.WRITE:
             if mutation.content is None or sha256_bytes(mutation.content) != (
                 mutation.after_sha256
@@ -1355,7 +1385,7 @@ def _execute_allocated_plan(
                     release_lock(root, operation_id)
                 raise DraftError("operation.plan_invalid", root / mutation.path)
             staged_name = Path("staged") / f"{index:04d}.bin"
-            durable_write(staged / f"{index:04d}.bin", mutation.content)
+            staged_contents[index] = mutation.content
         mutations.append(
             JournalMutation(
                 path=mutation.path,
@@ -1382,7 +1412,17 @@ def _execute_allocated_plan(
         metadata={**plan.metadata, **metadata},
         directory=directory,
     )
+    # 先在文件创建前耐久登记全部 original/staged 路径与摘要（回归 H4）：allocating
+    # 阶段永远不会有未登记文件；崩溃 mid-prepare 留下 PREPARED 日志 + 部分缺失文件，
+    # 恢复按登记清单容忍缺失并拒绝任何未登记内容。
     write_journal(prepared)
+    originals.mkdir(exist_ok=True)
+    staged.mkdir(exist_ok=True)
+    for index, mutation in enumerate(prepared.mutations):
+        if index in original_contents:
+            durable_write(originals / f"{index:04d}.bin", original_contents[index])
+        if mutation.staged is not None:
+            durable_write(staged / f"{index:04d}.bin", staged_contents[index])
 
     for mutation in prepared.mutations:
         current_hash = sha256_file(root / mutation.path)
@@ -1481,10 +1521,15 @@ def _classify(root: Path, mutation: JournalMutation) -> str:
 
 
 def _verify_recovery_material(journal: Journal) -> None:
+    """复核现存恢复材料摘要；登记但缺失（prepare 先登记后建文件，回归 H4）容忍。
+
+    缺失的 original 只在目标已进入 after 时才需要回滚，而 prepare 完成前不会应用
+    任何 mutation，因此登记即缺失不会阻断回滚；staged 缺失只阻断前向完成。
+    """
     for mutation in journal.mutations:
         if mutation.original is not None:
             original = journal.directory / mutation.original
-            if sha256_file(original) != mutation.before_sha256:
+            if original.exists() and sha256_file(original) != mutation.before_sha256:
                 raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, original)
         if mutation.staged is not None:
             staged = journal.directory / mutation.staged
@@ -1914,21 +1959,15 @@ def recover(root_path: Path) -> OperationResult:
                 write_journal(_with_phase(journal, OperationPhase.ROLLED_BACK))
                 continue
             # 无锁 allocating 碎片：协议明确拥有 journal.json 与 originals/staged
-            # 目录（prepare 阶段创建）；其余未知条目报 inconsistent_state，不得用
-            # rglob 递归删除任意内容（回归 H5）。
+            # 目录；其余未知条目报 inconsistent_state，不得用 rglob 递归删除任意
+            # 内容（回归 H5）。统一状态机：完整预检全部恢复目录 → 删除精确授权叶
+            # → 删除空目录 → journal 最后删除（回归 H4）。
             known_names = {"journal.json", "originals", "staged"}
             extra = [path for path in entry.iterdir() if path.name not in known_names]
             if extra:
                 raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
+            _clean_recovery_copies(journal)
             (entry / "journal.json").unlink()
-            for sub in ("originals", "staged"):
-                subdir = entry / sub
-                if subdir.is_symlink() or (subdir.exists() and not subdir.is_dir()):
-                    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, subdir)
-                if subdir.is_dir():
-                    for child in subdir.iterdir():
-                        child.unlink()
-                    subdir.rmdir()
             entry.rmdir()
         elif (
             journal.phase in _MID_WRITE_PHASES
