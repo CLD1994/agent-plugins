@@ -82,6 +82,9 @@ def test_candidate_root_incremental_migration_preserves_source(
     # 候选根存在无关诊断时局部命令仍成功。
     assert cli("create", "pages/e.md", "--title", "戊", "--status", "pending") == 0
     capsys.readouterr()
+    # 候选根存在无关诊断时 relation 仍成功：依赖判环只需两端可判定。
+    assert cli("relation", "add", "pages/topic.md", "depends_on", "pages/b.md") == 0
+    capsys.readouterr()
 
     code, count_only = _run_json(["check", "--root", str(target), "--count-only", "--json"], capsys)
     assert code == 1
@@ -98,6 +101,25 @@ def test_candidate_root_incremental_migration_preserves_source(
         "- [丁](pages/d.md)\n- [戊](pages/e.md)\n",
     )
 
+    assert cli("check") == 0
+    capsys.readouterr()
+    # 候选根生成结论：全部受管页面可判定时允许，并推进所有权。
+    assert cli("generate-conclusions") == 0
+    capsys.readouterr()
+    assert (target / "conclusions.md").is_file()
+    assert _marker(target)["conclusions_state"] == "generated"
+    # 候选根复用回收与恢复生命周期。
+    code, trash_payload = _run_json(
+        ["trash", "--root", str(target), "pages/e.md", "--json"], capsys
+    )
+    assert code == 0
+    trash_id = cast("str", trash_payload["operation_id"])
+    assert not (target / "pages/e.md").exists()
+    code, _restore_payload = _run_json(
+        ["restore", "--root", str(target), trash_id, "--json"], capsys
+    )
+    assert code == 0
+    assert (target / "pages/e.md").is_file()
     assert cli("check") == 0
     capsys.readouterr()
     assert cli("adopt") == 0

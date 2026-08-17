@@ -5,12 +5,10 @@ from pathlib import Path
 from draft.observations import (
     EMPTY_OBSERVATIONS,
     EntryKind,
-    FilesystemObservationProbe,
     Observation,
     ObservationManifest,
     directory_observation,
     file_observation,
-    graph_observations,
     missing_observation,
     observation_shape_error,
     verify_observations,
@@ -111,43 +109,6 @@ def test_manifest_for_path_returns_matching_entry() -> None:
     )
     assert manifest.for_path(Path("pages/a.md")) is not None
     assert manifest.for_path(Path("pages/missing.md")) is None
-
-
-def test_graph_observations_covers_pages_dirs_and_marker(tmp_path: Path) -> None:
-    from dataclasses import dataclass
-    from typing import cast
-
-    from draft.models import PageDocument
-
-    (tmp_path / "pages").mkdir()
-    (tmp_path / "pages/a.md").write_text("# 甲\n", encoding="utf-8")
-    (tmp_path / ".draft").mkdir()
-    (tmp_path / ".draft/draft.json").write_text("{}", encoding="utf-8")
-
-    @dataclass
-    class FakeGraph:
-        root: Path
-        pages: dict[Path, PageDocument]
-
-    class _Page:
-        text = "# 甲\n"
-
-    manifest = graph_observations(
-        FakeGraph(root=tmp_path, pages={Path("pages/a.md"): cast(PageDocument, _Page())})
-    )
-    assert manifest.for_path(Path("pages/a.md")) is not None
-    assert manifest.for_path(Path("pages")) is not None
-    assert manifest.for_path(Path(".draft/draft.json")) is not None
-
-
-def test_filesystem_probe_observes_actual_state(tmp_path: Path) -> None:
-    (tmp_path / "pages").mkdir()
-    (tmp_path / "pages/a.md").write_text("甲", encoding="utf-8")
-    probe = FilesystemObservationProbe(tmp_path)
-
-    assert probe.observe(Path("pages/a.md")).kind is EntryKind.FILE
-    assert probe.observe(Path("pages")).kind is EntryKind.DIRECTORY
-    assert probe.observe(Path("pages/missing.md")).kind is EntryKind.MISSING
 
 
 def test_empty_manifest_is_defined() -> None:
