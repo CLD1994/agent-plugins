@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -76,13 +75,6 @@ from draft.trash_package import (
 )
 
 OPERATIONS_RELATIVE = Path(INTERNAL_DIR) / "operations"
-
-
-def remove_tree(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-    elif path.is_dir():
-        shutil.rmtree(path)
 
 
 def _read_managed_text(root: Path, relative: Path) -> str:
