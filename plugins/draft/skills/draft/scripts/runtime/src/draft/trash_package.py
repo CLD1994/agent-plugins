@@ -16,10 +16,11 @@ from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import INTERNAL_DIR
 from draft.models import MutationKind, OperationKind
-from draft.observations import ObservationManifest
+from draft.observations import EntryKind, ObservationManifest
 from draft.operations import (
     Journal,
     JournalMutation,
+    classify_node,
     reject_symlink_components,
     sha256_bytes,
     validate_operation_id,
@@ -455,41 +456,41 @@ def _precheck_package_tree(
 def _remove_verified_leaf(
     root: Path, relative: Path, expected_digest: str, code_path: Path
 ) -> None:
-    """现存授权叶节点先逐组件拒绝符号链接、复核普通文件类型与锚定摘要，再删除精确路径。
+    """现存授权叶节点：锚定 no-follow 目录句柄复核类型与摘要后删除精确路径。
 
-    中间组件（payload/ 等）可能在验证后被替换为符号链接：只查最终叶节点会跟随中间
-    链接访问根外节点。删除前必须逐组件拒绝符号链接（回归 H1）。缺失（提交点后
-    幂等清理）容忍；摘要不符说明验证后内容被改写，拒绝删除。
+    验证（stat/read 摘要）与删除（unlink）使用同一锚定句柄：中间组件在"检查通过"
+    之后变成符号链接时，句柄仍指向原目录 inode，绝不按字符串重新解析绝对路径
+    （回归 H1）。缺失（提交点后幂等清理）容忍；摘要不符说明验证后内容被改写，
+    拒绝删除。
     """
-    from draft.operations import reject_symlink_components
+    from draft.operations import anchored_leaf
 
-    reject_symlink_components(root, relative)
-    path = root / relative
-    if path.is_symlink():
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
-    if not path.exists():
-        return
-    if not path.is_file():
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
-    try:
-        current = sha256_bytes(path.read_bytes())
-    except OSError as exc:
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path) from exc
-    if current != expected_digest:
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
-    path.unlink()
+    with anchored_leaf(
+        root, relative, code=CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path=code_path
+    ) as leaf:
+        node = leaf.classify()
+        if node is EntryKind.MISSING:
+            return
+        if node is not EntryKind.FILE:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        if sha256_bytes(leaf.read()) != expected_digest:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        leaf.unlink()
 
 
-def _remove_verified_dir(path: Path) -> None:
-    """已知目录 rmdir：缺失容忍；非空目录（含未知内容）或符号链接拒绝并保留。"""
-    if not path.exists():
-        return
-    if path.is_symlink() or not path.is_dir():
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, path)
-    try:
-        path.rmdir()
-    except OSError as exc:
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, path) from exc
+def _remove_verified_dir(root: Path, relative: Path, code_path: Path) -> None:
+    """已知目录 rmdir：缺失容忍；非空目录（含未知内容）、符号链接或类型变化拒绝。"""
+    from draft.operations import anchored_leaf
+
+    with anchored_leaf(
+        root, relative, code=CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path=code_path
+    ) as leaf:
+        node = leaf.classify()
+        if node is EntryKind.MISSING:
+            return
+        if node is not EntryKind.DIRECTORY:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        leaf.rmdir()
 
 
 def clean_authoritative_package(root: Path, trash_journal: Journal) -> None:
@@ -510,10 +511,11 @@ def clean_authoritative_package(root: Path, trash_journal: Journal) -> None:
     # 先验证日志协议再碰包：物理包缺失只是文件系统状态，不能跳过日志语义验证
     # （回归 H6）——空 mutation、缺 package write、第三个包内 WRITE 都必须报损坏。
     authorized = _authorized_leaves(trash_journal, package_dir)
-    if not package_dir.exists():
+    # lstat 分类：悬空符号链接是 link 不是 missing，不得折叠成幂等缺失（回归 M2）。
+    package_node = classify_node(package_dir)
+    if package_node is EntryKind.MISSING:
         return
-    _reject_symlink(package_dir)
-    if not package_dir.is_dir():
+    if package_node is not EntryKind.DIRECTORY:
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package_dir)
 
     _precheck_package_tree(root, package_dir, authorized, package_dir)
@@ -524,4 +526,4 @@ def clean_authoritative_package(root: Path, trash_journal: Journal) -> None:
         key=lambda path: len(path.parts),
         reverse=True,
     ):
-        _remove_verified_dir(directory)
+        _remove_verified_dir(root, directory.relative_to(root), package_dir)

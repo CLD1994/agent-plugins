@@ -410,6 +410,58 @@ def test_cleanup_rejects_third_package_write(
     assert before["package.json"] == (package / "package.json").read_bytes()
 
 
+def test_cleanup_leaf_removal_is_anchored_to_dir_fd(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """叶节点验证与删除通过同一锚定目录句柄（dir_fd），绝不按绝对路径二次解析（回归 H1）。"""
+    import os as os_module
+
+    from draft.operations import operation_journal_path
+    from draft.trash_package import clean_authoritative_package
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+
+    unlink_calls: list[tuple[str, int | None]] = []
+    original_unlink = os_module.unlink
+
+    def spy_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        unlink_calls.append((path, dir_fd))
+        if dir_fd is not None:
+            original_unlink(path, dir_fd=dir_fd)
+        else:
+            original_unlink(path)
+
+    monkeypatch.setattr(os_module, "unlink", spy_unlink)
+    clean_authoritative_package(root, journal)
+
+    assert unlink_calls
+    assert all(call[1] is not None for call in unlink_calls)
+
+
+def test_cleanup_dangling_package_dir_symlink_is_corrupt(
+    draft_factory: DraftFactory, tmp_path: Path
+) -> None:
+    """权威包目录是悬空符号链接：按 link 处理为损坏，不折叠成幂等缺失（回归 M2）。"""
+    import shutil
+
+    from draft.operations import operation_journal_path
+    from draft.trash_package import clean_authoritative_package
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    shutil.rmtree(package)
+    package.symlink_to(tmp_path / "nowhere", target_is_directory=True)
+
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        clean_authoritative_package(root, journal)
+
+    assert package.is_symlink()
+
+
 def test_cleanup_preserves_full_evidence_when_unknown_present(
     draft_factory: DraftFactory,
 ) -> None:

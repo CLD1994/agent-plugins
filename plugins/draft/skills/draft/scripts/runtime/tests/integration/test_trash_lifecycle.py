@@ -154,6 +154,30 @@ def test_attempt_retry_rejects_unknown_existing_content(
     assert (attempt / "package.json").is_file()
 
 
+def test_attempt_dangling_symlink_is_stable_error(
+    draft_factory: DraftFactory, tmp_path: Path
+) -> None:
+    """attempt 是悬空符号链接：make_attempt_copy 报稳定错误，不泄漏 FileExistsError（回归 M2）。"""
+    import shutil
+
+    from draft.operations import read_journal
+    from draft.trash_lifecycle import make_attempt_copy
+    from draft.trash_package import load_verified_package
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    journal = read_journal(_journal_path(root, pending.operation_id))
+    verified = load_verified_package(root, journal)
+    attempt = make_attempt_copy(verified)
+    shutil.rmtree(attempt)
+    attempt.symlink_to(tmp_path / "nowhere", target_is_directory=True)
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        make_attempt_copy(verified)
+
+    assert attempt.is_symlink()
+
+
 def test_remove_attempt_copy_rejects_unknown_content(
     draft_factory: DraftFactory,
 ) -> None:

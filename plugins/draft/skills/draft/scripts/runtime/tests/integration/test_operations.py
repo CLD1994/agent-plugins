@@ -1222,7 +1222,97 @@ def test_clean_recovery_copies_rejects_symlinked_staged_dir(
     with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
         clean_recovery_copies(read_journal(journal_path))
 
-    assert (external / "0000.bin").read_bytes() == b"external"
+
+def test_clean_recovery_copies_rejects_dangling_symlinked_dir(
+    operation_draft: Path, tmp_path: Path
+) -> None:
+    """悬空 originals 符号链接：按 link 处理为损坏，不折叠成幂等缺失后继续解锁（回归 M2）。"""
+    from draft.operations import clean_recovery_copies, read_journal
+
+    root = operation_draft
+    op_id = "c" * 32
+    journal_path = _write_journal_with_copies(
+        root, op_id, staged_names=["0000.bin"], originals_names=[]
+    )
+    staged = root / ".draft/operations" / op_id / "staged"
+    import shutil
+
+    shutil.rmtree(staged)
+    staged.symlink_to(tmp_path / "nowhere", target_is_directory=True)
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        clean_recovery_copies(read_journal(journal_path))
+
+    assert staged.is_symlink()
+
+
+def test_classify_node_distinguishes_dangling_symlink(tmp_path: Path) -> None:
+    """lstat 分类：悬空符号链接是 SYMLINK 不是 MISSING（回归 M2）。"""
+    from draft.observations import EntryKind
+    from draft.operations import classify_node
+
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to(tmp_path / "nowhere")
+    assert classify_node(dangling) is EntryKind.SYMLINK
+    assert classify_node(tmp_path / "missing") is EntryKind.MISSING
+    assert classify_node(tmp_path) is EntryKind.DIRECTORY
+
+
+def test_anchored_leaf_verifies_and_deletes_via_same_handle(tmp_path: Path) -> None:
+    """锚定访问：验证与删除使用同一 no-follow 目录句柄，缺失中间组件视为 MISSING。"""
+    from draft.observations import EntryKind
+    from draft.operations import anchored_leaf
+
+    root = tmp_path / "root"
+    leaf_rel = Path("a/b/file.txt")
+    (root / "a" / "b").mkdir(parents=True)
+    (root / leaf_rel).write_bytes(b"content")
+
+    with anchored_leaf(
+        root, leaf_rel, code=CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path=leaf_rel
+    ) as leaf:
+        assert leaf.classify() is EntryKind.FILE
+        assert leaf.read() == b"content"
+        leaf.unlink()
+    assert not (root / leaf_rel).exists()
+
+    # 中间组件缺失：叶视为 MISSING。
+    with anchored_leaf(
+        root,
+        Path("a/c/missing.txt"),
+        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+        code_path=leaf_rel,
+    ) as leaf:
+        assert leaf.classify() is EntryKind.MISSING
+
+
+def testanchored_leaf_rejects_intermediate_symlink(tmp_path: Path) -> None:
+    """中间组件替换为符号链接：锚定访问必须以稳定错误停止，不得跟随链接。"""
+    import shutil
+
+    from draft.errors import DraftError
+    from draft.operations import anchored_leaf  # pyright: ignore[reportPrivateUsage]
+
+    root = tmp_path / "root"
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "payload.txt").write_bytes(b"external")
+    (root / "a" / "b").mkdir(parents=True)
+    (root / "a" / "b" / "file.txt").write_bytes(b"inside")
+    shutil.rmtree(root / "a" / "b")
+    (root / "a" / "b").symlink_to(external)
+
+    with (
+        pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value),
+        anchored_leaf(
+            root,
+            Path("a/b/file.txt"),
+            code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+            code_path=Path("a/b/file.txt"),
+        ) as leaf,
+    ):
+        leaf.unlink()
+    assert (external / "payload.txt").read_bytes() == b"external"
 
 
 def test_no_lock_allocating_with_unknown_content_is_inconsistent(

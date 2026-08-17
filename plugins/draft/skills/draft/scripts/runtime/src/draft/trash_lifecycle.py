@@ -149,11 +149,14 @@ def _clean_attempt_tree(attempt: Path, authorized: list[tuple[Path, str]], code_
     """
     import os
 
-    if attempt.is_symlink():
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
-    if not attempt.exists():
+    from draft.observations import EntryKind
+    from draft.operations import anchored_leaf, classify_node
+
+    # lstat 分类：悬空符号链接是 link 不是 missing，不得折叠成幂等缺失（回归 M2）。
+    attempt_node = classify_node(attempt)
+    if attempt_node is EntryKind.MISSING:
         return
-    if not attempt.is_dir():
+    if attempt_node is not EntryKind.DIRECTORY:
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
     allowed_dirs = {attempt}
     for leaf, _ in authorized:
@@ -177,19 +180,44 @@ def _clean_attempt_tree(attempt: Path, authorized: list[tuple[Path, str]], code_
                 raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, leaf)
             if sha256_bytes(leaf.read_bytes()) != digest_by_path[leaf]:
                 raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, leaf)
+    # 删除阶段锚定到 attempt 根句柄：复核与删除同一句柄，不按绝对路径重新解析（回归 H1）。
     for leaf, digest in sorted(authorized):
-        if not leaf.exists():
-            continue  # 提交点后已移走：幂等容忍。
-        if leaf.is_symlink() or not leaf.is_file():
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, leaf)
-        if sha256_bytes(leaf.read_bytes()) != digest:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, leaf)
-        leaf.unlink()
-    for directory in sorted(allowed_dirs, key=lambda path: len(path.parts), reverse=True):
-        try:
-            directory.rmdir()
-        except OSError as exc:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, directory) from exc
+        relative = leaf.relative_to(attempt)
+        with anchored_leaf(
+            attempt,
+            relative,
+            code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+            code_path=code_path,
+        ) as anchor:
+            node = anchor.classify()
+            if node is EntryKind.MISSING:
+                continue  # 提交点后已移走：幂等容忍。
+            if node is not EntryKind.FILE:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
+            if sha256_bytes(anchor.read()) != digest:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
+            anchor.unlink()
+    for directory in sorted(
+        allowed_dirs - {attempt}, key=lambda path: len(path.parts), reverse=True
+    ):
+        relative = directory.relative_to(attempt)
+        with anchored_leaf(
+            attempt,
+            relative,
+            code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+            code_path=code_path,
+        ) as anchor:
+            node = anchor.classify()
+            if node is EntryKind.MISSING:
+                continue
+            if node is not EntryKind.DIRECTORY:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
+            anchor.rmdir()
+    # 最后清理 attempt 根：已分类为 DIRECTORY，预检通过后应已空。
+    try:
+        attempt.rmdir()
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path) from exc
 
 
 def make_attempt_copy(package: VerifiedTrashPackage) -> Path:
@@ -200,13 +228,21 @@ def make_attempt_copy(package: VerifiedTrashPackage) -> Path:
     猜测 payload 路径；逐文件耐久写入并同步目录，再交给外部适配器。重建前先按
     精确树形协议预检并清理旧 attempt：未知内容使重试停止保留，不递归删除（回归 M1）。
     """
+    from draft.observations import EntryKind
+    from draft.operations import classify_node
+
     root = _root_from_package(package)
     reject_symlink_components(root, OUTGOING_RELATIVE)
     attempt_relative = OPERATIONS_RELATIVE / package.operation_id / "attempt"
     reject_symlink_components(root, attempt_relative.parent)
     attempt = root / attempt_relative
-    if attempt.exists():
+    # lstat 分类：悬空符号链接是 link 不是 missing，不能绕过清理后由 mkdir 泄漏
+    # 原始 FileExistsError（回归 M2）。
+    attempt_node = classify_node(attempt)
+    if attempt_node is EntryKind.DIRECTORY:
         _clean_attempt_tree(attempt, _attempt_authorized(package, attempt), attempt)
+    elif attempt_node is not EntryKind.MISSING:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, attempt)
     attempt.mkdir(parents=True, exist_ok=False)
     durable_write(attempt / "package.json", package.manifest_bytes)
     durable_write(attempt / package.payload_relative, package.page_bytes)

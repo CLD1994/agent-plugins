@@ -4,9 +4,10 @@ import hashlib
 import json
 import os
 import re
+import stat
 import uuid
 from collections.abc import Callable, Mapping, Set
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -186,6 +187,142 @@ def reject_symlink_components(root: Path, relative: Path) -> None:
         cursor = cursor / part
         if cursor.is_symlink():
             raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, cursor)
+
+
+def classify_node(path: Path) -> EntryKind:
+    """lstat 节点分类：missing/普通文件/目录/符号链接/其他。
+
+    悬空符号链接是 SYMLINK 而不是 MISSING：``Path.exists()`` 对悬空链接返回 False，
+    会把本应按链接/路径错误处理的现实状态折叠成幂等缺失（回归 M2）。所有清理与
+    恢复分支必须先分类再决策，不得用 ``exists()`` 作为类型判断前置。
+    """
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return EntryKind.MISSING
+    if stat.S_ISLNK(mode):
+        return EntryKind.SYMLINK
+    if stat.S_ISREG(mode):
+        return EntryKind.FILE
+    if stat.S_ISDIR(mode):
+        return EntryKind.DIRECTORY
+    return EntryKind.OTHER
+
+
+@dataclass(frozen=True)
+class _AnchoredLeaf:
+    """锚定到 no-follow 打开的父目录句柄的叶节点访问对象。
+
+    验证（stat/read 摘要）与删除（unlink/rmdir）使用同一句柄：中间组件在"检查通过"
+    之后变成符号链接时，句柄仍指向原目录 inode，绝不跟随新链接解析新路径（回归 H1）。
+    """
+
+    parent_fd: int
+    name: str
+    display: Path
+    code: str
+    code_path: Path
+
+    def _io_error(self, exc: OSError) -> DraftError:
+        error = DraftError(self.code, self.code_path)
+        error.__cause__ = exc
+        return error
+
+    def classify(self) -> EntryKind:
+        try:
+            mode = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False).st_mode
+        except FileNotFoundError:
+            return EntryKind.MISSING
+        if stat.S_ISLNK(mode):
+            return EntryKind.SYMLINK
+        if stat.S_ISREG(mode):
+            return EntryKind.FILE
+        if stat.S_ISDIR(mode):
+            return EntryKind.DIRECTORY
+        return EntryKind.OTHER
+
+    def read(self) -> bytes:
+        try:
+            descriptor = os.open(self.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.parent_fd)
+        except OSError as exc:
+            raise self._io_error(exc) from exc
+        try:
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 1 << 16)
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
+        finally:
+            os.close(descriptor)
+
+    def unlink(self) -> None:
+        try:
+            os.unlink(self.name, dir_fd=self.parent_fd)
+        except OSError as exc:
+            raise self._io_error(exc) from exc
+
+    def rmdir(self) -> None:
+        try:
+            os.rmdir(self.name, dir_fd=self.parent_fd)
+        except OSError as exc:
+            raise self._io_error(exc) from exc
+
+
+@dataclass(frozen=True)
+class _MissingLeaf:
+    """中间父组件缺失时的占位：叶节点必然缺失，任何访问按缺失处理。"""
+
+    display: Path
+    code: str
+    code_path: Path
+
+    def classify(self) -> EntryKind:
+        return EntryKind.MISSING
+
+    def read(self) -> bytes:
+        raise AssertionError("missing leaf has no content")
+
+    def unlink(self) -> None:
+        raise AssertionError("missing leaf cannot be unlinked")
+
+    def rmdir(self) -> None:
+        raise AssertionError("missing leaf cannot be removed")
+
+
+@contextmanager
+def anchored_leaf(
+    root: Path,
+    relative: Path,
+    *,
+    code: str,
+    code_path: Path,
+):
+    """no-follow 打开叶节点祖先目录链，产出锚定到最终父目录句柄的访问对象。
+
+    任何中间组件缺失时叶视为 MISSING（幂等容忍）；中间组件为符号链接、非目录或
+    其他不可打开状态时以稳定 ``code`` 停止并保留现场。``root`` 必须由调用方先验证
+    不是符号链接。验证与删除使用同一句柄，禁止第二次按绝对路径解析。
+    """
+    if not relative.parts:
+        raise ValueError("relative must be non-empty")
+    parent_fd = os.open(root, os.O_RDONLY)
+    try:
+        for part in relative.parts[:-1]:
+            try:
+                parent_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+            except FileNotFoundError:
+                yield _MissingLeaf(relative, code, code_path)
+                return
+            except OSError as exc:
+                raise DraftError(code, code_path) from exc
+        yield _AnchoredLeaf(parent_fd, relative.name, relative, code, code_path)
+    finally:
+        os.close(parent_fd)
 
 
 def durable_write(path: Path, value: bytes) -> None:
@@ -748,9 +885,11 @@ def _clean_recovery_copies(journal: Journal) -> None:
     """
     for sub in ("originals", "staged"):
         directory = journal.directory / sub
-        if not directory.exists():
+        # lstat 分类：悬空符号链接是 link 不是 missing，不得折叠成幂等缺失后继续解锁。
+        directory_node = classify_node(directory)
+        if directory_node is EntryKind.MISSING:
             continue
-        if directory.is_symlink() or not directory.is_dir():
+        if directory_node is not EntryKind.DIRECTORY:
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, directory)
         registered: dict[str, str] = {}  # 文件名 -> 锚定摘要
         for mutation in journal.mutations:
