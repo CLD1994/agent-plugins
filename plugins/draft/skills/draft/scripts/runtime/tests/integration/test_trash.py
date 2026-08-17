@@ -8,9 +8,10 @@ from draft.checker import check_draft
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import OperationKind, OperationPhase, RootState
-from draft.operations import JOURNAL_VERSION, operation_journal_path, read_journal
+from draft.operations import JOURNAL_VERSION, Journal, operation_journal_path, read_journal
 from draft.trash import restore_retained_trash, trash_page
 from draft.trash_lifecycle import recover_draft
+from draft.trash_package import VerifiedTrashPackage
 from tests.integration.support import DraftFactory
 
 TRASH_INDEX = """# Topic
@@ -342,6 +343,71 @@ def test_restore_rejects_concurrent_package_addition(
     assert not (root / ".draft/operation.lock").exists()
 
 
+def test_restore_rejects_file_sneaked_between_verify_and_observe(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """包验证与观察捕获之间加入的未知文件不得被吸收为合法包内容并被删除。
+
+    回归 P1：_restore_observations 若重新扫描磁盘，会把该窗口的新文件记入观察
+    基线，执行复核通过后整包被递归删除（外部内容丢失）。
+    """
+    import draft.trash as trash_module
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    original_load = trash_module.load_verified_package
+
+    def load_and_sneak(root_path: Path, journal: Journal) -> VerifiedTrashPackage:
+        verified = original_load(root_path, journal)
+        (package / "sneaky.md").write_text("# 潜入\n", encoding="utf-8")
+        return verified
+
+    monkeypatch.setattr(trash_module, "load_verified_package", load_and_sneak)
+    with pytest.raises(DraftError, match="trash.restore_conflict"):
+        restore_retained_trash(root, pending.operation_id, now=NOW)
+    monkeypatch.undo()
+
+    # 外部内容与权威包都保留，页面未恢复，锁释放（可恢复现场）。
+    assert (package / "sneaky.md").is_file()
+    assert (package / "package.json").is_file()
+    assert not (root / "pages/obsolete.md").exists()
+    assert not (root / ".draft/operation.lock").exists()
+
+
+def test_restore_preserves_file_sneaked_before_package_cleanup(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """执行复核之后、包清理之前加入的未知文件不得被无条件递归删除。
+
+    回归 P1：清理入口必须再次核验已验证快照，禁止对未知条目使用无条件递归删除。
+    """
+    import draft.trash as trash_module
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    original_verify = trash_module.verify_restore_after_state
+
+    def verify_then_sneak(
+        root_path: Path,
+        trash_journal: Journal,
+        restore_journal: Journal,
+        verified: VerifiedTrashPackage,
+    ) -> None:
+        original_verify(root_path, trash_journal, restore_journal, verified)
+        (package / "late.md").write_text("# 迟来\n", encoding="utf-8")
+
+    monkeypatch.setattr(trash_module, "verify_restore_after_state", verify_then_sneak)
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        restore_retained_trash(root, pending.operation_id, now=NOW)
+    monkeypatch.undo()
+
+    # 未知条目不被删除：权威包（含迟来文件）保留。
+    assert (package / "late.md").is_file()
+    assert (package / "package.json").is_file()
+
+
 def test_trash_restore_crlf_page_is_byte_identical(
     draft_factory: DraftFactory,
 ) -> None:
@@ -437,7 +503,7 @@ def test_restore_mixed_newline_parent_only_rewrites_nav_span(
     assert result.phase is OperationPhase.COMPLETED
     restored = (root / "index.md").read_bytes()
     # 移除新增的整行导航后，其余字节必须与 trash 后内容逐字节一致（混合换行不被规范化）。
-    nav_line = "- [旧页](pages/obsolete.md)".encode("utf-8") + b"\n"
+    nav_line = "- [旧页](pages/obsolete.md)".encode() + b"\n"
     stripped_nav = restored.replace(nav_line, b"")
     assert stripped_nav == after_trash
     assert mixed_before != after_trash

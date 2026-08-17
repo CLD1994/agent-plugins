@@ -358,15 +358,25 @@ def require_no_existing_restore_claim(root: Path, journal: Journal, restore_id: 
 
 
 def remove_authoritative_package(package: VerifiedTrashPackage) -> None:
-    """幂等清理权威删除包；仅在三个显式授权分支调用。"""
+    """幂等清理权威删除包；仅在三个显式授权分支调用。
+
+    清理前用 load_verified_package 的可变快照复核当前包树：验证后新增的未知
+    条目使清理拒绝（trash.package_corrupt），绝不无条件递归删除未知内容。
+    """
     from draft.operations import reject_symlink_components
 
     # 清理前逐组件拒绝符号链接：包路径必须在草稿根内。
     # package.directory = root / OUTGOING_RELATIVE / operation_id
     root = package.directory.parents[len(OUTGOING_RELATIVE.parts)]
     reject_symlink_components(root, OUTGOING_RELATIVE)
-    if package.directory.exists():
-        remove_tree(package.directory)
+    if not package.directory.exists():
+        return
+    from draft.observations import FilesystemObservationProbe, verify_observations
+
+    changed = verify_observations(FilesystemObservationProbe(root), package.observations)
+    if changed:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package.directory)
+    remove_tree(package.directory)
 
 
 def _proven_unapplied_restore(root: Path, journal: Journal) -> bool:
@@ -490,7 +500,7 @@ def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackag
         (mutation for mutation in mutations if mutation.kind is MutationKind.DELETE),
         key=lambda mutation: str(mutation.path),
     )
-    observations = _restore_observations(resolved, package, graph)
+    observations = _restore_observations(package, graph)
     return OperationPlan(
         kind=OperationKind.RESTORE,
         root=resolved,
@@ -501,41 +511,21 @@ def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackag
     )
 
 
-def _restore_observations(
-    root: Path, package: VerifiedTrashPackage, graph: DraftGraph
-) -> ObservationManifest:
+def _restore_observations(package: VerifiedTrashPackage, graph: DraftGraph) -> ObservationManifest:
     """恢复读集观察：页面/目录/状态与权威删除包文件。
 
     恢复计划读取父/枢纽导航、受影响页面与权威包；并发修改其中任一都会改变读集，
-    执行前复核必须拒绝（唯一权威包不变量）。
+    执行前复核必须拒绝（唯一权威包不变量）。权威包观察直接复用 load_verified_package
+    的已验证快照，不重新扫描磁盘：验证后新增的未知条目不能进入基线、不能随整包
+    递归删除（回归：验证—观察窗口的并发新增被复核发现并保留现场）。
     """
-    import os
-
     from draft.observations import (
-        EntryKind,
-        Observation,
         ObservationManifest,
-        directory_observation,
-        file_digest_observation,
         graph_observations,
     )
 
     entries = list(graph_observations(graph).entries)
-    if package.directory.is_dir():
-        for dirpath, _dirnames, filenames in os.walk(package.directory):
-            rel_dir = Path(dirpath).relative_to(root)
-            # 每个目录的直接成员集合（含空目录）：向包内新增文件/目录/符号链接都可被复核发现。
-            members = tuple(sorted(_dirnames + filenames))
-            entries.append(directory_observation(rel_dir, members))
-            for name in sorted(filenames):
-                target = Path(dirpath) / name
-                relative = rel_dir / name
-                if target.is_symlink():
-                    entries.append(Observation(path=relative, kind=EntryKind.SYMLINK))
-                elif target.is_file():
-                    entries.append(
-                        file_digest_observation(relative, sha256_bytes(target.read_bytes()))
-                    )
+    entries.extend(package.observations.entries)
     return ObservationManifest(entries=tuple(entries))
 
 

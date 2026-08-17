@@ -16,6 +16,7 @@ from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import INTERNAL_DIR
 from draft.models import MutationKind, OperationKind
+from draft.observations import ObservationManifest
 from draft.operations import (
     Journal,
     JournalMutation,
@@ -54,6 +55,10 @@ class VerifiedTrashPackage:
     page_bytes: bytes
     page_sha256: str
     parent_sha256: str
+    # payload 相对包目录的路径与已验证包树快照：恢复观察与包清理都以它为准，
+    # 不再重新扫描磁盘，验证后新增的未知条目不能进入基线。
+    payload_relative: Path
+    observations: ObservationManifest
 
 
 def require_journal_write(journal: Journal, relative_path: Path) -> JournalMutation:
@@ -147,6 +152,40 @@ def _reject_package_extra_entries(
             raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
 
 
+def _verified_package_observations(
+    root: Path,
+    package_dir: Path,
+    payload_relative: Path,
+    manifest_digest: str,
+    payload_digest: str,
+) -> ObservationManifest:
+    """从已验证协议形状构造不可变包观察快照：只有 package.json、payload 及其父目录。
+
+    观察来自验证时刻的授权集合（而非重新扫描磁盘），恢复执行复核与包清理都以
+    它为准：验证后新增的未知条目无法进入基线，会因目录成员/摘要不一致被拒绝，
+    绝不被吸收后随整包递归删除（唯一权威包不变量）。
+    """
+    from draft.observations import (
+        Observation,
+        directory_observation,
+        file_digest_observation,
+    )
+
+    package_relative = package_dir.relative_to(root)
+    parts = payload_relative.parts
+    # 包目录直接成员 = {package.json, payload 第一段}；中间目录成员 = 下一段。
+    entries: list[Observation] = [
+        file_digest_observation(package_relative / "package.json", manifest_digest),
+        file_digest_observation(package_relative / payload_relative, payload_digest),
+        directory_observation(package_relative, tuple(sorted({"package.json", parts[0]}))),
+    ]
+    cursor = package_relative
+    for index, part in enumerate(parts[:-1]):
+        cursor = cursor / part
+        entries.append(directory_observation(cursor, (parts[index + 1],)))
+    return ObservationManifest(entries=tuple(entries))
+
+
 def _parse_manifest(manifest_path: Path) -> dict[str, object]:
     try:
         decoded = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -191,6 +230,7 @@ def _load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashP
     _reject_symlink(manifest_path)
     _require_regular_file(manifest_path, manifest_path)
     manifest_mutation = require_journal_write(trash_journal, package_relative / "package.json")
+    assert manifest_mutation.after_sha256 is not None
     if sha256_file(manifest_path) != manifest_mutation.after_sha256:
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
 
@@ -254,4 +294,12 @@ def _load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashP
         page_bytes=page_bytes,
         page_sha256=page_hash,
         parent_sha256=parent_hash,
+        payload_relative=payload_relative,
+        observations=_verified_package_observations(
+            root,
+            package_dir,
+            payload_relative,
+            manifest_mutation.after_sha256,  # require_journal_write 已保证非 None
+            page_hash,
+        ),
     )
