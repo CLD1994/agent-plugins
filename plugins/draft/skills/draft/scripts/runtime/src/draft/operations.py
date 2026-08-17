@@ -647,12 +647,52 @@ def _execute_apply_phase(root: Path, journal: Journal) -> Journal:
 
 
 def _clean_recovery_copies(journal: Journal) -> None:
+    """按日志登记路径精确清理恢复副本（originals/staged）。
+
+    只删除 mutation.original/mutation.staged 登记的文件（复核普通文件类型与锚定
+    摘要）；已知空目录 rmdir。未知成员、符号链接、错误类型或摘要不符以
+    operation.inconsistent_state 停止并保留现场，绝不递归删除恢复目录中的未知
+    内容。已登记文件部分缺失（提交点后幂等清理）容忍。
+    """
     for sub in ("originals", "staged"):
         directory = journal.directory / sub
-        if directory.is_dir():
+        if not directory.exists():
+            continue
+        if directory.is_symlink() or not directory.is_dir():
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, directory)
+        registered: dict[str, str] = {}  # 文件名 -> 锚定摘要
+        for mutation in journal.mutations:
+            if sub == "originals":
+                if mutation.original is not None and mutation.before_sha256 is not None:
+                    relative = Path(mutation.original)
+                    if relative.parent == Path(sub):
+                        registered[relative.name] = mutation.before_sha256
+            elif mutation.staged is not None and mutation.after_sha256 is not None:
+                relative = Path(mutation.staged)
+                if relative.parent == Path(sub):
+                    registered[relative.name] = mutation.after_sha256
+        if registered:
+            # 有登记 mutation：严格只删登记文件，未知成员/类型/摘要不符拒绝。
+            unknown = {entry.name for entry in directory.iterdir()} - set(registered)
+            if unknown:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, directory)
+            for name in sorted(registered):
+                target = directory / name
+                if not target.exists():
+                    continue  # 提交点后部分清理幂等容忍。
+                if target.is_symlink() or not target.is_file():
+                    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, target)
+                if sha256_bytes(target.read_bytes()) != registered[name]:
+                    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, target)
+                target.unlink()
+        else:
+            # 无登记 mutation（allocating/prepare 崩溃）：目录是协议持有的 prepare
+            # 暂存，删除其全部普通文件；符号链接或目录仍是未知内容，拒绝。
             for entry in directory.iterdir():
+                if entry.is_symlink() or not entry.is_file():
+                    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
                 entry.unlink()
-            directory.rmdir()
+        directory.rmdir()
 
 
 def finalize_operation(
@@ -664,17 +704,21 @@ def finalize_operation(
     retain_terminal_lock: bool = False,
     changed_paths: tuple[Path, ...] | None = None,
 ) -> OperationResult:
-    """Mark a terminal phase; by default release the lock and clean recovery copies.
+    """Mark a terminal phase; by default clean recovery copies then release the lock.
 
     ``retain_terminal_lock=True`` 仅耐久写入终态并移除空目录，不释放写锁、不清理恢复副本，
     供恢复包装层在证明终态后统一解关联、清理与释放。``changed_paths`` 由调用方从
     公开效果派生；缺省回退到日志 mutation 路径（恢复等无公开效果边界）。
+
+    顺序为终态日志耐久 → 安全清理已授权恢复材料 → 释放锁：清理遇到未知成员/类型
+    错误时保留锁与现场，CLI 报错后 recover 仍能凭锁定位，不会出现"报错时根内已无锁"
+    （回归 H5）。
     """
     terminal = _with_phase(journal, phase)
     write_journal(terminal)
     if not retain_terminal_lock:
-        release_lock(root, journal.operation_id)
         _clean_recovery_copies(journal)
+        release_lock(root, journal.operation_id)
     for relative in journal.remove_empty_directories:
         with suppress(OSError):
             (root / relative).rmdir()
@@ -1600,11 +1644,22 @@ def recover(root_path: Path) -> OperationResult:
                 _clean_recovery_copies(journal)
                 write_journal(_with_phase(journal, OperationPhase.ROLLED_BACK))
                 continue
-            for child in sorted(entry.rglob("*"), reverse=True):
-                if child.is_file():
-                    child.unlink()
-                elif child.is_dir():
-                    child.rmdir()
+            # 无锁 allocating 碎片：协议明确拥有 journal.json 与 originals/staged
+            # 目录（prepare 阶段创建）；其余未知条目报 inconsistent_state，不得用
+            # rglob 递归删除任意内容（回归 H5）。
+            known_names = {"journal.json", "originals", "staged"}
+            extra = [path for path in entry.iterdir() if path.name not in known_names]
+            if extra:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
+            (entry / "journal.json").unlink()
+            for sub in ("originals", "staged"):
+                subdir = entry / sub
+                if subdir.is_symlink() or (subdir.exists() and not subdir.is_dir()):
+                    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, subdir)
+                if subdir.is_dir():
+                    for child in subdir.iterdir():
+                        child.unlink()
+                    subdir.rmdir()
             entry.rmdir()
         elif (
             journal.phase in _MID_WRITE_PHASES

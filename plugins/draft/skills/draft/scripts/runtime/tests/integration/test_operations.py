@@ -1086,3 +1086,125 @@ def test_internal_state_symlink_escape_rejected(operation_draft: Path, tmp_path:
 
     # 外部目录必须保持为空：不得被写入任何内部状态。
     assert list(external.iterdir()) == []
+
+
+def _write_journal_with_copies(
+    operation_draft: Path, op_id: str, *, staged_names: list[str], originals_names: list[str]
+) -> Path:
+    """写入带 originals/staged 副本与登记 mutation 的日志；返回日志路径。"""
+    import json as json_module
+
+    root = operation_draft
+    journal_dir = root / ".draft/operations" / op_id
+    mutations: list[dict[str, object]] = []
+    for index, name in enumerate(originals_names):
+        (journal_dir / "originals").mkdir(parents=True, exist_ok=True)
+        path = journal_dir / "originals" / name
+        path.write_bytes(b"original")
+        mutations.append(
+            {
+                "path": f"pages/old-{index}.md",
+                "kind": "write",
+                "before_sha256": sha256_bytes(b"original"),
+                "after_sha256": "a" * 64,
+                "original": f"originals/{name}",
+                "staged": None,
+                "applied": True,
+            }
+        )
+    for index, name in enumerate(staged_names):
+        (journal_dir / "staged").mkdir(parents=True, exist_ok=True)
+        path = journal_dir / "staged" / name
+        path.write_bytes(b"staged")
+        mutations.append(
+            {
+                "path": f"pages/new-{index}.md",
+                "kind": "write",
+                "before_sha256": None,
+                "after_sha256": sha256_bytes(b"staged"),
+                "original": None,
+                "staged": f"staged/{name}",
+                "applied": True,
+            }
+        )
+    journal: dict[str, object] = {
+        "journal_version": JOURNAL_VERSION,
+        "operation_id": op_id,
+        "kind": OperationKind.CREATE.value,
+        "phase": OperationPhase.COMPLETED.value,
+        "root_state": "registered",
+        "observations": [],
+        "mutations": mutations,
+        "remove_empty_directories": [],
+        "metadata": {},
+    }
+    journal_path = journal_dir / "journal.json"
+    journal_path.write_text(json_module.dumps(journal), encoding="utf-8")
+    return journal_path
+
+
+def test_clean_recovery_copies_rejects_unknown_staged_member(
+    operation_draft: Path,
+) -> None:
+    """staged/ 中的未知成员不得被静默删除（回归 H5）。"""
+    from draft.operations import clean_recovery_copies, read_journal
+
+    root = operation_draft
+    op_id = "a" * 32
+    journal_path = _write_journal_with_copies(
+        root, op_id, staged_names=["0000.bin"], originals_names=[]
+    )
+    staged = root / ".draft/operations" / op_id / "staged"
+    unknown = staged / "unknown.txt"
+    unknown.write_text("unknown\n", encoding="utf-8")
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        clean_recovery_copies(read_journal(journal_path))
+
+    assert unknown.is_file()
+    assert (staged / "0000.bin").is_file()
+
+
+def test_clean_recovery_copies_rejects_symlinked_staged_dir(
+    operation_draft: Path, tmp_path: Path
+) -> None:
+    """originals/staged 被替换为目录符号链接：清理必须拒绝而非跟随删除（回归 H5）。"""
+    from draft.operations import clean_recovery_copies, read_journal
+
+    root = operation_draft
+    op_id = "b" * 32
+    journal_path = _write_journal_with_copies(
+        root, op_id, staged_names=["0000.bin"], originals_names=[]
+    )
+    staged = root / ".draft/operations" / op_id / "staged"
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "0000.bin").write_bytes(b"external")
+    import shutil
+
+    shutil.rmtree(staged)
+    staged.symlink_to(external)
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        clean_recovery_copies(read_journal(journal_path))
+
+    assert (external / "0000.bin").read_bytes() == b"external"
+
+
+def test_no_lock_allocating_with_unknown_content_is_inconsistent(
+    operation_draft: Path,
+) -> None:
+    """无锁 allocating 操作目录含未知内容：不得递归删除，报 inconsistent_state（回归 H5）。"""
+    from draft.operations import recover
+
+    root = operation_draft
+    op_id = "c" * 32
+    journal_dir = root / ".draft/operations" / op_id
+    write_journal(root, op_id, "allocating")
+    unknown = journal_dir / "unknown.txt"
+    unknown.write_text("unknown\n", encoding="utf-8")
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        recover(root)
+
+    assert unknown.is_file()
