@@ -20,7 +20,10 @@ from draft.observations import EntryKind, ObservationManifest
 from draft.operations import (
     Journal,
     JournalMutation,
+    anchored_leaf,
     classify_node,
+    durable_write,
+    fsync_directory,
     reject_symlink_components,
     sha256_bytes,
     validate_operation_id,
@@ -399,15 +402,6 @@ def _load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashP
     )
 
 
-def _authorized_leaves(trash_journal: Journal, code_path: Path) -> list[tuple[Path, str]]:
-    """从 T 日志派生授权叶节点：恰好 package.json 与一个 payload 新建文件。
-
-    包内 mutation 只允许这两个精确新建文件；额外包内 WRITE（恶意日志）或形状
-    不符即损坏。已授权条目部分缺失（提交点后幂等清理）由删除阶段容忍。
-    """
-    return list(parse_package_authorization(trash_journal, code_path).leaves())
-
-
 def _package_directories(
     root: Path, package_dir: Path, authorized: list[tuple[Path, str]]
 ) -> set[Path]:
@@ -493,32 +487,149 @@ def _remove_verified_dir(root: Path, relative: Path, code_path: Path) -> None:
         leaf.rmdir()
 
 
+_CLEANUP_EVIDENCE_VERSION = 1
+_CLEANUP_EVIDENCE_NAME = "cleanup-evidence.json"
+
+
+def _cleanup_evidence_path(journal: Journal) -> Path:
+    """清理证据路径：锁所属操作目录内，包目录全部成功移除前不得清理。"""
+    return journal.directory / _CLEANUP_EVIDENCE_NAME
+
+
+def _write_cleanup_evidence(
+    journal: Journal,
+    auth: PackageAuthorization,
+    leaves_bytes: dict[Path, bytes],
+) -> None:
+    """删除第一个权威叶节点前，把清理开始时存在的授权叶字节耐久记录在锁所属操作目录。
+
+    只保存实际存在的叶（post-commit 部分缺失的叶不在其中）；该证据在包目录全部
+    成功移除前不得清理：删除中途出现 extra/类型变化时，恢复用它重建完整合法包，
+    绝不只剩未知内容（回归 H2）。
+    """
+    import base64
+
+    entries: list[dict[str, str]] = []
+    for relative in (auth.package_json_path, auth.payload_path):
+        content = leaves_bytes.get(relative)
+        if content is not None:
+            entries.append(
+                {
+                    "relative": relative.as_posix(),
+                    "sha256": sha256_bytes(content),
+                    "b64": base64.b64encode(content).decode("ascii"),
+                }
+            )
+    if not entries:
+        return  # 清理开始时已无任何合法叶：无可保留证据，直接幂等清理空目录。
+    payload = {"version": _CLEANUP_EVIDENCE_VERSION, "leaves": entries}
+    durable_write(_cleanup_evidence_path(journal), (json.dumps(payload) + "\n").encode("utf-8"))
+
+
+def _clear_cleanup_evidence(journal: Journal) -> None:
+    """清理成功后移除证据；只删除本文件，不触碰其他内容。"""
+    path = _cleanup_evidence_path(journal)
+    if path.is_file():
+        path.unlink()
+    fsync_directory(path.parent)
+
+
+def _restore_missing_leaves_from_evidence(root: Path, journal: Journal, code_path: Path) -> None:
+    """从证据恢复缺失授权叶：上次清理中途失败后使合法包完整可重建。
+
+    只恢复 classify 为 MISSING 的授权叶，且证据叶的 relative/sha256 必须与日志授权
+    一致；现存叶保持不动（类型/摘要问题由预检拒绝）。恢复写入与验证/删除共用锚定
+    句柄，不按绝对路径重新解析。
+    """
+    import base64
+
+    auth = parse_package_authorization(journal, code_path)
+    expected = {auth.package_json_path, auth.payload_path}
+    evidence = _cleanup_evidence_path(journal)
+    try:
+        data = json.loads(evidence.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path) from exc
+    if not isinstance(data, dict):
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+    parsed = cast("dict[str, object]", data)
+    if parsed.get("version") != _CLEANUP_EVIDENCE_VERSION:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+    entries = parsed.get("leaves")
+    if not isinstance(entries, list):
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+    for entry in cast("list[object]", entries):
+        if not isinstance(entry, dict):
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        item = cast("dict[str, object]", entry)
+        relative_raw = item.get("relative")
+        digest = item.get("sha256")
+        b64 = item.get("b64")
+        if (
+            not isinstance(relative_raw, str)
+            or not isinstance(digest, str)
+            or not isinstance(b64, str)
+        ):
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        relative = Path(relative_raw)
+        if relative not in expected:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        content = base64.b64decode(b64)
+        if sha256_bytes(content) != digest:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        with anchored_leaf(
+            root, relative, code=CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path=code_path
+        ) as leaf:
+            if leaf.classify() is EntryKind.MISSING:
+                leaf.write(content)
+
+
 def clean_authoritative_package(root: Path, trash_journal: Journal) -> None:
-    """唯一权威包清理原语：先只读预检，再按授权路径逐个复核后删除。
+    """唯一权威包清理原语：日志验证 → 节点分类 → 证据事务 → 锚定删除。
 
     清理计划从原 T 日志派生恰好两个授权叶节点（package.json + payload）；预检枚举
     整个包树，任何未知成员、符号链接、错误类型或摘要不符都在第一次 unlink 之前
-    失败，保证失败不破坏已授权证据（可重试）。预检通过后逐组件拒绝符号链接并复核
-    后删除精确叶节点，已知目录从深到浅 rmdir。已授权条目部分缺失（提交点后幂等
-    清理）容忍。
+    失败。首次删除前把两个合法叶的字节耐久写入锁所属操作目录（回归 H2），删除
+    中途出现 extra/类型变化时证据保留、下次恢复先重建完整合法包再收敛；包目录
+    全部成功移除后才清除证据。删除阶段全部经锚定句柄（回归 H1）。
 
     restore、handoff、purge 与终态恢复全部经此原语清理，不再各自直接 remove_tree。
     """
-    from draft.operations import reject_symlink_components
-
     reject_symlink_components(root, OUTGOING_RELATIVE)
     package_dir = root / OUTGOING_RELATIVE / trash_journal.operation_id
     # 先验证日志协议再碰包：物理包缺失只是文件系统状态，不能跳过日志语义验证
     # （回归 H6）——空 mutation、缺 package write、第三个包内 WRITE 都必须报损坏。
-    authorized = _authorized_leaves(trash_journal, package_dir)
+    auth = parse_package_authorization(trash_journal, package_dir)
+    authorized = list(auth.leaves())
     # lstat 分类：悬空符号链接是 link 不是 missing，不得折叠成幂等缺失（回归 M2）。
     package_node = classify_node(package_dir)
     if package_node is EntryKind.MISSING:
+        # 证据存在说明上次清理已删除全部叶：清除证据，幂等完成；缺失且无证据为
+        # 已提交消费，同样无操作。
+        _clear_cleanup_evidence(trash_journal)
         return
     if package_node is not EntryKind.DIRECTORY:
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package_dir)
 
+    evidence_present = _cleanup_evidence_path(trash_journal).is_file()
+    if evidence_present:
+        # 上次清理中途失败：先从证据恢复缺失叶，使合法包完整可重建。
+        _restore_missing_leaves_from_evidence(root, trash_journal, package_dir)
     _precheck_package_tree(root, package_dir, authorized, package_dir)
+    if not evidence_present:
+        # 首次删除前：用锚定句柄读取存在的授权叶已验证字节，耐久写入证据。
+        # post-commit 已缺失的叶不在其中；叶类型已变化时跳过（删除阶段会拒绝）。
+        leaves_bytes: dict[Path, bytes] = {}
+        for relative, _ in sorted(authorized):
+            with anchored_leaf(
+                root,
+                relative,
+                code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+                code_path=package_dir,
+            ) as leaf:
+                if leaf.classify() is EntryKind.FILE:
+                    leaves_bytes[relative] = leaf.read()
+        _write_cleanup_evidence(trash_journal, auth, leaves_bytes)
     for relative, digest in sorted(authorized):
         _remove_verified_leaf(root, relative, digest, package_dir)
     for directory in sorted(
@@ -527,3 +638,4 @@ def clean_authoritative_package(root: Path, trash_journal: Journal) -> None:
         reverse=True,
     ):
         _remove_verified_dir(root, directory.relative_to(root), package_dir)
+    _clear_cleanup_evidence(trash_journal)

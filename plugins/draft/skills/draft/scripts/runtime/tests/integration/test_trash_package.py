@@ -436,8 +436,49 @@ def test_cleanup_leaf_removal_is_anchored_to_dir_fd(
     monkeypatch.setattr(os_module, "unlink", spy_unlink)
     clean_authoritative_package(root, journal)
 
-    assert unlink_calls
-    assert all(call[1] is not None for call in unlink_calls)
+    # 授权叶必须经 dir_fd 锚定删除（基础名 + 句柄），绝不以绝对路径 unlink。
+    assert any(path == "package.json" and dir_fd is not None for path, dir_fd in unlink_calls)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    assert not any(path == str(package / "package.json") for path, _ in unlink_calls)
+
+
+def test_cleanup_mid_delete_extra_preserves_evidence_and_converges(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """删除期间出现晚到 extra：失败保留证据与未知内容，移除后从证据收敛（回归 H2）。"""
+    from draft.operations import operation_journal_path
+    from draft.trash_package import clean_authoritative_package
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+
+    import draft.trash_package as trash_package_module
+
+    original_precheck = trash_package_module._precheck_package_tree  # pyright: ignore[reportPrivateUsage]
+
+    def precheck_then_inject(
+        root_path: Path, package_path: Path, authorized: list[tuple[Path, str]], code_path: Path
+    ) -> None:
+        original_precheck(root_path, package_path, authorized, code_path)
+        (package / "late.txt").write_text("late\n", encoding="utf-8")
+
+    monkeypatch.setattr(trash_package_module, "_precheck_package_tree", precheck_then_inject)
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        clean_authoritative_package(root, journal)
+
+    # 未知内容保留，且耐久证据在锁所属操作目录中（可重建合法包，不只剩未知内容）。
+    assert (package / "late.txt").read_text(encoding="utf-8") == "late\n"
+    evidence = journal.directory / "cleanup-evidence.json"
+    assert evidence.is_file()
+
+    # 停止注入后移除未知条目，再次清理：从证据重建缺失叶并完成收敛。
+    monkeypatch.undo()
+    (package / "late.txt").unlink()
+    clean_authoritative_package(root, journal)
+    assert not package.exists()
+    assert not evidence.exists()
 
 
 def test_cleanup_dangling_package_dir_symlink_is_corrupt(

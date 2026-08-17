@@ -268,6 +268,35 @@ class _AnchoredLeaf:
         except OSError as exc:
             raise self._io_error(exc) from exc
 
+    def write(self, content: bytes) -> None:
+        """原子写入叶文件：临时文件经同一父目录句柄创建，replace 也在句柄内完成。
+
+        供清理证据恢复使用：目标可能已被部分删除或替换，绝不按绝对路径重新解析。
+        """
+        temporary = f".{self.name}.restore-{uuid.uuid4().hex}"
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o644,
+                dir_fd=self.parent_fd,
+            )
+        except OSError as exc:
+            raise self._io_error(exc) from exc
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            raise self._io_error(exc) from exc
+        try:
+            os.replace(temporary, self.name, src_dir_fd=self.parent_fd, dst_dir_fd=self.parent_fd)
+        except OSError as exc:
+            raise self._io_error(exc) from exc
+        with suppress(OSError):
+            os.fsync(self.parent_fd)
+
 
 @dataclass(frozen=True)
 class _MissingLeaf:
@@ -288,6 +317,10 @@ class _MissingLeaf:
 
     def rmdir(self) -> None:
         raise AssertionError("missing leaf cannot be removed")
+
+    def write(self, _content: bytes) -> None:
+        # 中间父组件缺失：叶必然缺失，无需恢复（清理可继续，无需重建父链）。
+        return
 
 
 @contextmanager

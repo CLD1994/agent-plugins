@@ -495,6 +495,47 @@ def test_terminal_recovery_rejects_empty_mutation_log(
     assert _phase(root, pending.operation_id) == "trash_handoff_succeeded"
 
 
+def test_terminal_recovery_converges_after_mid_delete_extra(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """终态恢复删除期间出现晚到 extra：保留证据，移除后 recover 从证据收敛（回归 H2）。"""
+    import draft.trash_package as trash_package_module
+    from draft.operations import acquire_lock, read_journal, with_phase, write_journal
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    journal = read_journal(_journal_path(root, pending.operation_id))
+    write_journal(with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED))
+    acquire_lock(root, pending.operation_id)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+
+    original_precheck = trash_package_module._precheck_package_tree  # pyright: ignore[reportPrivateUsage]
+
+    def precheck_then_inject(
+        root_path: Path, package_path: Path, authorized: list[tuple[Path, str]], code_path: Path
+    ) -> None:
+        original_precheck(root_path, package_path, authorized, code_path)
+        (package / "late.txt").write_text("late\n", encoding="utf-8")
+
+    monkeypatch.setattr(trash_package_module, "_precheck_package_tree", precheck_then_inject)
+    calls: list[str] = []
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        recover_draft(root, now=PURGE, handoff=calls.append)
+
+    assert calls == []
+    assert _phase(root, pending.operation_id) == "trash_handoff_succeeded"
+    assert (root / ".draft/operation.lock").exists()
+    assert (journal.directory / "cleanup-evidence.json").is_file()
+    assert (package / "late.txt").read_text(encoding="utf-8") == "late\n"
+
+    monkeypatch.undo()
+    (package / "late.txt").unlink()
+    recover_draft(root, now=PURGE, handoff=calls.append)
+    assert _phase(root, pending.operation_id) == "completed"
+    assert not _package_exists(root, pending.operation_id)
+    assert not (journal.directory / "cleanup-evidence.json").exists()
+
+
 def test_handoff_not_called_for_third_package_write(
     draft_factory: DraftFactory,
 ) -> None:
