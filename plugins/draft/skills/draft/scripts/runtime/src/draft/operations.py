@@ -5,7 +5,7 @@ import json
 import os
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Set
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -23,7 +23,7 @@ from draft.models import (
     OperationResult,
     RootState,
 )
-from draft.observations import ObservationManifest
+from draft.observations import ObservationManifest, ObservationProbe
 from draft.paths import resolve_draft_root
 from draft.plan_effects import public_changed_paths
 
@@ -1172,30 +1172,69 @@ def _recover_terminal(root: Path, journal: Journal, operation_id: str) -> Operat
     )
 
 
+def adjusted_observation_manifest(
+    observations: ObservationManifest,
+    *,
+    excluded: frozenset[Path],
+    explained: frozenset[Path],
+    added: Mapping[Path, Set[str]],
+    removed: Mapping[Path, Set[str]],
+) -> ObservationManifest:
+    """纯函数：按本操作可解释的目录成员变化调整观察清单。
+
+    只排除本操作目录/锁与 explained mutation 路径；目录成员调整为"若只发生本操作
+    mutation 应有的成员"，再与当前状态比较，避免把操作自身副作用误判为外部修改。
+    不访问文件系统，可独立单测。
+    """
+    from draft.observations import (
+        EntryKind,
+        Observation,
+        ObservationManifest,
+        directory_observation,
+    )
+
+    adjusted: list[Observation] = []
+    for observation in observations.entries:
+        if observation.path in excluded or observation.path in explained:
+            continue
+        if observation.kind is EntryKind.DIRECTORY:
+            planned = set(observation.members)
+            expected = tuple(
+                sorted(
+                    (planned - removed.get(observation.path, set()))
+                    | added.get(observation.path, set())
+                )
+            )
+            adjusted.append(directory_observation(observation.path, expected))
+        else:
+            adjusted.append(observation)
+    return ObservationManifest(entries=tuple(adjusted))
+
+
 def _verify_observations_for_recovery(
-    root: Path, journal: Journal, explained_mutations: tuple[_MutationLike, ...]
+    root: Path,
+    journal: Journal,
+    explained_mutations: tuple[_MutationLike, ...],
+    *,
+    probe: ObservationProbe | None = None,
 ) -> tuple[Path, ...]:
     """恢复时复核观察：只排除本操作目录、锁与 explained mutation 路径。
 
-    本操作新增/删除文件会改变受观察目录的成员集合，这是可解释变化；恢复时把目录
-    观察成员调整为"若只发生本操作 mutation 应有的成员"，再与当前状态比较，避免把
-    操作自身副作用误判为外部修改，同时仍能发现操作范围之外的目录变化。
+    目录成员变化以活文件 before/after 分类推导，不能信任可能滞后的 applied 标志：
+    文件落盘发生在 applied=true 日志持久化之前，二者之间崩溃时 applied=false 但
+    文件已是 after，仍应解释该成员变化。remove_empty_directories 只在终态推进时
+    执行，中段恢复时对应目录仍存在，不应计入。``probe`` 缺省为文件系统探针，
+    单测可注入 fake 探针。
     """
     from draft.observations import (
         EntryKind,
         FilesystemObservationProbe,
         Observation,
-        ObservationManifest,
-        directory_observation,
         verify_observations,
     )
 
     excluded = {journal.directory.relative_to(root), LOCK_RELATIVE}
     explained = {mutation.path for mutation in explained_mutations}
-    # 目录成员变化以活文件 before/after 分类推导，不能信任可能滞后的 applied 标志：
-    # 文件落盘发生在 applied=true 日志持久化之前，二者之间崩溃时 applied=false 但
-    # 文件已是 after，仍应解释该成员变化。remove_empty_directories 只在终态推进时
-    # 执行，中段恢复时对应目录仍存在，不应计入。
     added: dict[Path, set[str]] = {}
     removed: dict[Path, set[str]] = {}
     for mutation in journal.mutations:
@@ -1215,30 +1254,22 @@ def _verify_observations_for_recovery(
         current = current.parent
     added.setdefault(LOCK_RELATIVE.parent, set()).add(LOCK_RELATIVE.name)
 
-    adjusted: list[Observation] = []
-    for observation in journal.observations.entries:
-        if observation.path in excluded or observation.path in explained:
-            continue
-        if observation.kind is EntryKind.DIRECTORY:
-            planned = set(observation.members)
-            expected = tuple(
-                sorted(
-                    (planned - removed.get(observation.path, set()))
-                    | added.get(observation.path, set())
-                )
-            )
-            adjusted.append(directory_observation(observation.path, expected))
-        else:
-            adjusted.append(observation)
+    adjusted = adjusted_observation_manifest(
+        journal.observations,
+        excluded=frozenset(excluded),
+        explained=frozenset(explained),
+        added=added,
+        removed=removed,
+    )
 
     class _RecoveryProbe:
         """复核探针：忽略本操作崩溃遗留的 .tmp-<hex> 瞬态文件（可解释残留）。"""
 
-        def __init__(self, probe: FilesystemObservationProbe) -> None:
-            self._probe = probe
+        def __init__(self, inner: ObservationProbe) -> None:
+            self._inner = inner
 
         def observe(self, path: Path) -> Observation:
-            observed = self._probe.observe(path)
+            observed = self._inner.observe(path)
             if observed.kind is EntryKind.DIRECTORY:
                 members = tuple(
                     member for member in observed.members if not _is_temp_artifact(member)
@@ -1246,11 +1277,9 @@ def _verify_observations_for_recovery(
                 return Observation(path=path, kind=EntryKind.DIRECTORY, members=members)
             return observed
 
-    return verify_observations(
-        _RecoveryProbe(FilesystemObservationProbe(root)),
-        ObservationManifest(entries=tuple(adjusted)),
-        explained_mutations=(),
-    )
+    if probe is None:
+        probe = _RecoveryProbe(FilesystemObservationProbe(root))
+    return verify_observations(probe, adjusted, explained_mutations=())
 
 
 def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> OperationResult:

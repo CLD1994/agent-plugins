@@ -10,7 +10,12 @@ import pytest
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import MutationKind, OperationKind, OperationPhase, RootState
-from draft.observations import EMPTY_OBSERVATIONS
+from draft.observations import (
+    EMPTY_OBSERVATIONS,
+    ObservationManifest,
+    directory_observation,
+    file_observation,
+)
 from draft.operations import (
     HANDOFF_ATTEMPTED_AT_KEY,
     HANDOFF_ERROR_MESSAGE_KEY,
@@ -18,6 +23,7 @@ from draft.operations import (
     Journal,
     JournalMutation,
     TrashDeadlines,
+    adjusted_observation_manifest,
     format_utc,
     handoff_failure_metadata,
     has_handoff_failure,
@@ -28,6 +34,33 @@ from draft.operations import (
     with_phase,
     without_metadata,
 )
+
+# ---------------------------------------------------------------------------
+# adjusted_observation_manifest：纯函数，不访问文件系统
+# ---------------------------------------------------------------------------
+
+
+def test_adjusted_observation_manifest_explains_directory_members() -> None:
+    manifest = ObservationManifest(
+        entries=(
+            directory_observation(Path("pages"), ("a.md",)),
+            file_observation(Path("pages/b.md"), b"b"),
+        )
+    )
+    adjusted = adjusted_observation_manifest(
+        manifest,
+        excluded=frozenset({Path(".draft/operations/x")}),
+        explained=frozenset({Path("pages/b.md")}),
+        added={Path("pages"): frozenset({"c.md"})},
+        removed={Path("pages"): frozenset({"a.md"})},
+    )
+    # explained mutation 路径被排除。
+    assert adjusted.for_path(Path("pages/b.md")) is None
+    pages = adjusted.for_path(Path("pages"))
+    assert pages is not None
+    # 目录成员 = planned - removed + added。
+    assert pages.members == ("c.md",)
+
 
 # ---------------------------------------------------------------------------
 # TrashDeadlines.from_created_at
