@@ -21,10 +21,13 @@ from draft.operations import (
     LOCK_RELATIVE,
     Journal,
     JournalMutation,
+    _name_node,  # pyright: ignore[reportPrivateUsage]
+    _pending_name,  # pyright: ignore[reportPrivateUsage]
+    _read_name_bytes,  # pyright: ignore[reportPrivateUsage]
+    _same_name_node,  # pyright: ignore[reportPrivateUsage]
     anchored_leaf,
     classify_node,
     durable_write,
-    fsync_directory,
     operation_journal_path,
     read_journal,
     read_lock,
@@ -712,10 +715,63 @@ def _write_cleanup_evidence(
     )
 
 
-def _clear_cleanup_evidence(root: Path, journal: Journal) -> None:
-    """清理成功后移除证据：只接受已分类的精确普通文件；目录/链接/其他类型不是清理
-    成功，保留现场报错（回归 H4）。缺失幂等容忍。
+def _recover_cleanup_evidence_pending(root: Path, journal: Journal) -> None:
+    """收敛崩溃遗留的 evidence pending（回归 H5）：先按当前 T 授权完整验证，再决定发布/保留。
+
+    证据写是 create-only（O_EXCL pending + link 发布），发布前崩溃留下
+    ``cleanup-evidence.json.pending``。只有完整解析并交叉校验 T 授权的 pending 才可
+    发布/消费；非法 pending 保留现场报 corrupt，绝不按文件名删除。
     """
+    evidence_path = _cleanup_evidence_path(journal)
+    pending = evidence_path.with_name(_pending_name(evidence_path.name))
+    pending_kind = classify_node(pending)
+    if pending_kind is EntryKind.MISSING:
+        return
+    if pending_kind is not EntryKind.FILE:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, pending)
+    from draft.operations import _AnchoredLeaf  # pyright: ignore[reportPrivateUsage]
+
+    with anchored_leaf(
+        journal.directory,
+        Path(_CLEANUP_EVIDENCE_NAME),
+        code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+        code_path=pending,
+    ) as leaf:
+        if not isinstance(leaf, _AnchoredLeaf):
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, pending)
+        if leaf.classify() is not EntryKind.FILE:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, pending)
+        verified = _name_node(leaf.parent_fd, _pending_name(leaf.name))
+        data = _read_name_bytes(
+            leaf.parent_fd,
+            _pending_name(leaf.name),
+            code_path=pending,
+            code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+        )
+        parse_cleanup_evidence(data, journal, evidence_path)  # 完整验证 T 授权。
+        if not _same_name_node(leaf.parent_fd, _pending_name(leaf.name), verified):
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, pending)
+    from draft.operations import recover_digest_pending
+
+    recover_digest_pending(
+        journal.directory,
+        Path(_CLEANUP_EVIDENCE_NAME),
+        sha256_bytes(data),
+        code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+        code_path=evidence_path,
+    )
+
+
+def _clear_cleanup_evidence(root: Path, journal: Journal) -> None:
+    """清理成功后移除证据：只消费从当前已提交 T 授权完整验证出的精确 evidence 节点（回归 H5）。
+
+    存在但非法不等于可清除残留：先以 ``parse_cleanup_evidence`` 完整解析并交叉校验 T
+    授权，验证通过后用节点事务（inode + 摘要复核）消费同一已验证节点；解析/类型/链接
+    /I/O 失败都保留现场报 trash.package_corrupt，绝不按文件名删除未验证证据。
+    缺失幂等容忍。
+    """
+    from draft.operations import _AnchoredLeaf  # pyright: ignore[reportPrivateUsage]
+
     path = _cleanup_evidence_path(journal)
     with anchored_leaf(
         journal.directory,
@@ -723,13 +779,25 @@ def _clear_cleanup_evidence(root: Path, journal: Journal) -> None:
         code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
         code_path=path,
     ) as leaf:
+        if not isinstance(leaf, _AnchoredLeaf):
+            return  # 中间组件缺失：证据必然缺失，幂等。
         node = leaf.classify()
         if node is EntryKind.MISSING:
             return
         if node is not EntryKind.FILE:
             raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, path)
-        leaf.unlink()
-        fsync_directory(journal.directory)
+        # 先捕获 inode 再读取原始 bytes：完整解析后证明消费的是同一已验证节点。
+        verified_node = _name_node(leaf.parent_fd, leaf.name)
+        data = _read_name_bytes(
+            leaf.parent_fd,
+            leaf.name,
+            code_path=path,
+            code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+        )
+        parse_cleanup_evidence(data, journal, path)
+        if not _same_name_node(leaf.parent_fd, leaf.name, verified_node):
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, path)
+        leaf.quarantine_delete(sha256_bytes(data))
 
 
 def _restore_missing_leaves_from_evidence(root: Path, journal: Journal, code_path: Path) -> None:
@@ -742,7 +810,28 @@ def _restore_missing_leaves_from_evidence(root: Path, journal: Journal, code_pat
     from draft.operations import recover_digest_pending, recover_quarantine
 
     evidence_path = _cleanup_evidence_path(journal)
-    evidence = parse_cleanup_evidence(evidence_path.read_bytes(), journal, code_path)
+    from draft.operations import _AnchoredLeaf  # pyright: ignore[reportPrivateUsage]
+
+    with anchored_leaf(
+        journal.directory,
+        Path(_CLEANUP_EVIDENCE_NAME),
+        code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+        code_path=evidence_path,
+    ) as evidence_leaf:
+        if not isinstance(evidence_leaf, _AnchoredLeaf):
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, evidence_path)
+        if evidence_leaf.classify() is not EntryKind.FILE:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, evidence_path)
+        evidence = parse_cleanup_evidence(
+            _read_name_bytes(
+                evidence_leaf.parent_fd,
+                evidence_leaf.name,
+                code_path=evidence_path,
+                code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+            ),
+            journal,
+            code_path,
+        )
     for leaf_state in evidence.leaves:
         if leaf_state.state != "present":
             continue
@@ -787,6 +876,8 @@ def clean_authoritative_package(root: Path, authorization: CleanupAuthorization)
     """
     journal = authorization.journal
     reject_symlink_components(root, OUTGOING_RELATIVE)
+    # 先收敛崩溃遗留的 evidence pending（回归 H5）：完整验证 T 授权后才发布/保留。
+    _recover_cleanup_evidence_pending(root, journal)
     package_dir = root / OUTGOING_RELATIVE / journal.operation_id
     # 先验证日志协议再碰包：物理包缺失只是文件系统状态，不能跳过日志语义验证
     # （回归 H6）——空 mutation、缺 package write、第三个包内 WRITE 都必须报损坏。

@@ -999,3 +999,66 @@ def test_cleanup_quarantine_does_not_delete_swapped_node(
     package_json = package / "package.json"
     assert package_json.read_bytes() == swapped["content"]
     assert package.exists()
+
+
+def _remove_package(root: Path, operation_id: str) -> None:
+    import shutil
+
+    shutil.rmtree(root / OUTGOING_RELATIVE / operation_id)
+
+
+def test_package_missing_with_invalid_evidence_is_preserved(
+    draft_factory: DraftFactory,
+) -> None:
+    """包缺失 + 非法证据：保留证据报损坏，绝不按文件名删除（回归 H5）。"""
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    _commit_phase(root, pending.operation_id, "rolled_back")
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+    evidence = journal.directory / "cleanup-evidence.json"
+    evidence.write_bytes(b"\xff not a valid evidence json")
+    _remove_package(root, pending.operation_id)
+
+    from draft.operations import acquire_lock
+
+    acquire_lock(root, pending.operation_id)
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        _clean_with_authorization(root, pending.operation_id)
+    assert evidence.is_file()  # 非法证据保留。
+    assert evidence.read_bytes() == b"\xff not a valid evidence json"
+
+
+def test_package_missing_with_valid_evidence_is_consumed(
+    draft_factory: DraftFactory,
+) -> None:
+    """包缺失 + 合法证据：节点事务消费证据后幂等完成（回归 H5）。"""
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    _commit_phase(root, pending.operation_id, "rolled_back")
+    payload = _valid_evidence_payload(root, pending.operation_id)
+    evidence = _write_evidence(root, pending.operation_id, payload)
+    _remove_package(root, pending.operation_id)
+
+    _clean_with_authorization(root, pending.operation_id)
+
+    assert not evidence.exists()  # 合法证据被消费。
+
+
+def test_checker_reports_corrupt_evidence_content(
+    draft_factory: DraftFactory,
+) -> None:
+    """checker 只读验证 evidence 内容：非法普通文件证据报告具体损坏（回归 H5）。"""
+    from draft.checker import check_draft
+    from draft.operations import acquire_lock
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    _commit_phase(root, pending.operation_id, "trash_handoff_succeeded")
+    acquire_lock(root, pending.operation_id)
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+    evidence = journal.directory / "cleanup-evidence.json"
+    evidence.write_bytes(b"not json at all")
+
+    report = check_draft(root)
+
+    assert any(issue.code == CheckCode.TRASH_PACKAGE_CORRUPT.value for issue in report.errors)

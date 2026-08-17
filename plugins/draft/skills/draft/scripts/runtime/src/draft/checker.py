@@ -442,6 +442,26 @@ _OP_DIR_ALLOCATING_ALLOWED = frozenset(
 )
 
 
+def _invalid_cleanup_evidence(operation_dir: Path, evidence_path: Path) -> bool:
+    """只读验证 evidence 内容：任何 schema/T 授权/读取错误都视为损坏（回归 H5）。
+
+    checker 只读：从锁内重读的 journal 派生授权，调用与 clean 共用同一
+    parse_cleanup_evidence 验证器，报告具体损坏而不只验证 EntryKind.FILE。
+    """
+    try:
+        journal = read_journal(operation_dir / "journal.json")
+        if journal.kind is not OperationKind.TRASH:
+            return True
+        from draft.trash_package import parse_cleanup_evidence
+
+        parse_cleanup_evidence(evidence_path.read_bytes(), journal, evidence_path)
+        return False
+    except DraftError:
+        return True
+    except OSError:
+        return True
+
+
 def _check_operation_directory_entries(
     entry: Path, phase: OperationPhase, issues: list[CheckIssue]
 ) -> None:
@@ -473,6 +493,15 @@ def _check_operation_directory_entries(
                 issues.append(
                     _error(
                         CheckCode.INTERNAL_UNEXPECTED_ENTRY,
+                        child.relative_to(entry.parents[1]),
+                    )
+                )
+                continue
+            if node is EntryKind.FILE and _invalid_cleanup_evidence(entry, child):
+                # 非法普通文件证据：内容损坏可见，不能只验证节点类型（回归 H5）。
+                issues.append(
+                    _error(
+                        CheckCode.TRASH_PACKAGE_CORRUPT,
                         child.relative_to(entry.parents[1]),
                     )
                 )

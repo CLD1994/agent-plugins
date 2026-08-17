@@ -631,12 +631,18 @@ def _same_name_node(parent_fd: int, name: str, node: tuple[int, int] | None) -> 
     return node is not None and _name_node(parent_fd, name) == node
 
 
-def _read_name_bytes(parent_fd: int, name: str, *, code_path: Path) -> bytes:
-    """在父目录句柄内 no-follow 读取名字内容；失败映射 operation.durability_failed。"""
+def _read_name_bytes(
+    parent_fd: int,
+    name: str,
+    *,
+    code_path: Path,
+    code: str = CheckCode.OPERATION_DURABILITY_FAILED.value,
+) -> bytes:
+    """在父目录句柄内 no-follow 读取名字内容；失败映射稳定领域错误（回归 M3）。"""
     try:
         descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
     except OSError as exc:
-        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+        raise DraftError(code, code_path) from exc
     try:
         chunks: list[bytes] = []
         while True:
@@ -645,7 +651,7 @@ def _read_name_bytes(parent_fd: int, name: str, *, code_path: Path) -> bytes:
                 return b"".join(chunks)
             chunks.append(chunk)
     except OSError as exc:
-        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+        raise DraftError(code, code_path) from exc
     finally:
         os.close(descriptor)
 
