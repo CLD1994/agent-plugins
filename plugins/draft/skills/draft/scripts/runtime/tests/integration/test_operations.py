@@ -1186,13 +1186,15 @@ def test_crash_during_recovery_copy_creation_is_judgable(
     original_durable = operations_module.durable_write
     calls = {"n": 0}
 
-    def crash_on_fourth_durable(path: object, value: object) -> None:
+    def crash_on_second_durable(path: object, value: object) -> None:
+        # journal 写入不再经过 durable_write（回归 H2 发布拆分），副本写入从第 1 次
+        # durable_write 起计：第 2 次即第一个 staged 写入处崩溃。
         calls["n"] += 1
-        if calls["n"] == 4:  # 预分配、prepared 日志后第一次 staged 写入处崩溃。
+        if calls["n"] == 2:  # prepared 日志后第一个 staged 写入处崩溃。
             raise RuntimeError("injected crash during copy creation")
         original_durable(path, value)  # type: ignore[arg-type]
 
-    monkeypatch.setattr("draft.operations.durable_write", crash_on_fourth_durable)
+    monkeypatch.setattr("draft.operations.durable_write", crash_on_second_durable)
     with pytest.raises(RuntimeError, match="injected crash"):
         execute_plan(plan)
     monkeypatch.undo()
@@ -1716,12 +1718,16 @@ def test_durable_write_pending_dir_fsync_failure_then_resolve_converges(
 def test_durable_write_final_dir_fsync_failure_reports_not_durable(
     operation_draft: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """最终目录 fsync 失败：发布已发生但报 durability_failed，调用方不得视为耐久（回归 H1）。"""
+    """最终目录 fsync 失败：发布已发生但报 durability_failed，调用方不得视为耐久（回归 H1）。
+
+    create-only 发布的 fsync 序为 file(1)/pending-dir(2)/after-link(3)/after-unlink(4)，
+    最终目录同步是第 4 次。
+    """
     from draft.operations import durable_write
 
     target = operation_draft / ".draft/operations/cccccccccccccccccccccccccccccccc/journal.json"
     target.parent.mkdir(parents=True)
-    _fail_fsync_at(monkeypatch, frozenset({3}))
+    _fail_fsync_at(monkeypatch, frozenset({4}))
     with pytest.raises(DraftError, match=CheckCode.OPERATION_DURABILITY_FAILED.value):
         durable_write(target, _valid_journal_bytes("c" * 32))
     monkeypatch.undo()
@@ -1799,7 +1805,8 @@ def test_subprocess_kill_leaves_synced_pending_then_resolve_converges(
     script = (
         "import os, signal, sys\n"
         "from pathlib import Path\n"
-        "os.replace = lambda *a, **k: os.kill(os.getpid(), signal.SIGKILL)\n"
+        # create-only 发布在 link（no-clobber 发布点）处崩溃：pending 已 fsync。
+        "os.link = lambda *a, **k: os.kill(os.getpid(), signal.SIGKILL)\n"
         "from draft.operations import durable_write\n"
         f"durable_write(Path({str(target)!r}), {payload!r})\n"
     )
@@ -1813,7 +1820,7 @@ def test_subprocess_kill_leaves_synced_pending_then_resolve_converges(
     assert pending.read_bytes() == payload
 
     # 新进程收敛：发布 pending 后日志可读，pending 已消费。
-    from draft.operations import read_journal, resolve_journal_pending
+    from draft.operations import resolve_journal_pending
 
     resolve_journal_pending(target)
     assert read_journal(target).operation_id == op_id
@@ -1824,7 +1831,7 @@ def test_resolve_journal_pending_with_old_journal_publishes_newer(
     operation_draft: Path,
 ) -> None:
     """旧 journal 与有效 pending 并存：发布较新的 pending（回归 H2 决策表"完整发布新"）。"""
-    from draft.operations import read_journal, resolve_journal_pending
+    from draft.operations import resolve_journal_pending
 
     op_id = "9" * 32
     journal_dir = operation_draft / ".draft/operations" / op_id
@@ -1843,7 +1850,7 @@ def test_resolve_journal_pending_with_old_journal_keeps_old_on_invalid(
     operation_draft: Path,
 ) -> None:
     """旧 journal 存在 + pending 半写无效：保留旧 journal，不报错（回归 H2 决策表"选择旧"）。"""
-    from draft.operations import read_journal, resolve_journal_pending
+    from draft.operations import resolve_journal_pending
 
     op_id = "8" * 32
     journal_dir = operation_draft / ".draft/operations" / op_id
@@ -2096,3 +2103,129 @@ def test_read_lock_non_utf8_is_stable_corrupt(operation_draft: Path) -> None:
         read_lock(root)
     with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
         recover(root)
+
+
+def test_resolve_journal_pending_rejects_mutation_replaced_successor(
+    operation_draft: Path,
+) -> None:
+    """旧 journal 存在 + pending 可解析但替换 mutation：保留 old+pending，报损坏（回归 H1）。"""
+    import json as json_module
+
+    from draft.operations import resolve_journal_pending
+
+    root = operation_draft
+    op_id = "7" * 32
+    journal_dir = root / ".draft/operations" / op_id
+    journal_dir.mkdir(parents=True)
+    target = journal_dir / "journal.json"
+
+    def _journal_bytes(phase: str, after: str) -> bytes:
+        payload: dict[str, object] = {
+            "journal_version": JOURNAL_VERSION,
+            "operation_id": op_id,
+            "kind": OperationKind.CREATE.value,
+            "phase": phase,
+            "root_state": "registered",
+            "observations": [],
+            "mutations": [
+                {
+                    "path": "pages/a.md",
+                    "kind": "write",
+                    "before_sha256": None,
+                    "after_sha256": after,
+                    "original": None,
+                    "staged": "staged/0000.bin",
+                    "applied": False,
+                }
+            ],
+            "remove_empty_directories": [],
+            "metadata": {},
+        }
+        return (json_module.dumps(payload) + "\n").encode("utf-8")
+
+    old_bytes = _journal_bytes("prepared", "a" * 64)
+    pending_bytes = _journal_bytes("applying", "b" * 64)  # 换 mutation 摘要。
+    target.write_bytes(old_bytes)
+    (journal_dir / "journal.json.pending").write_bytes(pending_bytes)
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        resolve_journal_pending(target)
+
+    assert target.read_bytes() == old_bytes  # old 字节不变。
+    assert (journal_dir / "journal.json.pending").read_bytes() == pending_bytes  # pending 保留。
+
+
+def test_resolve_journal_pending_rejects_phase_regression(operation_draft: Path) -> None:
+    """旧 journal 存在 + pending 阶段倒退：保留 old+pending，报损坏（回归 H1）。"""
+    import json as json_module
+
+    from draft.operations import resolve_journal_pending
+
+    root = operation_draft
+    op_id = "6" * 32
+    journal_dir = root / ".draft/operations" / op_id
+    journal_dir.mkdir(parents=True)
+    target = journal_dir / "journal.json"
+
+    def _journal_bytes(phase: str) -> bytes:
+        payload: dict[str, object] = {
+            "journal_version": JOURNAL_VERSION,
+            "operation_id": op_id,
+            "kind": OperationKind.CREATE.value,
+            "phase": phase,
+            "root_state": "registered",
+            "observations": [],
+            "mutations": [],
+            "remove_empty_directories": [],
+            "metadata": {},
+        }
+        return (json_module.dumps(payload) + "\n").encode("utf-8")
+
+    old_bytes = _journal_bytes("applying")
+    pending_bytes = _journal_bytes("allocating")  # 倒退回分配期。
+    target.write_bytes(old_bytes)
+    (journal_dir / "journal.json.pending").write_bytes(pending_bytes)
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        resolve_journal_pending(target)
+
+    assert target.read_bytes() == old_bytes
+    assert (journal_dir / "journal.json.pending").read_bytes() == pending_bytes
+
+
+def test_resolve_journal_pending_rejects_identity_rewrite(operation_draft: Path) -> None:
+    """旧 journal 存在 + pending 改写 kind：保留 old+pending，报损坏（回归 H1）。"""
+    import json as json_module
+
+    from draft.operations import resolve_journal_pending
+
+    root = operation_draft
+    op_id = "5" * 32
+    journal_dir = root / ".draft/operations" / op_id
+    journal_dir.mkdir(parents=True)
+    target = journal_dir / "journal.json"
+
+    def _journal_bytes(kind: str) -> bytes:
+        payload: dict[str, object] = {
+            "journal_version": JOURNAL_VERSION,
+            "operation_id": op_id,
+            "kind": kind,
+            "phase": "prepared",
+            "root_state": "registered",
+            "observations": [],
+            "mutations": [],
+            "remove_empty_directories": [],
+            "metadata": {},
+        }
+        return (json_module.dumps(payload) + "\n").encode("utf-8")
+
+    old_bytes = _journal_bytes("create")
+    pending_bytes = _journal_bytes("move")  # kind 改写。
+    target.write_bytes(old_bytes)
+    (journal_dir / "journal.json.pending").write_bytes(pending_bytes)
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        resolve_journal_pending(target)
+
+    assert target.read_bytes() == old_bytes
+    assert (journal_dir / "journal.json.pending").read_bytes() == pending_bytes

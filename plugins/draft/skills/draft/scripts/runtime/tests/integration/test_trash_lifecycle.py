@@ -81,6 +81,21 @@ def _package_exists(root: Path, operation_id: str) -> bool:
     return (root / ".draft/trash/outgoing" / operation_id).is_dir()
 
 
+def _force_phase(root: Path, operation_id: str, phase: OperationPhase) -> None:
+    """直接改写 journal phase 以模拟崩溃遗留的已提交状态（回归 H1/Q1）。
+
+    崩溃只能留下状态机某个耐久写产生的终态组合；trash_handoff_succeeded /
+    trash_purge_committed 由 handoff 流程从 pending 产生，测试直接构造该状态必须
+    绕过 write_journal 的合法后继验证，否则会把手工快捷路径误当成协议允许的转换。
+    """
+    import json
+
+    path = _journal_path(root, operation_id)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["phase"] = phase.value
+    path.write_bytes((json.dumps(data, ensure_ascii=False) + "\n").encode("utf-8"))
+
+
 def _accept_into(bin_dir: Path, accepted: list[str]) -> Callable[[str], None]:
     def accept(path: str) -> None:
         import shutil
@@ -358,12 +373,10 @@ def test_handoff_success_marker_prevents_resubmission_after_crash(
     root = build_trashable_draft(draft_factory)
     pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
 
-    from draft.operations import acquire_lock, read_journal, with_phase, write_journal
+    from draft.operations import acquire_lock
 
     # 手工构造“成功标记已耐久、清理前崩溃”现场：T=trash_handoff_succeeded、持锁、包仍在。
-    journal = read_journal(_journal_path(root, pending.operation_id))
-    succeeded = with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED)
-    write_journal(succeeded)
+    _force_phase(root, pending.operation_id, OperationPhase.TRASH_HANDOFF_SUCCEEDED)
     acquire_lock(root, pending.operation_id)
 
     calls: list[str] = []
@@ -380,12 +393,10 @@ def test_purge_committed_recovery_only_finishes_cleanup(
     root = build_trashable_draft(draft_factory)
     pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
 
-    from draft.operations import acquire_lock, read_journal, with_phase, write_journal
+    from draft.operations import acquire_lock
 
-    journal = read_journal(_journal_path(root, pending.operation_id))
     # 手工写入 purge_committed 模拟“最终清理提交点已耐久、清理前崩溃”。
-    committed = with_phase(journal, OperationPhase.TRASH_PURGE_COMMITTED)
-    write_journal(committed)
+    _force_phase(root, pending.operation_id, OperationPhase.TRASH_PURGE_COMMITTED)
     acquire_lock(root, pending.operation_id)
     assert _package_exists(root, pending.operation_id)
 
@@ -424,12 +435,11 @@ def test_terminal_recovery_preserves_unknown_package_entry(
     清理原语必须拒绝而不是无条件递归删除：未知文件/空目录/符号链接保留，操作不
     报告 completed，锁与阶段保留。
     """
-    from draft.operations import acquire_lock, read_journal, with_phase, write_journal
+    from draft.operations import acquire_lock
 
     root = build_trashable_draft(draft_factory)
     pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
-    journal = read_journal(_journal_path(root, pending.operation_id))
-    write_journal(with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED))
+    _force_phase(root, pending.operation_id, OperationPhase.TRASH_HANDOFF_SUCCEEDED)
     acquire_lock(root, pending.operation_id)
     package = root / ".draft/trash/outgoing" / pending.operation_id
     unknown = _inject_unknown_package_entry(package, entry_type)
@@ -448,12 +458,11 @@ def test_terminal_recovery_idempotent_when_payload_missing(
     draft_factory: DraftFactory,
 ) -> None:
     """已授权条目部分缺失（提交点后幂等清理）：终态恢复必须成功而非误报损坏。"""
-    from draft.operations import acquire_lock, read_journal, with_phase, write_journal
+    from draft.operations import acquire_lock
 
     root = build_trashable_draft(draft_factory)
     pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
-    journal = read_journal(_journal_path(root, pending.operation_id))
-    write_journal(with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED))
+    _force_phase(root, pending.operation_id, OperationPhase.TRASH_HANDOFF_SUCCEEDED)
     acquire_lock(root, pending.operation_id)
     payload = root / ".draft/trash/outgoing" / pending.operation_id / "payload/pages/obsolete.md"
     payload.unlink()
@@ -473,12 +482,11 @@ def test_terminal_recovery_rejects_empty_mutation_log(
     import json
     import shutil
 
-    from draft.operations import acquire_lock, read_journal, with_phase, write_journal
+    from draft.operations import acquire_lock
 
     root = build_trashable_draft(draft_factory)
     pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
-    journal = read_journal(_journal_path(root, pending.operation_id))
-    write_journal(with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED))
+    _force_phase(root, pending.operation_id, OperationPhase.TRASH_HANDOFF_SUCCEEDED)
     acquire_lock(root, pending.operation_id)
     # 清空 mutation 并把权威包整个移除：物理包缺失只是文件系统状态，不能跳过日志验证。
     data = json.loads(_journal_path(root, pending.operation_id).read_text(encoding="utf-8"))
@@ -500,12 +508,12 @@ def test_terminal_recovery_converges_after_mid_delete_extra(
 ) -> None:
     """终态恢复删除期间出现晚到 extra：保留证据，移除后 recover 从证据收敛（回归 H2）。"""
     import draft.trash_package as trash_package_module
-    from draft.operations import acquire_lock, read_journal, with_phase, write_journal
+    from draft.operations import acquire_lock, read_journal
 
     root = build_trashable_draft(draft_factory)
     pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
     journal = read_journal(_journal_path(root, pending.operation_id))
-    write_journal(with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED))
+    _force_phase(root, pending.operation_id, OperationPhase.TRASH_HANDOFF_SUCCEEDED)
     acquire_lock(root, pending.operation_id)
     package = root / ".draft/trash/outgoing" / pending.operation_id
 
@@ -577,10 +585,9 @@ def test_recover_cli_never_exposes_internal_paths(
     root = build_trashable_draft(draft_factory)
     pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
 
-    from draft.operations import acquire_lock, read_journal, with_phase, write_journal
+    from draft.operations import acquire_lock
 
-    journal = read_journal(_journal_path(root, pending.operation_id))
-    write_journal(with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED))
+    _force_phase(root, pending.operation_id, OperationPhase.TRASH_HANDOFF_SUCCEEDED)
     acquire_lock(root, pending.operation_id)
     capsys.readouterr()
 
@@ -794,15 +801,12 @@ def test_terminal_cleanup_rejects_symlinked_outgoing(
     import shutil
 
     from draft.errors import DraftError
-    from draft.operations import acquire_lock, with_phase, write_journal
+    from draft.operations import acquire_lock
 
     root = build_trashable_draft(draft_factory)
     pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
     # 构造 succeeded 持锁现场，再把 trash/outgoing 换成符号链接。
-    from draft.operations import read_journal
-
-    journal = read_journal(_journal_path(root, pending.operation_id))
-    write_journal(with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED))
+    _force_phase(root, pending.operation_id, OperationPhase.TRASH_HANDOFF_SUCCEEDED)
     acquire_lock(root, pending.operation_id)
     outgoing = root / ".draft/trash/outgoing"
     external = tmp_path / "external-bin"

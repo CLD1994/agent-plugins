@@ -48,6 +48,14 @@ HANDOFF_RETRY_INTERVAL = timedelta(hours=24)
 HANDOFF_ERROR_TYPE_KEY = "handoff_error_type"
 HANDOFF_ERROR_MESSAGE_KEY = "handoff_error_message"
 HANDOFF_ATTEMPTED_AT_KEY = "handoff_attempted_at"
+# 终态处置键（与 HANDOFF 键同属 journal metadata 协议）：唯一权威来源，trash_lifecycle 复用。
+DISPOSITION_KEY = "disposition"
+# trash_retained 阶段的恢复认领键：T 用它回指已完成关联的 R。
+RESTORE_OPERATION_ID_KEY = "restore_operation_id"
+# 投递重试下一次时间键（与 HANDOFF 键同属失败记录协议）。
+NEXT_HANDOFF_ATTEMPT_KEY = "next_handoff_attempt_at"
+# prepared 冻结点追加的公开变更路径审计键。
+PUBLIC_CHANGED_PATHS_KEY = "public_changed_paths"
 
 _MID_WRITE_PHASES = frozenset(
     {
@@ -216,33 +224,41 @@ def _quarantine_name(name: str) -> str:
     return f"{name}{_QUARANTINE_SUFFIX}"
 
 
-def _publish_via_pending(
+def _publish_pending(
     parent_fd: int,
     name: str,
     content: bytes,
     *,
-    no_clobber: bool,
+    pending_mode: Literal["create", "replace"],
+    publish: Literal["link", "replace"],
     code_path: Path,
 ) -> None:
-    """在父目录句柄内把 content 耐久发布为 name（确定名 pending + 严格同步，回归 H1/H2）。
+    """在父目录句柄内把 content 耐久发布为 name（确定名 pending + 严格同步，回归 H1/H2/H3）。
 
-    顺序：截断创建 pending → 写入 → fsync 文件 → 严格 fsync 父目录（pending 目录项
-    耐久，崩溃时恢复可按授权源分类）→ 发布 → 严格 fsync 父目录（目标目录项耐久）。
-    任一步失败保留 pending/旧目标现场并抛 operation.durability_failed；调用方不得
-    把该写入当作已耐久，也不得继续删除权威叶或释放锁。
+    顺序：创建 pending → 写入 → fsync 文件 → 严格 fsync 父目录（pending 目录项耐久，
+    崩溃时恢复可按授权源分类）→ 发布 → 严格 fsync 父目录（新名字目录项耐久，至少
+    一个授权名字可证明存在）→ 删除 pending → 严格 fsync 父目录（pending 移除耐久）。
 
-    no_clobber=True：link 无覆盖发布，发布瞬间目标已出现即外部变化（恢复写不覆盖）。
+    - ``pending_mode="create"``：O_EXCL 原子创建，已有 pending 拒绝（绝不截断未知
+      pending，回归 H2 create-only）；``pending_mode="replace"``：journal 更新由 H1
+      转换授权持有该命名临时，半写残留可替换。
+    - ``publish="link"``：no-clobber 发布，发布瞬间目标已出现即外部变化（create-only
+      目标与恢复写不覆盖）；``publish="replace"``：经 H1 验证后的权威 journal 原子替换。
+
+    任一步失败保留 pending/旧目标现场并抛稳定领域错误；调用方不得把该写入当作已耐久，
+    也不得继续删除权威叶或释放锁。
     """
     pending = _pending_name(name)
-    # 打开 pending：O_NOFOLLOW 拒绝符号链接；持锁写无并发，已有崩溃遗留 pending 由
-    # 当前拥有者重写。
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_NOFOLLOW
+        | (os.O_EXCL if pending_mode == "create" else os.O_TRUNC)
+    )
     try:
-        descriptor = os.open(
-            pending,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
-            0o644,
-            dir_fd=parent_fd,
-        )
+        descriptor = os.open(pending, flags, 0o644, dir_fd=parent_fd)
+    except FileExistsError as exc:
+        raise DraftError("operation.external_change", code_path) from exc
     except OSError as exc:
         raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
     try:
@@ -253,13 +269,14 @@ def _publish_via_pending(
     except OSError as exc:
         raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
     _fsync_dir_fd(parent_fd, code_path)
-    if no_clobber:
+    if publish == "link":
         try:
             os.link(pending, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         except FileExistsError as exc:
             raise DraftError("operation.external_change", code_path) from exc
         except OSError as exc:
             raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+        _fsync_dir_fd(parent_fd, code_path)  # 新名字耐久：至少一个授权名字可证明存在。
         try:
             os.unlink(pending, dir_fd=parent_fd)
         except OSError as exc:
@@ -270,6 +287,29 @@ def _publish_via_pending(
         except OSError as exc:
             raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
     _fsync_dir_fd(parent_fd, code_path)
+
+
+def _create_only_publish(parent_fd: int, name: str, content: bytes, *, code_path: Path) -> None:
+    """create-only 发布（回归 H2）：目标与 pending 都必须是 missing 的首次创建。
+
+    绝不截断未知 pending、绝不覆盖既有目标；目标/pending 已占用（file/directory/link/
+    other）都保留现场报 operation.external_change，除非调用方已先跑专用恢复决策并证明
+    exact。用于 journal bootstrap、original/staged、attempt、cleanup evidence。
+    """
+    _publish_pending(
+        parent_fd, name, content, pending_mode="create", publish="link", code_path=code_path
+    )
+
+
+def _replace_publish(parent_fd: int, name: str, content: bytes, *, code_path: Path) -> None:
+    """权威 journal 更新发布（回归 H2）：调用方必须先经 H1 转换验证授权 old→new。
+
+    journal 自身的命名临时可替换半写残留（旧 journal 权威且已同步）；最终 os.replace
+    原子替换目标，绝不出现目标缺失窗口。
+    """
+    _publish_pending(
+        parent_fd, name, content, pending_mode="replace", publish="replace", code_path=code_path
+    )
 
 
 def _open_parent_dir(path: Path, *, code: str, code_path: Path) -> int:
@@ -543,15 +583,14 @@ class _AnchoredLeaf:
             raise self._io_error(exc) from exc
 
     def write(self, content: bytes) -> None:
-        """no-clobber 耐久发布叶文件（restore 恢复缺失叶，回归 H1/H2/H3）。
+        """create-only 耐久发布叶文件（restore 恢复缺失叶，回归 H1/H2/H3）。
 
-        确定名 pending（``<名>.pending``）+ link 无覆盖发布：发布瞬间目标已出现即
-        外部变化，保留 pending 与新目标并报错，绝不覆盖。严格同步父目录，失败映射
-        operation.durability_failed。供清理证据恢复使用：绝不按绝对路径重新解析。
+        目标与 pending 都必须 missing（O_EXCL + link 无覆盖发布）：发布瞬间目标或
+        pending 已出现即外部变化，保留现场报错，绝不截断未知 pending、绝不覆盖既有
+        目标。严格同步父目录，失败映射 operation.durability_failed。供清理证据恢复
+        使用：调用方已先收敛崩溃遗留 pending，绝不按绝对路径重新解析。
         """
-        _publish_via_pending(
-            self.parent_fd, self.name, content, no_clobber=True, code_path=self.code_path
-        )
+        _create_only_publish(self.parent_fd, self.name, content, code_path=self.code_path)
 
     def quarantine_delete(self, expected_digest: str) -> None:
         """先原子隔离、后验证、再删除（回归 H3）。
@@ -690,18 +729,20 @@ def anchored_leaf(
 
 
 def durable_write(path: Path, value: bytes) -> None:
-    """内部状态（日志、锁、恢复副本、清理证据）的严格耐久写：确定名 pending + 原子发布。
+    """create-only 严格耐久写（回归 H1/H2/H3）：journal bootstrap、original/staged、
+    attempt、cleanup evidence 等首次创建目标。
 
-    崩溃遗留为 ``<目标名>.pending`` 而非随机 uuid 临时文件（回归 H2）：恢复按授权源
-    精确分类收敛。父目录以 no-follow 打开（发布边界不重新解析路径）；严格同步失败
-    映射 operation.durability_failed（回归 H1）。
+    目标与 pending 都必须是 missing 的瞬时状态：O_EXCL 创建确定名 pending（绝不截断
+    未知 pending）+ link 无覆盖发布（发布瞬间目标已出现即外部变化），绝不覆盖既有
+    目标。父目录以 no-follow 打开（发布边界不重新解析路径）；严格同步失败映射
+    operation.durability_failed。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     parent_fd = _open_parent_dir(
         path.parent, code=CheckCode.OPERATION_DURABILITY_FAILED.value, code_path=path.parent
     )
     try:
-        _publish_via_pending(parent_fd, path.name, value, no_clobber=False, code_path=path)
+        _create_only_publish(parent_fd, path.name, value, code_path=path)
     finally:
         os.close(parent_fd)
 
@@ -936,40 +977,268 @@ def _parse_journal_bytes(data: bytes, journal_path: Path) -> Journal:
     return _parse_journal(decoded, journal_path)
 
 
+# ---------------------------------------------------------------------------
+# 日志单步后继的权威转换验证器（回归 H1）
+# ---------------------------------------------------------------------------
+# journal pending 或普通 write_journal 发布前都必须证明 new 是 old（或 bootstrap）
+# 的合法后继：identity 不可变、阶段只能走状态图允许的边、mutation 已冻结后不可增删换、
+# applied 只能 false→true、待删空目录冻结后不可变、metadata 只能按拥有它的转换变化。
+# 纯函数，不访问文件系统；``resolve_journal_pending`` 与 ``write_journal`` 共用。
+
+# 合法阶段边：覆盖正向执行、恢复收敛与 trash/restore/adopt 生命周期全部写点。
+# 终态（completed/rolled_back）没有回到中段的后继。
+_JOURNAL_PHASE_EDGES: frozenset[tuple[OperationPhase, OperationPhase]] = frozenset(
+    {
+        (OperationPhase.ALLOCATING, OperationPhase.ALLOCATING),
+        (OperationPhase.ALLOCATING, OperationPhase.PREPARED),
+        (OperationPhase.ALLOCATING, OperationPhase.ROLLED_BACK),
+        (OperationPhase.PREPARED, OperationPhase.APPLYING),
+        (OperationPhase.PREPARED, OperationPhase.ROLLED_BACK),
+        (OperationPhase.PREPARED, OperationPhase.COMPLETED),  # adopt：marker 已生效
+        (OperationPhase.APPLYING, OperationPhase.APPLYING),
+        (OperationPhase.APPLYING, OperationPhase.VALIDATING),
+        (OperationPhase.APPLYING, OperationPhase.ROLLED_BACK),
+        (OperationPhase.APPLYING, OperationPhase.COMPLETED),  # adopt：marker 已生效
+        (OperationPhase.VALIDATING, OperationPhase.COMPLETED),
+        (OperationPhase.VALIDATING, OperationPhase.TRASH_RETAINED),
+        (OperationPhase.VALIDATING, OperationPhase.ROLLED_BACK),
+        (OperationPhase.TRASH_RETAINED, OperationPhase.TRASH_RETAINED),
+        (OperationPhase.TRASH_RETAINED, OperationPhase.TRASH_HANDOFF_PENDING),
+        (OperationPhase.TRASH_RETAINED, OperationPhase.ROLLED_BACK),
+        (OperationPhase.TRASH_HANDOFF_PENDING, OperationPhase.TRASH_HANDOFF_PENDING),
+        (OperationPhase.TRASH_HANDOFF_PENDING, OperationPhase.TRASH_PURGE_COMMITTED),
+        (OperationPhase.TRASH_HANDOFF_PENDING, OperationPhase.TRASH_HANDOFF_SUCCEEDED),
+        (OperationPhase.TRASH_HANDOFF_SUCCEEDED, OperationPhase.COMPLETED),
+        (OperationPhase.TRASH_PURGE_COMMITTED, OperationPhase.COMPLETED),
+    }
+)
+
+_HANDOFF_KEYS = frozenset(
+    {
+        HANDOFF_ERROR_TYPE_KEY,
+        HANDOFF_ERROR_MESSAGE_KEY,
+        HANDOFF_ATTEMPTED_AT_KEY,
+        NEXT_HANDOFF_ATTEMPT_KEY,
+    }
+)
+
+# 阶段边允许的 metadata 增量（add, change, remove）：None=任意键；frozenset=只允许
+# 这些键；不在表中的阶段边 metadata 必须逐键相等。
+_JOURNAL_METADATA_DELTA: dict[
+    tuple[OperationPhase, OperationPhase],
+    tuple[frozenset[str] | None, frozenset[str] | None, frozenset[str] | None],
+] = {
+    # allocating 计划期：只允许已批准的关联/观察元数据单调补充，不得改写或删除。
+    (OperationPhase.ALLOCATING, OperationPhase.ALLOCATING): (None, frozenset(), frozenset()),
+    # prepared 一次性冻结完整状态：计划合并的 metadata 键（operation_id、
+    # public_changed_paths 等）在此一次性确立，之后 metadata 不可变（除 trash 转换）。
+    (OperationPhase.ALLOCATING, OperationPhase.PREPARED): (None, frozenset(), frozenset()),
+    # trash_retained：恢复认领键可增可删，其余不变。
+    (OperationPhase.TRASH_RETAINED, OperationPhase.TRASH_RETAINED): (
+        frozenset({RESTORE_OPERATION_ID_KEY}),
+        frozenset(),
+        frozenset({RESTORE_OPERATION_ID_KEY}),
+    ),
+    # handoff 失败记录：重试节流替换失败字段，purge 提交时新增失败字段。
+    (OperationPhase.TRASH_HANDOFF_PENDING, OperationPhase.TRASH_HANDOFF_PENDING): (
+        _HANDOFF_KEYS,
+        _HANDOFF_KEYS,
+        frozenset(),
+    ),
+    (OperationPhase.TRASH_HANDOFF_PENDING, OperationPhase.TRASH_PURGE_COMMITTED): (
+        _HANDOFF_KEYS,
+        _HANDOFF_KEYS,
+        frozenset(),
+    ),
+    # 提交点 → completed：只允许追加 disposition。
+    (OperationPhase.TRASH_HANDOFF_SUCCEEDED, OperationPhase.COMPLETED): (
+        frozenset({DISPOSITION_KEY}),
+        frozenset(),
+        frozenset(),
+    ),
+    (OperationPhase.TRASH_PURGE_COMMITTED, OperationPhase.COMPLETED): (
+        frozenset({DISPOSITION_KEY}),
+        frozenset(),
+        frozenset(),
+    ),
+}
+
+
+def _raise_journal_invalid(path: Path) -> None:
+    raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, path)
+
+
+def _validate_mutation_transition(old: Journal, new: Journal, *, path: Path) -> None:
+    """mutation 列表转换规则：冻结前只允许 allocating→prepared 一次性冻结；
+    冻结后 identity 逐条不可变，applied 只能 false→true 单向推进。"""
+    if not old.mutations:
+        if old.phase is OperationPhase.ALLOCATING and new.phase is OperationPhase.PREPARED:
+            return  # 一次性冻结点：mutation 形状已由解析边界验证。
+        if not new.mutations:
+            return  # allocating→allocating/→rolled_back 必须保持空。
+        _raise_journal_invalid(path)
+    if len(new.mutations) != len(old.mutations):
+        _raise_journal_invalid(path)
+    for before, after in zip(old.mutations, new.mutations, strict=True):
+        if (
+            before.path,
+            before.kind,
+            before.before_sha256,
+            before.after_sha256,
+            before.original,
+            before.staged,
+        ) != (
+            after.path,
+            after.kind,
+            after.before_sha256,
+            after.after_sha256,
+            after.original,
+            after.staged,
+        ):
+            # 已冻结 mutation 不可增删、换路径/种类/摘要/恢复材料。
+            _raise_journal_invalid(path)
+        if after.applied and not before.applied:
+            continue  # false→true：合法的已应用推进。
+        if after.applied == before.applied:
+            continue  # 状态保持（如 adopt 恢复直接终态化）。
+        _raise_journal_invalid(path)  # applied=true→false 反转：拒绝。
+
+
+def _validate_journal_transition(old: Journal | None, new: Journal, *, path: Path) -> None:
+    """验证 new 是 old（或 bootstrap）的合法单步后继（纯函数，回归 H1）。
+
+    old=None 为 bootstrap：只允许 allocating、空 mutations、空待删空目录。
+    违反任何身份/阶段/内容规则抛 operation.journal_corrupt。
+    """
+    if old is None:
+        if (
+            new.phase is not OperationPhase.ALLOCATING
+            or new.mutations
+            or new.remove_empty_directories
+        ):
+            _raise_journal_invalid(path)
+        return
+    if (
+        new.operation_id != old.operation_id
+        or new.kind != old.kind
+        or new.root_state != old.root_state
+        or new.directory != old.directory
+    ):
+        # identity（operation_id/kind/root_state/操作目录）不可改写。
+        _raise_journal_invalid(path)
+    if (old.phase, new.phase) not in _JOURNAL_PHASE_EDGES:
+        _raise_journal_invalid(path)
+    _validate_mutation_transition(old, new, path=path)
+    if (
+        not (old.phase is OperationPhase.ALLOCATING and new.phase is OperationPhase.ALLOCATING)
+        and old.observations != new.observations
+    ):
+        # 观察清单只允许在 allocating→allocating（恢复读集补充）变化，其余必须一致。
+        _raise_journal_invalid(path)
+    if old.phase is OperationPhase.ALLOCATING:
+        if new.phase is OperationPhase.PREPARED:
+            pass  # 待删空目录在 prepared 一次性冻结。
+        elif new.remove_empty_directories:
+            _raise_journal_invalid(path)  # allocating→allocating/→rolled_back 必须保持空。
+    elif old.remove_empty_directories != new.remove_empty_directories:
+        _raise_journal_invalid(path)
+    delta = _JOURNAL_METADATA_DELTA.get((old.phase, new.phase))
+    if delta is None:
+        if old.metadata != new.metadata:
+            _raise_journal_invalid(path)
+        return
+    add_allowed, change_allowed, remove_allowed = delta
+    for key in set(old.metadata) | set(new.metadata):
+        if old.metadata.get(key) == new.metadata.get(key):
+            continue
+        if key not in old.metadata:
+            allowed = add_allowed
+        elif key not in new.metadata:
+            allowed = remove_allowed
+        else:
+            allowed = change_allowed
+        if allowed is None or key in allowed:  # None=该方向允许任意键。
+            continue
+        _raise_journal_invalid(path)
+
+
+def validate_journal_transition(old: Journal | None, new: Journal, *, path: Path) -> None:
+    """公开的转换验证入口：resolve_journal_pending 与 write_journal 共用（回归 H1）。"""
+    _validate_journal_transition(old, new, path=path)
+
+
+def _read_persistent_bytes(path: Path, *, code: str) -> bytes:
+    """no-follow 读取持久协议文件 bytes 一次（回归 M3）。
+
+    分类后（is_file 等）与实际读取之间节点被删除/目录化/替换为链接时，原始 OSError
+    在最窄边界映射为稳定领域错误，绝不泄漏给 CLI。调用方负责解码与解析。
+    """
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise DraftError(code, path) from exc
+    try:
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1 << 16)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    except OSError as exc:
+        raise DraftError(code, path) from exc
+    finally:
+        os.close(descriptor)
+
+
+def _read_optional_journal(path: Path) -> Journal | None:
+    """读取当前持久 journal；缺失（分类为 missing）返回 None，其余类型/读取失败报损坏。"""
+    node = classify_node(path)
+    if node is EntryKind.MISSING:
+        return None
+    if node is not EntryKind.FILE:
+        _raise_journal_invalid(path)
+    return _parse_journal_bytes(
+        _read_persistent_bytes(path, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value), path
+    )
+
+
 def read_journal(journal_path: Path) -> Journal:
-    if not journal_path.is_file():
-        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
-    return _parse_journal_bytes(journal_path.read_bytes(), journal_path)
+    return _parse_journal_bytes(
+        _read_persistent_bytes(journal_path, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value),
+        journal_path,
+    )
 
 
 def resolve_journal_pending(journal_path: Path) -> None:
-    """把崩溃遗留的 ``journal.json.pending`` 收敛为已发布日志（回归 H2）。
+    """把崩溃遗留的 ``journal.json.pending`` 收敛为已发布日志（回归 H1/H2）。
 
-    ``durable_write`` 的 pending 总是比现存 journal 更新（同一写调用里 replace 前
-    崩溃才留下 pending；replace 会消费它），因此有效 pending 发布为新 journal 比回退
-    旧 journal 更忠实。旧 journal 存在且 pending 非法（崩溃半写/类型错误）时保留旧
-    journal 推进，pending 留作 checker 可见的可人工处理残留；旧 journal 缺失且 pending
-    非法时无法继续，报 journal_corrupt。绝不按文件名删除 pending。
+    只有能由当前耐久 journal 通过一次合法状态转换产生的完整新对象才可发布：
+    ``validate_journal_transition`` 消费 old/new 两个纯对象判定合法单步后继，不凭文件名
+    获得权威。可解析但非法后继（改身份/阶段倒退/换 mutation/applied 反转/metadata 越权）
+    保留 old+pending 并报 journal_corrupt；半写/类型错误 pending 在旧 journal 存在时保留
+    旧 journal 推进（崩溃容错，checker 报告残留），旧 journal 缺失时无法继续报损坏。
+    绝不按文件名删除 pending。
     """
     pending_path = journal_path.with_name(_pending_name(journal_path.name))
     pending_kind = classify_node(pending_path)
     if pending_kind is EntryKind.MISSING:
         return
-    old_exists = classify_node(journal_path) is EntryKind.FILE
+    old = _read_optional_journal(journal_path)
     if pending_kind is not EntryKind.FILE:
-        if old_exists:
-            return  # 保留旧 journal 推进；类型错误 pending 由 checker 报告。
+        if old is not None:
+            return  # 类型错误 pending：保留旧 journal 推进，checker 报告。
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, pending_path)
     try:
-        journal = _parse_journal_bytes(pending_path.read_bytes(), pending_path)
+        journal = _parse_journal_bytes(
+            _read_persistent_bytes(pending_path, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value),
+            pending_path,
+        )
     except DraftError:
-        if old_exists:
-            return  # 半写 pending：旧 journal 仍可推进。
+        if old is not None:
+            return  # 半写 pending：旧 journal 仍可推进（崩溃容错），checker 报告。
         raise
-    if journal.operation_id != journal_path.parent.name:
-        if old_exists:
-            return
-        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, pending_path)
+    # 权威后继验证：identity 不可变、阶段边合法、mutation/观察/待删目录/metadata 受约束。
+    validate_journal_transition(old, journal, path=journal_path)
     parent_fd = _open_parent_dir(
         journal_path.parent,
         code=CheckCode.OPERATION_DURABILITY_FAILED.value,
@@ -1115,7 +1384,28 @@ def _parse_journal(data: object, journal_path: Path) -> Journal:
 
 
 def write_journal(journal: Journal) -> None:
-    durable_write(journal.directory / "journal.json", _journal_to_json(journal))
+    """耐久写入 journal，发布前验证 new 是当前持久 journal 的合法单步后继（回归 H1）。
+
+    先收敛崩溃遗留 pending（有效后继发布、半写残留保留旧 journal），再从磁盘重读当前
+    持久 journal 作为 old，以 ``validate_journal_transition`` 证明 new 是合法后继后才发布。
+    bootstrap（无旧 journal）走 create-only；更新走经 H1 授权后的原子 replace。
+    """
+    path = journal.directory / "journal.json"
+    resolve_journal_pending(path)
+    old = _read_optional_journal(path)
+    validate_journal_transition(old, journal, path=path)
+    parent_fd = _open_parent_dir(
+        path.parent,
+        code=CheckCode.OPERATION_DURABILITY_FAILED.value,
+        code_path=path.parent,
+    )
+    try:
+        if old is None:
+            _create_only_publish(parent_fd, path.name, _journal_to_json(journal), code_path=path)
+        else:
+            _replace_publish(parent_fd, path.name, _journal_to_json(journal), code_path=path)
+    finally:
+        os.close(parent_fd)
 
 
 def with_phase(journal: Journal, phase: OperationPhase) -> Journal:
@@ -1882,9 +2172,6 @@ def _execute_allocated_plan(
         retain_terminal_lock=retain_terminal_lock,
         changed_paths=changed_paths,
     )
-
-
-PUBLIC_CHANGED_PATHS_KEY = "public_changed_paths"
 
 
 def _encode_public_paths(paths: tuple[Path, ...]) -> str:

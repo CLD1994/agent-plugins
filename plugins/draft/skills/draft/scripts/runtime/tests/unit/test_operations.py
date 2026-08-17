@@ -36,6 +36,7 @@ from draft.operations import (
     has_handoff_failure,
     normalize_utc,
     sha256_bytes,
+    validate_journal_transition,
     validate_operation_id,
     with_metadata,
     with_phase,
@@ -1072,3 +1073,330 @@ def test_write_recovery_decision_table(
         )
         == expected
     )
+
+
+# ---------------------------------------------------------------------------
+# validate_journal_transition：日志单步后继的权威转换验证器（回归 H1）
+# ---------------------------------------------------------------------------
+
+
+def _j(
+    phase: OperationPhase = OperationPhase.ALLOCATING,
+    *,
+    kind: OperationKind = OperationKind.CREATE,
+    root_state: RootState = RootState.REGISTERED,
+    op_id: str = "a" * 32,
+    mutations: tuple[JournalMutation, ...] = (),
+    observations: ObservationManifest = EMPTY_OBSERVATIONS,
+    remove_empty: tuple[Path, ...] = (),
+    metadata: dict[str, str] | None = None,
+) -> Journal:
+    return Journal(
+        operation_id=op_id,
+        kind=kind,
+        phase=phase,
+        root_state=root_state,
+        observations=observations,
+        mutations=mutations,
+        remove_empty_directories=remove_empty,
+        metadata=dict(metadata or {}),
+        directory=Path(".draft/operations") / op_id,
+    )
+
+
+def _m(
+    path: str = "pages/a.md",
+    *,
+    kind: MutationKind = MutationKind.WRITE,
+    before: str | None = None,
+    after: str | None = "a" * 64,
+    original: Path | None = None,
+    staged: Path | None = Path("staged/0000.bin"),
+    applied: bool = False,
+) -> JournalMutation:
+    return JournalMutation(Path(path), kind, before, after, original, staged, applied)
+
+
+def test_journal_transition_bootstrap_accepts_allocating_empty() -> None:
+    """bootstrap：allocating、空 mutation、空待删目录是合法初始日志。"""
+    validate_journal_transition(None, _j(), path=Path("journal.json"))
+
+
+def test_journal_transition_bootstrap_rejects_phase() -> None:
+    """bootstrap 只允许 allocating：其他 phase 的 pending 不得发布。"""
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(None, _j(OperationPhase.PREPARED), path=Path("journal.json"))
+
+
+def test_journal_transition_bootstrap_rejects_mutations() -> None:
+    """bootstrap 只允许空 mutation：真实 bootstrap 只能产生初始 allocating。"""
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(None, _j(mutations=(_m(),)), path=Path("journal.json"))
+
+
+def test_journal_transition_bootstrap_rejects_remove_empty() -> None:
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            None, _j(remove_empty=(Path("pages/topic"),)), path=Path("journal.json")
+        )
+
+
+def test_journal_transition_rejects_identity_rewrite() -> None:
+    """identity（kind/root_state/operation_id/目录）不可改写。"""
+    old = _j(OperationPhase.ALLOCATING)
+    for rewrite in (
+        _j(OperationPhase.ALLOCATING, kind=OperationKind.MOVE),
+        _j(OperationPhase.ALLOCATING, root_state=RootState.CANDIDATE),
+        _j(OperationPhase.ALLOCATING, op_id="b" * 32),
+    ):
+        with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+            validate_journal_transition(old, rewrite, path=Path("journal.json"))
+
+
+def test_journal_transition_rejects_phase_regression() -> None:
+    """阶段倒退：applying→allocating、terminal→mid 都拒绝。"""
+    frozen = (_m(applied=False),)
+    applying = _j(OperationPhase.APPLYING, mutations=frozen)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            applying, _j(OperationPhase.ALLOCATING, mutations=frozen), path=Path("journal.json")
+        )
+    completed = _j(OperationPhase.COMPLETED, mutations=frozen)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            completed, _j(OperationPhase.APPLYING, mutations=frozen), path=Path("journal.json")
+        )
+
+
+def test_journal_transition_rejects_skipped_commit_point() -> None:
+    """跳过提交点：prepared→validating 不在状态图边上。"""
+    frozen = (_m(applied=False),)
+    prepared = _j(OperationPhase.PREPARED, mutations=frozen)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            prepared, _j(OperationPhase.VALIDATING, mutations=frozen), path=Path("journal.json")
+        )
+
+
+def test_journal_transition_allows_adjacent_forward_edges() -> None:
+    """正向相邻边合法：prepared→applying→validating→completed。"""
+    frozen = (_m(applied=False),)
+    prepared = _j(OperationPhase.PREPARED, mutations=frozen)
+    applying = _j(OperationPhase.APPLYING, mutations=frozen)
+    validating = _j(OperationPhase.VALIDATING, mutations=frozen)
+    completed = _j(OperationPhase.COMPLETED, mutations=frozen)
+    validate_journal_transition(prepared, applying, path=Path("journal.json"))
+    validate_journal_transition(applying, validating, path=Path("journal.json"))
+    validate_journal_transition(validating, completed, path=Path("journal.json"))
+
+
+def test_journal_transition_rejects_mutation_replace() -> None:
+    """已冻结 mutation 不可替换 path/摘要/恢复材料。"""
+    old = _j(OperationPhase.APPLYING, mutations=(_m(path="pages/a.md"),))
+    for replacement in (
+        _j(OperationPhase.APPLYING, mutations=(_m(path="pages/b.md"),)),
+        _j(OperationPhase.APPLYING, mutations=(_m(after="b" * 64),)),
+        _j(OperationPhase.APPLYING, mutations=(_m(staged=Path("staged/0001.bin")),)),
+    ):
+        with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+            validate_journal_transition(old, replacement, path=Path("journal.json"))
+
+
+def test_journal_transition_rejects_mutation_add_and_remove() -> None:
+    old = _j(OperationPhase.APPLYING, mutations=(_m(),))
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            old,
+            _j(OperationPhase.APPLYING, mutations=(_m(), _m(path="pages/b.md"))),
+            path=Path("journal.json"),
+        )
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            old, _j(OperationPhase.APPLYING, mutations=()), path=Path("journal.json")
+        )
+
+
+def test_journal_transition_applied_flag_forward_only() -> None:
+    """applied 只能 false→true 单向推进，不得反转。"""
+    old = _j(OperationPhase.APPLYING, mutations=(_m(applied=True),))
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            old,
+            _j(OperationPhase.APPLYING, mutations=(_m(applied=False),)),
+            path=Path("journal.json"),
+        )
+    # 保持已应用状态（如 adopt 恢复直接终态化）合法。
+    validate_journal_transition(
+        old,
+        _j(OperationPhase.APPLYING, mutations=(_m(applied=True),)),
+        path=Path("journal.json"),
+    )
+
+
+def test_journal_transition_observations_only_allocating() -> None:
+    """观察清单只允许 allocating→allocating 变化，其余必须一致。"""
+    entry = file_observation(Path("pages/a.md"), b"a" * 64)
+    manifest = ObservationManifest(entries=(entry,))
+    old = _j(OperationPhase.ALLOCATING)
+    validate_journal_transition(
+        old, _j(OperationPhase.ALLOCATING, observations=manifest), path=Path("journal.json")
+    )
+    frozen = (_m(applied=False),)
+    prepared = _j(OperationPhase.PREPARED, mutations=frozen)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            prepared,
+            _j(OperationPhase.APPLYING, mutations=frozen, observations=manifest),
+            path=Path("journal.json"),
+        )
+
+
+def test_journal_transition_metadata_restore_claim_only() -> None:
+    """trash_retained→trash_retained 只允许增删 restore_operation_id。"""
+    op_id = "a" * 32
+    old = _j(OperationPhase.TRASH_RETAINED, kind=OperationKind.TRASH, op_id=op_id)
+    claimed = _j(
+        OperationPhase.TRASH_RETAINED,
+        kind=OperationKind.TRASH,
+        op_id=op_id,
+        metadata={"restore_operation_id": "b" * 32},
+    )
+    validate_journal_transition(old, claimed, path=Path("journal.json"))
+    unclaimed = _j(OperationPhase.TRASH_RETAINED, kind=OperationKind.TRASH, op_id=op_id)
+    validate_journal_transition(claimed, unclaimed, path=Path("journal.json"))
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            old,
+            _j(
+                OperationPhase.TRASH_RETAINED,
+                kind=OperationKind.TRASH,
+                op_id=op_id,
+                metadata={"restore_operation_id": "b" * 32, "foreign": "x"},
+            ),
+            path=Path("journal.json"),
+        )
+
+
+def test_journal_transition_metadata_handoff_failure_and_disposition() -> None:
+    """handoff 失败记录/终态处置只允许拥有它们的转换改变。"""
+    op_id = "a" * 32
+    pending = _j(
+        OperationPhase.TRASH_HANDOFF_PENDING,
+        kind=OperationKind.TRASH,
+        op_id=op_id,
+        metadata={"created_at": "2026-01-01T00:00:00Z"},
+    )
+    retry = _j(
+        OperationPhase.TRASH_HANDOFF_PENDING,
+        kind=OperationKind.TRASH,
+        op_id=op_id,
+        metadata={
+            "created_at": "2026-01-01T00:00:00Z",
+            HANDOFF_ERROR_TYPE_KEY: "OSError",
+            HANDOFF_ERROR_MESSAGE_KEY: "boom",
+            HANDOFF_ATTEMPTED_AT_KEY: "2026-01-01T00:00:00Z",
+        },
+    )
+    validate_journal_transition(pending, retry, path=Path("journal.json"))
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            pending,
+            _j(
+                OperationPhase.TRASH_HANDOFF_PENDING,
+                kind=OperationKind.TRASH,
+                op_id=op_id,
+                metadata={"created_at": "2026-01-01T00:00:00Z", "foreign": "x"},
+            ),
+            path=Path("journal.json"),
+        )
+    succeeded = _j(
+        OperationPhase.TRASH_HANDOFF_SUCCEEDED,
+        kind=OperationKind.TRASH,
+        op_id=op_id,
+        metadata={"created_at": "2026-01-01T00:00:00Z"},
+    )
+    validate_journal_transition(
+        succeeded,
+        _j(
+            OperationPhase.COMPLETED,
+            kind=OperationKind.TRASH,
+            op_id=op_id,
+            metadata={"created_at": "2026-01-01T00:00:00Z", "disposition": "system_trash"},
+        ),
+        path=Path("journal.json"),
+    )
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            succeeded,
+            _j(
+                OperationPhase.COMPLETED,
+                kind=OperationKind.TRASH,
+                op_id=op_id,
+                metadata={"created_at": "2026-01-01T00:00:00Z", "foreign": "x"},
+            ),
+            path=Path("journal.json"),
+        )
+
+
+def test_journal_transition_prepared_freezes_metadata_and_mutations() -> None:
+    """allocating→prepared：一次性冻结 mutations 与计划合并 metadata；之后 metadata 不可变。"""
+    prepared = _j(
+        OperationPhase.PREPARED,
+        mutations=(_m(),),
+        metadata={"operation_id": "a" * 32, "public_changed_paths": "pages/a.md"},
+    )
+    validate_journal_transition(_j(), prepared, path=Path("journal.json"))
+    applying = _j(
+        OperationPhase.APPLYING,
+        mutations=(_m(),),
+        metadata={"operation_id": "a" * 32, "public_changed_paths": "pages/a.md"},
+    )
+    validate_journal_transition(prepared, applying, path=Path("journal.json"))
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            prepared,
+            _j(
+                OperationPhase.APPLYING,
+                mutations=(_m(),),
+                metadata={"operation_id": "a" * 32, "foreign": "x"},
+            ),
+            path=Path("journal.json"),
+        )
+
+
+def test_journal_transition_allocating_to_allocating_metadata_add_only() -> None:
+    """allocating→allocating：metadata 只允许单调补充，不得改写或删除。"""
+    op_id = "a" * 32
+    old = _j(
+        OperationPhase.ALLOCATING,
+        kind=OperationKind.RESTORE,
+        op_id=op_id,
+        metadata={"restores_trash_operation": "b" * 32},
+    )
+    validate_journal_transition(
+        old,
+        _j(
+            OperationPhase.ALLOCATING,
+            kind=OperationKind.RESTORE,
+            op_id=op_id,
+            metadata={"restores_trash_operation": "b" * 32, "extra": "x"},
+        ),
+        path=Path("journal.json"),
+    )
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            old,
+            _j(
+                OperationPhase.ALLOCATING,
+                kind=OperationKind.RESTORE,
+                op_id=op_id,
+                metadata={"restores_trash_operation": "c" * 32},
+            ),
+            path=Path("journal.json"),
+        )
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            old,
+            _j(OperationPhase.ALLOCATING, kind=OperationKind.RESTORE, op_id=op_id),
+            path=Path("journal.json"),
+        )

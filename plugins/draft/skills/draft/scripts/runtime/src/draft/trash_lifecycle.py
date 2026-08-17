@@ -21,6 +21,7 @@ from draft.models import (
     TrashResult,
 )
 from draft.operations import (
+    DISPOSITION_KEY,
     HANDOFF_ATTEMPTED_AT_KEY,
     HANDOFF_ERROR_MESSAGE_KEY,
     HANDOFF_ERROR_TYPE_KEY,
@@ -64,7 +65,6 @@ from draft.trash_package import (
 
 Handoff = Callable[[str], None]
 
-DISPOSITION_KEY = "disposition"
 SYSTEM_TRASH_DISPOSITION = "system_trash"
 EXPIRED_PURGE_DISPOSITION = "expired_purge"
 
