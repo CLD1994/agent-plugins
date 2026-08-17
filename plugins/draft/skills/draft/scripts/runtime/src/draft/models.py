@@ -53,6 +53,7 @@ class OperationPhase(StrEnum):
     PREPARED = "prepared"
     APPLYING = "applying"
     VALIDATING = "validating"
+    ROLLING_BACK = "rolling_back"
     TRASH_RETAINED = "trash_retained"
     TRASH_HANDOFF_PENDING = "trash_handoff_pending"
     TRASH_HANDOFF_SUCCEEDED = "trash_handoff_succeeded"

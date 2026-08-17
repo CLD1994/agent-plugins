@@ -562,6 +562,16 @@ def _recover_locked_trash(
         return TrashResult(
             operation_id=operation_id, phase=OperationPhase.COMPLETED, package=package_dir
         )
+    if journal.phase is OperationPhase.ROLLING_BACK:
+        # 回滚意图已耐久：trash 的 mutation 回滚由统一恢复入口继续（幂等跳过已恢复
+        # 目标），不得按生命周期推进或释放锁。终态化后返回 trash 结果形状。
+        result = recover(root)
+        return TrashResult(
+            operation_id=result.operation_id,
+            phase=result.phase,
+            package=root / OUTGOING_RELATIVE / operation_id,
+            changed_paths=result.changed_paths,
+        )
     # trash_retained/trash_handoff_pending 持锁：用持锁变体推进，不再重新获取锁。
     return _advance_one_locked(root, operation_id, now=now, handoff=handoff)
 

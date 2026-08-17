@@ -916,6 +916,44 @@ def test_cleanup_evidence_node_directory_or_link_is_corrupt(
     assert evidence.is_dir()
 
 
+def test_cleanup_evidence_lstat_permission_error_is_stable(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """evidence 的 lstat PermissionError 映射稳定错误并保留现场（回归 M2）。"""
+    import os as os_module
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+    evidence = journal.directory / "cleanup-evidence.json"
+    payload = _valid_evidence_payload(root, pending.operation_id)
+    _write_evidence(root, pending.operation_id, payload)
+    before = _leaf_snapshot(package)
+    real_lstat = os_module.lstat
+
+    def deny_evidence_lstat(
+        path: str | bytes | os_module.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> object:
+        if os_module.fspath(path) == os_module.fspath(evidence):
+            raise PermissionError("denied")
+        if dir_fd is None:
+            return real_lstat(path)
+        return real_lstat(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os_module, "lstat", deny_evidence_lstat)
+    with pytest.raises(DraftError) as caught:
+        _clean_with_authorization(root, pending.operation_id)
+    assert caught.value.code == CheckCode.TRASH_PACKAGE_CORRUPT.value
+    assert isinstance(caught.value.__cause__, PermissionError)
+    monkeypatch.undo()
+
+    assert evidence.read_bytes() == json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    assert _leaf_snapshot(package) == before
+
+
 def test_cleanup_evidence_already_missing_entry_converges(
     draft_factory: DraftFactory,
 ) -> None:

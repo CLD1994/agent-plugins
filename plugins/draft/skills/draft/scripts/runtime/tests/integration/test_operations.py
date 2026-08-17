@@ -168,6 +168,25 @@ def write_journal(root: Path, operation_id: str, phase: str) -> Path:
     return journal_dir
 
 
+def write_trash_phase_journal(root: Path, operation_id: str, phase: str) -> Path:
+    """写入合法 TRASH kind 的阶段日志（trash 生命周期阶段由 TRASH 独占，回归 M1）。"""
+    journal_dir = root / ".draft/operations" / operation_id
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    journal: dict[str, object] = {
+        "journal_version": JOURNAL_VERSION,
+        "operation_id": operation_id,
+        "kind": OperationKind.TRASH.value,
+        "phase": phase,
+        "root_state": "registered",
+        "observations": [],
+        "mutations": [],
+        "remove_empty_directories": [],
+        "metadata": {},
+    }
+    (journal_dir / "journal.json").write_text(json.dumps(journal), encoding="utf-8")
+    return journal_dir
+
+
 def write_trash_journal(
     root: Path, operation_id: str, *, phase: str, metadata: dict[str, str]
 ) -> Path:
@@ -590,7 +609,7 @@ def test_no_lock_prepared_journal_is_inconsistent(operation_draft: Path) -> None
 
 def test_no_lock_succeeded_journal_is_inconsistent(operation_draft: Path) -> None:
     root = operation_draft
-    write_journal(root, "e" * 32, "trash_handoff_succeeded")
+    write_trash_phase_journal(root, "e" * 32, "trash_handoff_succeeded")
 
     with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
         recover(root)
@@ -600,7 +619,7 @@ def test_no_lock_terminal_and_pending_journals_are_accepted(operation_draft: Pat
     root = operation_draft
     completed = write_journal(root, "f" * 32, "completed")
     rolled_back = write_journal(root, "0" * 32, "rolled_back")
-    pending = write_journal(root, "1" * 32, "trash_handoff_pending")
+    pending = write_trash_phase_journal(root, "1" * 32, "trash_handoff_pending")
 
     result = recover(root)
 
@@ -1166,6 +1185,113 @@ def test_execute_plan_observation_conflict_finalizes_journal_and_releases_lock(
     assert len(remaining) == 1
     journal = read_journal(remaining[0] / "journal.json")
     assert journal.phase is OperationPhase.ROLLED_BACK
+
+
+def _delete_linked_page_plan(root: Path) -> tuple[OperationPlan, bytes]:
+    """registered 根中删除被引用页面：应用后完整检查必然失败并触发回滚。"""
+    old_a = (root / "pages/a.md").read_bytes()
+    plan = OperationPlan(
+        kind=OperationKind.CREATE,
+        root=root,
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
+        mutations=(
+            FileMutation(
+                Path("pages/a.md"),
+                MutationKind.DELETE,
+                sha256_bytes(old_a),
+                None,
+                None,
+            ),
+        ),
+    )
+    return plan, old_a
+
+
+def test_registered_validation_failure_rolls_back_and_restores(
+    operation_draft: Path,
+) -> None:
+    """registered 根应用后检查失败：回滚恢复 original 并释放锁（回滚方向意图正常流程）。"""
+    root = operation_draft
+    plan, old_a = _delete_linked_page_plan(root)
+    with pytest.raises(DraftError, match="operation.validation_failed"):
+        execute_plan(plan)
+    assert (root / "pages/a.md").read_bytes() == old_a
+    assert not (root / ".draft/operation.lock").exists()
+    journal_dir = next(
+        entry for entry in (root / ".draft/operations").iterdir() if entry.is_dir()
+    )
+    journal = read_journal(journal_dir / "journal.json")
+    assert journal.phase is OperationPhase.ROLLED_BACK
+
+
+def test_rollback_writes_intent_before_first_mutation(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回滚首 mutation 前耐久登记 ROLLING_BACK 意图（第十轮 H3）。
+
+    正向与回滚共用 {目标}.pending/.quarantine 后缀，恢复器必须凭 phase 区分授权摘要。
+    注入崩溃在意图写入后、首个回滚 mutation 前：journal 必须已是 ROLLING_BACK，目标
+    仍处于回滚开始前的可分类状态。
+    """
+    import draft.operations as operations_module
+
+    root = operation_draft
+    plan, _old_a = _delete_linked_page_plan(root)
+    original_write_journal = operations_module.write_journal
+
+    def crash_after_intent(journal: object) -> None:
+        original_write_journal(journal)  # type: ignore[arg-type]
+        if getattr(journal, "phase", None) is OperationPhase.ROLLING_BACK:
+            raise RuntimeError("injected crash after rollback intent")
+
+    monkeypatch.setattr(operations_module, "write_journal", crash_after_intent)
+    with pytest.raises(RuntimeError, match="injected crash after rollback intent"):
+        execute_plan(plan)
+    monkeypatch.undo()
+
+    journal_dir = next(
+        entry for entry in (root / ".draft/operations").iterdir() if entry.is_dir()
+    )
+    journal = read_journal(journal_dir / "journal.json")
+    assert journal.phase is OperationPhase.ROLLING_BACK
+    # 删除已应用、尚未回滚：目标处于回滚前的 after（缺失）状态，锁仍持有。
+    assert not (root / "pages/a.md").exists()
+    assert (root / ".draft/operation.lock").exists()
+
+
+def test_read_lock_classifies_lstat_permission_error(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """lock 的 lstat PermissionError 映射稳定错误并保留现场（回归 M2）。"""
+    import os as os_module
+
+    from draft.operations import read_lock
+
+    root = operation_draft
+    lock = root / ".draft/operation.lock"
+    lock.write_text(json.dumps({"operation_id": "a" * 32}) + "\n", encoding="utf-8")
+    real_lstat = os_module.lstat
+
+    def deny_lock_lstat(
+        path: str | bytes | os_module.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> object:
+        if os_module.fspath(path) == os_module.fspath(lock):
+            raise PermissionError("denied")
+        if dir_fd is None:
+            return real_lstat(path)
+        return real_lstat(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os_module, "lstat", deny_lock_lstat)
+    with pytest.raises(DraftError) as caught:
+        read_lock(root)
+    assert caught.value.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
+    assert isinstance(caught.value.__cause__, PermissionError)
+    monkeypatch.undo()
+    assert lock.exists()
+    assert lock.read_text(encoding="utf-8") == json.dumps({"operation_id": "a" * 32}) + "\n"
 
 
 def test_recover_mid_write_verifies_observed_inputs_and_keeps_scene(

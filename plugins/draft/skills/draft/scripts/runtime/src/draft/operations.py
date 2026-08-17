@@ -62,6 +62,7 @@ _MID_WRITE_PHASES = frozenset(
         OperationPhase.PREPARED,
         OperationPhase.APPLYING,
         OperationPhase.VALIDATING,
+        OperationPhase.ROLLING_BACK,
     }
 )
 
@@ -613,6 +614,21 @@ def classify_node(path: Path) -> EntryKind:
     return EntryKind.OTHER
 
 
+def classify_node_or_error(path: Path, *, code: str, code_path: Path) -> EntryKind:
+    """调用方拥有错误语义的分类边界（回归 M2）。
+
+    ``classify_node`` 是低层事实函数，只吞 ENOENT；其原始 OSError 语义只允许在本包装
+    后的持久协议入口出现。同一入口的 classify/read/decode 共享领域错误码并保留
+    ``__cause__``，绝不把 PermissionError/I/O error 泄漏给 CLI。
+    """
+    try:
+        return classify_node(path)
+    except OSError as exc:
+        error = DraftError(code, code_path)
+        error.__cause__ = exc
+        raise error from exc
+
+
 def _name_node(parent_fd: int, name: str) -> tuple[int, int] | None:
     """no-follow stat 返回 (st_ino, st_dev)；缺失/失败返回 None。"""
     try:
@@ -957,9 +973,12 @@ def validate_operation_id(
 def read_lock(root: Path) -> str | None:
     reject_symlink_components(root, LOCK_RELATIVE)
     lock = root / LOCK_RELATIVE
-    # lstat 分类：缺失→无锁；非普通文件（目录/链接等）→损坏。分类后 no-follow 读取
-    # 一次（回归 M3）：分类与读取之间节点被删除/替换为链接时映射稳定领域错误。
-    node = classify_node(lock)
+    # lstat 分类：缺失→无锁；非普通文件（目录/链接等）→损坏。分类与读取共享稳定
+    # 领域错误（回归 M2/M3）：lstat/read/decode 任一失败都映射 journal_corrupt，
+    # 绝不泄漏原始 OSError。
+    node = classify_node_or_error(
+        lock, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value, code_path=lock
+    )
     if node is EntryKind.MISSING:
         return None
     if node is not EntryKind.FILE:
@@ -1171,21 +1190,101 @@ def _parse_journal_bytes(data: bytes, journal_path: Path) -> Journal:
 
 # 合法阶段边：覆盖正向执行、恢复收敛与 trash/restore/adopt 生命周期全部写点。
 # 终态（completed/rolled_back）没有回到中段的后继。
-_JOURNAL_PHASE_EDGES: frozenset[tuple[OperationPhase, OperationPhase]] = frozenset(
+# 受管理操作与 adopt 共用的提交前阶段边；不含 validating→completed，由各 kind 按
+# 终态语义补入（普通操作 completed；trash 走 trash_retained）。
+_COMMON_PRE_COMMIT_EDGES: frozenset[tuple[OperationPhase, OperationPhase]] = frozenset(
     {
         (OperationPhase.ALLOCATING, OperationPhase.ALLOCATING),
         (OperationPhase.ALLOCATING, OperationPhase.PREPARED),
         (OperationPhase.ALLOCATING, OperationPhase.ROLLED_BACK),
         (OperationPhase.PREPARED, OperationPhase.APPLYING),
-        (OperationPhase.PREPARED, OperationPhase.ROLLED_BACK),
-        (OperationPhase.PREPARED, OperationPhase.COMPLETED),  # adopt：marker 已生效
+        (OperationPhase.PREPARED, OperationPhase.ROLLING_BACK),
         (OperationPhase.APPLYING, OperationPhase.APPLYING),
         (OperationPhase.APPLYING, OperationPhase.VALIDATING),
+        (OperationPhase.APPLYING, OperationPhase.ROLLING_BACK),
+        (OperationPhase.VALIDATING, OperationPhase.ROLLING_BACK),
+        (OperationPhase.ROLLING_BACK, OperationPhase.ROLLING_BACK),
+        (OperationPhase.ROLLING_BACK, OperationPhase.ROLLED_BACK),
+    }
+)
+
+_FORWARD_COMPLETE_EDGE: frozenset[tuple[OperationPhase, OperationPhase]] = frozenset(
+    {(OperationPhase.VALIDATING, OperationPhase.COMPLETED)}
+)
+
+_GENERIC_STRUCTURAL_KINDS = frozenset(
+    {
+        OperationKind.CREATE,
+        OperationKind.MOVE,
+        OperationKind.PROMOTE,
+        OperationKind.COLLAPSE,
+        OperationKind.STATUS_SET,
+        OperationKind.RELATION_ADD,
+        OperationKind.RELATION_REMOVE,
+        OperationKind.GENERATE_CONCLUSIONS,
+    }
+)
+
+# kind 拥有的 phase 与边的单一权威来源（回归 M1）：解析单条 journal 与验证后继转换
+# 都从这里读取，不允许普通操作借用 adopt/trash 生命周期边。RECOVER 不允许形成持久
+# journal，phase 集为空。
+_PHASES_BY_KIND: dict[OperationKind, frozenset[OperationPhase]] = {
+    kind: frozenset(
+        {
+            OperationPhase.ALLOCATING,
+            OperationPhase.PREPARED,
+            OperationPhase.APPLYING,
+            OperationPhase.VALIDATING,
+            OperationPhase.ROLLING_BACK,
+            OperationPhase.COMPLETED,
+            OperationPhase.ROLLED_BACK,
+        }
+    )
+    for kind in _GENERIC_STRUCTURAL_KINDS
+}
+_PHASES_BY_KIND[OperationKind.ADOPT] = _PHASES_BY_KIND[OperationKind.CREATE]
+_PHASES_BY_KIND[OperationKind.RESTORE] = _PHASES_BY_KIND[OperationKind.CREATE]
+_PHASES_BY_KIND[OperationKind.TRASH] = frozenset(
+    {
+        OperationPhase.ALLOCATING,
+        OperationPhase.PREPARED,
+        OperationPhase.APPLYING,
+        OperationPhase.VALIDATING,
+        OperationPhase.ROLLING_BACK,
+        OperationPhase.TRASH_RETAINED,
+        OperationPhase.TRASH_HANDOFF_PENDING,
+        OperationPhase.TRASH_HANDOFF_SUCCEEDED,
+        OperationPhase.TRASH_PURGE_COMMITTED,
+        OperationPhase.COMPLETED,
+        OperationPhase.ROLLED_BACK,
+    }
+)
+_PHASES_BY_KIND[OperationKind.RECOVER] = frozenset()
+
+_EDGES_BY_KIND: dict[OperationKind, frozenset[tuple[OperationPhase, OperationPhase]]] = {
+    kind: _COMMON_PRE_COMMIT_EDGES | _FORWARD_COMPLETE_EDGE
+    for kind in _GENERIC_STRUCTURAL_KINDS
+}
+_EDGES_BY_KIND[OperationKind.ADOPT] = _EDGES_BY_KIND[OperationKind.CREATE] | frozenset(
+    {
+        # adopt：marker 已生效恢复允许 prepared/applying 直接提交（规格 §12.2）。
+        (OperationPhase.PREPARED, OperationPhase.COMPLETED),
+        (OperationPhase.APPLYING, OperationPhase.COMPLETED),
+        # adopt：marker 仍为 before 时放弃本次登记（_recover_adopt 观察变化路径）。
+        (OperationPhase.PREPARED, OperationPhase.ROLLED_BACK),
         (OperationPhase.APPLYING, OperationPhase.ROLLED_BACK),
-        (OperationPhase.APPLYING, OperationPhase.COMPLETED),  # adopt：marker 已生效
-        (OperationPhase.VALIDATING, OperationPhase.COMPLETED),
-        (OperationPhase.VALIDATING, OperationPhase.TRASH_RETAINED),
         (OperationPhase.VALIDATING, OperationPhase.ROLLED_BACK),
+    }
+)
+_EDGES_BY_KIND[OperationKind.RESTORE] = _EDGES_BY_KIND[OperationKind.CREATE] | frozenset(
+    {
+        # restore：proven-unapplied 放弃（未应用任何 mutation）直接写 rolled_back。
+        (OperationPhase.PREPARED, OperationPhase.ROLLED_BACK),
+    }
+)
+_EDGES_BY_KIND[OperationKind.TRASH] = _COMMON_PRE_COMMIT_EDGES | frozenset(
+    {
+        (OperationPhase.VALIDATING, OperationPhase.TRASH_RETAINED),
         (OperationPhase.TRASH_RETAINED, OperationPhase.TRASH_RETAINED),
         (OperationPhase.TRASH_RETAINED, OperationPhase.TRASH_HANDOFF_PENDING),
         (OperationPhase.TRASH_RETAINED, OperationPhase.ROLLED_BACK),
@@ -1196,6 +1295,7 @@ _JOURNAL_PHASE_EDGES: frozenset[tuple[OperationPhase, OperationPhase]] = frozens
         (OperationPhase.TRASH_PURGE_COMMITTED, OperationPhase.COMPLETED),
     }
 )
+_EDGES_BY_KIND[OperationKind.RECOVER] = frozenset()
 
 _HANDOFF_KEYS = frozenset(
     {
@@ -1288,12 +1388,24 @@ def _validate_mutation_transition(old: Journal, new: Journal, *, path: Path) -> 
         _raise_journal_invalid(path)  # applied=true→false 反转：拒绝。
 
 
+def validate_journal_kind_phase(journal: Journal, *, path: Path) -> None:
+    """kind 是否拥有该 phase 的单一权威检查（回归 M1）。
+
+    解析单条 journal 与验证后继转换共用；RECOVER 不允许形成持久 journal，任何 phase
+    都被拒绝。跨 kind 借用 adopt/trash 生命周期状态在此被拒，不进入权威状态。
+    """
+    if journal.phase not in _PHASES_BY_KIND.get(journal.kind, frozenset()):
+        _raise_journal_invalid(path)
+
+
 def _validate_journal_transition(old: Journal | None, new: Journal, *, path: Path) -> None:
     """验证 new 是 old（或 bootstrap）的合法单步后继（纯函数，回归 H1）。
 
     old=None 为 bootstrap：只允许 allocating、空 mutations、空待删空目录。
-    违反任何身份/阶段/内容规则抛 operation.journal_corrupt。
+    违反任何身份/阶段/内容规则抛 operation.journal_corrupt。阶段合法性由
+    ``(kind, phase)`` 与 ``(kind, old_phase, new_phase)`` 共同决定（回归 M1）。
     """
+    validate_journal_kind_phase(new, path=path)
     if old is None:
         if (
             new.phase is not OperationPhase.ALLOCATING
@@ -1310,7 +1422,7 @@ def _validate_journal_transition(old: Journal | None, new: Journal, *, path: Pat
     ):
         # identity（operation_id/kind/root_state/操作目录）不可改写。
         _raise_journal_invalid(path)
-    if (old.phase, new.phase) not in _JOURNAL_PHASE_EDGES:
+    if (old.phase, new.phase) not in _EDGES_BY_KIND.get(new.kind, frozenset()):
         _raise_journal_invalid(path)
     _validate_mutation_transition(old, new, path=path)
     if (
@@ -1376,7 +1488,9 @@ def _read_persistent_bytes(path: Path, *, code: str) -> bytes:
 
 def _read_optional_journal(path: Path) -> Journal | None:
     """读取当前持久 journal；缺失（分类为 missing）返回 None，其余类型/读取失败报损坏。"""
-    node = classify_node(path)
+    node = classify_node_or_error(
+        path, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value, code_path=path
+    )
     if node is EntryKind.MISSING:
         return None
     if node is not EntryKind.FILE:
@@ -1404,7 +1518,9 @@ def resolve_journal_pending(journal_path: Path) -> None:
     绝不按文件名删除 pending。
     """
     pending_path = journal_path.with_name(_pending_name(journal_path.name))
-    pending_kind = classify_node(pending_path)
+    pending_kind = classify_node_or_error(
+        pending_path, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value, code_path=pending_path
+    )
     if pending_kind is EntryKind.MISSING:
         return
     old = _read_optional_journal(journal_path)
@@ -1551,7 +1667,7 @@ def _parse_journal(data: object, journal_path: Path) -> Journal:
     operation_id = validate_operation_id(_expect_str(parsed.get("operation_id"), journal_path))
     if operation_id != directory_id:
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
-    return Journal(
+    journal = Journal(
         operation_id=operation_id,
         kind=kind,
         phase=phase,
@@ -1565,6 +1681,10 @@ def _parse_journal(data: object, journal_path: Path) -> Journal:
         metadata=metadata,
         directory=journal_path.parent,
     )
+    # 磁盘读取验证 kind 拥有该 phase（回归 M1）：跨 kind 借用 adopt/trash 状态的
+    # journal 即使结构合法也不是权威状态。
+    validate_journal_kind_phase(journal, path=journal_path)
+    return journal
 
 
 def write_journal(journal: Journal) -> None:
@@ -2037,6 +2157,11 @@ def _rollback(
         known = {mutation.before_sha256, mutation.after_sha256}
         if current not in known:
             raise DraftError("operation.external_change", root / mutation.path)
+    # 首次回滚 mutation 前耐久登记方向意图：正向与回滚共用 {目标}.pending/.quarantine
+    # 后缀，恢复器必须凭 phase 区分授权摘要（第十轮 H3）。普通操作不再允许
+    # prepared/applying/validating 直接写 rolled_back。
+    rolling = _with_phase(journal, OperationPhase.ROLLING_BACK)
+    write_journal(rolling)
     for mutation in reversed(journal.mutations):
         current = sha256_file(root / mutation.path)
         if current == mutation.before_sha256:
@@ -2064,7 +2189,7 @@ def _rollback(
             )
     return finalize_operation(
         root,
-        journal,
+        rolling,
         OperationPhase.ROLLED_BACK,
         journal.kind,
         retain_terminal_lock=retain_terminal_lock,
@@ -3110,6 +3235,15 @@ def _recover_locked(root: Path, operation_id: str) -> OperationResult:
             details=(f"阶段 {journal.phase.value} 由 trash 子系统恢复",),
         )
     _verify_recovery_material(journal)
+    if journal.phase is OperationPhase.ROLLING_BACK:
+        # 回滚意图已耐久：继续回滚而不是前向完成。_rollback 幂等跳过已恢复目标，
+        # 全部恢复后终态化为 rolled_back 并释放锁。方向感知的 artifact 收敛由
+        # Task 3 的 mutation_artifact_actions 负责；此处保证方向正确且正常回滚可收敛。
+        return _rollback(
+            root,
+            journal,
+            changed_paths=_recover_changed_paths(journal),
+        )
     # 先把崩溃遗留的 managed temp quarantine 收敛（回归 H3）：被中断的 consume 删除
     # 留下的 ``{temp}.quarantine`` 若不在观察复核前处理，会被当成无法解释的新文件。
     _recover_managed_temp_quarantines(root, journal)

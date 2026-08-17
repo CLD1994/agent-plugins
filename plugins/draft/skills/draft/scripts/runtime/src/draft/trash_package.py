@@ -27,7 +27,7 @@ from draft.operations import (
     _read_name_bytes,  # pyright: ignore[reportPrivateUsage]
     _same_name_node,  # pyright: ignore[reportPrivateUsage]
     anchored_leaf,
-    classify_node,
+    classify_node_or_error,
     durable_write,
     operation_journal_path,
     read_journal,
@@ -746,7 +746,9 @@ def _recover_cleanup_evidence_pending(root: Path, journal: Journal) -> None:
     """
     evidence_path = _cleanup_evidence_path(journal)
     pending = evidence_path.with_name(_pending_name(evidence_path.name))
-    pending_kind = classify_node(pending)
+    pending_kind = classify_node_or_error(
+        pending, code=CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path=pending
+    )
     if pending_kind is EntryKind.MISSING:
         return
     if pending_kind is not EntryKind.FILE:
@@ -906,7 +908,9 @@ def clean_authoritative_package(root: Path, authorization: CleanupAuthorization)
     auth = parse_package_authorization(journal, package_dir)
     authorized = list(auth.leaves())
     # lstat 分类：悬空符号链接是 link 不是 missing，不得折叠成幂等缺失（回归 M2）。
-    package_node = classify_node(package_dir)
+    package_node = classify_node_or_error(
+        package_dir, code=CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path=package_dir
+    )
     if package_node is EntryKind.MISSING:
         # 已提交阶段：包缺失 = 清理已删除全部叶（幂等）。证据必须是可清除的精确
         # 普通文件；目录/链接/其他类型不是清理成功，保留现场报错（回归 H4）。
@@ -916,7 +920,9 @@ def clean_authoritative_package(root: Path, authorization: CleanupAuthorization)
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package_dir)
 
     evidence_path = _cleanup_evidence_path(journal)
-    evidence_node = classify_node(evidence_path)
+    evidence_node = classify_node_or_error(
+        evidence_path, code=CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path=evidence_path
+    )
     if evidence_node not in (EntryKind.MISSING, EntryKind.FILE):
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, evidence_path)
     if evidence_node is EntryKind.FILE:

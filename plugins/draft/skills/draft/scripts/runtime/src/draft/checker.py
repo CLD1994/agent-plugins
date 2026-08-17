@@ -661,6 +661,7 @@ _MID_WRITE_PHASES = (
     OperationPhase.PREPARED,
     OperationPhase.APPLYING,
     OperationPhase.VALIDATING,
+    OperationPhase.ROLLING_BACK,
 )
 
 

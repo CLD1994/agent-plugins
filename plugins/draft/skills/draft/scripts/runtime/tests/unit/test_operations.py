@@ -837,13 +837,15 @@ def _journal_payload(
     mutations: list[dict[str, object]],
     *,
     operation_id: str = "a" * 32,
+    kind: str = OperationKind.CREATE.value,
+    phase: str = OperationPhase.PREPARED.value,
 ) -> dict[str, object]:
     """构造解析输入；mutation 缺省字段由各用例显式给出，不再复制默认值。"""
     return {
         "journal_version": JOURNAL_VERSION,
         "operation_id": operation_id,
-        "kind": OperationKind.CREATE.value,
-        "phase": OperationPhase.PREPARED.value,
+        "kind": kind,
+        "phase": phase,
         "root_state": RootState.REGISTERED.value,
         "observations": [],
         "mutations": mutations,
@@ -1400,6 +1402,155 @@ def test_journal_transition_allocating_to_allocating_metadata_add_only() -> None
             _j(OperationPhase.ALLOCATING, kind=OperationKind.RESTORE, op_id=op_id),
             path=Path("journal.json"),
         )
+
+
+def test_journal_transition_rejects_cross_kind_edge() -> None:
+    """跨 kind 的非法阶段边必须被拒绝：普通操作不得接受 adopt/trash 跳转（回归 M1）。"""
+    frozen = (_m(),)
+    cases: list[tuple[OperationKind, OperationPhase, OperationPhase]] = [
+        (OperationKind.CREATE, OperationPhase.PREPARED, OperationPhase.COMPLETED),
+        (OperationKind.CREATE, OperationPhase.APPLYING, OperationPhase.COMPLETED),
+        (OperationKind.CREATE, OperationPhase.VALIDATING, OperationPhase.TRASH_RETAINED),
+        (OperationKind.CREATE, OperationPhase.TRASH_RETAINED, OperationPhase.TRASH_HANDOFF_PENDING),
+        (OperationKind.MOVE, OperationPhase.VALIDATING, OperationPhase.TRASH_RETAINED),
+        (OperationKind.ADOPT, OperationPhase.VALIDATING, OperationPhase.TRASH_RETAINED),
+        (OperationKind.ADOPT, OperationPhase.TRASH_RETAINED, OperationPhase.TRASH_RETAINED),
+        (OperationKind.RESTORE, OperationPhase.TRASH_RETAINED, OperationPhase.ROLLED_BACK),
+        (OperationKind.TRASH, OperationPhase.VALIDATING, OperationPhase.COMPLETED),
+    ]
+    for kind, old_phase, new_phase in cases:
+        old = _j(old_phase, kind=kind, mutations=frozen)
+        new = _j(new_phase, kind=kind, mutations=frozen)
+        with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+            validate_journal_transition(old, new, path=Path("journal.json"))
+
+
+def test_journal_transition_rejects_kind_without_phase() -> None:
+    """kind 不拥有该 phase 时，即使边在全局表中也不得发布（解析侧，回归 M1）。"""
+    from draft.operations import validate_journal_kind_phase  # pyright: ignore[reportPrivateUsage]
+
+    for kind, phase in [
+        (OperationKind.CREATE, OperationPhase.TRASH_RETAINED),
+        (OperationKind.CREATE, OperationPhase.TRASH_HANDOFF_PENDING),
+        (OperationKind.CREATE, OperationPhase.TRASH_PURGE_COMMITTED),
+        (OperationKind.ADOPT, OperationPhase.TRASH_RETAINED),
+        (OperationKind.RESTORE, OperationPhase.TRASH_RETAINED),
+    ]:
+        with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+            validate_journal_kind_phase(_j(phase, kind=kind), path=Path("journal.json"))
+
+
+def test_journal_transition_rejects_recover_journal() -> None:
+    """RECOVER 不允许形成持久 journal：任何 phase 都被拒绝。"""
+    from draft.operations import validate_journal_kind_phase  # pyright: ignore[reportPrivateUsage]
+
+    for phase in (OperationPhase.ALLOCATING, OperationPhase.PREPARED, OperationPhase.COMPLETED):
+        with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+            validate_journal_kind_phase(
+                _j(phase, kind=OperationKind.RECOVER), path=Path("journal.json")
+            )
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            _j(OperationPhase.ALLOCATING, kind=OperationKind.RECOVER),
+            _j(OperationPhase.ALLOCATING, kind=OperationKind.RECOVER),
+            path=Path("journal.json"),
+        )
+
+
+def test_journal_transition_allows_kind_owned_edges() -> None:
+    """各 kind 拥有的合法边必须被接受，防止纯表与真实 writer 漂移（回归 M1）。"""
+    frozen = (_m(),)
+    allowed: list[tuple[OperationKind, OperationPhase, OperationPhase]] = [
+        # 普通结构操作正向链。
+        (OperationKind.CREATE, OperationPhase.ALLOCATING, OperationPhase.PREPARED),
+        (OperationKind.CREATE, OperationPhase.PREPARED, OperationPhase.APPLYING),
+        (OperationKind.CREATE, OperationPhase.APPLYING, OperationPhase.VALIDATING),
+        (OperationKind.CREATE, OperationPhase.VALIDATING, OperationPhase.COMPLETED),
+        (OperationKind.CREATE, OperationPhase.ALLOCATING, OperationPhase.ROLLED_BACK),
+        # ADOPT：通用正向 + marker 已生效的 prepared/applying→completed。
+        (OperationKind.ADOPT, OperationPhase.PREPARED, OperationPhase.COMPLETED),
+        (OperationKind.ADOPT, OperationPhase.APPLYING, OperationPhase.COMPLETED),
+        (OperationKind.ADOPT, OperationPhase.ALLOCATING, OperationPhase.ROLLED_BACK),
+        # TRASH：validating→trash_retained 与生命周期推进。
+        (OperationKind.TRASH, OperationPhase.VALIDATING, OperationPhase.TRASH_RETAINED),
+        (OperationKind.TRASH, OperationPhase.TRASH_RETAINED, OperationPhase.TRASH_HANDOFF_PENDING),
+        (
+            OperationKind.TRASH,
+            OperationPhase.TRASH_HANDOFF_PENDING,
+            OperationPhase.TRASH_PURGE_COMMITTED,
+        ),
+        (
+            OperationKind.TRASH,
+            OperationPhase.TRASH_HANDOFF_PENDING,
+            OperationPhase.TRASH_HANDOFF_SUCCEEDED,
+        ),
+        (OperationKind.TRASH, OperationPhase.TRASH_HANDOFF_SUCCEEDED, OperationPhase.COMPLETED),
+        (OperationKind.TRASH, OperationPhase.TRASH_RETAINED, OperationPhase.ROLLED_BACK),
+        # RESTORE：proven-unapplied 的 prepared→rolled_back。
+        (OperationKind.RESTORE, OperationPhase.PREPARED, OperationPhase.ROLLED_BACK),
+        (OperationKind.RESTORE, OperationPhase.ALLOCATING, OperationPhase.ROLLED_BACK),
+    ]
+    for kind, old_phase, new_phase in allowed:
+        validate_journal_transition(
+            _j(old_phase, kind=kind, mutations=frozen),
+            _j(new_phase, kind=kind, mutations=frozen),
+            path=Path("journal.json"),
+        )
+
+
+def test_journal_transition_generic_rollback_requires_intent() -> None:
+    """普通操作只能经 ROLLING_BACK 到 ROLLED_BACK；prepared/applying/validating 直达拒绝。"""
+    frozen = (_m(),)
+    for kind in (OperationKind.CREATE, OperationKind.MOVE, OperationKind.STATUS_SET):
+        for phase in (OperationPhase.PREPARED, OperationPhase.APPLYING, OperationPhase.VALIDATING):
+            old = _j(phase, kind=kind, mutations=frozen)
+            with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+                validate_journal_transition(
+                    old, _j(OperationPhase.ROLLED_BACK, kind=kind, mutations=frozen),
+                    path=Path("journal.json"),
+                )
+            rolling = _j(OperationPhase.ROLLING_BACK, kind=kind, mutations=frozen)
+            validate_journal_transition(old, rolling, path=Path("journal.json"))
+            validate_journal_transition(rolling, rolling, path=Path("journal.json"))
+            validate_journal_transition(
+                rolling, _j(OperationPhase.ROLLED_BACK, kind=kind, mutations=frozen),
+                path=Path("journal.json"),
+            )
+            with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+                validate_journal_transition(
+                    rolling, _j(OperationPhase.COMPLETED, kind=kind, mutations=frozen),
+                    path=Path("journal.json"),
+                )
+
+
+def test_journal_transition_rolling_back_rejects_unknown_edges() -> None:
+    """ROLLING_BACK 不允许进入 trash 生命周期或从中段返回正向写阶段。"""
+    frozen = (_m(),)
+    rolling = _j(OperationPhase.ROLLING_BACK, mutations=frozen)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            rolling, _j(OperationPhase.VALIDATING, mutations=frozen), path=Path("journal.json")
+        )
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        validate_journal_transition(
+            _j(OperationPhase.ALLOCATING, mutations=frozen),
+            _j(OperationPhase.ROLLING_BACK, mutations=frozen),
+            path=Path("journal.json"),
+        )
+
+
+def test_parse_journal_rejects_phase_not_owned_by_kind() -> None:
+    """磁盘读取必须拒绝该 kind 不拥有的 phase（回归 M1：parser 也验证 kind-phase）。"""
+    payload = _journal_payload([_write_mutation(0)], phase="trash_retained")
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(payload, _parse_path())
+
+
+def test_parse_journal_rejects_recover_kind() -> None:
+    """RECOVER 不得形成持久 journal：解析即拒绝。"""
+    payload = _journal_payload([_write_mutation(0)], kind="recover")
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(payload, _parse_path())
 
 
 def test_pending_decision_matrix() -> None:
