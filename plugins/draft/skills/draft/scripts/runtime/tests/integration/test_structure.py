@@ -463,6 +463,44 @@ def build_promote_draft(draft_factory: DraftFactory) -> Path:
     )
 
 
+def test_promote_crash_after_first_new_hub_write_recovers(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """promote 首次创建嵌套目录时，新文件落盘但 applied=true 尚未持久化的崩溃窗口必须可恢复。
+
+    恢复必须解释新建文件对其缺失祖先目录（pages/topic）的成员变化，不能因 applied
+    滞后而把自身创建误判为外部修改。
+    """
+    import draft.operations as ops_module
+    from draft.operations import read_lock, recover
+
+    root = build_promote_draft(draft_factory)
+    original_apply_write = ops_module._apply_write  # pyright: ignore[reportPrivateUsage]
+
+    def write_then_crash(root_path: Path, target: Path, content: bytes) -> None:
+        original_apply_write(root_path, target, content)
+        if str(target).startswith("pages/topic/"):
+            raise RuntimeError("injected crash after new hub file lands")
+
+    monkeypatch.setattr(ops_module, "_apply_write", write_then_crash)
+    with pytest.raises(RuntimeError, match="injected crash after new hub file lands"):
+        promote_page(
+            root, Path("pages/topic.md"), [Path("pages/child-a.md"), Path("pages/child-b.md")]
+        )
+    monkeypatch.undo()
+    assert read_lock(root) is not None
+
+    result = recover(root)
+
+    assert result.phase == "completed"
+    assert (root / "pages/topic/index.md").is_file()
+    assert (root / "pages/topic/child-a.md").is_file()
+    assert (root / "pages/topic/child-b.md").is_file()
+    assert not (root / "pages/topic.md").exists()
+    assert read_lock(root) is None
+    assert check_draft(root).errors == ()
+
+
 def test_promote_becomes_hub_and_reparents_children(
     draft_factory: DraftFactory,
 ) -> None:

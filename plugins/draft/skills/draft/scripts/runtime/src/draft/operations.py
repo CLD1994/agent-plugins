@@ -1235,24 +1235,30 @@ def _verify_observations_for_recovery(
 
     excluded = {journal.directory.relative_to(root), LOCK_RELATIVE}
     explained = {mutation.path for mutation in explained_mutations}
+    # 目录成员变化以活文件 before/after 分类推导，不能信任可能滞后的 applied 标志。
+    # 可解释的增加 = 本操作创建的全部路径（before=None→after 的新建文件、操作日志目录、
+    # 锁文件）的完整祖先链：每个路径自身进入直接父目录，实际创建的缺失祖先目录
+    # （如 promote 首次创建 pages/topic/ 时 pages 新增的 topic）逐层解释。删除只改变
+    # 直接父目录成员；remove_empty_directories 只在终态推进时执行，中段恢复时对应
+    # 目录仍存在，不应计入。
     added: dict[Path, set[str]] = {}
     removed: dict[Path, set[str]] = {}
+    created_paths = {journal.directory.relative_to(root), LOCK_RELATIVE}
+    deleted_paths: set[Path] = set()
     for mutation in journal.mutations:
         if _classify(root, mutation) != "after":
             continue
-        parent = mutation.path.parent
         if mutation.kind is MutationKind.WRITE and mutation.before_sha256 is None:
-            added.setdefault(parent, set()).add(mutation.path.name)
+            created_paths.add(mutation.path)
         elif mutation.kind is MutationKind.DELETE:
-            removed.setdefault(parent, set()).add(mutation.path.name)
-    # 本操作创建自己的操作目录与锁：这会创建缺失的祖先目录（如首次 .draft/operations），
-    # 必须解释整条目录链的成员变化（adopt 观察清单包含内部目录成员，规格 §12.1）。
-    journal_dir = journal.directory.relative_to(root)
-    current = journal_dir
-    while current.parent != current:
-        added.setdefault(current.parent, set()).add(current.name)
-        current = current.parent
-    added.setdefault(LOCK_RELATIVE.parent, set()).add(LOCK_RELATIVE.name)
+            deleted_paths.add(mutation.path)
+    for path in created_paths:
+        current = path
+        while current.parent != current:
+            added.setdefault(current.parent, set()).add(current.name)
+            current = current.parent
+    for path in deleted_paths:
+        removed.setdefault(path.parent, set()).add(path.name)
 
     adjusted = adjusted_observation_manifest(
         journal.observations,
