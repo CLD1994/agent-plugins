@@ -813,6 +813,53 @@ def test_graph_observations_covers_empty_managed_directory(
     assert observed.members == ()
 
 
+def test_recover_uses_live_file_state_not_stale_applied(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """崩溃窗口：新文件已落盘但 applied=true 尚未持久化；恢复不得误判为外部变化。
+
+    文件落盘发生在 applied=true 日志持久化之前。目录成员变化必须按活文件 before/after
+    分类推导，不能信任可能滞后的 applied 标志。
+    """
+    import draft.operations as ops_module
+
+    root = operation_draft
+    new_bytes = b"resource-data\n"
+    plan = OperationPlan(
+        kind=OperationKind.CREATE,
+        root=root,
+        root_state=RootState.REGISTERED,
+        observations=graph_observations(load_graph(root)),
+        mutations=(
+            # 非受管页面文件：只改变目录成员，不触发页面解析检查。
+            FileMutation(
+                Path("pages/new.txt"),
+                MutationKind.WRITE,
+                None,
+                sha256_bytes(new_bytes),
+                new_bytes,
+            ),
+        ),
+    )
+    original_apply_write = ops_module._apply_write  # pyright: ignore[reportPrivateUsage]
+
+    def write_then_crash(root_path: Path, target: Path, content: bytes) -> None:
+        original_apply_write(root_path, target, content)
+        raise RuntimeError("injected crash after file lands")
+
+    monkeypatch.setattr(ops_module, "_apply_write", write_then_crash)
+    with pytest.raises(RuntimeError, match="injected crash after file lands"):
+        execute_plan(plan)
+    monkeypatch.undo()
+
+    # 新文件已落盘（after），但日志仍记录 applied=false：正常崩溃窗口。
+    assert (root / "pages/new.txt").exists()
+    result = recover(root)
+    assert result.phase == "completed"
+    assert (root / "pages/new.txt").exists()
+    assert not (root / ".draft/operation.lock").exists()
+
+
 def test_execute_plan_detects_new_page_in_previously_empty_directory(
     operation_draft: Path,
 ) -> None:

@@ -146,6 +146,25 @@ def test_initialize_accepts_empty_directory_and_keeps_it_on_later_use(
     assert not (root / "conclusions.md").exists()
 
 
+def test_adopt_succeeds_on_fresh_init_candidate(tmp_path: Path) -> None:
+    """真实 init --candidate 产物（无 .draft/operations、.draft/trash）上 adopt 必须成功。
+
+    集成夹具 build_valid_candidate 预创建 operations/trash 目录，掩盖了
+    首次创建 .draft/operations 改变 .draft 成员这一可解释变化。
+    """
+    from draft.lifecycle import adopt, initialize
+
+    root = tmp_path / "candidate"
+    initialize(root, root_state=RootState.CANDIDATE)
+
+    adopt(root)
+
+    assert (root / ".draft/draft.json").read_text(encoding="utf-8") == managed_marker_text(
+        root_state=RootState.REGISTERED
+    )
+    assert not (root / ".draft/operation.lock").exists()
+
+
 def test_adopt_registers_a_complete_candidate(tmp_path: Path) -> None:
     root = tmp_path / "candidate"
     build_valid_candidate(root)

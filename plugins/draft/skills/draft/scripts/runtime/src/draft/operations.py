@@ -1165,23 +1165,27 @@ def _verify_observations_for_recovery(
 
     excluded = {journal.directory.relative_to(root), LOCK_RELATIVE}
     explained = {mutation.path for mutation in explained_mutations}
-    # 只解释本操作实际已应用的 mutation 对目录成员的改变：崩溃可能只应用了部分
-    # 文件变更，目录成员必须按 applied 标志而不是按完整计划调整。remove_empty_directories
-    # 只在终态推进时执行，中段恢复时对应目录仍存在，不应计入。
+    # 目录成员变化以活文件 before/after 分类推导，不能信任可能滞后的 applied 标志：
+    # 文件落盘发生在 applied=true 日志持久化之前，二者之间崩溃时 applied=false 但
+    # 文件已是 after，仍应解释该成员变化。remove_empty_directories 只在终态推进时
+    # 执行，中段恢复时对应目录仍存在，不应计入。
     added: dict[Path, set[str]] = {}
     removed: dict[Path, set[str]] = {}
     for mutation in journal.mutations:
-        if not mutation.applied:
+        if _classify(root, mutation) != "after":
             continue
         parent = mutation.path.parent
         if mutation.kind is MutationKind.WRITE and mutation.before_sha256 is None:
             added.setdefault(parent, set()).add(mutation.path.name)
         elif mutation.kind is MutationKind.DELETE:
             removed.setdefault(parent, set()).add(mutation.path.name)
-    # 本操作自身创建的操作目录与锁会改变父目录成员，属于可解释变化
-    # （adopt 观察清单包含内部目录成员，规格 §12.1）。
+    # 本操作创建自己的操作目录与锁：这会创建缺失的祖先目录（如首次 .draft/operations），
+    # 必须解释整条目录链的成员变化（adopt 观察清单包含内部目录成员，规格 §12.1）。
     journal_dir = journal.directory.relative_to(root)
-    added.setdefault(journal_dir.parent, set()).add(journal_dir.name)
+    current = journal_dir
+    while current.parent != current:
+        added.setdefault(current.parent, set()).add(current.name)
+        current = current.parent
     added.setdefault(LOCK_RELATIVE.parent, set()).add(LOCK_RELATIVE.name)
 
     adjusted: list[Observation] = []
