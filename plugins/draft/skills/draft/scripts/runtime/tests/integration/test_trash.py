@@ -6,8 +6,8 @@ import pytest
 from draft.checker import check_draft
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
-from draft.models import OperationPhase, RootState
-from draft.operations import JOURNAL_VERSION, read_journal
+from draft.models import OperationKind, OperationPhase, RootState
+from draft.operations import JOURNAL_VERSION, operation_journal_path, read_journal
 from draft.trash import restore_retained_trash, trash_page
 from draft.trash_lifecycle import recover_draft
 from tests.integration.support import DraftFactory
@@ -252,8 +252,10 @@ def test_candidate_trash_then_restore_roundtrips(draft_factory: DraftFactory) ->
     assert result.phase is OperationPhase.COMPLETED
     assert (root / "pages/obsolete.md").read_text(encoding="utf-8") == OBSOLETE
     assert not (root / ".draft/operation.lock").exists()
-    # 恢复日志保留创建时的根状态作为审计事实。
-    restore_journal = read_journal(next((root / ".draft/operations").iterdir()) / "journal.json")
+    # 恢复日志保留创建时的根状态作为审计事实：按 result.operation_id 精确定位，
+    # 不依赖 iterdir 顺序（存在先创建的 trash 日志）。
+    restore_journal = read_journal(operation_journal_path(root, result.operation_id))
+    assert restore_journal.kind is OperationKind.RESTORE
     assert restore_journal.root_state is RootState.CANDIDATE
 
 

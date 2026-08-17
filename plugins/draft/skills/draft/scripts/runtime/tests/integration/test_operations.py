@@ -686,7 +686,9 @@ def test_completed_journal_with_matching_lock_is_cleaned_up(
     assert (root / "pages/b.md").read_bytes() == new_b
     assert not (root / ".draft/operation.lock").exists()
     operations = root / ".draft/operations"
-    journal_dir = next(operations.iterdir())
+    dirs = [entry for entry in operations.iterdir() if entry.is_dir()]
+    assert len(dirs) == 1
+    journal_dir = dirs[0]
     assert (journal_dir / "journal.json").is_file()
     assert not (journal_dir / "originals").exists()
     assert not (journal_dir / "staged").exists()
