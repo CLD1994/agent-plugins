@@ -453,7 +453,7 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
             issues.append(
                 _error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, Path(INTERNAL_DIR) / "operations")
             )
-        _check_orphan_trash_packages(root, issues)
+        _check_trash_tree(root, issues)
         return issues
     reject_symlink_components(root, Path(INTERNAL_DIR) / "operations")
     for entry in sorted(operations.iterdir()):
@@ -499,18 +499,44 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
             issues.extend(_check_trash_retained(root, journal_path, journal, relative))
         elif phase is OperationPhase.TRASH_HANDOFF_PENDING:
             issues.extend(_check_trash_handoff_pending(root, journal_path, journal, relative))
-    _check_orphan_trash_packages(root, issues)
+    _check_trash_tree(root, issues)
     return issues
 
 
-def _check_orphan_trash_packages(root: Path, issues: list[CheckIssue]) -> None:
-    """反向闭合：.draft/trash/outgoing/ 下未被任何持有中 trash 日志引用的包是孤儿。
+def _check_trash_tree(root: Path, issues: list[CheckIssue]) -> None:
+    """闭合 .draft/trash 树形协议（candidate 与 registered 共享）：
 
-    权威删除包必须被某个 trash_retained / trash_handoff_pending 日志持有；无对应
-    持有日志的包目录是内部命名空间的非法形状（规格 §5.4）。
+    ``.draft/trash/`` 只允许 ``outgoing/``，``outgoing/`` 只允许合法 operation_id
+    包目录；被持有日志引用的包内部损坏由 trash.package_corrupt 报告，其余非法
+    形状（未登记条目、非目录、非法包名、orphan）统一报 internal.unexpected_entry，
+    任意路径组件符号链接报 path.symlink_escape。
     """
+    from draft.operations import validate_operation_id
     from draft.trash_package import OUTGOING_RELATIVE
 
+    trash_dir = root / INTERNAL_DIR / "trash"
+    if trash_dir.is_symlink():
+        issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, Path(INTERNAL_DIR) / "trash"))
+        return
+    if not trash_dir.is_dir():
+        return
+    for entry in sorted(trash_dir.iterdir()):
+        if entry.name == "outgoing":
+            continue
+        relative = entry.relative_to(root)
+        if entry.is_symlink():
+            issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, relative))
+        else:
+            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
+    outgoing = root / OUTGOING_RELATIVE
+    if outgoing.is_symlink():
+        issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, Path(OUTGOING_RELATIVE)))
+        return
+    if not outgoing.is_dir():
+        if outgoing.exists():
+            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, Path(OUTGOING_RELATIVE)))
+        return
+    # 被持有日志引用的 operation_id。
     held: set[str] = set()
     operations = root / INTERNAL_DIR / "operations"
     if operations.is_dir():
@@ -526,13 +552,21 @@ def _check_orphan_trash_packages(root: Path, issues: list[CheckIssue]) -> None:
                 OperationPhase.TRASH_HANDOFF_PENDING,
             ):
                 held.add(entry.name)
-    outgoing = root / OUTGOING_RELATIVE
-    if not outgoing.is_dir():
-        return
     for package in sorted(outgoing.iterdir()):
-        if not package.is_dir() or package.name in held:
+        relative = package.relative_to(root)
+        if package.is_symlink():
+            issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, relative))
             continue
-        issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, package.relative_to(root)))
+        if not package.is_dir():
+            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
+            continue
+        try:
+            validate_operation_id(package.name)
+        except DraftError:
+            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
+            continue
+        if package.name not in held:
+            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
 
 
 _MID_WRITE_PHASES = (

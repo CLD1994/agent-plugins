@@ -250,6 +250,86 @@ def test_orphan_trash_package_without_holding_journal_is_reported(
     assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
 
 
+@pytest.mark.parametrize("root_state", tuple(RootState))
+def test_trash_outgoing_as_regular_file_is_reported(
+    draft_factory: DraftFactory,
+    root_state: RootState,
+) -> None:
+    """``.draft/trash/outgoing`` 本身是普通文件时报告内部形状损坏。"""
+    import shutil
+
+    root = draft_factory(healthy(), root_state=root_state)
+    trash = root / ".draft/trash"
+    if trash.exists():
+        shutil.rmtree(trash)
+    trash.mkdir()
+    (trash / "outgoing").write_text("not a directory", encoding="utf-8")
+
+    report = check_draft(root)
+
+    assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
+
+
+@pytest.mark.parametrize("root_state", tuple(RootState))
+def test_trash_unknown_entry_is_reported(
+    draft_factory: DraftFactory,
+    root_state: RootState,
+) -> None:
+    """``.draft/trash`` 下除 outgoing 外的条目非法。"""
+    root = draft_factory(healthy(), root_state=root_state)
+    (root / ".draft/trash/junk").write_text("x", encoding="utf-8")
+
+    report = check_draft(root)
+
+    assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
+
+
+@pytest.mark.parametrize("root_state", tuple(RootState))
+def test_trash_outgoing_regular_file_entry_is_reported(
+    draft_factory: DraftFactory,
+    root_state: RootState,
+) -> None:
+    """``outgoing`` 下非目录条目非法。"""
+    root = draft_factory(healthy(), root_state=root_state)
+    (root / ".draft/trash/outgoing/garbage").write_text("x", encoding="utf-8")
+
+    report = check_draft(root)
+
+    assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
+
+
+@pytest.mark.parametrize("root_state", tuple(RootState))
+def test_trash_outgoing_invalid_name_directory_is_reported(
+    draft_factory: DraftFactory,
+    root_state: RootState,
+) -> None:
+    """``outgoing`` 下包目录名不是合法 operation_id 时非法。"""
+    root = draft_factory(healthy(), root_state=root_state)
+    (root / ".draft/trash/outgoing/not-hex").mkdir()
+
+    report = check_draft(root)
+
+    assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
+
+
+@pytest.mark.parametrize("root_state", tuple(RootState))
+def test_held_trash_package_is_not_reported(
+    draft_factory: DraftFactory,
+    root_state: RootState,
+) -> None:
+    """被持有中 trash 日志引用的权威包不误报为孤儿。"""
+    from datetime import UTC, datetime
+
+    from draft.trash import trash_page
+
+    root = draft_factory(healthy(), root_state=root_state)
+    trash_page(root, Path("pages/question.md"), now=datetime(2026, 7, 21, 12, tzinfo=UTC))
+
+    report = check_draft(root)
+
+    assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value not in codes(report)
+
+
 def test_provisional_shape_in_final_marker_is_invalid(
     draft_factory: DraftFactory,
 ) -> None:
