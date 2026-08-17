@@ -22,7 +22,6 @@ from draft.operations import (
     JournalMutation,
     reject_symlink_components,
     sha256_bytes,
-    sha256_file,
     validate_operation_id,
 )
 
@@ -56,8 +55,10 @@ class VerifiedTrashPackage:
     page_sha256: str
     parent_sha256: str
     # payload 相对包目录的路径与已验证包树快照：恢复观察与包清理都以它为准，
-    # 不再重新扫描磁盘，验证后新增的未知条目不能进入基线。
+    # 不再重新扫描磁盘，验证后新增的未知条目不能进入基线。manifest_bytes 是验证
+    # 时刻的不可变清单字节：摘要复核与解析共用同一份，消费者不得重读 live 文件。
     payload_relative: Path
+    manifest_bytes: bytes
     observations: ObservationManifest
 
 
@@ -186,19 +187,20 @@ def _verified_package_observations(
     return ObservationManifest(entries=tuple(entries))
 
 
-def _parse_manifest(manifest_path: Path) -> dict[str, object]:
+def _parse_manifest(manifest_bytes: bytes, code_path: Path) -> dict[str, object]:
+    """从已验证清单字节解码：摘要复核与解析必须共用同一份字节，避免二次读取漂移。"""
     try:
-        decoded = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path) from exc
+        decoded = json.loads(manifest_bytes.decode("utf-8"))
+    except ValueError as exc:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path) from exc
     if not isinstance(decoded, dict):
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
     data = cast("dict[str, object]", decoded)
     if set(data) != set(_MANIFEST_FIELDS):
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
     version = data["version"]
     if isinstance(version, bool) or version != PACKAGE_VERSION:
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
     return data
 
 
@@ -231,10 +233,13 @@ def _load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashP
     _require_regular_file(manifest_path, manifest_path)
     manifest_mutation = require_journal_write(trash_journal, package_relative / "package.json")
     assert manifest_mutation.after_sha256 is not None
-    if sha256_file(manifest_path) != manifest_mutation.after_sha256:
+    # 清单只读一次：同一份字节同时用于日志摘要复核、UTF-8/JSON 解析，并作为不可变
+    # manifest_bytes 存给消费者；任何 live 重读都可能在验证后采信未验证字节。
+    manifest_bytes = manifest_path.read_bytes()
+    if sha256_bytes(manifest_bytes) != manifest_mutation.after_sha256:
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
 
-    data = _parse_manifest(manifest_path)
+    data = _parse_manifest(manifest_bytes, manifest_path)
     if _expect_str(data, "operation_id", manifest_path) != package_id:
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
     page_hash = _expect_str(data, "page_sha256", manifest_path)
@@ -295,6 +300,7 @@ def _load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashP
         page_sha256=page_hash,
         parent_sha256=parent_hash,
         payload_relative=payload_relative,
+        manifest_bytes=manifest_bytes,
         observations=_verified_package_observations(
             root,
             package_dir,

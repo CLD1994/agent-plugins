@@ -92,6 +92,69 @@ def _accept_into(bin_dir: Path, accepted: list[str]) -> Callable[[str], None]:
     return accept
 
 
+def test_handoff_blocked_when_manifest_changed_after_verification(
+    draft_factory: DraftFactory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证后改写 live manifest：handoff 不得被调用，attempt 不得包含未验证字节。
+
+    回归 H4：make_attempt_copy 曾重新读取 live package.json；若验证后清单被改写，
+    副本会携带未验证字节交给外部适配器，且正常生命周期要等清理时才发现摘要变化。
+    """
+    import draft.trash_lifecycle as lifecycle_module
+    from draft.operations import Journal
+    from draft.trash_package import VerifiedTrashPackage
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    accepted: list[str] = []
+    package_json = root / ".draft/trash/outgoing" / pending.operation_id / "package.json"
+    original_bytes = package_json.read_bytes()
+
+    original_load = lifecycle_module.load_verified_package
+
+    def load_then_tamper(root_path: Path, journal: Journal) -> VerifiedTrashPackage:
+        verified = original_load(root_path, journal)
+        package_json.write_bytes(original_bytes + b"\n# tampered\n")
+        return verified
+
+    monkeypatch.setattr(lifecycle_module, "load_verified_package", load_then_tamper)
+
+    report = advance_trash_lifecycle(root, now=EXPIRY, handoff=_accept_into(bin_dir, accepted))
+    monkeypatch.undo()
+
+    assert report.error is not None
+    assert report.error.code == CheckCode.TRASH_PACKAGE_CORRUPT.value
+    assert accepted == []  # 适配器不得被调用
+    assert package_json.read_bytes() == original_bytes + b"\n# tampered\n"
+    assert _package_exists(root, pending.operation_id)
+
+
+def test_attempt_copy_uses_verified_payload_relative(
+    draft_factory: DraftFactory,
+) -> None:
+    """attempt 副本只使用已验证的 manifest_bytes 与 payload_relative，不重新读取 live 包。"""
+    from draft.operations import read_journal
+    from draft.trash_lifecycle import make_attempt_copy
+    from draft.trash_package import load_verified_package
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    journal = read_journal(_journal_path(root, pending.operation_id))
+    verified = load_verified_package(root, journal)
+
+    attempt = make_attempt_copy(verified)
+
+    assert (attempt / "package.json").read_bytes() == (package / "package.json").read_bytes()
+    assert (attempt / verified.payload_relative).read_bytes() == verified.page_bytes
+    # 副本不含包内任何额外项（只统计文件，中间目录不算）。
+    assert {
+        path.relative_to(attempt).as_posix() for path in attempt.rglob("*") if path.is_file()
+    } == {"package.json", verified.payload_relative.as_posix()}
+
+
 def test_retained_before_expiry_does_not_handoff(
     draft_factory: DraftFactory,
 ) -> None:

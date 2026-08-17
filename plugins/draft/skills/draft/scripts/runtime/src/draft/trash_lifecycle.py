@@ -115,10 +115,12 @@ def _root_from_package(package: VerifiedTrashPackage) -> Path:
 
 
 def make_attempt_copy(package: VerifiedTrashPackage) -> Path:
-    """从已重新验证的权威包制作操作内一次性副本。
+    """从已验证快照制作操作内一次性副本。
 
-    只复制已验证的清单与负载（不含包内任何额外项），逐文件耐久写入并同步目录，
-    再交给外部适配器；符号链接或错误类型的旧 attempt 视为损坏。
+    只使用 load_verified_package 验证时刻的不可变字节（manifest_bytes、page_bytes）
+    与已验证的 payload_relative：绝不再读取 live 权威包文件，也不重新用 page_path
+    猜测 payload 路径；逐文件耐久写入并同步目录，再交给外部适配器。符号链接或
+    错误类型的旧 attempt 视为损坏。
     """
     root = _root_from_package(package)
     reject_symlink_components(root, OUTGOING_RELATIVE)
@@ -130,10 +132,8 @@ def make_attempt_copy(package: VerifiedTrashPackage) -> Path:
     if attempt.is_dir():
         remove_tree(attempt)
     attempt.mkdir(parents=True, exist_ok=False)
-    manifest_bytes = (package.directory / "package.json").read_bytes()
-    payload_relative = Path("payload") / package.page_path
-    durable_write(attempt / "package.json", manifest_bytes)
-    durable_write(attempt / payload_relative, package.page_bytes)
+    durable_write(attempt / "package.json", package.manifest_bytes)
+    durable_write(attempt / package.payload_relative, package.page_bytes)
     fsync_directory(attempt)
     return attempt
 
@@ -208,6 +208,13 @@ def _attempt_handoff_locked(
     operation_id = journal.operation_id
     deadlines = TrashDeadlines.parse(journal.metadata)
     attempt = make_attempt_copy(verified_package)
+    # 调用外部 handoff 前用已验证快照复核权威包：验证后发生的摘要/成员变化必须阻止
+    # 适配器读取未验证内容，保留权威包与可诊断状态（回归 H4）。
+    from draft.observations import FilesystemObservationProbe, verify_observations
+
+    changed = verify_observations(FilesystemObservationProbe(root), verified_package.observations)
+    if changed:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, verified_package.directory)
     try:
         handoff(str(attempt))
     except OSError as error:
