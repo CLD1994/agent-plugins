@@ -1359,22 +1359,23 @@ uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
 
 - [ ] **Step 5: 运行格式、静态检查和类型检查**
 
+  核心门禁使用 git 解析的绝对 RUNTIME（cwd 无关）；适配层一律调用唯一权威入口
+  `plugins/draft/scripts/check-adapters.sh`，不得复制多份 shell 片段。
+
   ```bash
-  RUNTIME=$PWD/plugins/draft/skills/draft/scripts/runtime
+  REPO_ROOT=$(git rev-parse --show-toplevel)
+  RUNTIME="$REPO_ROOT/plugins/draft/skills/draft/scripts/runtime"
   uv run --project "$RUNTIME" --locked ruff format --check \
-    plugins/draft/skills/draft/scripts/runtime/src \
-    plugins/draft/skills/draft/scripts/runtime/tests
+    "$REPO_ROOT/plugins/draft/skills/draft/scripts/runtime/src" \
+    "$REPO_ROOT/plugins/draft/skills/draft/scripts/runtime/tests"
   uv run --project "$RUNTIME" --locked ruff check \
-    plugins/draft/skills/draft/scripts/runtime/src \
-    plugins/draft/skills/draft/scripts/runtime/tests
+    "$REPO_ROOT/plugins/draft/skills/draft/scripts/runtime/src" \
+    "$REPO_ROOT/plugins/draft/skills/draft/scripts/runtime/tests"
   uv run --project "$RUNTIME" --locked pyright -p "$RUNTIME/pyproject.toml"
-  # 适配层 ruff 唯一权威入口：cd 到配置目录后自动发现 ruff.toml。
-  # 不得从仓库根用 --config 指定（src=["."] 相对 CWD 解析会把 adapter 误判为
-  # 第三方、mask 掉 I001，两条入口结果相反）。
-  (cd plugins/draft/scripts && uv run --project "$RUNTIME" --locked ruff format --check .)
-  (cd plugins/draft/scripts && uv run --project "$RUNTIME" --locked ruff check .)
-  uv run --project "$RUNTIME" --locked pyright \
-    -p plugins/draft/scripts/pyrightconfig.json
+  # 适配层唯一权威门禁入口：git 解析仓库根、内部 cd 到适配层目录自动发现 ruff.toml。
+  # src=["."] 相对该固定 cwd 解析，从仓库根/任意子目录调用结果一致；
+  # 仓库外、runtime 缺失、无 Python 文件或工具失败时非零退出。
+  bash "$REPO_ROOT/plugins/draft/scripts/check-adapters.sh"
   ```
 
 - [ ] **Step 6: 审计规格覆盖与实现残留**

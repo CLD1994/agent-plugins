@@ -39,3 +39,12 @@ uv run --project "$RUNTIME" --locked \
 uv run --project "$RUNTIME" --locked \
   pytest plugins/draft/scripts/tests/integration -q -m network
 ```
+
+适配层格式/静态/类型检查的唯一权威入口（cwd 无关，git 解析仓库根并内部 cd 到
+适配层目录；仓库外、runtime 缺失、无 Python 文件或工具失败时非零退出）：
+
+```bash
+bash plugins/draft/scripts/check-adapters.sh
+```
+
+核心 ruff/pyright 使用 git 解析的绝对 RUNTIME 运行，参见实施计划 Task 14 Step 5。
