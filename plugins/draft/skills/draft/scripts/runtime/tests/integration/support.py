@@ -27,7 +27,11 @@ def managed_marker_text(
 
 class DraftFactory(Protocol):
     def __call__(
-        self, files: dict[str, str], *, root_state: RootState | None = RootState.REGISTERED
+        self,
+        files: dict[str, str],
+        *,
+        root_state: RootState | None = RootState.REGISTERED,
+        precreate_internal: bool = False,
     ) -> Path:
         raise AssertionError("typing protocol method is not executed")
 

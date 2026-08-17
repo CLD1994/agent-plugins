@@ -157,6 +157,44 @@ def run_json(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, 
     return code, cast("dict[str, object]", json.loads(output))
 
 
+def test_minimal_root_first_create_creates_internal_dir_on_demand(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """最小受管根（无预建内部目录）首次 create 按需创建 .draft/operations。"""
+    root = draft_factory(
+        {
+            "index.md": (
+                "# Topic\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n## 子主题\n\n"
+                "- [乙](pages/b.md)\n"
+            ),
+            "pages/b.md": (
+                "# 乙\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n\n乙。\n"
+            ),
+        }
+    )
+    assert not (root / ".draft/operations").exists()
+
+    code, _payload = run_json(
+        [
+            "create",
+            "--root",
+            str(root),
+            "pages/a.md",
+            "--title",
+            "甲",
+            "--status",
+            "pending",
+            "--json",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    assert (root / "pages/a.md").is_file()
+    assert (root / ".draft/operations").exists()
+    assert check_draft(root).errors == ()
+
+
 def test_create_leaf_creates_page_and_updates_navigation(
     draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
 ) -> None:

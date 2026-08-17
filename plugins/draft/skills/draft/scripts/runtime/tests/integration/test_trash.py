@@ -135,7 +135,8 @@ def test_protected_pages_cannot_be_trashed(draft_factory: DraftFactory) -> None:
     with pytest.raises(DraftError, match="trash.protected"):
         trash_page(root, Path("conclusions.md"), now=datetime(2026, 7, 21, tzinfo=UTC))
 
-    assert list((root / ".draft/trash/outgoing").iterdir()) == []
+    # 受保护页拒绝时不创建任何回收目录。
+    assert not (root / ".draft/trash").exists()
 
 
 def test_page_with_children_cannot_be_trashed(draft_factory: DraftFactory) -> None:

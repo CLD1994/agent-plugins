@@ -110,16 +110,15 @@ def test_missing_marker(draft_factory: DraftFactory) -> None:
 def test_registered_mode_accepts_marker_without_runtime_directories(
     draft_factory: DraftFactory,
 ) -> None:
+    """最小受管根（marker 存在、无 operations/trash 按需目录）通过检查。"""
     root = draft_factory(healthy())
-    internal = root / ".draft"
-    (internal / "trash" / "outgoing").rmdir()
-    (internal / "trash").rmdir()
-    (internal / "operations").rmdir()
 
     report = check_draft(root)
 
     assert report.errors == ()
-    assert (internal / "draft.json").is_file()
+    assert (root / ".draft/draft.json").is_file()
+    assert not (root / ".draft/operations").exists()
+    assert not (root / ".draft/trash").exists()
 
 
 def test_invalid_marker_json(draft_factory: DraftFactory) -> None:
@@ -191,7 +190,7 @@ def test_non_directory_entry_in_operations_is_reported(
     root_state: RootState,
 ) -> None:
     """operations/ 下的非目录条目是内部协议非法形状，不能静默跳过（规格 §5.4）。"""
-    root = draft_factory(healthy(), root_state=root_state)
+    root = draft_factory(healthy(), root_state=root_state, precreate_internal=True)
     (root / ".draft" / "operations" / "garbage").write_text("x", encoding="utf-8")
 
     report = check_draft(root)
@@ -205,7 +204,7 @@ def test_operations_path_as_regular_file_is_reported(
     root_state: RootState,
 ) -> None:
     """``.draft/operations`` 本身是普通文件时报告内部形状损坏，不得当作空目录。"""
-    root = draft_factory(healthy(), root_state=root_state)
+    root = draft_factory(healthy(), root_state=root_state, precreate_internal=True)
     operations = root / ".draft" / "operations"
     operations.rmdir()
     operations.write_text("not a directory", encoding="utf-8")
@@ -276,7 +275,7 @@ def test_trash_unknown_entry_is_reported(
     root_state: RootState,
 ) -> None:
     """``.draft/trash`` 下除 outgoing 外的条目非法。"""
-    root = draft_factory(healthy(), root_state=root_state)
+    root = draft_factory(healthy(), root_state=root_state, precreate_internal=True)
     (root / ".draft/trash/junk").write_text("x", encoding="utf-8")
 
     report = check_draft(root)
@@ -290,7 +289,7 @@ def test_trash_outgoing_regular_file_entry_is_reported(
     root_state: RootState,
 ) -> None:
     """``outgoing`` 下非目录条目非法。"""
-    root = draft_factory(healthy(), root_state=root_state)
+    root = draft_factory(healthy(), root_state=root_state, precreate_internal=True)
     (root / ".draft/trash/outgoing/garbage").write_text("x", encoding="utf-8")
 
     report = check_draft(root)
@@ -304,7 +303,7 @@ def test_trash_outgoing_invalid_name_directory_is_reported(
     root_state: RootState,
 ) -> None:
     """``outgoing`` 下包目录名不是合法 operation_id 时非法。"""
-    root = draft_factory(healthy(), root_state=root_state)
+    root = draft_factory(healthy(), root_state=root_state, precreate_internal=True)
     (root / ".draft/trash/outgoing/not-hex").mkdir()
 
     report = check_draft(root)

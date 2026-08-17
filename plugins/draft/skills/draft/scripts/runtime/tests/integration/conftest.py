@@ -13,7 +13,10 @@ def draft_factory(tmp_path: Path) -> DraftFactory:
         files: dict[str, str],
         *,
         root_state: RootState | None = RootState.REGISTERED,
+        precreate_internal: bool = False,
     ) -> Path:
+        # 默认最小受管根：与真实 init 产物一致，不预创建按需内部目录（operations/trash）。
+        # 需要直接写入内部目录的测试显式传 precreate_internal=True。
         root = tmp_path / "topic"
         root.mkdir()
         for relative, text in files.items():
@@ -24,8 +27,9 @@ def draft_factory(tmp_path: Path) -> DraftFactory:
         if root_state is not None:
             internal = root / ".draft"
             internal.mkdir()
-            (internal / "operations").mkdir()
-            (internal / "trash" / "outgoing").mkdir(parents=True)
+            if precreate_internal:
+                (internal / "operations").mkdir()
+                (internal / "trash" / "outgoing").mkdir(parents=True)
             # conclusions.md 只属于机器所有权下的 generated 状态；夹具携带该文件时
             # 所有权状态必须同步为 generated（规格 §12.1/§12.2）。
             from draft.vocabulary import ConclusionsState
