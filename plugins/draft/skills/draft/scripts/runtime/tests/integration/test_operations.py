@@ -399,6 +399,84 @@ def test_recover_finishes_a_partially_applied_plan(
     assert not (root / ".draft/operation.lock").exists()
 
 
+def _operation_dir(root: Path) -> Path:
+    return next(entry for entry in (root / ".draft/operations").iterdir() if entry.is_dir())
+
+
+def test_recover_consumes_owned_temp_leftover(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """target=before + 精确 temp 摘要=after：允许消费（复核后清理）并前向完成（回归 H3）。"""
+    from draft.operations import _mutation_temporary_path  # pyright: ignore[reportPrivateUsage]
+
+    root = operation_draft
+    plan, _old_a, _old_b, _new_a, new_b = two_write_plan(root)
+    monkeypatch.setattr("draft.operations.replace_file", crash_on_nth_replace(2))
+    with pytest.raises(RuntimeError, match="injected crash"):
+        execute_plan(plan)
+    monkeypatch.undo()
+
+    operation_id = _operation_dir(root).name
+    b_temp = root / _mutation_temporary_path(Path("pages/b.md"), operation_id, 1)
+    assert b_temp.read_bytes() == new_b  # 崩溃遗留精确 temp。
+
+    result = recover(root)
+
+    assert result.phase == "completed"
+    assert not b_temp.exists()  # 遗留 temp 被清理。
+    assert (root / "pages/b.md").read_bytes() == new_b
+
+
+def test_recover_rejects_coexisting_temp_when_target_after(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """target=after 却存在共存精确 temp：原子 replace 不会遗留，判外部变化（回归 H3）。"""
+    from draft.operations import _mutation_temporary_path  # pyright: ignore[reportPrivateUsage]
+
+    root = operation_draft
+    plan, _old_a, _old_b, new_a, _new_b = two_write_plan(root)
+    monkeypatch.setattr("draft.operations.replace_file", crash_on_nth_replace(2))
+    with pytest.raises(RuntimeError, match="injected crash"):
+        execute_plan(plan)
+    monkeypatch.undo()
+
+    operation_id = _operation_dir(root).name
+    a_temp = root / _mutation_temporary_path(Path("pages/a.md"), operation_id, 0)
+    a_temp.write_bytes(new_a)
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        recover(root)
+
+    assert (root / "pages/a.md").read_bytes() == new_a
+    assert a_temp.is_file()  # 现场保留。
+    assert (root / ".draft/operation.lock").exists()
+
+
+def test_recover_rejects_wrong_temp_content(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """target=before + temp 摘要不符：外部篡改，判 external_change 并保留现场（回归 H3）。"""
+    from draft.operations import _mutation_temporary_path  # pyright: ignore[reportPrivateUsage]
+
+    root = operation_draft
+    plan, old_a, _old_b, _new_a, _new_b = two_write_plan(root)
+    monkeypatch.setattr("draft.operations.replace_file", crash_on_nth_replace(1))
+    with pytest.raises(RuntimeError, match="injected crash"):
+        execute_plan(plan)
+    monkeypatch.undo()
+
+    operation_id = _operation_dir(root).name
+    a_temp = root / _mutation_temporary_path(Path("pages/a.md"), operation_id, 0)
+    a_temp.write_bytes(b"tampered")
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        recover(root)
+
+    assert (root / "pages/a.md").read_bytes() == old_a  # 目标仍 before。
+    assert a_temp.read_bytes() == b"tampered"
+    assert (root / ".draft/operation.lock").exists()
+
+
 def test_recover_stops_on_external_edit(
     operation_draft: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

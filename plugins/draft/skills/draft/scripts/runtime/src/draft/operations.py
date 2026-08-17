@@ -11,7 +11,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
@@ -1254,7 +1254,7 @@ def validate_preallocated_journal(plan: OperationPlan, journal: Journal) -> None
 
 def _verify_plan_observations(root: Path, journal: Journal) -> None:
     """锁内、首次业务变更前复核观察清单；差异即外部变化，不应用 mutation。"""
-    changed = _verify_observations_for_recovery(root, journal, explained_mutations=())
+    changed, _ = _verify_observations_for_recovery(root, journal, explained_mutations=())
     if changed:
         raise DraftError("operation.external_change", root / changed[0])
 
@@ -1719,13 +1719,60 @@ def _classify_observation(mutation: JournalMutation, observed: Observation) -> s
     return "unknown"
 
 
+def _write_recovery_decision(
+    *,
+    before: str | None,
+    after: str,
+    target_kind: EntryKind,
+    target_digest: str | None,
+    temp_kind: EntryKind,
+    temp_digest: str | None,
+) -> Literal["forward", "consume", "external"]:
+    """WRITE 恢复决策表（回归 H3）：输入 target/登记精确临时路径的探针事实，输出动作。
+
+    | target 状态 | 登记 temp 状态 | 结果 |
+    | before | missing | forward：从 staged 正常前向完成 |
+    | before | 普通文件且摘要=after | consume：允许崩溃遗留，复核后清理再前向完成 |
+    | before | 摘要不符、目录、链接、other | external_change |
+    | after | missing | forward：正常提交/恢复 |
+    | after | 任意存在状态 | external_change（原子 replace 不会留下共存 temp） |
+    | unknown | 任意 | external_change |
+
+    目录成员 exact/extra 是独立维度：除 before+consume 允许的精确 temp 外，任何
+    额外成员都必须拒绝。探针只负责提供事实；本函数不访问文件系统，可独立单测。
+    """
+    if target_kind is EntryKind.FILE and target_digest == after:
+        target = "after"
+    elif target_kind is EntryKind.FILE and target_digest == before:
+        target = "before"
+    elif target_kind is EntryKind.MISSING and before is None:
+        target = "before"  # 新建文件尚未创建
+    else:
+        target = "unknown"
+    if temp_kind is EntryKind.MISSING:
+        temp = "missing"
+    elif temp_kind is EntryKind.FILE and temp_digest == after:
+        temp = "exact"
+    else:
+        temp = "wrong"
+    if target == "after":
+        return "external" if temp != "missing" else "forward"
+    if target == "before":
+        if temp == "missing":
+            return "forward"
+        if temp == "exact":
+            return "consume"
+        return "external"
+    return "external"
+
+
 def _verify_observations_for_recovery(
     root: Path,
     journal: Journal,
     explained_mutations: tuple[_MutationLike, ...],
     *,
     probe: ObservationProbe | None = None,
-) -> tuple[Path, ...]:
+) -> tuple[tuple[Path, ...], frozenset[Path]]:
     """恢复时复核观察：只排除本操作目录、锁与 explained mutation 路径。
 
     目录成员变化以探针观察的活文件 before/after 分类推导，不能信任可能滞后的
@@ -1788,18 +1835,35 @@ def _verify_observations_for_recovery(
         created_dirs=frozenset(created_dirs),
     )
 
-    owned_temp_paths = frozenset(
-        _mutation_temporary_path(mutation.path, journal.operation_id, index)
-        for index, mutation in enumerate(journal.mutations)
-        if mutation.kind is MutationKind.WRITE
-    )
+    # 每个 WRITE 按 target/登记 temp 状态表一次性分类（回归 H3）：只有
+    # before+owned-temp-exact（可消费的崩溃遗留）被排除出目录成员，target=after 时
+    # 任何共存 temp 都是外部变化，未登记的 temp-like 成员一律保留。
+    consume_temps: set[Path] = set()
+    for index, mutation in enumerate(journal.mutations):
+        if mutation.kind is not MutationKind.WRITE or mutation.after_sha256 is None:
+            continue
+        temporary = _mutation_temporary_path(mutation.path, journal.operation_id, index)
+        target_observed = probe.observe(mutation.path)
+        temp_observed = probe.observe(temporary)
+        decision = _write_recovery_decision(
+            before=mutation.before_sha256,
+            after=mutation.after_sha256,
+            target_kind=target_observed.kind,
+            target_digest=target_observed.sha256,
+            temp_kind=temp_observed.kind,
+            temp_digest=temp_observed.sha256,
+        )
+        if decision == "external":
+            raise DraftError("operation.external_change", mutation.path)
+        if decision == "consume":
+            consume_temps.add(temporary)
 
     class _RecoveryProbe:
-        """比较探针：只忽略本操作日志登记的精确临时路径（operation_id + index 绑定）。
+        """比较探针：只忽略允许消费的精确临时路径（target=before 且摘要=after）。
 
-        所有权证据是精确路径，不是文件名形状：预存 temp-like 合法文件不得被过滤
-        （否则计划观察与 live 成员不一致，误报 external_change）；未登记的 temp-like
-        入侵者（即使与目标同基础名）必须保留在成员里（否则被静默吸收）。
+        所有权证据是精确路径 + 状态组合，不是文件名形状：预存 temp-like 合法文件
+        不得被过滤；target=after 时精确 temp 的存在已在上方判为外部变化；未登记的
+        temp-like 入侵者（即使与目标同基础名）必须保留在成员里（否则被静默吸收）。
         """
 
         def __init__(self, inner: ObservationProbe) -> None:
@@ -1809,12 +1873,13 @@ def _verify_observations_for_recovery(
             observed = self._inner.observe(path)
             if observed.kind is EntryKind.DIRECTORY:
                 members = tuple(
-                    member for member in observed.members if (path / member) not in owned_temp_paths
+                    member for member in observed.members if (path / member) not in consume_temps
                 )
                 return Observation(path=path, kind=EntryKind.DIRECTORY, members=members)
             return observed
 
-    return verify_observations(_RecoveryProbe(probe), adjusted, explained_mutations=())
+    changed = verify_observations(_RecoveryProbe(probe), adjusted, explained_mutations=())
+    return changed, frozenset(consume_temps)
 
 
 def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> OperationResult:
@@ -1856,7 +1921,7 @@ def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> Operation
             changed_paths=(MARKER_PATH,),
         )
     # marker 仍是 before（candidate）：复核观察清单；未变则前向完成，变化则放弃本次 adopt。
-    changed = _verify_observations_for_recovery(root, journal, explained_mutations=(marker,))
+    changed, _ = _verify_observations_for_recovery(root, journal, explained_mutations=(marker,))
     if changed:
         rolled = _with_phase(journal, OperationPhase.ROLLED_BACK)
         write_journal(rolled)
@@ -1868,24 +1933,24 @@ def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> Operation
     return _finish_forward(root, journal, changed_paths=(MARKER_PATH,))
 
 
-def _clean_owned_temp_artifacts(root: Path, journal: Journal) -> None:
-    """清理本操作崩溃遗留、目标尚未替换的同名临时文件（精确路径 + 摘要复核）。
+def _clean_owned_temp_artifacts(
+    root: Path, journal: Journal, consume_temps: frozenset[Path]
+) -> None:
+    """清理决策表允许消费的崩溃遗留临时文件（精确相对路径 + 摘要复核）。
 
-    在观察复核通过后调用：前向完成会重新创建目标并替换，旧临时文件是孤儿。临时
-    文件必须与对应 mutation 的 after 摘要一致；类型不符或摘要不符即外部篡改，
-    停止并保留现场，不能当作本操作副作用静默清除。只处理日志登记的精确临时路径，
-    不扫描父目录猜测候选。
+    在观察复核通过后调用：前向完成会重新创建目标并替换，旧临时文件是孤儿。只处理
+    ``_write_recovery_decision`` 判为 consume 的精确临时路径；临时文件必须与对应
+    mutation 的 after 摘要一致，类型不符或摘要不符（决策与清理之间被外部改写）即
+    外部篡改，停止并保留现场。不扫描父目录猜测候选。
     """
     for index, mutation in enumerate(journal.mutations):
         if mutation.kind is not MutationKind.WRITE or mutation.after_sha256 is None:
             continue
-        target = root / mutation.path
-        if target.exists() or target.is_symlink():
-            continue  # 目标已就位：临时文件已被 replace 消耗。
-        temporary = root / _mutation_temporary_path(mutation.path, journal.operation_id, index)
-        if not temporary.exists():
+        relative = _mutation_temporary_path(mutation.path, journal.operation_id, index)
+        if relative not in consume_temps:
             continue
-        if temporary.is_symlink() or not temporary.is_file():
+        temporary = root / relative
+        if classify_node(temporary) is not EntryKind.FILE:
             raise DraftError("operation.external_change", temporary)
         if sha256_file(temporary) != mutation.after_sha256:
             raise DraftError("operation.external_change", temporary)
@@ -1926,12 +1991,12 @@ def _recover_locked(root: Path, operation_id: str) -> OperationResult:
     # 恢复前向完成必须复核观察清单：mutation 的 before/after 分类是可解释变化，
     # 其余被观察文件或目录成员的差异是无法解释的外部修改，保留现场（计划 Task 7
     # Step 4），不能把依赖旧读集语义的结果静默提交。
-    changed = _verify_observations_for_recovery(
+    changed, consume_temps = _verify_observations_for_recovery(
         root, journal, explained_mutations=journal.mutations
     )
     if changed:
         raise DraftError("operation.external_change", root / changed[0])
-    _clean_owned_temp_artifacts(root, journal)
+    _clean_owned_temp_artifacts(root, journal, consume_temps)
     return _finish_forward(root, journal, changed_paths=_recover_changed_paths(journal))
 
 

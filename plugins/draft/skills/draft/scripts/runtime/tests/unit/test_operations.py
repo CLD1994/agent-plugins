@@ -28,6 +28,7 @@ from draft.operations import (
     TrashDeadlines,
     _parse_journal,  # pyright: ignore[reportPrivateUsage]
     _verify_observations_for_recovery,  # pyright: ignore[reportPrivateUsage]
+    _write_recovery_decision,  # pyright: ignore[reportPrivateUsage]
     adjusted_observation_manifest,
     explained_directory_deltas,
     format_utc,
@@ -398,7 +399,7 @@ def test_verify_recovery_uses_probe_not_direct_fs(
         metadata={},
         directory=Path(".draft/operations") / ("a" * 32),
     )
-    changed = _verify_observations_for_recovery(
+    changed, _ = _verify_observations_for_recovery(
         Path("."),
         journal,
         (),
@@ -1016,3 +1017,58 @@ def test_parse_journal_rejects_duplicate_staged_path() -> None:
 def test_parse_journal_rejects_empty_or_dot_mutation_path(path: str) -> None:
     with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
         _parse_journal(_journal_payload([_write_mutation(0, path=path)]), _parse_path())
+
+
+# ---------------------------------------------------------------------------
+# _write_recovery_decision：WRITE 恢复决策表（回归 H3）
+# ---------------------------------------------------------------------------
+
+_BEFORE = "b" * 64
+_AFTER = "a" * 64
+
+
+@pytest.mark.parametrize(
+    "target_kind,target_digest,temp_kind,temp_digest,before,expected",
+    [
+        # target=before（文件摘要匹配 before；新建文件 before=None 且尚未创建）：
+        (EntryKind.FILE, _BEFORE, EntryKind.MISSING, None, _BEFORE, "forward"),
+        (EntryKind.FILE, _BEFORE, EntryKind.FILE, _AFTER, _BEFORE, "consume"),
+        (EntryKind.FILE, _BEFORE, EntryKind.FILE, "x" * 64, _BEFORE, "external"),
+        (EntryKind.FILE, _BEFORE, EntryKind.DIRECTORY, None, _BEFORE, "external"),
+        (EntryKind.FILE, _BEFORE, EntryKind.SYMLINK, None, _BEFORE, "external"),
+        (EntryKind.FILE, _BEFORE, EntryKind.OTHER, None, _BEFORE, "external"),
+        (EntryKind.MISSING, None, EntryKind.MISSING, None, None, "forward"),
+        (EntryKind.MISSING, None, EntryKind.FILE, _AFTER, None, "consume"),
+        # target=after（文件摘要匹配 after）：任何共存 temp 都是外部变化。
+        (EntryKind.FILE, _AFTER, EntryKind.MISSING, None, _BEFORE, "forward"),
+        (EntryKind.FILE, _AFTER, EntryKind.FILE, _AFTER, _BEFORE, "external"),
+        (EntryKind.FILE, _AFTER, EntryKind.FILE, "x" * 64, _BEFORE, "external"),
+        (EntryKind.FILE, _AFTER, EntryKind.DIRECTORY, None, _BEFORE, "external"),
+        (EntryKind.FILE, _AFTER, EntryKind.SYMLINK, None, _BEFORE, "external"),
+        # target=unknown：一律 external。
+        (EntryKind.DIRECTORY, None, EntryKind.MISSING, None, _BEFORE, "external"),
+        (EntryKind.FILE, "y" * 64, EntryKind.MISSING, None, _BEFORE, "external"),
+        (EntryKind.MISSING, None, EntryKind.MISSING, None, _BEFORE, "external"),
+        (EntryKind.SYMLINK, None, EntryKind.FILE, _AFTER, None, "external"),
+    ],
+)
+def test_write_recovery_decision_table(
+    target_kind: EntryKind,
+    target_digest: str | None,
+    temp_kind: EntryKind,
+    temp_digest: str | None,
+    before: str | None,
+    expected: str,
+) -> None:
+    """决策表预期由测试数据独立给出，不复制生产算法。"""
+    assert (
+        _write_recovery_decision(
+            before=before,
+            after=_AFTER,
+            target_kind=target_kind,
+            target_digest=target_digest,
+            temp_kind=temp_kind,
+            temp_digest=temp_digest,
+        )
+        == expected
+    )
