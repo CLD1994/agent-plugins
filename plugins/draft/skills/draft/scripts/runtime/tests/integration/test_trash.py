@@ -465,20 +465,27 @@ def test_restore_crlf_parent_preserves_unmodified_bytes(
 def test_collapsed_restore_crlf_leaf_preserves_bytes(
     draft_factory: DraftFactory,
 ) -> None:
-    """折叠恢复：CRLF 叶页内容被 rebase 进枢纽后既有字节保持 CRLF。"""
+    """折叠恢复：CRLF 叶页内容被 rebase 进枢纽、CRLF 入站引用页被重定向后字节保持。"""
     root = build_collapsed_rebase_draft(draft_factory)
     _to_crlf(root / "pages/solo/index.md")
+    # 入站引用页（折叠时被重定向到叶页，恢复时重定向回枢纽）也保持 CRLF。
+    _to_crlf(root / "pages/other.md")
 
     pending = trash_page(root, Path("pages/solo/only.md"), now=NOW)
     assert (root / "pages/solo.md").is_file()
     collapsed = (root / "pages/solo.md").read_bytes()
     assert collapsed.count(b"\r\n") > 0
+    other_crlf = (root / "pages/other.md").read_bytes()
+    assert other_crlf.count(b"\r\n") > 0
 
     result = restore_retained_trash(root, pending.operation_id, now=NOW)
 
     assert result.phase is OperationPhase.COMPLETED
     restored_hub = (root / "pages/solo/index.md").read_bytes()
     assert restored_hub.count(b"\r\n") == collapsed.count(b"\r\n")
+    # 入站引用页只改写链接跨度：CRLF 计数保持。
+    restored_other = (root / "pages/other.md").read_bytes()
+    assert restored_other.count(b"\r\n") == other_crlf.count(b"\r\n")
     assert check_draft(root).errors == ()
 
 

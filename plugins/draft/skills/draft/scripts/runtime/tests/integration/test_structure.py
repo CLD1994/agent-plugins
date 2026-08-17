@@ -518,13 +518,39 @@ def test_promote_crash_after_first_new_hub_write_recovers(
     assert check_draft(root).errors == ()
 
 
+def _inject_intruder(root: Path, entry_type: str) -> Path:
+    """向 pages/topic 注入指定类型的未指定条目，返回其路径。"""
+    topic = root / "pages/topic"
+    if entry_type == "file":
+        path = topic / "intruder.txt"
+        path.write_text("plain file\n", encoding="utf-8")
+    elif entry_type == "markdown":
+        path = topic / "intruder.md"
+        # 含指向旧路径的链接：吸收后旧语义会被错误承接。
+        path.write_text(
+            "# 入侵者\n\n> 状态：`待讨论`\n>\n> 父主题：[主题](../topic.md)\n\n入侵正文。\n",
+            encoding="utf-8",
+        )
+    elif entry_type == "symlink":
+        path = topic / "intruder-link"
+        external = root / ".draft" / "external-target.md"
+        external.write_text("# 外部\n", encoding="utf-8")
+        path.symlink_to(external)
+    else:  # pragma: no cover
+        raise AssertionError(entry_type)
+    return path
+
+
+@pytest.mark.parametrize("entry_type", ["file", "markdown", "symlink"])
 def test_promote_crash_recovery_rejects_intruder_in_created_directory(
-    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_type: str,
 ) -> None:
-    """promote 首次创建的新目录内混入未指定条目时，恢复必须拒绝并保留可恢复现场。
+    """promote 首次创建的新目录内混入普通文件/页面/符号链接时，恢复必须拒绝并保留现场。
 
     回归 P1：计划期 pages/topic 不存在、没有观察基线；若把"解释祖先目录出现"当成
-    证明新目录内部只含本操作条目，恢复会把外部页面静默吸收并完成提交。
+    证明新目录内部只含本操作条目，恢复会把外部条目静默吸收并完成提交。
     """
     import draft.operations as ops_module
     from draft.operations import operation_journal_path, read_journal, read_lock
@@ -545,19 +571,16 @@ def test_promote_crash_recovery_rejects_intruder_in_created_directory(
     monkeypatch.undo()
     assert read_lock(root) is not None
 
-    # 外部向本操作新建的目录注入未指定文件（普通文件 + 指向旧路径的页面）。
-    (root / "pages/topic/intruder.md").write_text(
-        "# 入侵者\n\n> 状态：`待讨论`\n>\n> 父主题：[主题](index.md)\n\n入侵正文。\n",
-        encoding="utf-8",
-    )
+    # 外部向本操作新建的目录注入未指定条目。
+    intruder = _inject_intruder(root, entry_type)
 
     with pytest.raises(DraftError, match="operation.external_change"):
         recover(root)
 
-    # 可恢复现场保留：锁、日志与外部文件都在。
+    # 可恢复现场保留：锁、日志与外部条目都在。
     held_id = read_lock(root)
     assert held_id is not None
-    assert (root / "pages/topic/intruder.md").is_file()
+    assert intruder.is_symlink() or intruder.is_file()
     journal = read_journal(operation_journal_path(root, held_id))
     assert journal.phase in (
         ops_module.OperationPhase.PREPARED,
