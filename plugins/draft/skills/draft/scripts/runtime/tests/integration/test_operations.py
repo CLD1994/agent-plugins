@@ -2068,3 +2068,31 @@ def test_clean_owned_temp_artifacts_quarantines_exact_temp(operation_draft: Path
     _clean_owned_temp_artifacts(root, journal, frozenset({temp}))
 
     assert not (root / temp).exists()
+
+
+def test_read_journal_non_utf8_is_stable_corrupt(operation_draft: Path) -> None:
+    """非 UTF-8 journal：报 operation.journal_corrupt，不泄漏 UnicodeDecodeError（回归 M3）。"""
+    from draft.operations import read_journal
+
+    root = operation_draft
+    op_id = "1" * 32
+    journal_dir = root / ".draft/operations" / op_id
+    journal_dir.mkdir(parents=True)
+    (journal_dir / "journal.json").write_bytes(b"\xff\xfe\x00 garbage")
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        read_journal(journal_dir / "journal.json")
+
+
+def test_read_lock_non_utf8_is_stable_corrupt(operation_draft: Path) -> None:
+    """非 UTF-8 lock：read_lock 与 recover 都报 operation.journal_corrupt，不泄漏（回归 M3）。"""
+    from draft.operations import read_lock, recover
+
+    root = operation_draft
+    (root / ".draft").mkdir(parents=True, exist_ok=True)
+    (root / ".draft/operation.lock").write_bytes(b"\xff\xfe\x00 garbage")
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        read_lock(root)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        recover(root)

@@ -739,10 +739,15 @@ def read_lock(root: Path) -> str | None:
     lock = root / LOCK_RELATIVE
     if not lock.exists():
         return None
+    # 共享持久 JSON 解码边界（回归 M3）：非 UTF-8 / 读取失败的 lock 都映射
+    # operation.journal_corrupt，绝不泄漏原始异常。
     try:
-        decoded = json.loads(lock.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        data = lock.read_bytes()
+    except OSError as exc:
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, lock) from exc
+    decoded = _decode_persistent_json(
+        data, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value, path=lock
+    )
     if not isinstance(decoded, dict):
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, lock)
     operation_id = cast("dict[str, object]", decoded).get("operation_id")
@@ -908,16 +913,26 @@ def _parse_observations(data: object, journal_path: Path) -> ObservationManifest
     return ObservationManifest(entries=tuple(entries))
 
 
+def _decode_persistent_json(data: bytes, *, code: str, path: Path) -> object:
+    """持久 JSON 严格解码边界（回归 M3）：非法 UTF-8 与 JSON 错误统一映射领域错误。
+
+    journal 与 lock 共用此 helper；``UnicodeDecodeError`` 绝不泄漏原始异常。
+    """
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DraftError(code, path) from exc
+
+
 def _parse_journal_bytes(data: bytes, journal_path: Path) -> Journal:
     """持久 JSON bytes 解码 + 形状验证的单一解析边界（回归 M3）。
 
-    严格 UTF-8 解码、JSON 解析与 journal 形状验证在同一处；``UnicodeDecodeError``、
-    读取错误与 JSON 错误统一映射 operation.journal_corrupt，绝不泄漏原始异常。
+    严格 UTF-8 解码、JSON 解析与 journal 形状验证在同一处；``UnicodeDecodeError``
+    与 JSON 错误统一映射 operation.journal_corrupt，绝不泄漏原始异常。
     """
-    try:
-        decoded = json.loads(data.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path) from exc
+    decoded = _decode_persistent_json(
+        data, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value, path=journal_path
+    )
     return _parse_journal(decoded, journal_path)
 
 

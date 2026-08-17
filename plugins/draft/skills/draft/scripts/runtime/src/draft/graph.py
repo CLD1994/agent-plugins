@@ -148,7 +148,8 @@ def _read_marker_file(path: Path) -> MarkerState:
         raise DraftError(CheckCode.FORMAT_INVALID.value, path)
     try:
         decoded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # 非法 UTF-8 的登记文件与 JSON 损坏一致映射 format.invalid（回归 M3）。
         raise DraftError(CheckCode.FORMAT_INVALID.value, path) from exc
     return parse_marker_value(decoded, path)
 

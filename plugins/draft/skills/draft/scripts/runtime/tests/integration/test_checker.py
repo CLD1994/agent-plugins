@@ -1555,3 +1555,17 @@ def test_clean_terminal_operation_is_not_reported(
     report = check_draft(root)
 
     assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value not in codes(report)
+
+
+@pytest.mark.parametrize("root_state", tuple(RootState))
+def test_non_utf8_marker_is_reported_as_format_invalid(
+    draft_factory: DraftFactory,
+    root_state: RootState,
+) -> None:
+    """非 UTF-8 的 draft.json：check 报告 format.invalid，而非原始异常（回归 M3）。"""
+    root = draft_factory(healthy(), root_state=root_state)
+    (root / ".draft/draft.json").write_bytes(b"\xff\xfe\x00 garbage")
+
+    report = check_draft(root)
+
+    assert CheckCode.FORMAT_INVALID.value in codes(report)
