@@ -148,6 +148,46 @@ def test_adjusted_observation_manifest_skips_synthesis_without_evidence() -> Non
     assert adjusted.for_path(Path(".draft")) is None
 
 
+def test_adjusted_observation_manifest_synthesizes_deep_missing_directory() -> None:
+    """缺失证明按深度传递：父目录可证明缺失时，其计划内子目录也可证明缺失（回归 H2）。"""
+    manifest = ObservationManifest(entries=(directory_observation(Path("pages"), ("topic.md",)),))
+    adjusted = adjusted_observation_manifest(
+        manifest,
+        excluded=frozenset({Path(".draft/operations/x")}),
+        explained=frozenset({Path("pages/topic.md")}),
+        added={
+            Path("pages/topic/sub"): frozenset({"index.md"}),
+            Path("pages/topic"): frozenset({"sub"}),
+            Path("pages"): frozenset({"topic"}),
+        },
+        removed={Path("pages"): frozenset({"topic.md"})},
+    )
+    deep = adjusted.for_path(Path("pages/topic/sub"))
+    assert deep is not None
+    assert deep.kind is EntryKind.DIRECTORY
+    assert deep.members == ("index.md",)
+
+
+def test_adjusted_observation_manifest_does_not_synthesize_observed_deep_dir() -> None:
+    """深层目录已被父观察列出的不得合成（计划期已存在，只调整父成员）。"""
+    manifest = ObservationManifest(
+        entries=(
+            directory_observation(Path("pages"), ("topic",)),
+            directory_observation(Path("pages/topic"), ("sub",)),
+        )
+    )
+    adjusted = adjusted_observation_manifest(
+        manifest,
+        excluded=frozenset({Path(".draft/operations/x")}),
+        explained=frozenset(),
+        added={Path("pages/topic"): frozenset({"new.md"})},
+        removed={},
+    )
+    topic = adjusted.for_path(Path("pages/topic"))
+    assert topic is not None
+    assert topic.members == ("new.md", "sub")
+
+
 # ---------------------------------------------------------------------------
 # _classify_observation：按 EntryKind 区分，不依赖 sha256=None
 # ---------------------------------------------------------------------------

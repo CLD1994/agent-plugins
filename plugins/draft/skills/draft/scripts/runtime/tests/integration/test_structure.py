@@ -592,6 +592,99 @@ def test_promote_crash_recovery_rejects_intruder_in_created_directory(
     )
 
 
+def test_promote_crash_before_replace_recovers_created_directory(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mkdir 后、目标文件替换前崩溃：本操作创建的空目录不得被误判为外部变化。
+
+    回归 H2：_apply_write 先 mkdir(parents=True) 再写临时文件替换目标；若进程在
+    父目录已创建、目标尚未替换时退出，目录只含本操作临时文件。恢复若只把 live
+    状态为 after 的新文件计入创建，会把该空目录误判为 external_change 并保留锁。
+    """
+    import draft.operations as ops_module
+    from draft.operations import read_lock, recover
+
+    root = build_promote_draft(draft_factory)
+    original_replace = ops_module.replace_file  # pyright: ignore[reportPrivateUsage]
+
+    def crash_before_replace(source: Path, target: Path) -> None:
+        if "pages/topic/" in str(target):
+            raise RuntimeError("injected crash before replace")
+        original_replace(source, target)
+
+    monkeypatch.setattr(ops_module, "replace_file", crash_before_replace)
+    with pytest.raises(RuntimeError, match="injected crash before replace"):
+        promote_page(
+            root, Path("pages/topic.md"), [Path("pages/child-a.md"), Path("pages/child-b.md")]
+        )
+    monkeypatch.undo()
+    assert read_lock(root) is not None
+    assert (root / "pages/topic").is_dir()
+
+    result = recover(root)
+
+    assert result.phase == "completed"
+    assert read_lock(root) is None
+    assert (root / "pages/topic/index.md").is_file()
+    assert (root / "pages/topic/child-a.md").is_file()
+    # 本操作崩溃遗留的同名临时文件被清理，不留下孤儿。
+    assert not [path for path in (root / "pages/topic").iterdir() if ".tmp-" in path.name]
+    assert check_draft(root).errors == ()
+
+
+def test_promote_crash_recovery_rejects_intruder_in_nested_created_directory(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """子枢纽（嵌套新目录）恢复：深层目录内的未指定条目必须被拒绝。
+
+    回归 H2：缺失证明必须按深度传递（pages/topic 缺失则 pages/topic/sub 也缺失），
+    只传播一层会把深层新目录的内部成员漏检并静默吸收。
+    """
+    import draft.operations as ops_module
+    from draft.operations import read_lock
+
+    root = draft_factory(
+        {
+            "index.md": PROMOTE_INDEX.replace(
+                "- [乙](pages/child-b.md)",
+                "- [子枢纽](pages/sub/index.md)",
+            ),
+            "conclusions.md": SOLO_CONCLUSIONS,
+            "pages/topic.md": PROMOTE_TOPIC,
+            "pages/child-a.md": PROMOTE_CHILD_A,
+            "pages/sub/index.md": (
+                "# 子枢纽\n\n> 状态：`已关闭：纯导航页`\n>\n"
+                "> 父主题：[根索引](../../index.md)\n\n- [乙](child-b.md)\n"
+            ),
+            "pages/sub/child-b.md": (
+                "# 乙\n\n> 状态：`待讨论`\n>\n> 父主题：[子枢纽](index.md)\n\n乙的正文。\n"
+            ),
+        }
+    )
+    original_apply_write = ops_module._apply_write  # pyright: ignore[reportPrivateUsage]
+
+    def write_then_crash(root_path: Path, target: Path, content: bytes) -> None:
+        original_apply_write(root_path, target, content)
+        if str(target).startswith("pages/topic/sub/"):
+            raise RuntimeError("injected crash after nested hub file lands")
+
+    monkeypatch.setattr(ops_module, "_apply_write", write_then_crash)
+    with pytest.raises(RuntimeError, match="injected crash after nested hub file lands"):
+        promote_page(root, Path("pages/topic.md"), [Path("pages/sub/index.md")])
+    monkeypatch.undo()
+    assert read_lock(root) is not None
+    assert (root / "pages/topic/sub").is_dir()
+
+    (root / "pages/topic/sub/intruder.txt").write_text("入侵正文\n", encoding="utf-8")
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        recover(root)
+
+    held_id = read_lock(root)
+    assert held_id is not None
+    assert (root / "pages/topic/sub/intruder.txt").is_file()
+
+
 def test_promote_becomes_hub_and_reparents_children(
     draft_factory: DraftFactory,
 ) -> None:

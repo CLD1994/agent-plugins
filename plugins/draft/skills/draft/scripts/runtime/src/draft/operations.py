@@ -5,7 +5,7 @@ import json
 import os
 import re
 import uuid
-from collections.abc import Mapping, Set
+from collections.abc import Callable, Mapping, Set
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -1185,20 +1185,46 @@ def _recover_terminal(root: Path, journal: Journal, operation_id: str) -> Operat
     )
 
 
-def _plan_time_missing(observations: ObservationManifest, directory: Path) -> bool:
-    """观察清单是否证明该目录在计划期缺失。
+def _plan_time_missing_index(
+    observations: ObservationManifest,
+) -> Callable[[Path], bool]:
+    """构建 O(1) 的"计划期缺失"查询（按深度传递：父缺失则子缺失）。
 
-    只有正向证据才成立：目录自身是 MISSING 观察，或其父目录观察明确未列出该名字。
-    没有任何存在性证据时保守判定为已存在（不合成），避免把已存在但未观察的共享
-    目录（如 EMPTY_OBSERVATIONS 夹具下的 .draft）误判为"只含本操作成员"。
+    只有正向证据才成立：目录自身是 MISSING 观察，或其父目录观察明确未列出该名字，
+    或其父目录自身也可证明计划期缺失（传递）。没有任何存在性证据时保守判定为已
+    存在，避免把已存在但未观察的共享目录（如 EMPTY_OBSERVATIONS 夹具下的 .draft）
+    误判为缺失。一次性索引，查询不重新扫描观察清单。
     """
-    for entry in observations.entries:
-        if entry.path == directory:
-            return entry.kind is EntryKind.MISSING
-    for entry in observations.entries:
-        if entry.kind is EntryKind.DIRECTORY and entry.path == directory.parent:
-            return directory.name not in entry.members
-    return False
+    path_to_entry = {entry.path: entry for entry in observations.entries}
+    memo: dict[Path, bool] = {}
+
+    def is_missing(directory: Path) -> bool:
+        cached = memo.get(directory)
+        if cached is not None:
+            return cached
+        entry = path_to_entry.get(directory)
+        if entry is not None:
+            result = entry.kind is EntryKind.MISSING
+            memo[directory] = result
+            return result
+        parent = directory.parent
+        if parent == directory:
+            memo[directory] = False
+            return False
+        parent_entry = path_to_entry.get(parent)
+        if parent_entry is not None:
+            # 父观察为目录：成员里没有它则缺失；父为文件/符号链接：子目录不可能存在。
+            result = (
+                parent_entry.kind is not EntryKind.DIRECTORY
+                or directory.name not in parent_entry.members
+            )
+            memo[directory] = result
+            return result
+        result = is_missing(parent)
+        memo[directory] = result
+        return result
+
+    return is_missing
 
 
 def adjusted_observation_manifest(
@@ -1225,6 +1251,9 @@ def adjusted_observation_manifest(
         directory_observation,
     )
 
+    observed_paths = {entry.path for entry in observations.entries}
+    is_missing = _plan_time_missing_index(observations)
+
     adjusted: list[Observation] = []
     for observation in observations.entries:
         if observation.path in excluded or observation.path in explained:
@@ -1248,9 +1277,9 @@ def adjusted_observation_manifest(
     for directory, members in sorted(added.items()):
         if directory in excluded or directory in explained:
             continue
-        if any(entry.path == directory for entry in observations.entries):
+        if directory in observed_paths:
             continue  # 已有观察：DIRECTORY 已在上方调整，MISSING 已在上方转换。
-        if not _plan_time_missing(observations, directory):
+        if not is_missing(directory):
             continue  # 无法证明计划期缺失：保守不合成（避免误判已存在共享目录）。
         adjusted.append(directory_observation(directory, tuple(sorted(members))))
     return ObservationManifest(entries=tuple(adjusted))
@@ -1336,6 +1365,24 @@ def _verify_observations_for_recovery(
     explained = {mutation.path for mutation in explained_mutations}
     created_paths = {journal.directory.relative_to(root), LOCK_RELATIVE}
     deleted_paths: set[Path] = set()
+    # 从全部计划创建目标（WRITE-before-None mutation、操作日志目录、锁）的祖先链
+    # 推导"本操作可能创建的目录闭包"；只把当前确实存在（本操作已 mkdir）的目录
+    # 计入可解释创建。不等到目标文件达到 after 才承认目录出现：mkdir 后、目标文件
+    # 替换前崩溃时，本操作创建的空目录不得被误判为外部变化（回归 H2）。
+    is_missing = _plan_time_missing_index(journal.observations)
+    plan_created_targets = [
+        mutation.path
+        for mutation in journal.mutations
+        if mutation.kind is MutationKind.WRITE and mutation.before_sha256 is None
+    ]
+    for target in [*plan_created_targets, journal.directory.relative_to(root), LOCK_RELATIVE]:
+        current = target.parent
+        while is_missing(current):
+            if probe.observe(current).kind is EntryKind.DIRECTORY:
+                created_paths.add(current)
+            current = current.parent
+            if current == current.parent:
+                break
     for mutation in journal.mutations:
         state = _classify_observation(mutation, probe.observe(mutation.path))
         if state != "after":
@@ -1357,9 +1404,7 @@ def _verify_observations_for_recovery(
     )
 
     owned_temp_bases = frozenset(
-        mutation.path.name
-        for mutation in journal.mutations
-        if mutation.kind is MutationKind.WRITE
+        mutation.path.name for mutation in journal.mutations if mutation.kind is MutationKind.WRITE
     )
 
     class _RecoveryProbe:
@@ -1439,6 +1484,33 @@ def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> Operation
     return _finish_forward(root, journal, changed_paths=(MARKER_PATH,))
 
 
+def _clean_owned_temp_artifacts(root: Path, journal: Journal) -> None:
+    """清理本操作崩溃遗留、目标尚未替换的同名临时文件（精确路径 + 摘要复核）。
+
+    在观察复核通过后调用：前向完成会重新创建目标并替换，旧临时文件是孤儿。临时
+    文件必须与对应 mutation 的 after 摘要一致；类型不符或摘要不符即外部篡改，
+    停止并保留现场，不能当作本操作副作用静默清除。
+    """
+    for mutation in journal.mutations:
+        if mutation.kind is not MutationKind.WRITE or mutation.after_sha256 is None:
+            continue
+        target = root / mutation.path
+        if target.exists() or target.is_symlink():
+            continue  # 目标已就位：临时文件已被 replace 消耗。
+        parent = target.parent
+        if not parent.is_dir() or parent.is_symlink():
+            continue
+        for candidate in sorted(parent.iterdir()):
+            if not _is_owned_temp_artifact(candidate.name, frozenset({target.name})):
+                continue
+            if candidate.is_symlink() or not candidate.is_file():
+                raise DraftError("operation.external_change", candidate)
+            if sha256_file(candidate) != mutation.after_sha256:
+                raise DraftError("operation.external_change", candidate)
+            candidate.unlink()
+            fsync_directory(parent)
+
+
 def _recover_locked(root: Path, operation_id: str) -> OperationResult:
     journal = read_journal(operation_journal_path(root, operation_id))
     if journal.operation_id != operation_id:
@@ -1477,6 +1549,7 @@ def _recover_locked(root: Path, operation_id: str) -> OperationResult:
     )
     if changed:
         raise DraftError("operation.external_change", root / changed[0])
+    _clean_owned_temp_artifacts(root, journal)
     return _finish_forward(root, journal, changed_paths=_recover_changed_paths(journal))
 
 
