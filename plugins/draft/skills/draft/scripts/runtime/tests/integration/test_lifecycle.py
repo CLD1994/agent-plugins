@@ -6,7 +6,7 @@ import draft.lifecycle as lifecycle_module
 from draft.checker import check_draft
 from draft.errors import DraftError
 from draft.lifecycle import adopt, initialize
-from draft.models import RootState
+from draft.models import OperationPhase, RootState
 from tests.integration.support import build_valid_candidate, managed_marker_text
 
 FINAL_MARKER_BYTES = managed_marker_text().encode("utf-8")
@@ -399,6 +399,36 @@ def test_adopt_crash_before_marker_is_forwarded_by_recover(
 
     assert (root / ".draft/draft.json").read_bytes() == FINAL_MARKER_BYTES
     assert check_draft(root).errors == ()
+
+
+def test_adopt_recover_with_observation_change_raises_external_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """adopt 在 marker 写入前崩溃、恢复时观察已变：安全回滚后必须抛 external_change，
+    不能把"已放弃 adopt"报告为恢复成功（规格 §12.2 外部变化分区）。"""
+    from draft.operations import operation_journal_path, read_journal, read_lock
+    from draft.trash_lifecycle import recover_draft
+
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    _crash_during_adopt(root, monkeypatch, on_verify=True)
+    adopt_id = read_lock(root)
+    assert adopt_id is not None
+    # 外部编辑一个被观察页面。
+    index = root / "index.md"
+    index.write_text(index.read_text(encoding="utf-8") + "\n并发修改。\n", encoding="utf-8")
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        recover_draft(root)
+
+    # 已安全放弃：marker 仍 candidate、外部修改保留、日志终态化、锁释放。
+    assert (root / ".draft/draft.json").read_text(encoding="utf-8") == managed_marker_text(
+        root_state=RootState.CANDIDATE
+    )
+    assert "并发修改" in (root / "index.md").read_text(encoding="utf-8")
+    journal = read_journal(operation_journal_path(root, adopt_id))
+    assert journal.phase is OperationPhase.ROLLED_BACK
+    assert read_lock(root) is None
 
 
 def test_adopt_crash_after_marker_never_rolls_back(

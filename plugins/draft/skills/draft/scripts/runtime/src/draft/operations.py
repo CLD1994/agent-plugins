@@ -1327,12 +1327,9 @@ def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> Operation
         write_journal(rolled)
         _clean_recovery_copies(journal)
         release_lock(root, operation_id)
-        return OperationResult(
-            operation_id=operation_id,
-            kind=journal.kind.value,
-            phase=OperationPhase.ROLLED_BACK,
-            changed_paths=(),
-        )
+        # 外部修改必须可观察："已安全放弃 adopt" 不等于恢复成功（规格 §12.2）。
+        # 已证明 marker 未提交且回滚安全，释放锁后仍报告外部变化。
+        raise DraftError("operation.external_change", root / changed[0])
     return _finish_forward(root, journal, changed_paths=(MARKER_PATH,))
 
 
