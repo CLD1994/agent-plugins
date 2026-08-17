@@ -471,7 +471,7 @@ def test_recover_converges_apply_crash_leftover_quarantine(
 def test_recover_converges_exact_pending_at_after_target(
     operation_draft: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """target=after 且共存精确 pending（发布 link 后、消费 pending 前崩溃）：收敛消费（回归 H4）。"""
+    """target=after 且共存精确 pending（发布 link 后、消费 pending 前崩溃）：收敛消费。"""
     import draft.operations as operations_module
 
     root = operation_draft
@@ -1587,9 +1587,27 @@ def test_no_lock_allocating_with_unknown_content_is_inconsistent(
 
 
 def _valid_journal_bytes(op_id: str, phase: str = "allocating") -> bytes:
-    """构造 _parse_journal 接受的最小合法日志 bytes（operation_id 与目录名匹配）。"""
+    """构造协议合法的 journal bytes（operation_id 与目录名匹配）。
+
+    prepared/applying 携带一个真实 WRITE mutation（回归 Q1）：真实生产者只产生非空
+    mutation 的 prepared/applying，测试 fixture 不得维持更宽松的"空 mutation 合法
+    journal"。
+    """
     import json as json_module
 
+    mutations: list[dict[str, object]] = []
+    if phase in ("prepared", "applying"):
+        mutations = [
+            {
+                "path": "pages/a.md",
+                "kind": "write",
+                "before_sha256": "a" * 64,
+                "after_sha256": "b" * 64,
+                "original": "originals/0000.bin",
+                "staged": "staged/0000.bin",
+                "applied": phase == "applying",
+            }
+        ]
     payload: dict[str, object] = {
         "journal_version": JOURNAL_VERSION,
         "operation_id": op_id,
@@ -1597,7 +1615,7 @@ def _valid_journal_bytes(op_id: str, phase: str = "allocating") -> bytes:
         "phase": phase,
         "root_state": "registered",
         "observations": [],
-        "mutations": [],
+        "mutations": mutations,
         "remove_empty_directories": [],
         "metadata": {},
     }
@@ -1618,129 +1636,6 @@ def _fail_fsync_at(monkeypatch: pytest.MonkeyPatch, fail_at: frozenset[int]) -> 
         real_fsync(fd)
 
     monkeypatch.setattr(os_module, "fsync", flaky_fsync)
-
-
-def test_pending_decision_matrix() -> None:
-    """恢复期 pending 收敛决策表：publish/delete/ignore/external（回归 H2）。"""
-    from draft.observations import EntryKind
-    from draft.operations import _pending_decision  # pyright: ignore[reportPrivateUsage]
-
-    F, M, D, S = (
-        EntryKind.FILE,
-        EntryKind.MISSING,
-        EntryKind.DIRECTORY,
-        EntryKind.SYMLINK,
-    )
-    expected = "a" * 64
-    other = "0" * 64
-
-    # 目标缺失 + pending 授权精确 → 发布 pending。
-    assert (
-        _pending_decision(
-            target_kind=M,
-            pending_kind=F,
-            target_digest=None,
-            pending_digest=expected,
-            expected_digest=expected,
-        )
-        == "publish"
-    )
-    # 目标与 pending 都是授权精确 → pending 已消费，只删 pending。
-    assert (
-        _pending_decision(
-            target_kind=F,
-            pending_kind=F,
-            target_digest=expected,
-            pending_digest=expected,
-            expected_digest=expected,
-        )
-        == "delete"
-    )
-    # 目标已是授权精确且无 pending → 已发布。
-    assert (
-        _pending_decision(
-            target_kind=F,
-            pending_kind=M,
-            target_digest=expected,
-            pending_digest=None,
-            expected_digest=expected,
-        )
-        == "ignore"
-    )
-    # 目标与 pending 都缺失 → 无可收敛。
-    assert (
-        _pending_decision(
-            target_kind=M,
-            pending_kind=M,
-            target_digest=None,
-            pending_digest=None,
-            expected_digest=expected,
-        )
-        == "ignore"
-    )
-    # pending 摘要不符 / 类型错误（目录、符号链接）→ external，保留现场。
-    assert (
-        _pending_decision(
-            target_kind=M,
-            pending_kind=F,
-            target_digest=None,
-            pending_digest=other,
-            expected_digest=expected,
-        )
-        == "external"
-    )
-    assert (
-        _pending_decision(
-            target_kind=M,
-            pending_kind=D,
-            target_digest=None,
-            pending_digest=None,
-            expected_digest=expected,
-        )
-        == "external"
-    )
-    assert (
-        _pending_decision(
-            target_kind=M,
-            pending_kind=S,
-            target_digest=None,
-            pending_digest=None,
-            expected_digest=expected,
-        )
-        == "external"
-    )
-    # 目标被外部替换（摘要不符）→ external，不得删除/覆盖。
-    assert (
-        _pending_decision(
-            target_kind=F,
-            pending_kind=F,
-            target_digest=other,
-            pending_digest=expected,
-            expected_digest=expected,
-        )
-        == "external"
-    )
-    assert (
-        _pending_decision(
-            target_kind=F,
-            pending_kind=M,
-            target_digest=other,
-            pending_digest=None,
-            expected_digest=expected,
-        )
-        == "external"
-    )
-    # 目标类型错误（目录）+ 无 pending → external。
-    assert (
-        _pending_decision(
-            target_kind=D,
-            pending_kind=M,
-            target_digest=None,
-            pending_digest=None,
-            expected_digest=expected,
-        )
-        == "external"
-    )
 
 
 def test_durable_write_file_fsync_failure_leaves_pending_scene(
@@ -1937,107 +1832,6 @@ def test_resolve_journal_pending_with_old_journal_keeps_old_on_invalid(
 # ---------------------------------------------------------------------------
 # 第八轮 H3/M2：节点隔离删除 + fd 生命周期
 # ---------------------------------------------------------------------------
-
-
-def test_quarantine_decision_matrix() -> None:
-    """恢复期 quarantine 收敛决策表：complete/restore/delete_stale/external/ignore（回归 H3）。"""
-    from draft.observations import EntryKind
-    from draft.operations import _quarantine_decision  # pyright: ignore[reportPrivateUsage]
-
-    F, M, D, S = (
-        EntryKind.FILE,
-        EntryKind.MISSING,
-        EntryKind.DIRECTORY,
-        EntryKind.SYMLINK,
-    )
-    expected = "a" * 64
-    other = "0" * 64
-
-    # 目标缺失 + quarantine 授权精确 → 完成删除（隔离已通过验证）。
-    assert (
-        _quarantine_decision(
-            target_kind=M,
-            quarantine_kind=F,
-            target_digest=None,
-            quarantine_digest=expected,
-            expected_digest=expected,
-        )
-        == "complete"
-    )
-    # 目标与 quarantine 都是授权精确（同一 inode 中途移动）→ 删除 stale quarantine。
-    assert (
-        _quarantine_decision(
-            target_kind=F,
-            quarantine_kind=F,
-            target_digest=expected,
-            quarantine_digest=expected,
-            expected_digest=expected,
-        )
-        == "delete_stale"
-    )
-    # 目标缺失 + quarantine 摘要不符 → 恢复原名。
-    assert (
-        _quarantine_decision(
-            target_kind=M,
-            quarantine_kind=F,
-            target_digest=None,
-            quarantine_digest=other,
-            expected_digest=expected,
-        )
-        == "restore"
-    )
-    # quarantine 类型错误 / 目标被替换 → external。
-    assert (
-        _quarantine_decision(
-            target_kind=M,
-            quarantine_kind=D,
-            target_digest=None,
-            quarantine_digest=None,
-            expected_digest=expected,
-        )
-        == "external"
-    )
-    assert (
-        _quarantine_decision(
-            target_kind=M,
-            quarantine_kind=S,
-            target_digest=None,
-            quarantine_digest=None,
-            expected_digest=expected,
-        )
-        == "external"
-    )
-    assert (
-        _quarantine_decision(
-            target_kind=F,
-            quarantine_kind=F,
-            target_digest=other,
-            quarantine_digest=expected,
-            expected_digest=expected,
-        )
-        == "external"
-    )
-    # 无 quarantine → ignore。
-    assert (
-        _quarantine_decision(
-            target_kind=F,
-            quarantine_kind=M,
-            target_digest=expected,
-            quarantine_digest=None,
-            expected_digest=expected,
-        )
-        == "ignore"
-    )
-    assert (
-        _quarantine_decision(
-            target_kind=M,
-            quarantine_kind=M,
-            target_digest=None,
-            quarantine_digest=None,
-            expected_digest=expected,
-        )
-        == "ignore"
-    )
 
 
 def test_anchored_leaf_does_not_leak_directory_fds(

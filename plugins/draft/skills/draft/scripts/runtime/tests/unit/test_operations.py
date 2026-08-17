@@ -1400,3 +1400,227 @@ def test_journal_transition_allocating_to_allocating_metadata_add_only() -> None
             _j(OperationPhase.ALLOCATING, kind=OperationKind.RESTORE, op_id=op_id),
             path=Path("journal.json"),
         )
+
+
+def test_pending_decision_matrix() -> None:
+    """恢复期 pending 收敛决策表：publish/delete/ignore/external（回归 H2）。"""
+    from draft.observations import EntryKind
+    from draft.operations import _pending_decision  # pyright: ignore[reportPrivateUsage]
+
+    F, M, D, S = (
+        EntryKind.FILE,
+        EntryKind.MISSING,
+        EntryKind.DIRECTORY,
+        EntryKind.SYMLINK,
+    )
+    expected = "a" * 64
+    other = "0" * 64
+
+    # 目标缺失 + pending 授权精确 → 发布 pending。
+    assert (
+        _pending_decision(
+            target_kind=M,
+            pending_kind=F,
+            target_digest=None,
+            pending_digest=expected,
+            expected_digest=expected,
+        )
+        == "publish"
+    )
+    # 目标与 pending 都是授权精确 → pending 已消费，只删 pending。
+    assert (
+        _pending_decision(
+            target_kind=F,
+            pending_kind=F,
+            target_digest=expected,
+            pending_digest=expected,
+            expected_digest=expected,
+        )
+        == "delete"
+    )
+    # 目标已是授权精确且无 pending → 已发布。
+    assert (
+        _pending_decision(
+            target_kind=F,
+            pending_kind=M,
+            target_digest=expected,
+            pending_digest=None,
+            expected_digest=expected,
+        )
+        == "ignore"
+    )
+    # 目标与 pending 都缺失 → 无可收敛。
+    assert (
+        _pending_decision(
+            target_kind=M,
+            pending_kind=M,
+            target_digest=None,
+            pending_digest=None,
+            expected_digest=expected,
+        )
+        == "ignore"
+    )
+    # pending 摘要不符 / 类型错误（目录、符号链接）→ external，保留现场。
+    assert (
+        _pending_decision(
+            target_kind=M,
+            pending_kind=F,
+            target_digest=None,
+            pending_digest=other,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    assert (
+        _pending_decision(
+            target_kind=M,
+            pending_kind=D,
+            target_digest=None,
+            pending_digest=None,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    assert (
+        _pending_decision(
+            target_kind=M,
+            pending_kind=S,
+            target_digest=None,
+            pending_digest=None,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    # 目标被外部替换（摘要不符）→ external，不得删除/覆盖。
+    assert (
+        _pending_decision(
+            target_kind=F,
+            pending_kind=F,
+            target_digest=other,
+            pending_digest=expected,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    assert (
+        _pending_decision(
+            target_kind=F,
+            pending_kind=M,
+            target_digest=other,
+            pending_digest=None,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    # 目标类型错误（目录）+ 无 pending → external。
+    assert (
+        _pending_decision(
+            target_kind=D,
+            pending_kind=M,
+            target_digest=None,
+            pending_digest=None,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+
+
+def test_quarantine_decision_matrix() -> None:
+    """恢复期 quarantine 收敛决策表：complete/restore/delete_stale/external/ignore（回归 H3）。"""
+    from draft.observations import EntryKind
+    from draft.operations import _quarantine_decision  # pyright: ignore[reportPrivateUsage]
+
+    F, M, D, S = (
+        EntryKind.FILE,
+        EntryKind.MISSING,
+        EntryKind.DIRECTORY,
+        EntryKind.SYMLINK,
+    )
+    expected = "a" * 64
+    other = "0" * 64
+
+    # 目标缺失 + quarantine 授权精确 → 完成删除（隔离已通过验证）。
+    assert (
+        _quarantine_decision(
+            target_kind=M,
+            quarantine_kind=F,
+            target_digest=None,
+            quarantine_digest=expected,
+            expected_digest=expected,
+        )
+        == "complete"
+    )
+    # 目标与 quarantine 都是授权精确（同一 inode 中途移动）→ 删除 stale quarantine。
+    assert (
+        _quarantine_decision(
+            target_kind=F,
+            quarantine_kind=F,
+            target_digest=expected,
+            quarantine_digest=expected,
+            expected_digest=expected,
+        )
+        == "delete_stale"
+    )
+    # 目标缺失 + quarantine 摘要不符 → 恢复原名。
+    assert (
+        _quarantine_decision(
+            target_kind=M,
+            quarantine_kind=F,
+            target_digest=None,
+            quarantine_digest=other,
+            expected_digest=expected,
+        )
+        == "restore"
+    )
+    # quarantine 类型错误 / 目标被替换 → external。
+    assert (
+        _quarantine_decision(
+            target_kind=M,
+            quarantine_kind=D,
+            target_digest=None,
+            quarantine_digest=None,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    assert (
+        _quarantine_decision(
+            target_kind=M,
+            quarantine_kind=S,
+            target_digest=None,
+            quarantine_digest=None,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    assert (
+        _quarantine_decision(
+            target_kind=F,
+            quarantine_kind=F,
+            target_digest=other,
+            quarantine_digest=expected,
+            expected_digest=expected,
+        )
+        == "external"
+    )
+    # 无 quarantine → ignore。
+    assert (
+        _quarantine_decision(
+            target_kind=F,
+            quarantine_kind=M,
+            target_digest=expected,
+            quarantine_digest=None,
+            expected_digest=expected,
+        )
+        == "ignore"
+    )
+    assert (
+        _quarantine_decision(
+            target_kind=M,
+            quarantine_kind=M,
+            target_digest=None,
+            quarantine_digest=None,
+            expected_digest=expected,
+        )
+        == "ignore"
+    )
