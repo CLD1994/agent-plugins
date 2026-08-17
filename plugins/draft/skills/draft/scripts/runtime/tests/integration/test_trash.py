@@ -360,6 +360,90 @@ def test_trash_restore_crlf_page_is_byte_identical(
     assert check_draft(root).errors == ()
 
 
+def _to_crlf(path: Path) -> Path:
+    """把受管理页面改写为 CRLF 换行，返回其字节快照前的路径。"""
+    text = path.read_text(encoding="utf-8")
+    path.write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+    return path
+
+
+def test_restore_crlf_parent_preserves_unmodified_bytes(
+    draft_factory: DraftFactory,
+) -> None:
+    """CRLF 父页 restore 只改写导航跨度，既有字节（含 CRLF）不得整页规范化为 LF。
+
+    回归 P1：规划通过 read_text() 读父页会触发通用换行规范化，把整页改写为 LF，
+    且后置证明因摘要与 CRLF parent_sha256 不一致报 operation.inconsistent_state。
+    """
+    root = build_trashable_draft(draft_factory)
+    _to_crlf(root / "index.md")
+    crlf_before = (root / "index.md").read_bytes()
+
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    after_trash = (root / "index.md").read_bytes()
+    # 回收只移除导航行：CRLF 计数恰少一行（导航行是 CRLF 行）。
+    assert after_trash.count(b"\r\n") == crlf_before.count(b"\r\n") - 1
+
+    result = restore_retained_trash(root, pending.operation_id, now=NOW)
+
+    assert result.phase is OperationPhase.COMPLETED
+    restored = (root / "index.md").read_bytes()
+    # 未修改内容字节保持 CRLF（新增导航行不引入额外 CRLF），证明必须通过。
+    assert restored.count(b"\r\n") == after_trash.count(b"\r\n")
+    assert b"pages/obsolete.md" in restored
+    assert not (root / ".draft/operation.lock").exists()
+    assert not (root / ".draft/trash/outgoing" / pending.operation_id).exists()
+    assert check_draft(root).errors == ()
+
+
+def test_collapsed_restore_crlf_leaf_preserves_bytes(
+    draft_factory: DraftFactory,
+) -> None:
+    """折叠恢复：CRLF 叶页内容被 rebase 进枢纽后既有字节保持 CRLF。"""
+    root = build_collapsed_rebase_draft(draft_factory)
+    _to_crlf(root / "pages/solo/index.md")
+
+    pending = trash_page(root, Path("pages/solo/only.md"), now=NOW)
+    assert (root / "pages/solo.md").is_file()
+    collapsed = (root / "pages/solo.md").read_bytes()
+    assert collapsed.count(b"\r\n") > 0
+
+    result = restore_retained_trash(root, pending.operation_id, now=NOW)
+
+    assert result.phase is OperationPhase.COMPLETED
+    restored_hub = (root / "pages/solo/index.md").read_bytes()
+    assert restored_hub.count(b"\r\n") == collapsed.count(b"\r\n")
+    assert check_draft(root).errors == ()
+
+
+def test_restore_mixed_newline_parent_only_rewrites_nav_span(
+    draft_factory: DraftFactory,
+) -> None:
+    """混合换行父页：只有导航跨度被改写，其余既有行（CRLF 或 LF）逐字节保留。"""
+    root = build_trashable_draft(draft_factory)
+    index = root / "index.md"
+    text = index.read_text(encoding="utf-8")
+    # 前两行 CRLF、其余行 LF 的混合页。
+    lines = text.split("\n")
+    mixed = "\r\n".join(lines[:2]) + "\n" + "\n".join(lines[2:])
+    index.write_bytes(mixed.encode("utf-8"))
+    mixed_before = index.read_bytes()
+
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    after_trash = (root / "index.md").read_bytes()
+
+    result = restore_retained_trash(root, pending.operation_id, now=NOW)
+
+    assert result.phase is OperationPhase.COMPLETED
+    restored = (root / "index.md").read_bytes()
+    # 移除新增的整行导航后，其余字节必须与 trash 后内容逐字节一致（混合换行不被规范化）。
+    nav_line = "- [旧页](pages/obsolete.md)".encode("utf-8") + b"\n"
+    stripped_nav = restored.replace(nav_line, b"")
+    assert stripped_nav == after_trash
+    assert mixed_before != after_trash
+    assert check_draft(root).errors == ()
+
+
 def test_restore_completes_within_window(draft_factory: DraftFactory) -> None:
     root = build_trashable_draft(draft_factory)
     pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)

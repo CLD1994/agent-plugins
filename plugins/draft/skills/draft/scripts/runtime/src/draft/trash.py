@@ -82,6 +82,15 @@ def remove_tree(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def _read_managed_text(root: Path, relative: Path) -> str:
+    """受管理 Markdown 的字节保真读取：保留 CRLF，不触发通用换行规范化。
+
+    通用文本读取会把 CRLF 规范化为 LF；任何参与编辑或摘要证明的页面读取都必须
+    基于实际字节，否则未修改内容会被整页改写（只允许改写协议指定跨度）。
+    """
+    return (root / relative).read_bytes().decode("utf-8")
+
+
 def _rebase_links(text: str, old_path: Path, new_path: Path, root: Path) -> str:
     """Recompute every local destination of a page moved from old_path to new_path."""
     page = parse_page(new_path, text)
@@ -414,7 +423,7 @@ def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackag
     if collapsed:
         if hub_path is None:
             raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package.directory)
-        leaf_text = (root / parent_path).read_text(encoding="utf-8")
+        leaf_text = _read_managed_text(root, parent_path)
         hub_text = _rebase_links(leaf_text, parent_path, hub_path, root)
         navigation = relative_markdown_destination(hub_path, page_path, None)
         hub_text = append_parent_navigation(hub_text, page_title, navigation)
@@ -449,7 +458,7 @@ def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackag
                     )
                 )
     else:
-        parent_text = (root / parent_path).read_text(encoding="utf-8")
+        parent_text = _read_managed_text(root, parent_path)
         navigation = relative_markdown_destination(parent_path, page_path, None)
         if parent_path == ROOT_PAGE:
             # 根导航结论链接由生成器管理，必须保持最后（规格 §12.4）。
@@ -711,7 +720,7 @@ def _prove_parent_restore(
         hub_path = package.hub_path
         if hub_path is None:
             raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package.directory)
-        hub_text = (root / hub_path).read_text(encoding="utf-8")
+        hub_text = _read_managed_text(root, hub_path)
         # 枢纽去掉页面导航（两种候选）后逆 rebase 回叶页，应回到回收后的叶内容。
         if not any(
             sha256_bytes(
@@ -730,14 +739,14 @@ def _prove_parent_restore(
             if t_mutation.path in (package.page_path, package.parent_path, hub_path):
                 continue
             if t_mutation.kind is MutationKind.WRITE and t_mutation.before_sha256 is not None:
-                live_text = (root / t_mutation.path).read_text(encoding="utf-8")
+                live_text = _read_managed_text(root, t_mutation.path)
                 rebased_back = _retarget_links(
                     live_text, t_mutation.path, hub_path, package.parent_path, root
                 )
                 if sha256_bytes(rebased_back.encode("utf-8")) != t_mutation.after_sha256:
                     raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, t_mutation.path)
     else:
-        parent_text = (root / package.parent_path).read_text(encoding="utf-8")
+        parent_text = _read_managed_text(root, package.parent_path)
         if not any(
             sha256_bytes(candidate.encode("utf-8")) == package.parent_sha256
             for candidate in _parent_restore_candidates(parent_text, canonical)
