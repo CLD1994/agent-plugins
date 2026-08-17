@@ -553,7 +553,7 @@ def _validate_plan_paths(plan: OperationPlan) -> None:
 def _check(root: Path) -> None:
     from draft.checker import check_draft
 
-    report = check_draft(root, include_operation_state=False, exclude_resource_facts=True)
+    report = check_draft(root, include_operation_state=False)
     if report.errors:
         codes = ", ".join(issue.code for issue in report.errors)
         raise DraftError("operation.validation_failed", root, details=(codes,))

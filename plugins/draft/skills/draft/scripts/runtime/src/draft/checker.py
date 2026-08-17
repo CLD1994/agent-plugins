@@ -647,7 +647,6 @@ def check_draft(
     root: Path,
     *,
     include_operation_state: bool = True,
-    exclude_resource_facts: bool = False,
 ) -> CheckReport:
     resolved = resolve_draft_root(root)
     layout: list[CheckIssue] = []
@@ -719,7 +718,4 @@ def check_draft(
                 key=_sort_key,
             )
         )
-    if exclude_resource_facts:
-        facts = set(result.resource_facts)
-        ordered = [issue for issue in ordered if issue not in facts]
     return CheckReport(issues=tuple(ordered))

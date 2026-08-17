@@ -234,11 +234,36 @@ def test_move_with_dirty_graph_fails(draft_factory: DraftFactory) -> None:
         move_page(root, Path("pages/old/a.md"), Path("pages/new/a.md"))
 
 
-def test_move_tolerates_missing_body_link_resource_fact(
+def test_registered_move_rejects_missing_body_link(
     draft_factory: DraftFactory,
 ) -> None:
-    """正文链接目标缺失是资源事实：移动不因它失败。"""
+    """registered 根规划前必须通过完整全局健康门禁：正文断链也阻止写操作。"""
     root = build_two_hub_draft(draft_factory)
+    (root / "pages/new/b.md").write_text(
+        B_PAGE + "\n见 [断链](missing.md)。\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DraftError, match=CheckCode.LINK_MISSING.value):
+        move_page(root, Path("pages/old/a.md"), Path("pages/new/a.md"))
+
+
+def test_candidate_move_tolerates_missing_body_link(
+    draft_factory: DraftFactory,
+) -> None:
+    """candidate 根中正文链接目标缺失是已知资源事实：移动不因它失败。"""
+    root = draft_factory(
+        {
+            "index.md": INDEX,
+            "conclusions.md": CONCLUSIONS,
+            "pages/old/index.md": OLD_HUB,
+            "pages/old/a.md": A_PAGE,
+            "pages/old/keep.md": KEEP,
+            "pages/new/index.md": NEW_HUB,
+            "pages/new/b.md": B_PAGE,
+        },
+        root_state=RootState.CANDIDATE,
+    )
     (root / "pages/new/b.md").write_text(
         B_PAGE + "\n见 [断链](missing.md)。\n",
         encoding="utf-8",

@@ -40,7 +40,7 @@ def load_operation_facts(root: Path, *, allow_hub_empty: Path | None = None) -> 
     resolved = resolve_draft_root(root)
     state = read_marker(resolved)
     if state.root_state is RootState.REGISTERED:
-        report = check_draft(resolved, exclude_resource_facts=True)
+        report = check_draft(resolved)
         errors = [
             issue
             for issue in report.errors

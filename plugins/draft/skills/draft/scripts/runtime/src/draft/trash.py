@@ -381,7 +381,7 @@ def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackag
     if sha256_file(resolved / parent_path) != parent_hash:
         raise DraftError("operation.validation_failed", parent_path, details=("restore_conflict",))
     if root_state is RootState.REGISTERED:
-        report = check_draft(resolved, include_operation_state=False, exclude_resource_facts=True)
+        report = check_draft(resolved, include_operation_state=False)
         if report.errors:
             codes = tuple(issue.code for issue in report.errors)
             raise DraftError("operation.validation_failed", resolved, details=codes)
