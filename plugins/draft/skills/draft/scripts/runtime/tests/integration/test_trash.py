@@ -423,6 +423,68 @@ def test_restore_preserves_unknown_entry_sneaked_before_package_cleanup(
     assert (root / ".draft/operation.lock").exists()
 
 
+def test_restore_planning_deleted_parent_maps_to_restore_conflict(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """规划期父页读取失败（删除/目录化/非 UTF-8）：必须转稳定恢复冲突而非原始异常。
+
+    回归 M1：规划前外部变化可安全回滚，应进入统一 restore resolver；原始
+    FileNotFoundError 泄漏会保留 R 锁与 T→R 关联。
+    """
+    import draft.trash as trash_module
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    original_read = trash_module._read_managed_text  # pyright: ignore[reportPrivateUsage]
+
+    def fail_parent_planning_read(root_path: Path, relative: Path) -> str:
+        if relative == Path("index.md"):
+            raise FileNotFoundError(relative)
+        return original_read(root_path, relative)
+
+    monkeypatch.setattr(trash_module, "_read_managed_text", fail_parent_planning_read)
+    with pytest.raises(DraftError, match="trash.restore_conflict"):
+        restore_retained_trash(root, pending.operation_id, now=NOW)
+    monkeypatch.undo()
+
+    # T 已解关联、锁释放、权威包保留、页面未恢复。
+    assert not (root / ".draft/operation.lock").exists()
+    assert not (root / "pages/obsolete.md").exists()
+    assert (root / ".draft/trash/outgoing" / pending.operation_id / "package.json").is_file()
+
+
+def test_completed_restore_deleted_parent_is_inconsistent_state(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R completed 后证明阶段父页读取失败：必须报告状态不一致并保留现场。
+
+    回归 M1：提交后证明失败必须保留 completed R、关联与锁，不得误映射为普通冲突。
+    """
+    import draft.trash as trash_module
+    from draft.operations import read_lock
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    original_read = trash_module._read_managed_text  # pyright: ignore[reportPrivateUsage]
+    reads: list[int] = []
+
+    def fail_proof_parent_read(root_path: Path, relative: Path) -> str:
+        if relative == Path("index.md"):
+            reads.append(len(reads) + 1)
+            if len(reads) == 2:  # 第 1 次规划读取成功，第 2 次证明读取失败。
+                raise FileNotFoundError(relative)
+        return original_read(root_path, relative)
+
+    monkeypatch.setattr(trash_module, "_read_managed_text", fail_proof_parent_read)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        restore_retained_trash(root, pending.operation_id, now=NOW)
+    monkeypatch.undo()
+
+    # 现场保留：锁、completed R 与权威包都在。
+    assert read_lock(root) is not None
+    assert (root / ".draft/trash/outgoing" / pending.operation_id / "package.json").is_file()
+
+
 def test_trash_restore_crlf_page_is_byte_identical(
     draft_factory: DraftFactory,
 ) -> None:

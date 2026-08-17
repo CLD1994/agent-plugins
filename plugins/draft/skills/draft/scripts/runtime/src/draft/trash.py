@@ -371,6 +371,24 @@ def _proven_unapplied_restore(root: Path, journal: Journal) -> bool:
 def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackage) -> OperationPlan:
     """构造恢复计划：页面回写、父/枢纽导航恢复；冲突在此以 operation.* 抛出。
 
+    规划阶段边界把受管页面读取失败（删除、目录化、非 UTF-8）统一转换为
+    ``operation.external_change``：规划前的外部变化可安全回滚，进入统一 resolver
+    证明 R 未应用后映射为 ``trash.restore_conflict``、解关联并释放锁。不把原始
+    FileNotFoundError/IsADirectoryError/UnicodeDecodeError 泄漏给调用方。
+    """
+    try:
+        return _build_restore_plan_impl(root, restore_id, package)
+    except DraftError:
+        raise
+    except (OSError, UnicodeDecodeError) as exc:
+        raise DraftError("operation.external_change", package.page_path) from exc
+
+
+def _build_restore_plan_impl(
+    root: Path, restore_id: str, package: VerifiedTrashPackage
+) -> OperationPlan:
+    """构造恢复计划：页面回写、父/枢纽导航恢复；冲突在此以 operation.* 抛出。
+
     registered 根在规划前通过完整健康门禁；candidate 根按操作级契约恢复，不要求
     全根健康，但折叠恢复需要重写全部指向叶页的入站链接，不可解析页面仍须阻止。
     """
@@ -509,6 +527,28 @@ def _restore_observations(package: VerifiedTrashPackage, graph: DraftGraph) -> O
 
 
 def verify_restore_after_state(
+    root: Path,
+    trash_journal: Journal,
+    restore_journal: Journal,
+    package: VerifiedTrashPackage,
+) -> None:
+    """逐项精确证明 R=completed 的变更与 T 结构变更对应、活文件匹配 after。
+
+    提交后证明边界把受管页面读取失败（删除、目录化、非 UTF-8）统一转换为
+    ``operation.inconsistent_state``：证明证据不足必须保留 completed R、关联与锁，
+    不得把提交后证据不足误映射为普通恢复冲突。
+    """
+    try:
+        _verify_restore_after_state_impl(root, trash_journal, restore_journal, package)
+    except DraftError:
+        raise
+    except (OSError, UnicodeDecodeError) as exc:
+        raise DraftError(
+            CheckCode.OPERATION_INCONSISTENT_STATE.value, restore_journal.directory
+        ) from exc
+
+
+def _verify_restore_after_state_impl(
     root: Path,
     trash_journal: Journal,
     restore_journal: Journal,
