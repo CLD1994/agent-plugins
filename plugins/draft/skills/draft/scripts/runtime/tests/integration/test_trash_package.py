@@ -332,3 +332,100 @@ def test_check_reports_package_json_directory_as_stable_diagnostic(
 
     report = check_draft(root)
     assert CheckCode.TRASH_PACKAGE_CORRUPT.value in tuple(issue.code for issue in report.errors)
+
+
+def _leaf_snapshot(package_dir: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(package_dir).as_posix(): path.read_bytes()
+        for path in package_dir.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+@pytest.mark.parametrize("level", ["payload", "payload/pages"])
+def test_cleanup_rejects_payload_intermediate_symlink(
+    draft_factory: DraftFactory, tmp_path: Path, level: str
+) -> None:
+    """payload 中间父目录被替换为符号链接：清理不得跟随链接访问根外节点（回归 H1）。"""
+    import shutil
+
+    from draft.operations import operation_journal_path
+    from draft.trash_package import clean_authoritative_package
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    external = tmp_path / "external"
+    external.mkdir()
+    # 把整棵 payload 树移到外部，再把中间父目录替换为指向外部的符号链接。
+    shutil.copytree(package / "payload", external / "payload", dirs_exist_ok=True)
+    shutil.rmtree(package / "payload")
+    (package / level).parent.mkdir(parents=True, exist_ok=True)
+    (package / level).symlink_to(external / "payload")
+
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        clean_authoritative_package(root, journal)
+
+    # 根外节点完全不变：符号链接未被跟随，外部文件仍存在、权威包现场保留。
+    external_leaf = external / "payload" / "pages" / "obsolete.md"
+    assert external_leaf.exists()
+    assert (package / "package.json").is_file()
+
+
+def test_cleanup_rejects_third_package_write(
+    draft_factory: DraftFactory,
+) -> None:
+    """T 日志出现第三个包内 WRITE：清理必须判损坏，不得删除任何授权叶节点（回归 H1）。"""
+    from draft.operations import operation_journal_path
+    from draft.trash_package import clean_authoritative_package
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    journal_path = operation_journal_path(root, pending.operation_id)
+    read_journal(journal_path)
+    # 追加第三个包内 WRITE（恶意日志）。
+    forged = {
+        "path": (package.relative_to(root) / "payload/extra.md").as_posix(),
+        "kind": "write",
+        "before_sha256": None,
+        "after_sha256": "a" * 64,
+        "original": None,
+        "staged": None,
+        "applied": False,
+    }
+    # 直接构造携带该 mutation 的 journal 不可行（frozen dataclass），改用磁盘 JSON 注入。
+    import json as json_module
+
+    raw = json_module.loads(journal_path.read_text(encoding="utf-8"))
+    raw["mutations"].append(forged)
+    journal_path.write_text(json_module.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        clean_authoritative_package(root, read_journal(journal_path))
+
+    # 合法叶节点与未知内容都保留。
+    before = _leaf_snapshot(package)
+    assert before["package.json"] == (package / "package.json").read_bytes()
+
+
+def test_cleanup_preserves_full_evidence_when_unknown_present(
+    draft_factory: DraftFactory,
+) -> None:
+    """清理前存在未知成员：预检必须在第一次删除前失败，完整证据（含 package.json/payload）保留（回归 H2）。"""
+    from draft.operations import operation_journal_path
+    from draft.trash_package import clean_authoritative_package
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    before = _leaf_snapshot(package)
+    (package / "intruder.txt").write_text("入侵\n", encoding="utf-8")
+
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        clean_authoritative_package(root, journal)
+
+    # 完整证据保留：package.json、payload 与全部摘要不变。
+    assert _leaf_snapshot(package) == {**before, "intruder.txt": b"\xe5\x85\xa5\xe4\xbe\xb5\n"}

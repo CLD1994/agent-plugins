@@ -311,12 +311,93 @@ def _load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashP
     )
 
 
-def _remove_verified_leaf(path: Path, expected_digest: str, code_path: Path) -> None:
-    """现存授权叶节点先复核普通文件类型与日志锚定摘要，再删除精确路径。
+def _authorized_leaves(
+    trash_journal: Journal, package_relative: Path, code_path: Path
+) -> list[tuple[Path, str]]:
+    """从原 T 日志派生授权叶节点：恰好 package.json 与一个 payload 新建文件。
 
-    缺失（提交点后幂等清理）容忍；符号链接或错误类型拒绝并保留现场。摘要不符
-    说明验证后内容被改写，拒绝删除。
+    包内 mutation 只允许这两个精确新建文件；额外包内 WRITE（恶意日志）或形状
+    不符即损坏。已授权条目部分缺失（提交点后幂等清理）由删除阶段容忍。
     """
+    authorized: list[tuple[Path, str]] = []
+    for mutation in trash_journal.mutations:
+        if not mutation.path.is_relative_to(package_relative):
+            continue
+        if (
+            mutation.kind is not MutationKind.WRITE
+            or mutation.before_sha256 is not None
+            or mutation.after_sha256 is None
+        ):
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        authorized.append((mutation.path, mutation.after_sha256))
+    if len(authorized) != 2:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+    payload_paths = [
+        relative for relative, _ in authorized if relative != package_relative / "package.json"
+    ]
+    if len(payload_paths) != 1 or not payload_paths[0].is_relative_to(package_relative / "payload"):
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+    return authorized
+
+
+def _package_directories(
+    root: Path, package_dir: Path, authorized: list[tuple[Path, str]]
+) -> set[Path]:
+    """授权目录树：包目录 + 每个叶节点的父目录链（不含 root）。"""
+    allowed = {package_dir}
+    for relative, _ in authorized:
+        cursor = (root / relative).parent
+        while cursor != root and cursor not in allowed:
+            allowed.add(cursor)
+            cursor = cursor.parent
+    return allowed
+
+
+def _precheck_package_tree(
+    root: Path,
+    package_dir: Path,
+    authorized: list[tuple[Path, str]],
+    code_path: Path,
+) -> None:
+    """只读预检：在第一次删除前枚举整个包树，未知/符号链接/类型/摘要不符即失败。
+
+    不跟随目录符号链接遍历；目录符号链接与未知成员都在第一次 unlink 之前拒绝，
+    保证清理失败不破坏已授权证据（回归 H2）。
+    """
+    import os
+
+    allowed_dirs = _package_directories(root, package_dir, authorized)
+    allowed_leaves = {root / relative for relative, _ in authorized}
+    digest_by_path = {root / relative: digest for relative, digest in authorized}
+    for dirpath, dirnames, filenames in os.walk(package_dir, followlinks=False):
+        directory = Path(dirpath)
+        if directory.is_symlink() or directory not in allowed_dirs:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, directory)
+        for name in dirnames:
+            child = directory / name
+            if child.is_symlink() or child not in allowed_dirs:
+                raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, child)
+        for name in filenames:
+            leaf = directory / name
+            if leaf.is_symlink() or leaf not in allowed_leaves or not leaf.is_file():
+                raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, leaf)
+            if sha256_bytes(leaf.read_bytes()) != digest_by_path[leaf]:
+                raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, leaf)
+
+
+def _remove_verified_leaf(
+    root: Path, relative: Path, expected_digest: str, code_path: Path
+) -> None:
+    """现存授权叶节点先逐组件拒绝符号链接、复核普通文件类型与锚定摘要，再删除精确路径。
+
+    中间组件（payload/ 等）可能在验证后被替换为符号链接：只查最终叶节点会跟随中间
+    链接访问根外节点。删除前必须逐组件拒绝符号链接（回归 H1）。缺失（提交点后
+    幂等清理）容忍；摘要不符说明验证后内容被改写，拒绝删除。
+    """
+    from draft.operations import reject_symlink_components
+
+    reject_symlink_components(root, relative)
+    path = root / relative
     if path.is_symlink():
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
     if not path.exists():
@@ -345,13 +426,13 @@ def _remove_verified_dir(path: Path) -> None:
 
 
 def clean_authoritative_package(root: Path, trash_journal: Journal) -> None:
-    """唯一权威包清理原语：从原 T 日志派生授权条目，逐个复核后删除精确路径。
+    """唯一权威包清理原语：先只读预检，再按授权路径逐个复核后删除。
 
-    清理计划从 T 日志的包内 mutation 派生（只允许 package.json 与 payload 新建
-    文件）；对现存叶节点先复核普通文件类型与日志锚定摘要，再删除精确路径；已知
-    目录按从深到浅顺序 rmdir。出现额外成员、符号链接或错误类型时以
-    ``trash.package_corrupt`` 停止并保留现场。已授权条目部分缺失（提交点后幂等
-    清理）不视为损坏。绝不对权威包目录递归删除未知内容。
+    清理计划从原 T 日志派生恰好两个授权叶节点（package.json + payload）；预检枚举
+    整个包树，任何未知成员、符号链接、错误类型或摘要不符都在第一次 unlink 之前
+    失败，保证失败不破坏已授权证据（可重试）。预检通过后逐组件拒绝符号链接并复核
+    后删除精确叶节点，已知目录从深到浅 rmdir。已授权条目部分缺失（提交点后幂等
+    清理）容忍。
 
     restore、handoff、purge 与终态恢复全部经此原语清理，不再各自直接 remove_tree。
     """
@@ -366,29 +447,13 @@ def clean_authoritative_package(root: Path, trash_journal: Journal) -> None:
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package_dir)
 
     package_relative = OUTGOING_RELATIVE / trash_journal.operation_id
-    authorized: list[tuple[Path, str]] = []
-    for mutation in trash_journal.mutations:
-        if not mutation.path.is_relative_to(package_relative):
-            continue
-        if (
-            mutation.kind is not MutationKind.WRITE
-            or mutation.before_sha256 is not None
-            or mutation.after_sha256 is None
-        ):
-            # 包内必须只有 package.json 与 payload 新建文件；其他包内 mutation 为损坏。
-            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package_dir)
-        authorized.append((mutation.path, mutation.after_sha256))
-    if not authorized:
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package_dir)
-
+    authorized = _authorized_leaves(trash_journal, package_relative, package_dir)
+    _precheck_package_tree(root, package_dir, authorized, package_dir)
     for relative, digest in sorted(authorized):
-        _remove_verified_leaf(root / relative, digest, package_dir)
-
-    known_dirs = {package_dir}
-    for relative, _ in authorized:
-        cursor = (root / relative).parent
-        while cursor != root and cursor not in known_dirs:
-            known_dirs.add(cursor)
-            cursor = cursor.parent
-    for directory in sorted(known_dirs, key=lambda path: len(path.parts), reverse=True):
+        _remove_verified_leaf(root, relative, digest, package_dir)
+    for directory in sorted(
+        _package_directories(root, package_dir, authorized),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
         _remove_verified_dir(directory)
