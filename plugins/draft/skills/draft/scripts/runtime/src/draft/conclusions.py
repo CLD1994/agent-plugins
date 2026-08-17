@@ -400,10 +400,18 @@ def plan_generation(
     # 优先使用已解析的页面文本；解析失败的损坏页回退到磁盘原文，保证可重写。
     if previous_document is not None:
         previous_bytes = previous_document.text.encode("utf-8")
+        digest_provider = getattr(graph, "page_digest", None)
+        conclusions_before = (
+            digest_provider(CONCLUSIONS_PAGE)
+            if digest_provider is not None
+            else sha256_bytes(previous_bytes)
+        )
     elif conclusions_path.is_file() and not conclusions_path.is_symlink():
         previous_bytes = conclusions_path.read_bytes()
+        conclusions_before = sha256_bytes(previous_bytes)
     else:
         previous_bytes = None
+        conclusions_before = None
     previous = previous_bytes is not None
     rendered_bytes = rendered.encode("utf-8")
 
@@ -418,18 +426,24 @@ def plan_generation(
             FileMutation(
                 CONCLUSIONS_PAGE,
                 MutationKind.WRITE,
-                sha256_bytes(previous_bytes) if previous else None,
+                conclusions_before,
                 sha256_bytes(rendered_bytes),
                 rendered_bytes,
             )
         )
     if index_changed:
         assert index is not None
+        digest_provider = getattr(graph, "page_digest", None)
+        index_before = (
+            digest_provider(ROOT_PAGE)
+            if digest_provider is not None
+            else sha256_bytes(index.text.encode("utf-8"))
+        )
         mutations.append(
             FileMutation(
                 ROOT_PAGE,
                 MutationKind.WRITE,
-                sha256_bytes(index.text.encode("utf-8")),
+                index_before,
                 sha256_bytes(index_text.encode("utf-8")),
                 index_text.encode("utf-8"),
             )

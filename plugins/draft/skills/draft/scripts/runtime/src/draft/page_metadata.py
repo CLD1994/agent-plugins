@@ -36,9 +36,11 @@ from draft.vocabulary import (
 )
 
 
-def _target_marker_observations(resolved: Path, page: Path, text: str) -> ObservationManifest:
-    """status set 的自有事实闭包：目标页与 marker 所有权。"""
-    entries = [file_digest_observation(page, sha256_bytes(text.encode("utf-8")))]
+def _target_marker_observations(
+    resolved: Path, page: Path, page_digest: str
+) -> ObservationManifest:
+    """status set 的自有事实闭包：目标页（实际字节摘要）与 marker 所有权。"""
+    entries = [file_digest_observation(page, page_digest)]
     marker = resolved / MARKER_PATH
     if marker.is_file() and not marker.is_symlink():
         entries.append(file_digest_observation(MARKER_PATH, sha256_bytes(marker.read_bytes())))
@@ -181,7 +183,6 @@ def plan_set_status(
 
     _validate_final_graph(resolved, page, new_text)
 
-    before = document.text.encode("utf-8")
     after = new_text.encode("utf-8")
     plan = OperationPlan(
         kind=OperationKind.STATUS_SET,
@@ -190,13 +191,13 @@ def plan_set_status(
             FileMutation(
                 page,
                 MutationKind.WRITE,
-                sha256_bytes(before),
+                graph.page_digest(page),
                 sha256_bytes(after),
                 after,
             ),
         ),
         root_state=facts.root_state,
-        observations=_target_marker_observations(resolved, page, document.text),
+        observations=_target_marker_observations(resolved, page, graph.page_digest(page)),
         effects=(PlanEffect(action=PlanAction.MODIFY, path=page),),
     )
     return plan
@@ -485,11 +486,11 @@ def _multi_write_plan(
         FileMutation(
             path,
             MutationKind.WRITE,
-            sha256_bytes(before.encode("utf-8")),
+            graph.page_digest(path),
             sha256_bytes(after.encode("utf-8")),
             after.encode("utf-8"),
         )
-        for path, (before, after) in sorted(edits.items(), key=lambda item: str(item[0]))
+        for path, (_before, after) in sorted(edits.items(), key=lambda item: str(item[0]))
     ]
     effects = tuple(
         PlanEffect(action=PlanAction.MODIFY, path=path) for path in sorted(edits, key=str)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -28,6 +29,11 @@ from draft.resources import (
 )
 from draft.vocabulary import ConclusionsState, RelationCode
 
+
+def _sha256_hex(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
 ROOT_PAGE = Path("index.md")
 CONCLUSIONS_PAGE = Path("conclusions.md")
 PAGES_DIR = Path("pages")
@@ -52,6 +58,16 @@ class DraftGraph:
     inbound_resources: Mapping[ResourceIdentity, tuple[Path, ...]] = field(
         default_factory=dict[ResourceIdentity, tuple[Path, ...]]
     )
+    # 页面实际读取字节（未做换行规范化的原文）：观察与 mutation 的 before 摘要必须
+    # 基于它，避免 CRLF 页面被规范化文本摘要误判为外部变化（计划 Task 10 Step 4）。
+    page_bytes: Mapping[Path, bytes] = field(default_factory=dict[Path, bytes])
+
+    def page_digest(self, path: Path) -> str:
+        """页面实际字节摘要；缺省回退到规范化文本（仅内存合成图）。"""
+        data = self.page_bytes.get(path)
+        if data is not None:
+            return _sha256_hex(data)
+        return _sha256_hex(self.pages[path].text.encode("utf-8"))
 
 
 @dataclass(frozen=True)
@@ -244,10 +260,24 @@ def _load(root: Path) -> LoadResult:
     managed_set = set(managed_paths)
 
     pages: dict[Path, PageDocument] = {}
+    page_bytes: dict[Path, bytes] = {}
     for relative in managed_paths:
         try:
-            text = (root / relative).read_text(encoding="utf-8")
+            data = (root / relative).read_bytes()
+            # 保留原始字节用于观察/mutation 摘要；文本按通用换行规范化为 \n 供解析。
+            page_bytes[relative] = data
+            text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
             pages[relative] = parse_page(relative, text)
+        except (UnicodeDecodeError, OSError) as exc:
+            issues.append(
+                CheckIssue(
+                    code=CheckCode.PAGE_PARSE_ERROR.value,
+                    severity=IssueSeverity.ERROR,
+                    path=relative,
+                    line=None,
+                    details=(str(exc),),
+                )
+            )
         except DraftError as error:
             issues.append(
                 CheckIssue(
@@ -382,6 +412,7 @@ def _load(root: Path) -> LoadResult:
     graph = DraftGraph(
         root=root,
         pages={path: pages[path] for path in sorted(pages)},
+        page_bytes={path: page_bytes[path] for path in sorted(page_bytes)},
         parents={path: parents[path] for path in sorted(parents)},
         # children 已按父导航声明顺序排序；外层保持父键排序，条目顺序不变。
         children={parent: tuple(entries) for parent, entries in sorted(children.items())},

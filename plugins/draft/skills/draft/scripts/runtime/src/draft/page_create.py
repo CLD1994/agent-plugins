@@ -116,7 +116,7 @@ def plan_create_page(
         FileMutation(
             parent,
             MutationKind.WRITE,
-            sha256_bytes(parent_page.text.encode("utf-8")),
+            graph.page_digest(parent),
             sha256_bytes(parent_bytes),
             parent_bytes,
         ),

@@ -292,7 +292,7 @@ def plan_path_remap(
                 FileMutation(
                     path,
                     MutationKind.DELETE,
-                    sha256_bytes(original_bytes),
+                    graph.page_digest(path),
                     None,
                     None,
                 )
@@ -303,7 +303,7 @@ def plan_path_remap(
                 FileMutation(
                     path,
                     MutationKind.WRITE,
-                    sha256_bytes(original_bytes),
+                    graph.page_digest(path),
                     sha256_bytes(rendered_bytes),
                     rendered_bytes,
                 )

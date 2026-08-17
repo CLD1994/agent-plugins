@@ -172,7 +172,15 @@ def graph_observations(graph: _GraphLike) -> ObservationManifest:
     entries: list[Observation] = []
     directories: set[Path] = set()
     for relative, page in graph.pages.items():
-        entries.append(file_digest_observation(relative, sha256_bytes(page.text.encode("utf-8"))))
+        # 摘要基于实际读取字节（page_digest 优先），避免 CRLF 页面被规范化文本摘要
+        # 误判为外部变化；内存合成图回退到规范化文本。
+        digest_provider = getattr(graph, "page_digest", None)
+        digest = (
+            digest_provider(relative)
+            if digest_provider is not None
+            else sha256_bytes(page.text.encode("utf-8"))
+        )
+        entries.append(file_digest_observation(relative, digest))
         parent = relative.parent
         while str(parent) != "." and str(parent) != "":
             directories.add(parent)

@@ -187,7 +187,8 @@ def trash_plan(
         parent_final_text = _rebase_links(parent_after, parent, leaf, graph.root)
         remove_empty.append(parent.parent)
 
-    page_bytes = graph.pages[page].text.encode("utf-8")
+    # 权威包保存页面实际字节：CRLF 页面恢复后必须逐字节一致。
+    page_bytes = graph.page_bytes.get(page, graph.pages[page].text.encode("utf-8"))
     package = {
         "version": PACKAGE_VERSION,
         "operation_id": operation_id,
@@ -221,7 +222,6 @@ def trash_plan(
     )
 
     if collapsed_hub is not None:
-        hub_bytes = graph.pages[collapsed_hub].text.encode("utf-8")
         leaf_bytes = parent_final_text.encode("utf-8")
         mutations.append(
             FileMutation(
@@ -229,7 +229,9 @@ def trash_plan(
             )
         )
         mutations.append(
-            FileMutation(collapsed_hub, MutationKind.DELETE, sha256_bytes(hub_bytes), None, None)
+            FileMutation(
+                collapsed_hub, MutationKind.DELETE, graph.page_digest(collapsed_hub), None, None
+            )
         )
         for other_path, other_page in graph.pages.items():
             if other_path in (page, collapsed_hub):
@@ -258,7 +260,13 @@ def trash_plan(
         if before == after:
             continue
         mutations.append(
-            FileMutation(path, MutationKind.WRITE, sha256_bytes(before), sha256_bytes(after), after)
+            FileMutation(
+                path,
+                MutationKind.WRITE,
+                graph.page_digest(path),
+                sha256_bytes(after),
+                after,
+            )
         )
     mutations.append(FileMutation(page, MutationKind.DELETE, sha256_bytes(page_bytes), None, None))
 
@@ -425,13 +433,12 @@ def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackag
                 if destination != link.destination:
                     edits.setdefault(link.destination_span, destination)
             if edits:
-                before = other_page.text.encode("utf-8")
                 after = rewrite_link_destinations(other_page.text, edits).encode("utf-8")
                 mutations.append(
                     FileMutation(
                         other_path,
                         MutationKind.WRITE,
-                        sha256_bytes(before),
+                        graph.page_digest(other_path),
                         sha256_bytes(after),
                         after,
                     )

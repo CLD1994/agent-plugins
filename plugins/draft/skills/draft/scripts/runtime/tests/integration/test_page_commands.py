@@ -311,6 +311,26 @@ def test_status_set_changes_and_validates_final_state(
     assert check_draft(root).errors == ()
 
 
+def test_status_set_on_crlf_page_succeeds(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CRLF 页面：观察与 before 摘要必须基于实际读取字节，命令不得报 external_change。"""
+    root = build_page_draft(draft_factory)
+    page = root / "pages/a.md"
+    text = page.read_text(encoding="utf-8")
+    page.write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+    capsys.readouterr()
+
+    code, payload = run_json(
+        ["status", "set", "--root", str(root), "pages/a.md", "proposed", "--json"], capsys
+    )
+
+    assert code == 0
+    assert payload["result_type"] == "status.set"
+    assert "当前提案" in (root / "pages/a.md").read_text(encoding="utf-8")
+    assert check_draft(root).errors == ()
+
+
 def test_status_set_rejects_invalid_final_state(
     draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
 ) -> None:
