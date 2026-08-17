@@ -108,6 +108,16 @@ def _reject_symlink(path: Path) -> None:
         raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, path)
 
 
+def _require_regular_file(path: Path, code_path: Path) -> None:
+    """权威包叶节点必须是普通文件：目录、设备、FIFO、符号链接等均视为损坏。
+
+    必须在摘要或解码触达目标 I/O 之前执行，避免 IsADirectoryError 等原始文件
+    系统异常绕过稳定领域错误（破坏包停止且不遗留新恢复现场）。
+    """
+    if path.is_symlink() or not path.is_file():
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+
+
 def _reject_symlink_components(base: Path, relative: Path) -> None:
     cursor = base
     for part in relative.parts:
@@ -140,7 +150,7 @@ def _reject_package_extra_entries(
 def _parse_manifest(manifest_path: Path) -> dict[str, object]:
     try:
         decoded = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path) from exc
     if not isinstance(decoded, dict):
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
@@ -154,6 +164,21 @@ def _parse_manifest(manifest_path: Path) -> dict[str, object]:
 
 
 def load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashPackage:
+    """以原回收日志为信任根验证权威删除包。
+
+    共同责任边界：把预期的文件系统异常（目录替换叶节点、不可读、非 UTF-8 清单等）
+    统一转换为 ``trash.package_corrupt``，不把 IsADirectoryError、FileNotFoundError、
+    UnicodeDecodeError 等原始异常泄漏给 check/restore/recover 消费者。
+    """
+    try:
+        return _load_verified_package(root, trash_journal)
+    except DraftError:
+        raise
+    except (OSError, UnicodeDecodeError) as exc:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, trash_journal.directory) from exc
+
+
+def _load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashPackage:
     package_id = validate_operation_id(trash_journal.operation_id)
     package_relative = OUTGOING_RELATIVE / package_id
     package_dir = root / package_relative
@@ -164,6 +189,7 @@ def load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashPa
     _reject_symlink(package_dir)
     manifest_path = package_dir / "package.json"
     _reject_symlink(manifest_path)
+    _require_regular_file(manifest_path, manifest_path)
     manifest_mutation = require_journal_write(trash_journal, package_relative / "package.json")
     if sha256_file(manifest_path) != manifest_mutation.after_sha256:
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, manifest_path)
@@ -214,6 +240,7 @@ def load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashPa
         _reject_symlink_components(root, hub_path)
 
     payload_path = package_dir / payload_relative
+    _require_regular_file(payload_path, payload_path)
     page_bytes = payload_path.read_bytes()
     if sha256_bytes(page_bytes) != payload_mutation.after_sha256:
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, payload_path)

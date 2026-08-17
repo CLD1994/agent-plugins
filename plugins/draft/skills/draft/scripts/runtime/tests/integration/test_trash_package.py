@@ -267,3 +267,70 @@ def test_package_rejects_operation_id_or_symlink_mismatch(
     assert sentinel.hits == []
     assert payload.is_symlink()
     assert (package_dir / "package.json").read_bytes() == original["package.json"]
+
+
+def test_package_json_as_directory_is_corrupt(draft_factory: DraftFactory) -> None:
+    """package.json 被替换成目录：报稳定损坏，而非原始 IsADirectoryError。
+
+    叶节点类型必须在摘要触达前验证：目录、设备、FIFO 等都不是权威包文件。
+    """
+    from draft.operations import operation_journal_path
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package_json = root / ".draft/trash/outgoing" / pending.operation_id / "package.json"
+    package_json.unlink()
+    package_json.mkdir()
+
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        load_verified_package(root, journal)
+
+
+def test_payload_missing_is_corrupt(draft_factory: DraftFactory) -> None:
+    """payload 缺失：报稳定损坏，而非原始 FileNotFoundError。"""
+    from draft.operations import operation_journal_path
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    payload = root / ".draft/trash/outgoing" / pending.operation_id / "payload/pages/obsolete.md"
+    payload.unlink()
+
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        load_verified_package(root, journal)
+
+
+def test_non_utf8_manifest_with_anchored_journal_is_corrupt(
+    draft_factory: DraftFactory,
+) -> None:
+    """清单字节与日志锚定一致但无法按 UTF-8 解码：报稳定损坏，而非 UnicodeDecodeError。"""
+    from draft.operations import operation_journal_path
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    manifest = root / ".draft/trash/outgoing" / pending.operation_id / "package.json"
+    manifest.write_bytes(b"\xff\xfe\x00garbage")
+    _anchor_manifest_to_journal(root, pending.operation_id)
+
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        load_verified_package(root, journal)
+
+
+def test_check_reports_package_json_directory_as_stable_diagnostic(
+    draft_factory: DraftFactory,
+) -> None:
+    """check_draft 对损坏包返回稳定诊断，不把原始文件系统异常抛给调用方。"""
+    from draft.checker import check_draft
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    package_json = root / ".draft/trash/outgoing" / pending.operation_id / "package.json"
+    package_json.unlink()
+    package_json.mkdir()
+
+    report = check_draft(root)
+    assert CheckCode.TRASH_PACKAGE_CORRUPT.value in tuple(
+        issue.code for issue in report.errors
+    )
