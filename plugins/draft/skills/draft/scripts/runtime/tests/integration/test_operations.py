@@ -783,6 +783,51 @@ def _plan_with_observed_inputs(root: Path) -> OperationPlan:
     )
 
 
+def test_graph_observations_covers_empty_managed_directory(
+    operation_draft: Path,
+) -> None:
+    """受管理命名空间的空目录也进入观察清单：向其中新增页面可被复核发现（计划 Task 10）。"""
+    from dataclasses import dataclass
+    from typing import cast
+
+    from draft.models import PageDocument
+    from draft.observations import EntryKind, graph_observations
+
+    root = operation_draft
+    (root / "pages/empty").mkdir()
+
+    @dataclass
+    class FakeGraph:
+        root: Path
+        pages: dict[Path, PageDocument]
+
+    class _Page:
+        text = "# A\n"
+
+    manifest = graph_observations(
+        FakeGraph(root=root, pages={Path("pages/a.md"): cast(PageDocument, _Page())})
+    )
+    observed = manifest.for_path(Path("pages/empty"))
+    assert observed is not None
+    assert observed.kind is EntryKind.DIRECTORY
+    assert observed.members == ()
+
+
+def test_execute_plan_detects_new_page_in_previously_empty_directory(
+    operation_draft: Path,
+) -> None:
+    """plan→execute 之间向此前为空的受管理目录新增页面：观察复核拒绝且不遗留锁。"""
+    root = operation_draft
+    (root / "pages/empty").mkdir()
+    plan = _plan_with_observed_inputs(root)
+    (root / "pages/empty/new.md").write_text("# new\n", encoding="utf-8")
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        execute_plan(plan)
+
+    assert read_lock(root) is None
+
+
 def test_execute_plan_observation_conflict_finalizes_journal_and_releases_lock(
     operation_draft: Path,
 ) -> None:

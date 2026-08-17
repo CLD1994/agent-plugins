@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -164,7 +165,7 @@ def graph_observations(graph: _GraphLike) -> ObservationManifest:
     ``graph`` 需提供 ``root`` 与 ``pages``（path → 带 ``text`` 的页面对象）。
     复杂度 O(页面字节总数 + 受管理目录条目数 + marker 一次读取)。
     """
-    from draft.graph import MARKER_PATH
+    from draft.graph import MARKER_PATH, PAGES_DIR
     from draft.operations import sha256_bytes
 
     entries: list[Observation] = []
@@ -176,6 +177,13 @@ def graph_observations(graph: _GraphLike) -> ObservationManifest:
             directories.add(parent)
             parent = parent.parent
     directories.add(Path("."))
+    # 受管理命名空间是 pages/ 整棵子树：必须观察全部目录成员（含此前为空的目录），
+    # 才能证明 plan→execute 之间没有向任意受管理目录新增可能引用目标的页面
+    # （计划 Task 10 Step 2），不能只从成功解析页面的祖先反推目录。
+    pages_root = graph.root / PAGES_DIR
+    if pages_root.is_dir() and not pages_root.is_symlink():
+        for dirpath, _dirnames, _filenames in os.walk(pages_root):
+            directories.add(Path(dirpath).relative_to(graph.root))
     root = graph.root
     for directory in sorted(directories):
         target = root / directory
