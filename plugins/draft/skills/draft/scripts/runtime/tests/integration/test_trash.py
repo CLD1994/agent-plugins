@@ -257,6 +257,38 @@ def test_candidate_trash_then_restore_roundtrips(draft_factory: DraftFactory) ->
     assert restore_journal.root_state is RootState.CANDIDATE
 
 
+def test_restore_rejects_concurrent_package_edit(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """restore 读集观察必须覆盖权威包：并发的 package.json 改动使恢复失败而非静默删除。"""
+    import draft.operations as ops_module
+    from draft.models import OperationPlan
+    from draft.operations import Journal
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+
+    original_verify = ops_module._verify_plan_observations  # pyright: ignore[reportPrivateUsage]
+
+    def verify_then_edit(root_path: Path, plan: OperationPlan, journal: Journal) -> None:
+        package_file = package / "package.json"
+        package_file.write_text(
+            package_file.read_text(encoding="utf-8") + "\n// 外部修改\n", encoding="utf-8"
+        )
+        original_verify(root_path, plan, journal)
+
+    monkeypatch.setattr(ops_module, "_verify_plan_observations", verify_then_edit)
+
+    # 读集变化使恢复按领域错误中止，而不是静默完成。
+    with pytest.raises(DraftError, match="trash.restore_conflict"):
+        restore_retained_trash(root, pending.operation_id, now=NOW)
+
+    # 唯一权威包未被静默删除。
+    assert package.exists()
+    assert (package / "package.json").is_file()
+
+
 def test_restore_completes_within_window(draft_factory: DraftFactory) -> None:
     root = build_trashable_draft(draft_factory)
     pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)

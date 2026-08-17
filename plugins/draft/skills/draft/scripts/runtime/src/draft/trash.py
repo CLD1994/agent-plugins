@@ -58,6 +58,7 @@ from draft.operations import (
     validate_operation_id,
     validate_restore_link,
     with_metadata,
+    with_observations,
     with_phase,
     without_metadata,
     write_journal,
@@ -468,18 +469,44 @@ def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackag
         (mutation for mutation in mutations if mutation.kind is MutationKind.DELETE),
         key=lambda mutation: str(mutation.path),
     )
-    from draft.observations import EMPTY_OBSERVATIONS
-
-    # restore 的完整观察闭包在 Task 11 按操作级契约补全；当前恢复复核由
-    # verify_restore_after_state 保证原子性。
+    observations = _restore_observations(resolved, package, graph)
     return OperationPlan(
         kind=OperationKind.RESTORE,
         root=resolved,
         mutations=tuple([*writes, *deletes]),
         root_state=root_state,
-        observations=EMPTY_OBSERVATIONS,
+        observations=observations,
         metadata={"operation_id": restore_id},
     )
+
+
+def _restore_observations(
+    root: Path, package: VerifiedTrashPackage, graph: DraftGraph
+) -> ObservationManifest:
+    """恢复读集观察：页面/目录/状态与权威删除包文件。
+
+    恢复计划读取父/枢纽导航、受影响页面与权威包；并发修改其中任一都会改变读集，
+    执行前复核必须拒绝（唯一权威包不变量）。
+    """
+    import os
+
+    from draft.observations import (
+        ObservationManifest,
+        file_digest_observation,
+        graph_observations,
+    )
+
+    entries = list(graph_observations(graph).entries)
+    if package.directory.is_dir():
+        for dirpath, _dirnames, filenames in os.walk(package.directory):
+            rel_dir = Path(dirpath).relative_to(root)
+            for name in sorted(filenames):
+                target = Path(dirpath) / name
+                if target.is_file() and not target.is_symlink():
+                    entries.append(
+                        file_digest_observation(rel_dir / name, sha256_bytes(target.read_bytes()))
+                    )
+    return ObservationManifest(entries=tuple(entries))
 
 
 def verify_restore_after_state(
@@ -765,6 +792,9 @@ def restore_retained_trash(
     write_journal(linked_trash)
     try:
         plan = build_restore_plan(resolved, restore_id, package)
+        # 读集观察耐久写入预分配日志，供执行前复核与恢复使用。
+        restore_journal = read_journal(operation_journal_path(resolved, restore_id))
+        write_journal(with_observations(restore_journal, plan.observations))
         result = execute_preallocated_plan(plan, retain_terminal_lock=True)
     except DraftError as error:
         return resolve_restore_execution(

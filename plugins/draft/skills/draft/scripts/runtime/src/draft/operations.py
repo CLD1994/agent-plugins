@@ -468,6 +468,21 @@ def with_phase(journal: Journal, phase: OperationPhase) -> Journal:
     )
 
 
+def with_observations(journal: Journal, observations: ObservationManifest) -> Journal:
+    """公开的不可变日志观察清单替换；restore 在规划后把读集观察耐久写入日志。"""
+    return Journal(
+        operation_id=journal.operation_id,
+        kind=journal.kind,
+        phase=journal.phase,
+        root_state=journal.root_state,
+        observations=observations,
+        mutations=journal.mutations,
+        remove_empty_directories=journal.remove_empty_directories,
+        metadata=journal.metadata,
+        directory=journal.directory,
+    )
+
+
 def with_metadata(journal: Journal, extra: Mapping[str, str]) -> Journal:
     """公开的不可变日志元数据合并；生命周期模块共享。"""
     return Journal(
@@ -942,6 +957,9 @@ def execute_preallocated_plan(
         raise DraftError("operation.plan_invalid", root)
     journal = read_journal(operation_journal_path(root, operation_id))
     validate_preallocated_journal(plan, journal)
+    # 预分配执行同样复核读集观察（如 restore 的权威包）：计划与日志的读集在
+    # 首次业务变更前必须与当前事实一致。
+    _verify_plan_observations(root, plan, journal)
     return _execute_allocated_plan(
         plan,
         journal,
