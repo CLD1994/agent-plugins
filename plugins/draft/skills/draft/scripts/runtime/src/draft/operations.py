@@ -1719,15 +1719,93 @@ def _mutation_temporary_path(target: Path, operation_id: str, index: int) -> Pat
     return target.with_name(f"{target.name}.tmp-{digest}")
 
 
-def _apply_write(root: Path, target: Path, content: bytes, *, temporary: Path) -> None:
-    destination = root / target
+def _quarantine_before_then_publish(
+    leaf: _AnchoredLeaf, *, expected_digest: str, content: bytes, code_path: Path
+) -> None:
+    """改写/回滚的节点事务：先隔离 before 到 quarantine（保留），发布新内容后再消费。
+
+    隔离名保持到新内容耐久发布之后才删除（回归 H4）：崩溃不会出现"目标缺失且无
+    隔离名"的歧义现场——before 节点要么仍在原名、要么可恢复地存在于隔离名，恢复
+    据此决定前向补发还是外部变化。每步命名动作后严格 fsync，inode 复核后消费。
+    """
+    quarantine = _quarantine_name(leaf.name)
+    try:
+        os.link(
+            leaf.name,
+            quarantine,
+            src_dir_fd=leaf.parent_fd,
+            dst_dir_fd=leaf.parent_fd,
+            follow_symlinks=False,
+        )
+    except FileExistsError as exc:
+        raise DraftError("operation.external_change", code_path) from exc
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+    _fsync_dir_fd(leaf.parent_fd, code_path)
+    if not _same_name_node(leaf.parent_fd, leaf.name, _name_node(leaf.parent_fd, quarantine)):
+        # 原名已被替换：不触碰未知节点，no-clobber 恢复隔离名并报告外部变化。
+        try:
+            os.link(
+                quarantine,
+                leaf.name,
+                src_dir_fd=leaf.parent_fd,
+                dst_dir_fd=leaf.parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            pass  # 原名被占用：同时保留两者。
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+        raise DraftError("operation.external_change", code_path)
+    try:
+        os.unlink(leaf.name, dir_fd=leaf.parent_fd)
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+    _fsync_dir_fd(leaf.parent_fd, code_path)
+    # 发布新内容（create-only no-clobber）：目标此刻缺失。
+    leaf.write(content)
+    # 消费陈旧 before 隔离名：inode + 内容复核后删除。
+    quarantined = _AnchoredLeaf(leaf.parent_fd, quarantine, leaf.display, leaf.code, leaf.code_path)
+    verified = _name_node(leaf.parent_fd, quarantine)
+    qk = quarantined.classify()
+    qd = sha256_bytes(quarantined.read()) if qk is EntryKind.FILE else None
+    if qk is not EntryKind.FILE or qd != expected_digest:
+        raise DraftError("operation.external_change", code_path)
+    if not _same_name_node(leaf.parent_fd, quarantine, verified):
+        raise DraftError("operation.external_change", code_path)
+    try:
+        os.unlink(quarantine, dir_fd=leaf.parent_fd)
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+    _fsync_dir_fd(leaf.parent_fd, code_path)
+
+
+def _apply_write(
+    root: Path,
+    target: Path,
+    content: bytes,
+    *,
+    expected_current: str | None,
+    code_path: Path,
+) -> None:
+    """摘要绑定受管写（回归 H4）。
+
+    先沿锚定链创建/同步目标父目录（回归 M2），再在同一锚定父目录内验证目标当前
+    授权状态并发布：
+    - ``expected_current=None``（新建）：目标必须 missing，create-only no-clobber
+      发布，目标瞬时出现即 external_change；
+    - ``expected_current=摘要``（改写/回滚）：先验证目标为精确摘要节点，经节点事务
+      隔离 before 到 quarantine（保留）后 no-clobber 发布新内容，再消费隔离名。
+
+    日志只授权把摘要精确的节点转换为目标状态，绝不覆盖最后复核后才出现的不同节点；
+    崩溃遗留的 ``{目标}.pending/.quarantine`` 由恢复按授权摘要收敛。
+    """
     cursor = root
     for part in target.parts[:-1]:
         cursor /= part
         if cursor.is_symlink():
             raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, cursor)
-    # 目录链从 root no-follow 逐层创建/同步（回归 M2）：多层新目录每层 mkdirat 后
-    # fsync 父目录，绝不按绝对路径重新解析祖先；晚到的组件链接由 O_NOFOLLOW 拒绝。
+    # 目录链逐层创建/同步（回归 M2）；晚到的组件链接由后续锚定 O_NOFOLLOW 拒绝。
     parent_fd = ensure_directory_chain(
         root,
         target.parent,
@@ -1735,32 +1813,38 @@ def _apply_write(root: Path, target: Path, content: bytes, *, temporary: Path) -
         code_path=target.parent,
     )
     os.close(parent_fd)
-    temporary = root / temporary
-    reject_symlink_components(root, temporary.relative_to(root))
-    if temporary.exists() or temporary.is_symlink():
-        # 崩溃遗留的同名精确临时文件：复核普通文件类型与内容后替换，不重复创建。
-        if temporary.is_symlink() or not temporary.is_file():
-            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, temporary)
-        if temporary.read_bytes() != content:
-            raise DraftError("operation.external_change", temporary)
-        replace_file(temporary, destination)
-        fsync_directory(destination.parent)
-        return
-    with temporary.open("xb") as handle:
-        handle.write(content)
-        handle.flush()
-        os.fsync(handle.fileno())
-    replace_file(temporary, destination)
-    fsync_directory(destination.parent)
+    with anchored_leaf(
+        root, target, code=CheckCode.PATH_SYMLINK_ESCAPE.value, code_path=code_path
+    ) as leaf:
+        if isinstance(leaf, _MissingLeaf):
+            raise DraftError("operation.external_change", code_path)
+        node = leaf.classify()
+        if expected_current is None:
+            if node is not EntryKind.MISSING:
+                raise DraftError("operation.external_change", code_path)
+            leaf.write(content)
+            return
+        if node is not EntryKind.FILE or sha256_bytes(leaf.read()) != expected_current:
+            raise DraftError("operation.external_change", code_path)
+        _quarantine_before_then_publish(
+            leaf, expected_digest=expected_current, content=content, code_path=code_path
+        )
 
 
-def _apply_delete(root: Path, target: Path) -> None:
-    destination = root / target
-    if destination.is_symlink():
-        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, destination)
-    if destination.exists():
-        destination.unlink()
-        fsync_directory(destination.parent)
+def _apply_delete(root: Path, target: Path, *, expected_digest: str) -> None:
+    """摘要绑定受管删（回归 H4）：目标必须当前为 expected_digest 的精确普通文件，
+    经节点事务隔离验证后消费；缺失（提交点后幂等清理）容忍。"""
+    with anchored_leaf(
+        root, target, code=CheckCode.PATH_SYMLINK_ESCAPE.value, code_path=root / target
+    ) as leaf:
+        if isinstance(leaf, _MissingLeaf):
+            return  # 中间组件缺失：目标必然缺失，幂等删除。
+        node = leaf.classify()
+        if node is EntryKind.MISSING:
+            return
+        if node is not EntryKind.FILE or sha256_bytes(leaf.read()) != expected_digest:
+            raise DraftError("operation.external_change", root / target)
+        leaf.quarantine_delete(expected_digest)
 
 
 def _execute_apply_phase(root: Path, journal: Journal) -> Journal:
@@ -1768,7 +1852,6 @@ def _execute_apply_phase(root: Path, journal: Journal) -> Journal:
     current = journal
     writes = [m for m in current.mutations if m.kind is MutationKind.WRITE]
     deletes = [m for m in current.mutations if m.kind is MutationKind.DELETE]
-    index_by_path = {m.path: index for index, m in enumerate(current.mutations)}
     for mutation in [*writes, *deletes]:
         if mutation.applied:
             continue
@@ -1777,12 +1860,19 @@ def _execute_apply_phase(root: Path, journal: Journal) -> Journal:
             staged_hash = sha256_file(staged)
             if staged_hash is None:
                 raise DraftError("operation.staged_missing", staged)
-            temporary = _mutation_temporary_path(
-                mutation.path, current.operation_id, index_by_path[mutation.path]
+            _apply_write(
+                root,
+                mutation.path,
+                staged.read_bytes(),
+                expected_current=mutation.before_sha256,
+                code_path=root / mutation.path,
             )
-            _apply_write(root, mutation.path, staged.read_bytes(), temporary=temporary)
         else:
-            _apply_delete(root, mutation.path)
+            _apply_delete(
+                root,
+                mutation.path,
+                expected_digest=cast("str", mutation.before_sha256),
+            )
         current = _with_applied(current, mutation.path)
         write_journal(current)
     return current
@@ -1946,20 +2036,25 @@ def _rollback(
         if current == mutation.before_sha256:
             continue
         if mutation.before_sha256 is None:
-            _apply_delete(root, mutation.path)
+            # 回滚新建 WRITE：目标当前为 after 精确节点，节点事务隔离验证后消费。
+            _apply_delete(
+                root,
+                mutation.path,
+                expected_digest=cast("str", mutation.after_sha256),
+            )
         else:
             original = journal.directory / cast("Path", mutation.original)
             original_hash = sha256_file(original)
             if original_hash != mutation.before_sha256:
                 raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, original)
-            # 确定性临时路径（回归 H2）：回滚重写也走登记精确临时路径，不用随机 uuid。
+            # 回滚改写/DELETE：目标当前为 after（或缺失）授权状态，恢复 original
+            # 的 before 内容（摘要绑定受管写，回归 H4）。
             _apply_write(
                 root,
                 mutation.path,
                 original.read_bytes(),
-                temporary=_mutation_temporary_path(
-                    mutation.path, journal.operation_id, journal.mutations.index(mutation)
-                ),
+                expected_current=mutation.after_sha256,
+                code_path=root / mutation.path,
             )
     return finalize_operation(
         root,
@@ -2009,17 +2104,15 @@ def _apply_one(root: Path, journal: Journal, mutation: JournalMutation) -> Journ
     if mutation.kind is MutationKind.WRITE:
         staged = journal.directory / cast("Path", mutation.staged)
         content = staged.read_bytes()
-        # 确定性临时路径（回归 H2）：前向恢复重写也走登记精确临时路径，不用随机 uuid。
         _apply_write(
             root,
             mutation.path,
             content,
-            temporary=_mutation_temporary_path(
-                mutation.path, journal.operation_id, journal.mutations.index(mutation)
-            ),
+            expected_current=mutation.before_sha256,
+            code_path=root / mutation.path,
         )
     else:
-        _apply_delete(root, mutation.path)
+        _apply_delete(root, mutation.path, expected_digest=cast("str", mutation.before_sha256))
     updated = _with_applied(journal, mutation.path)
     write_journal(updated)
     return updated
@@ -2869,6 +2962,88 @@ def _recover_managed_temp_quarantines(root: Path, journal: Journal) -> None:
         )
 
 
+def _recover_apply_transaction_artifacts(root: Path, journal: Journal) -> None:
+    """恢复前收敛受管写/删应用的崩溃遗留 pending/quarantine（回归 H4）。
+
+    改写/删除应用先把旧节点隔离到 ``{目标}.quarantine``（隔离名保持到新内容耐久发布
+    后才消费），发布用 create-only 产生 ``{目标}.pending``；崩溃后观察复核前先按授权
+    摘要分类收敛，让前向重放从干净状态继续，未登记同形名字仍当外部内容。
+    """
+    for mutation in journal.mutations:
+        relative = mutation.path
+        if mutation.after_sha256 is not None:
+            pending_path = relative.with_name(_pending_name(relative.name))
+            if classify_node(root / pending_path) is not EntryKind.MISSING:
+                recover_digest_pending(
+                    root,
+                    relative,
+                    mutation.after_sha256,
+                    code="operation.external_change",
+                    code_path=root / relative,
+                )
+        if mutation.before_sha256 is None:
+            continue
+        quarantine_path = relative.with_name(_quarantine_name(relative.name))
+        if classify_node(root / quarantine_path) is EntryKind.MISSING:
+            continue
+        _recover_apply_target_quarantine(root, journal, mutation)
+
+
+def _recover_apply_target_quarantine(
+    root: Path, journal: Journal, mutation: JournalMutation
+) -> None:
+    """目标 quarantine 收敛：隔离名必须是授权 before 节点。
+
+    目标处于 before（隔离后未删原名）时 delete_stale；目标缺失且为 WRITE（before 已
+    消费、after 未发布）时从登记 staged 补发 after 再删除隔离名；目标缺失且为 DELETE
+    （删除已消费 before）或目标处于 after（改写已完成）时按 inode 复核删除隔离名；
+    其余目标状态保留现场报外部变化。
+    """
+    relative = mutation.path
+    before = cast("str", mutation.before_sha256)
+    code_path = root / relative
+    with anchored_leaf(
+        root, relative, code="operation.external_change", code_path=code_path
+    ) as target:
+        if isinstance(target, _MissingLeaf):
+            return
+        quarantine = _AnchoredLeaf(
+            target.parent_fd,
+            _quarantine_name(target.name),
+            relative,
+            "operation.external_change",
+            code_path,
+        )
+        qk = quarantine.classify()
+        tk = target.classify()
+        # 先捕获 inode 再读内容验摘要：消费前复核隔离名仍指向刚验证的节点。
+        verified_node = _name_node(target.parent_fd, quarantine.name)
+        qd = sha256_bytes(quarantine.read()) if qk is EntryKind.FILE else None
+        if qk is not EntryKind.FILE or qd != before:
+            raise DraftError("operation.external_change", code_path)
+        td = sha256_bytes(target.read()) if tk is EntryKind.FILE else None
+        if tk is EntryKind.MISSING:
+            if mutation.kind is MutationKind.WRITE:
+                # before 已消费、after 未发布：从登记 staged 补发（create-only）。
+                staged = journal.directory / cast("Path", mutation.staged)
+                target.write(staged.read_bytes())
+        elif mutation.after_sha256 is not None and td == mutation.after_sha256:
+            pass  # 改写已完成：陈旧隔离名直接删除。
+        elif td == before:
+            # 目标仍在 before：隔离名已消费（delete_stale），直接删除。
+            pass
+        else:
+            raise DraftError("operation.external_change", code_path)
+        # 消费（删除）隔离名：inode 复核后删除。
+        if not _same_name_node(target.parent_fd, quarantine.name, verified_node):
+            raise DraftError("operation.external_change", code_path)
+        try:
+            os.unlink(quarantine.name, dir_fd=target.parent_fd)
+        except OSError as exc:
+            raise DraftError("operation.external_change", code_path) from exc
+        _fsync_dir_fd(target.parent_fd, code_path)
+
+
 def _clean_owned_temp_artifacts(
     root: Path, journal: Journal, consume_temps: frozenset[Path]
 ) -> None:
@@ -2929,12 +3104,16 @@ def _recover_locked(root: Path, operation_id: str) -> OperationResult:
             details=(f"阶段 {journal.phase.value} 由 trash 子系统恢复",),
         )
     _verify_recovery_material(journal)
-    for mutation in journal.mutations:
-        if _classify(root, mutation) == "unknown":
-            raise DraftError("operation.external_change", root / mutation.path)
     # 先把崩溃遗留的 managed temp quarantine 收敛（回归 H3）：被中断的 consume 删除
     # 留下的 ``{temp}.quarantine`` 若不在观察复核前处理，会被当成无法解释的新文件。
     _recover_managed_temp_quarantines(root, journal)
+    # 再收敛受管写/删应用的崩溃遗留 pending/quarantine（回归 H4）：被中断的改写/删除
+    # 隔离与发布留下的 ``{目标}.pending/.quarantine`` 会让目标短暂缺失/带残留名，必须
+    # 在 _classify 与观察复核前按授权摘要收敛，否则会误判为无法解释的外部变化。
+    _recover_apply_transaction_artifacts(root, journal)
+    for mutation in journal.mutations:
+        if _classify(root, mutation) == "unknown":
+            raise DraftError("operation.external_change", root / mutation.path)
     # 恢复前向完成必须复核观察清单：mutation 的 before/after 分类是可解释变化，
     # 其余被观察文件或目录成员的差异是无法解释的外部修改，保留现场（计划 Task 7
     # Step 4），不能把依赖旧读集语义的结果静默提交。

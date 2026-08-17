@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -120,6 +121,31 @@ def crash_on_nth_replace(nth: int) -> object:
         if calls == nth:
             raise RuntimeError("injected crash")
         source.replace(target)
+
+    return crash
+
+
+def crash_after_nth_apply(ops_module: Any, nth: int) -> object:
+    """第 Nth 次 _apply_write 完成后崩溃（回归 H4 节点事务发布语义）。
+
+    新的受管写不再走 replace_file（临时文件替换），而是节点事务（隔离 before +
+    create-only 发布）；"文件已落盘、日志未推进"的崩溃点改为 _apply_write 完成点。
+    """
+    original = ops_module._apply_write  # pyright: ignore[reportPrivateUsage]
+    calls = {"n": 0}
+
+    def crash(
+        root: Path,
+        target: Path,
+        content: bytes,
+        *,
+        expected_current: str | None,
+        code_path: Path,
+    ) -> None:
+        calls["n"] += 1
+        original(root, target, content, expected_current=expected_current, code_path=code_path)
+        if calls["n"] == nth:
+            raise RuntimeError("injected crash")
 
     return crash
 
@@ -386,7 +412,11 @@ def test_recover_finishes_a_partially_applied_plan(
     root = operation_draft
     plan, _old_a, _old_b, new_a, new_b = two_write_plan(root)
 
-    monkeypatch.setattr("draft.operations.replace_file", crash_on_nth_replace(2))
+    import draft.operations as operations_module
+
+    monkeypatch.setattr(
+        "draft.operations._apply_write", crash_after_nth_apply(operations_module, 2)
+    )
     with pytest.raises(RuntimeError, match="injected crash"):
         execute_plan(plan)
 
@@ -399,81 +429,98 @@ def test_recover_finishes_a_partially_applied_plan(
     assert not (root / ".draft/operation.lock").exists()
 
 
-def _operation_dir(root: Path) -> Path:
-    return next(entry for entry in (root / ".draft/operations").iterdir() if entry.is_dir())
-
-
-def test_recover_consumes_owned_temp_leftover(
+def test_recover_converges_apply_crash_leftover_quarantine(
     operation_draft: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """target=before + 精确 temp 摘要=after：允许消费（复核后清理）并前向完成（回归 H3）。"""
-    from draft.operations import _mutation_temporary_path  # pyright: ignore[reportPrivateUsage]
+    """改写应用发布前崩溃：before 隔离名遗留，恢复补发 after 并收敛（回归 H4）。"""
+    import draft.operations as operations_module
 
     root = operation_draft
-    plan, _old_a, _old_b, _new_a, new_b = two_write_plan(root)
-    monkeypatch.setattr("draft.operations.replace_file", crash_on_nth_replace(2))
-    with pytest.raises(RuntimeError, match="injected crash"):
+    plan, _old_a, old_b, new_a, new_b = two_write_plan(root)
+    original_write = operations_module._AnchoredLeaf.write  # pyright: ignore[reportPrivateUsage]
+    calls = {"n": 0}
+
+    def crash_on_second_write(self: Any, content: bytes) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:  # b.md 的 create-only 发布：a.md 已完成、b.md 隔离名遗留。
+            raise RuntimeError("injected crash during publish")
+        original_write(self, content)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        operations_module._AnchoredLeaf,  # pyright: ignore[reportPrivateUsage]
+        "write",
+        crash_on_second_write,
+    )
+    with pytest.raises(RuntimeError, match="injected crash during publish"):
         execute_plan(plan)
     monkeypatch.undo()
 
-    operation_id = _operation_dir(root).name
-    b_temp = root / _mutation_temporary_path(Path("pages/b.md"), operation_id, 1)
-    assert b_temp.read_bytes() == new_b  # 崩溃遗留精确 temp。
+    # b.md 的 before 隔离名遗留、目标缺失；a.md 已完成。
+    assert not (root / "pages/b.md").exists()
+    assert (root / "pages/b.md.quarantine").read_bytes() == old_b
+    assert (root / "pages/a.md").read_bytes() == new_a  # a.md 已是 after。
 
     result = recover(root)
 
     assert result.phase == "completed"
-    assert not b_temp.exists()  # 遗留 temp 被清理。
     assert (root / "pages/b.md").read_bytes() == new_b
+    assert not (root / "pages/b.md.quarantine").exists()
+    assert not (root / ".draft/operation.lock").exists()
 
 
-def test_recover_rejects_coexisting_temp_when_target_after(
+def test_recover_converges_exact_pending_at_after_target(
     operation_draft: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """target=after 却存在共存精确 temp：原子 replace 不会遗留，判外部变化（回归 H3）。"""
-    from draft.operations import _mutation_temporary_path  # pyright: ignore[reportPrivateUsage]
+    """target=after 且共存精确 pending（发布 link 后、消费 pending 前崩溃）：收敛消费（回归 H4）。"""
+    import draft.operations as operations_module
 
     root = operation_draft
     plan, _old_a, _old_b, new_a, _new_b = two_write_plan(root)
-    monkeypatch.setattr("draft.operations.replace_file", crash_on_nth_replace(2))
+    monkeypatch.setattr(
+        "draft.operations._apply_write",
+        crash_after_nth_apply(operations_module, 1),
+    )
     with pytest.raises(RuntimeError, match="injected crash"):
         execute_plan(plan)
     monkeypatch.undo()
-
-    operation_id = _operation_dir(root).name
-    a_temp = root / _mutation_temporary_path(Path("pages/a.md"), operation_id, 0)
-    a_temp.write_bytes(new_a)
-
-    with pytest.raises(DraftError, match="operation.external_change"):
-        recover(root)
-
     assert (root / "pages/a.md").read_bytes() == new_a
-    assert a_temp.is_file()  # 现场保留。
-    assert (root / ".draft/operation.lock").exists()
+
+    # 注入崩溃窗口内的精确 pending：target=after + pending=after → 删除 pending 收敛。
+    (root / "pages/a.md.pending").write_bytes(new_a)
+
+    result = recover(root)
+
+    assert result.phase == "completed"
+    assert (root / "pages/a.md").read_bytes() == new_a
+    assert not (root / "pages/a.md.pending").exists()
+    assert not (root / ".draft/operation.lock").exists()
 
 
-def test_recover_rejects_wrong_temp_content(
+def test_recover_rejects_foreign_pending_content(
     operation_draft: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """target=before + temp 摘要不符：外部篡改，判 external_change 并保留现场（回归 H3）。"""
-    from draft.operations import _mutation_temporary_path  # pyright: ignore[reportPrivateUsage]
+    """target=after 却存在摘要不符的 pending：外部篡改，判 external_change 并保留（回归 H4）。"""
+    import draft.operations as operations_module
 
     root = operation_draft
-    plan, old_a, _old_b, _new_a, _new_b = two_write_plan(root)
-    monkeypatch.setattr("draft.operations.replace_file", crash_on_nth_replace(1))
+    plan, _old_a, _old_b, new_a, _new_b = two_write_plan(root)
+    monkeypatch.setattr(
+        "draft.operations._apply_write",
+        crash_after_nth_apply(operations_module, 1),
+    )
     with pytest.raises(RuntimeError, match="injected crash"):
         execute_plan(plan)
     monkeypatch.undo()
+    assert (root / "pages/a.md").read_bytes() == new_a
 
-    operation_id = _operation_dir(root).name
-    a_temp = root / _mutation_temporary_path(Path("pages/a.md"), operation_id, 0)
-    a_temp.write_bytes(b"tampered")
+    foreign = root / "pages/a.md.pending"
+    foreign.write_bytes(b"tampered")
 
     with pytest.raises(DraftError, match="operation.external_change"):
         recover(root)
 
-    assert (root / "pages/a.md").read_bytes() == old_a  # 目标仍 before。
-    assert a_temp.read_bytes() == b"tampered"
+    assert (root / "pages/a.md").read_bytes() == new_a  # after 目标保留。
+    assert foreign.read_bytes() == b"tampered"  # 现场保留。
     assert (root / ".draft/operation.lock").exists()
 
 
@@ -483,7 +530,11 @@ def test_recover_stops_on_external_edit(
     root = operation_draft
     plan, _old_a, _old_b, _new_a, _new_b = two_write_plan(root)
 
-    monkeypatch.setattr("draft.operations.replace_file", crash_on_nth_replace(2))
+    import draft.operations as operations_module
+
+    monkeypatch.setattr(
+        "draft.operations._apply_write", crash_after_nth_apply(operations_module, 2)
+    )
     with pytest.raises(RuntimeError, match="injected crash"):
         execute_plan(plan)
     monkeypatch.undo()
@@ -565,7 +616,12 @@ def test_missing_staged_bytes_roll_back_from_originals(
     root = operation_draft
     plan, old_a, old_b, _new_a, _new_b = two_write_plan(root)
 
-    monkeypatch.setattr("draft.operations.replace_file", crash_on_nth_replace(2))
+    import draft.operations as operations_module
+
+    # 第 1 次 apply 后崩溃：a.md 已应用、b.md 仍 before，staged 缺失时才可回滚。
+    monkeypatch.setattr(
+        "draft.operations._apply_write", crash_after_nth_apply(operations_module, 1)
+    )
     with pytest.raises(RuntimeError, match="injected crash"):
         execute_plan(plan)
     monkeypatch.undo()
@@ -661,7 +717,11 @@ def test_second_platform_recovers_from_root_local_facts_only(
     root = operation_draft
     plan, _old_a, _old_b, new_a, new_b = two_write_plan(root)
 
-    monkeypatch.setattr("draft.operations.replace_file", crash_on_nth_replace(1))
+    import draft.operations as operations_module
+
+    monkeypatch.setattr(
+        "draft.operations._apply_write", crash_after_nth_apply(operations_module, 1)
+    )
     with pytest.raises(RuntimeError, match="injected crash"):
         execute_plan(plan)
     monkeypatch.undo()
@@ -1048,9 +1108,16 @@ def test_recover_uses_live_file_state_not_stale_applied(
         target: Path,
         content: bytes,
         *,
-        temporary: Path,
+        expected_current: str | None,
+        code_path: Path,
     ) -> None:
-        original_apply_write(root_path, target, content, temporary=temporary)
+        original_apply_write(
+            root_path,
+            target,
+            content,
+            expected_current=expected_current,
+            code_path=code_path,
+        )
         raise RuntimeError("injected crash after file lands")
 
     monkeypatch.setattr(ops_module, "_apply_write", write_then_crash)
@@ -2495,3 +2562,103 @@ def test_durable_write_rejects_symlink_ancestor(operation_draft: Path, tmp_path:
 
     assert not (external / "new").exists()  # 根外无任何文件。
     assert not (pages / "new").exists()
+
+
+def test_apply_write_overwrite_rejects_wrong_current_digest(
+    operation_draft: Path,
+) -> None:
+    """改写写目标当前摘要不符：external_change，目标保留（回归 H4）。"""
+    from draft.operations import _apply_write, sha256_bytes  # pyright: ignore[reportPrivateUsage]
+
+    root = operation_draft
+    target = Path("pages/a.md")
+    target_path = root / target
+    original = target_path.read_bytes()
+    target_path.write_bytes(b"unexpected external content")
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        _apply_write(
+            root,
+            target,
+            b"new content",
+            expected_current=sha256_bytes(original),
+            code_path=target_path,
+        )
+
+    assert target_path.read_bytes() == b"unexpected external content"  # 目标保留。
+    assert not (root / "pages/a.md.pending").exists()
+    assert not (root / "pages/a.md.quarantine").exists()
+
+
+def test_apply_write_new_file_rejects_existing_target(operation_draft: Path) -> None:
+    """新建写目标已存在：external_change，目标保留（回归 H4）。"""
+    from draft.operations import _apply_write  # pyright: ignore[reportPrivateUsage]
+
+    root = operation_draft
+    target = Path("pages/a.md")
+    target_path = root / target
+    original = target_path.read_bytes()
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        _apply_write(root, target, b"new content", expected_current=None, code_path=target_path)
+
+    assert target_path.read_bytes() == original  # 目标保留。
+    assert not (root / "pages/a.md.pending").exists()
+
+
+def test_apply_delete_rejects_wrong_digest(operation_draft: Path) -> None:
+    """删除目标当前摘要不符：external_change，目标保留（回归 H4）。"""
+    from draft.operations import _apply_delete, sha256_bytes  # pyright: ignore[reportPrivateUsage]
+
+    root = operation_draft
+    target = Path("pages/a.md")
+    target_path = root / target
+    target_path.write_bytes(b"different content")
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        _apply_delete(root, target, expected_digest=sha256_bytes(b"expected"))
+
+    assert target_path.read_bytes() == b"different content"  # 目标保留。
+    assert not (root / "pages/a.md.quarantine").exists()
+
+
+def test_apply_write_overwrite_preserves_unknown_quarantined_node(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """改写隔离 link 后、unlink 前替换原名：inode 复核拒绝，未知节点不删（回归 H4）。"""
+    import os as os_module
+
+    from draft.operations import _apply_write, sha256_bytes  # pyright: ignore[reportPrivateUsage]
+
+    root = operation_draft
+    target = Path("pages/a.md")
+    target_path = root / target
+    original = target_path.read_bytes()
+    expected = sha256_bytes(original)
+    real_link = os_module.link
+    calls = {"n": 0}
+
+    def swap_after_first_link(
+        src: str | bytes | os_module.PathLike[str],
+        dst: str | bytes | os_module.PathLike[str],
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        calls["n"] += 1
+        real_link(
+            src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, follow_symlinks=follow_symlinks
+        )
+        if calls["n"] == 1:
+            # 隔离 link 之后替换原名（新 inode）：inode 复核必须拒绝，不删未知节点。
+            target_path.unlink()
+            target_path.write_bytes(b"attacker replaced name")
+
+    monkeypatch.setattr(os_module, "link", swap_after_first_link)
+    with pytest.raises(DraftError, match="operation.external_change"):
+        _apply_write(root, target, b"new content", expected_current=expected, code_path=target_path)
+    monkeypatch.undo()
+
+    assert target_path.read_bytes() == b"attacker replaced name"  # 未知节点保留。
+    assert (root / "pages/a.md.quarantine").read_bytes() == original  # 隔离的原始节点保留。

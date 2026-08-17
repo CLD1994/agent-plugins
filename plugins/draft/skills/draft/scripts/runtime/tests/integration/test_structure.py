@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -284,17 +285,32 @@ def test_move_target_escaping_root_fails(draft_factory: DraftFactory) -> None:
 def test_interrupted_move_recovers_to_same_final_state(
     draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import draft.operations as ops_module
+
     root = build_two_hub_draft(draft_factory)
-    calls = 0
+    original_apply_write = ops_module._apply_write  # pyright: ignore[reportPrivateUsage]
+    calls = {"n": 0}
 
-    def crash_on_second(source: Path, target: Path) -> None:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
+    def crash_on_second_apply(
+        root_path: Path,
+        target: Path,
+        content: bytes,
+        *,
+        expected_current: str | None,
+        code_path: Path,
+    ) -> None:
+        calls["n"] += 1
+        original_apply_write(
+            root_path,
+            target,
+            content,
+            expected_current=expected_current,
+            code_path=code_path,
+        )
+        if calls["n"] == 2:  # 第二次 apply 已落盘、日志未推进：崩溃。
             raise RuntimeError("injected crash")
-        source.replace(target)
 
-    monkeypatch.setattr("draft.operations.replace_file", crash_on_second)
+    monkeypatch.setattr(ops_module, "_apply_write", crash_on_second_apply)
     with pytest.raises(RuntimeError, match="injected crash"):
         move_page(root, Path("pages/old/a.md"), Path("pages/new/a.md"))
     monkeypatch.undo()
@@ -499,9 +515,16 @@ def test_promote_crash_after_first_new_hub_write_recovers(
         target: Path,
         content: bytes,
         *,
-        temporary: Path,
+        expected_current: str | None,
+        code_path: Path,
     ) -> None:
-        original_apply_write(root_path, target, content, temporary=temporary)
+        original_apply_write(
+            root_path,
+            target,
+            content,
+            expected_current=expected_current,
+            code_path=code_path,
+        )
         if str(target).startswith("pages/topic/"):
             raise RuntimeError("injected crash after new hub file lands")
 
@@ -573,9 +596,16 @@ def test_promote_crash_recovery_rejects_intruder_in_created_directory(
         target: Path,
         content: bytes,
         *,
-        temporary: Path,
+        expected_current: str | None,
+        code_path: Path,
     ) -> None:
-        original_apply_write(root_path, target, content, temporary=temporary)
+        original_apply_write(
+            root_path,
+            target,
+            content,
+            expected_current=expected_current,
+            code_path=code_path,
+        )
         if str(target).startswith("pages/topic/"):
             raise RuntimeError("injected crash after new hub file lands")
 
@@ -617,15 +647,20 @@ def test_promote_crash_before_replace_recovers_created_directory(
     from draft.operations import read_lock, recover
 
     root = build_promote_draft(draft_factory)
-    original_replace = ops_module.replace_file  # pyright: ignore[reportPrivateUsage]
+    original_write = ops_module._AnchoredLeaf.write  # pyright: ignore[reportPrivateUsage]
 
-    def crash_before_replace(source: Path, target: Path) -> None:
-        if "pages/topic/" in str(target):
-            raise RuntimeError("injected crash before replace")
-        original_replace(source, target)
+    def crash_before_publish(self: Any, content: bytes) -> None:
+        # 目录链已创建、目标文件发布前崩溃：本操作创建的空目录遗留。
+        if "pages/topic/" in str(self.display):
+            raise RuntimeError("injected crash before publish")
+        original_write(self, content)
 
-    monkeypatch.setattr(ops_module, "replace_file", crash_before_replace)
-    with pytest.raises(RuntimeError, match="injected crash before replace"):
+    monkeypatch.setattr(
+        ops_module._AnchoredLeaf,  # pyright: ignore[reportPrivateUsage]
+        "write",
+        crash_before_publish,
+    )
+    with pytest.raises(RuntimeError, match="injected crash before publish"):
         promote_page(
             root, Path("pages/topic.md"), [Path("pages/child-a.md"), Path("pages/child-b.md")]
         )
@@ -656,15 +691,20 @@ def test_promote_crash_before_replace_rejects_intruder_in_created_directory(
     from draft.operations import read_lock, recover
 
     root = build_promote_draft(draft_factory)
-    original_replace = ops_module.replace_file  # pyright: ignore[reportPrivateUsage]
+    original_write = ops_module._AnchoredLeaf.write  # pyright: ignore[reportPrivateUsage]
 
-    def crash_before_replace(source: Path, target: Path) -> None:
-        if "pages/topic/" in str(target):
-            raise RuntimeError("injected crash before replace")
-        original_replace(source, target)
+    def crash_before_publish(self: Any, content: bytes) -> None:
+        # 目录链已创建、目标文件发布前崩溃：本操作创建的空目录遗留。
+        if "pages/topic/" in str(self.display):
+            raise RuntimeError("injected crash before publish")
+        original_write(self, content)
 
-    monkeypatch.setattr(ops_module, "replace_file", crash_before_replace)
-    with pytest.raises(RuntimeError, match="injected crash before replace"):
+    monkeypatch.setattr(
+        ops_module._AnchoredLeaf,  # pyright: ignore[reportPrivateUsage]
+        "write",
+        crash_before_publish,
+    )
+    with pytest.raises(RuntimeError, match="injected crash before publish"):
         promote_page(
             root, Path("pages/topic.md"), [Path("pages/child-a.md"), Path("pages/child-b.md")]
         )
@@ -702,9 +742,16 @@ def test_promote_crash_recovery_rejects_same_basename_unregistered_temp(
         target: Path,
         content: bytes,
         *,
-        temporary: Path,
+        expected_current: str | None,
+        code_path: Path,
     ) -> None:
-        original_apply_write(root_path, target, content, temporary=temporary)
+        original_apply_write(
+            root_path,
+            target,
+            content,
+            expected_current=expected_current,
+            code_path=code_path,
+        )
         if str(target).startswith("pages/topic/"):
             raise RuntimeError("injected crash after new hub file lands")
 
@@ -766,9 +813,16 @@ def test_promote_crash_recovery_rejects_intruder_in_nested_created_directory(
         target: Path,
         content: bytes,
         *,
-        temporary: Path,
+        expected_current: str | None,
+        code_path: Path,
     ) -> None:
-        original_apply_write(root_path, target, content, temporary=temporary)
+        original_apply_write(
+            root_path,
+            target,
+            content,
+            expected_current=expected_current,
+            code_path=code_path,
+        )
         if str(target).startswith("pages/topic/sub/"):
             raise RuntimeError("injected crash after nested hub file lands")
 
