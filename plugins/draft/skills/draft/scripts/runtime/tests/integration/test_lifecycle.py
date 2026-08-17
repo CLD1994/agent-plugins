@@ -248,6 +248,67 @@ def test_adopt_rejects_concurrent_page_change(
     assert "并发补充" in (root / "index.md").read_text(encoding="utf-8")
 
 
+def test_adopt_observations_cover_pre_existing_internal_protocol_files(
+    tmp_path: Path,
+) -> None:
+    """adopt 观察清单必须纳入既有操作日志与权威删除包（规格 §12.1）。"""
+    from draft.graph import load_graph_tolerant
+    from draft.observations import graph_observations, internal_protocol_observations
+
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    # 既有终态操作日志与权威删除包。
+    journal_dir = root / ".draft/operations" / ("b" * 32)
+    journal_dir.mkdir(parents=True)
+    (journal_dir / "journal.json").write_text("{}", encoding="utf-8")
+    package = root / ".draft/trash/outgoing" / ("c" * 32) / "package.json"
+    package.parent.mkdir(parents=True)
+    package.write_text('{"version":1}\n', encoding="utf-8")
+
+    graph = load_graph_tolerant(root).graph
+    manifest = internal_protocol_observations(graph)
+    merged = graph_observations(graph).entries + manifest.entries
+
+    assert Path(".draft/operations") / ("b" * 32) / "journal.json" in {
+        entry.path for entry in merged
+    }
+    assert Path(".draft/trash/outgoing") / ("c" * 32) / "package.json" in {
+        entry.path for entry in merged
+    }
+
+
+def test_adopt_rejects_concurrent_internal_protocol_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """adopt 锁内复核发现内部协议文件并发变化时不应用 marker 变更（规格 §12.1）。"""
+    import draft.operations as ops_module
+
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    # 既有权威删除包：adopt 必须观察它。
+    package = root / ".draft/trash/outgoing" / ("a" * 32) / "package.json"
+    package.parent.mkdir(parents=True)
+    package.write_text('{"version":1}\n', encoding="utf-8")
+
+    from draft.models import OperationPlan
+    from draft.operations import Journal
+
+    original_verify = ops_module._verify_plan_observations  # pyright: ignore[reportPrivateUsage]
+
+    def verify_then_edit(root_path: Path, plan: OperationPlan, journal: Journal) -> None:
+        package.write_text('{"version":2}\n', encoding="utf-8")
+        original_verify(root_path, plan, journal)
+
+    monkeypatch.setattr(ops_module, "_verify_plan_observations", verify_then_edit)
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        adopt(root)
+
+    assert (root / ".draft/draft.json").read_text(encoding="utf-8") == managed_marker_text(
+        root_state=RootState.CANDIDATE
+    )
+
+
 def _crash_during_adopt(root: Path, monkeypatch: pytest.MonkeyPatch, *, on_verify: bool) -> None:
     """在 adopt 执行期注入进程级中断：before marker 应用时或 marker 应用后。"""
     import draft.operations as ops_module

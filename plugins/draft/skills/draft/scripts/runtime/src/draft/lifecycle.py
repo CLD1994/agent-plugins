@@ -21,7 +21,6 @@ from draft.models import (
     OperationResult,
     RootState,
 )
-from draft.observations import graph_observations
 from draft.operations import (
     durable_write,
     fsync_directory,
@@ -129,6 +128,21 @@ def adopt(root: Path) -> OperationResult:
     before_bytes = final_marker.read_bytes()
     after_bytes = marker_bytes(RootState.REGISTERED, state.conclusions_state)
     graph = load_graph_tolerant(target).graph
+    from draft.observations import (
+        Observation,
+        ObservationManifest,
+        graph_observations,
+        internal_protocol_observations,
+    )
+
+    # marker 同时属于页面协议与内部协议，两处捕获会重复：按路径去重。
+    merged: dict[Path, Observation] = {}
+    for observation in (
+        *graph_observations(graph).entries,
+        *internal_protocol_observations(graph).entries,
+    ):
+        merged.setdefault(observation.path, observation)
+    observations = ObservationManifest(entries=tuple(merged.values()))
     plan = OperationPlan(
         kind=OperationKind.ADOPT,
         root=target,
@@ -142,6 +156,6 @@ def adopt(root: Path) -> OperationResult:
             ),
         ),
         root_state=RootState.CANDIDATE,
-        observations=graph_observations(graph),
+        observations=observations,
     )
     return execute_plan(plan)

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from draft.graph import DraftGraph
     from draft.models import PageDocument
 
 
@@ -196,4 +197,60 @@ def graph_observations(graph: _GraphLike) -> ObservationManifest:
     marker = root / MARKER_PATH
     if marker.is_file() and not marker.is_symlink():
         entries.append(file_digest_observation(MARKER_PATH, sha256_bytes(marker.read_bytes())))
+    return ObservationManifest(entries=tuple(entries))
+
+
+def internal_protocol_observations(graph: DraftGraph) -> ObservationManifest:
+    """adopt 的额外观察：既有内部协议文件、目录成员与根内资源目标（规格 §12.1）。
+
+    只观察本函数调用时已存在的 .draft/ 内部文件（操作日志、恢复副本、权威删除包、
+    锁等）与根内本地资源目标；adopt 随后自己创建的操作目录与锁由恢复复核按可解释
+    变化处理。复杂度 O(内部文件字节数 + 目录条目数)。
+    """
+    from draft.graph import INTERNAL_DIR
+    from draft.operations import sha256_bytes
+    from draft.resources import ResourceKind, ResourceScope, TargetState
+
+    entries: list[Observation] = []
+    directories: set[Path] = set()
+    internal = graph.root / INTERNAL_DIR
+    if internal.is_dir() and not internal.is_symlink():
+        for dirpath, _dirnames, filenames in os.walk(internal):
+            relative_dir = Path(dirpath).relative_to(graph.root)
+            directories.add(relative_dir)
+            for name in sorted(filenames):
+                relative = relative_dir / name
+                target = graph.root / relative
+                if target.is_file() and not target.is_symlink():
+                    entries.append(
+                        file_digest_observation(relative, sha256_bytes(target.read_bytes()))
+                    )
+    # 完整检查实际读到的根内本地资源目标（页面/本地文件，present）。
+    for references in graph.body_resources.values():
+        for reference in references:
+            resource = reference.resource
+            if resource.target_state is not TargetState.PRESENT:
+                continue
+            if resource.kind is ResourceKind.PAGE or (
+                resource.kind is ResourceKind.LOCAL and resource.scope is ResourceScope.DRAFT
+            ):
+                relative = Path(resource.target)
+            else:
+                continue
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            if relative in graph.pages:
+                continue
+            target = graph.root / relative
+            if target.is_file() and not target.is_symlink():
+                entries.append(file_digest_observation(relative, sha256_bytes(target.read_bytes())))
+                directories.add(relative.parent)
+    for directory in sorted(directories):
+        target = graph.root / directory
+        members = (
+            tuple(sorted(entry.name for entry in target.iterdir()))
+            if target.is_dir() and not target.is_symlink()
+            else ()
+        )
+        entries.append(directory_observation(directory, members))
     return ObservationManifest(entries=tuple(entries))

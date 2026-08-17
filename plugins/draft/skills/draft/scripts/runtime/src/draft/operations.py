@@ -1178,6 +1178,11 @@ def _verify_observations_for_recovery(
             added.setdefault(parent, set()).add(mutation.path.name)
         elif mutation.kind is MutationKind.DELETE:
             removed.setdefault(parent, set()).add(mutation.path.name)
+    # 本操作自身创建的操作目录与锁会改变父目录成员，属于可解释变化
+    # （adopt 观察清单包含内部目录成员，规格 §12.1）。
+    journal_dir = journal.directory.relative_to(root)
+    added.setdefault(journal_dir.parent, set()).add(journal_dir.name)
+    added.setdefault(LOCK_RELATIVE.parent, set()).add(LOCK_RELATIVE.name)
 
     adjusted: list[Observation] = []
     for observation in journal.observations.entries:
