@@ -84,6 +84,30 @@ def test_initialize_marker_publish_failure_rolls_back(
     assert not root.exists()
 
 
+def test_initialize_check_failure_removes_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """最终检查失败（确定性失败）时 marker 必须回滚，不能留下半初始化根（规格 §6）。"""
+    from draft.models import CheckIssue, CheckReport, IssueSeverity
+
+    def failing_check(root: Path) -> CheckReport:
+        del root
+        return CheckReport(
+            issues=(CheckIssue("test.injected", IssueSeverity.ERROR, Path("index.md"), None),)
+        )
+
+    monkeypatch.setattr(lifecycle_module, "check_draft", failing_check)
+
+    root = tmp_path / "new-topic"
+    with pytest.raises(DraftError, match="init.invalid_template"):
+        initialize(root)
+
+    assert not (root / ".draft/draft.json").exists()
+    assert not (root / "index.md").exists()
+    assert not (root / "pages").exists()
+    assert not root.exists()
+
+
 def test_initialize_finalize_crash_leaves_complete_registered_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

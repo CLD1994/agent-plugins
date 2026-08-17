@@ -83,6 +83,10 @@ def initialize(root: Path, *, root_state: RootState = RootState.REGISTERED) -> N
         report = check_draft(target)
         if report.errors:
             codes = tuple(issue.code for issue in report.errors)
+            # 检查失败是确定性失败，不是 marker 线性化点后的崩溃：marker 必须回滚，
+            # 不能把"有效 marker + 缺失骨架"伪装成已完成初始化（规格 §6）。随后通用
+            # 清理会移除空的 .draft/、骨架与目标目录。
+            (target / MARKER_PATH).unlink(missing_ok=True)
             raise DraftError("init.invalid_template", target, details=codes)
     except Exception:
         for path in sorted(created, key=lambda entry: len(entry.parts), reverse=True):
