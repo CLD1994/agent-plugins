@@ -314,11 +314,12 @@ def test_status_set_changes_and_validates_final_state(
 def test_status_set_on_crlf_page_succeeds(
     draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """CRLF 页面：观察与 before 摘要必须基于实际读取字节，命令不得报 external_change。"""
+    """CRLF 页面：写回只修改状态跨度，未修改字节（含 \r\n）保持不变。"""
     root = build_page_draft(draft_factory)
     page = root / "pages/a.md"
     text = page.read_text(encoding="utf-8")
     page.write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+    crlf_before = (root / "pages/a.md").read_bytes().count(b"\r\n")
     capsys.readouterr()
 
     code, payload = run_json(
@@ -327,7 +328,43 @@ def test_status_set_on_crlf_page_succeeds(
 
     assert code == 0
     assert payload["result_type"] == "status.set"
-    assert "当前提案" in (root / "pages/a.md").read_text(encoding="utf-8")
+    after_bytes = (root / "pages/a.md").read_bytes()
+    # 未修改区域的换行与字节保持不变，只有状态跨度被替换。
+    assert after_bytes.count(b"\r\n") == crlf_before
+    assert "当前提案".encode() in after_bytes
+    assert check_draft(root).errors == ()
+
+
+def test_relation_add_on_crlf_page_preserves_unmodified_bytes(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CRLF 页面：relation add 只插入新行，未修改行的换行保持不变。"""
+    root = build_page_draft(draft_factory)
+    page = root / "pages/a.md"
+    page.write_bytes(page.read_text(encoding="utf-8").replace("\n", "\r\n").encode("utf-8"))
+    assert b"\r\n" in page.read_bytes()
+    capsys.readouterr()
+
+    code, payload = run_json(
+        [
+            "relation",
+            "add",
+            "--root",
+            str(root),
+            "pages/a.md",
+            "depends_on",
+            "pages/b.md",
+            "--json",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    assert payload["result_type"] == "relation.add"
+    after_bytes = (root / "pages/a.md").read_bytes()
+    # 未修改的标题行仍为 CRLF（read_bytes 不规范化换行）。
+    assert after_bytes.split(b"\n")[0].endswith(b"\r")
+    assert "依赖".encode() in after_bytes
     assert check_draft(root).errors == ()
 
 

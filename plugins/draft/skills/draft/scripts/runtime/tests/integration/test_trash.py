@@ -341,6 +341,24 @@ def test_restore_rejects_concurrent_package_addition(
     assert not (root / ".draft/operation.lock").exists()
 
 
+def test_trash_restore_crlf_page_is_byte_identical(
+    draft_factory: DraftFactory,
+) -> None:
+    """CRLF 页面 trash 后 restore 必须逐字节还原（权威包保存实际字节）。"""
+    root = build_trashable_draft(draft_factory)
+    page = root / "pages/obsolete.md"
+    crlf = page.read_text(encoding="utf-8").replace("\n", "\r\n")
+    page.write_bytes(crlf.encode("utf-8"))
+    crlf_before = page.read_bytes()
+
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    result = restore_retained_trash(root, pending.operation_id, now=NOW)
+
+    assert result.phase is OperationPhase.COMPLETED
+    assert (root / "pages/obsolete.md").read_bytes() == crlf_before
+    assert check_draft(root).errors == ()
+
+
 def test_restore_completes_within_window(draft_factory: DraftFactory) -> None:
     root = build_trashable_draft(draft_factory)
     pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)

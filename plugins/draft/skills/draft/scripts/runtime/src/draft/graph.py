@@ -264,9 +264,10 @@ def _load(root: Path) -> LoadResult:
     for relative in managed_paths:
         try:
             data = (root / relative).read_bytes()
-            # 保留原始字节用于观察/mutation 摘要；文本按通用换行规范化为 \n 供解析。
+            # 保留原始字节用于观察/mutation 摘要；解析与重写基于原始解码文本保留 \r\n，
+            # 使机械命令只修改协议要求的跨度，未修改区域的字节表示保持不变。
             page_bytes[relative] = data
-            text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+            text = data.decode("utf-8")
             pages[relative] = parse_page(relative, text)
         except (UnicodeDecodeError, OSError) as exc:
             issues.append(

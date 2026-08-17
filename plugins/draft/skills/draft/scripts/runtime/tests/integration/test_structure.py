@@ -463,6 +463,23 @@ def build_promote_draft(draft_factory: DraftFactory) -> Path:
     )
 
 
+def test_move_crlf_page_preserves_unmodified_bytes(
+    draft_factory: DraftFactory,
+) -> None:
+    """CRLF 页面移动后：未修改字节（含 \r\n）保持不变，只重写协议要求的链接跨度。"""
+    root = build_two_hub_draft(draft_factory)
+    page = root / "pages/old/a.md"
+    page.write_bytes(page.read_text(encoding="utf-8").replace("\n", "\r\n").encode("utf-8"))
+
+    move_page(root, Path("pages/old/a.md"), Path("pages/new/a.md"))
+
+    moved = (root / "pages/new/a.md").read_bytes()
+    assert b"\r\n" in moved
+    # 正文"关联 [留存](keep.md#细节)"的未修改部分保持 CRLF。
+    assert moved.split(b"\n")[0].endswith(b"\r")
+    assert check_draft(root).errors == ()
+
+
 def test_promote_crash_after_first_new_hub_write_recovers(
     draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
