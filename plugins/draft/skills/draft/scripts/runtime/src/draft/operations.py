@@ -1234,16 +1234,18 @@ def adjusted_observation_manifest(
     explained: frozenset[Path],
     added: Mapping[Path, Set[str]],
     removed: Mapping[Path, Set[str]],
+    created_dirs: frozenset[Path] = frozenset(),
 ) -> ObservationManifest:
     """纯函数：按本操作可解释的目录成员变化调整观察清单。
 
     只排除本操作目录/锁与 explained mutation 路径；目录成员调整为"若只发生本操作
     mutation 应有的成员"，再与当前状态比较，避免把操作自身副作用误判为外部修改。
 
-    计划期不存在的目录没有观察基线：本操作实际创建时按"只含本操作创建成员"
-    合成精确期望（MISSING 观察转换或未观察目录补建），恢复才能证明新目录内部
-    只含本操作条目、不吸收外部注入（如 promote 首次创建 pages/topic/）。
-    不访问文件系统，可独立单测。
+    计划期不存在的目录没有观察基线：本操作实际创建（``created_dirs``，目标文件
+    尚未达到 after 时成员集合允许为空）按"只含本操作创建成员"合成精确期望（MISSING
+    观察转换或未观察目录补建），恢复才能证明新目录内部只含本操作条目、不吸收外部
+    注入（如 promote 首次创建 pages/topic/）。目录出现不等于目录内任意内容也由本
+    操作创建。不访问文件系统，可独立单测。
     """
     from draft.observations import (
         EntryKind,
@@ -1267,21 +1269,27 @@ def adjusted_observation_manifest(
                 )
             )
             adjusted.append(directory_observation(observation.path, expected))
-        elif observation.kind is EntryKind.MISSING and observation.path in added:
-            # 计划期缺失的目录被本操作创建：期望恰好是操作创建的成员集合。
+        elif observation.kind is EntryKind.MISSING and (
+            observation.path in added or observation.path in created_dirs
+        ):
+            # 计划期缺失的目录被本操作创建：期望恰好是操作创建的成员集合（可为空）。
             adjusted.append(
-                directory_observation(observation.path, tuple(sorted(added[observation.path])))
+                directory_observation(
+                    observation.path, tuple(sorted(added.get(observation.path, set())))
+                )
             )
         else:
             adjusted.append(observation)
-    for directory, members in sorted(added.items()):
+    for directory in sorted(set(added) | set(created_dirs)):
         if directory in excluded or directory in explained:
             continue
         if directory in observed_paths:
             continue  # 已有观察：DIRECTORY 已在上方调整，MISSING 已在上方转换。
         if not is_missing(directory):
             continue  # 无法证明计划期缺失：保守不合成（避免误判已存在共享目录）。
-        adjusted.append(directory_observation(directory, tuple(sorted(members))))
+        adjusted.append(
+            directory_observation(directory, tuple(sorted(added.get(directory, set()))))
+        )
     return ObservationManifest(entries=tuple(adjusted))
 
 
@@ -1368,18 +1376,21 @@ def _verify_observations_for_recovery(
     # 从全部计划创建目标（WRITE-before-None mutation、操作日志目录、锁）的祖先链
     # 推导"本操作可能创建的目录闭包"；只把当前确实存在（本操作已 mkdir）的目录
     # 计入可解释创建。不等到目标文件达到 after 才承认目录出现：mkdir 后、目标文件
-    # 替换前崩溃时，本操作创建的空目录不得被误判为外部变化（回归 H2）。
+    # 替换前崩溃时，本操作创建的空目录不得被误判为外部变化。created_dirs 单独保留，
+    # 供合成"成员可为空"的明确观察（回归 H3）。
     is_missing = _plan_time_missing_index(journal.observations)
     plan_created_targets = [
         mutation.path
         for mutation in journal.mutations
         if mutation.kind is MutationKind.WRITE and mutation.before_sha256 is None
     ]
+    created_dirs: set[Path] = set()
     for target in [*plan_created_targets, journal.directory.relative_to(root), LOCK_RELATIVE]:
         current = target.parent
         while is_missing(current):
             if probe.observe(current).kind is EntryKind.DIRECTORY:
                 created_paths.add(current)
+                created_dirs.add(current)
             current = current.parent
             if current == current.parent:
                 break
@@ -1401,6 +1412,7 @@ def _verify_observations_for_recovery(
         explained=frozenset(explained),
         added=added,
         removed=removed,
+        created_dirs=frozenset(created_dirs),
     )
 
     owned_temp_bases = frozenset(

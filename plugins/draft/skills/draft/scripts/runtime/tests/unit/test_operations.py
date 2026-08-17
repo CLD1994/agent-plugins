@@ -168,6 +168,46 @@ def test_adjusted_observation_manifest_synthesizes_deep_missing_directory() -> N
     assert deep.members == ("index.md",)
 
 
+def test_adjusted_observation_manifest_synthesizes_created_dir_with_empty_members() -> None:
+    """created_dirs 中目标文件仍为 before 的目录必须合成成员可为空的观察（回归 H3）。
+
+    目录出现不等于目录内任意内容也由本操作创建；即使期望成员为空也必须形成明确
+    观察，否则外部注入会被吸收。
+    """
+    manifest = ObservationManifest(entries=(directory_observation(Path("pages"), ("topic.md",)),))
+    adjusted = adjusted_observation_manifest(
+        manifest,
+        excluded=frozenset({Path(".draft/operations/x")}),
+        explained=frozenset({Path("pages/topic.md")}),
+        added={Path("pages"): frozenset({"topic"})},
+        removed={Path("pages"): frozenset({"topic.md"})},
+        created_dirs=frozenset({Path("pages/topic")}),
+    )
+    topic = adjusted.for_path(Path("pages/topic"))
+    assert topic is not None
+    assert topic.kind is EntryKind.DIRECTORY
+    assert topic.members == ()
+
+
+def test_adjusted_observation_manifest_missing_observation_created_empty_dir() -> None:
+    """计划期 MISSING 观察的目录被创建且成员为空：转换为空成员期望而非误报。"""
+    from draft.observations import missing_observation
+
+    manifest = ObservationManifest(entries=(missing_observation(Path("pages/topic")),))
+    adjusted = adjusted_observation_manifest(
+        manifest,
+        excluded=frozenset({Path(".draft/operations/x")}),
+        explained=frozenset(),
+        added={},
+        removed={},
+        created_dirs=frozenset({Path("pages/topic")}),
+    )
+    topic = adjusted.for_path(Path("pages/topic"))
+    assert topic is not None
+    assert topic.kind is EntryKind.DIRECTORY
+    assert topic.members == ()
+
+
 def test_adjusted_observation_manifest_does_not_synthesize_observed_deep_dir() -> None:
     """深层目录已被父观察列出的不得合成（计划期已存在，只调整父成员）。"""
     manifest = ObservationManifest(

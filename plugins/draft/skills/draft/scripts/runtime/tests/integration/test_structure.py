@@ -632,6 +632,45 @@ def test_promote_crash_before_replace_recovers_created_directory(
     assert check_draft(root).errors == ()
 
 
+def test_promote_crash_before_replace_rejects_intruder_in_created_directory(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mkdir 后、目标替换前，新目录内混入外部成员：恢复必须拒绝（回归 H3）。
+
+    目标文件仍是 before 时，本操作创建的空目录也必须形成明确观察（成员可为空）；
+    否则外部注入会被吸收，recover 错误地 completed 并保留外部条目。
+    """
+    import draft.operations as ops_module
+    from draft.operations import read_lock, recover
+
+    root = build_promote_draft(draft_factory)
+    original_replace = ops_module.replace_file  # pyright: ignore[reportPrivateUsage]
+
+    def crash_before_replace(source: Path, target: Path) -> None:
+        if "pages/topic/" in str(target):
+            raise RuntimeError("injected crash before replace")
+        original_replace(source, target)
+
+    monkeypatch.setattr(ops_module, "replace_file", crash_before_replace)
+    with pytest.raises(RuntimeError, match="injected crash before replace"):
+        promote_page(
+            root, Path("pages/topic.md"), [Path("pages/child-a.md"), Path("pages/child-b.md")]
+        )
+    monkeypatch.undo()
+    assert read_lock(root) is not None
+    assert (root / "pages/topic").is_dir()
+
+    # 外部向本操作创建但目标尚未替换的空目录注入成员。
+    (root / "pages/topic/intruder.txt").write_text("入侵\n", encoding="utf-8")
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        recover(root)
+
+    held_id = read_lock(root)
+    assert held_id is not None
+    assert (root / "pages/topic/intruder.txt").is_file()
+
+
 def test_promote_crash_recovery_rejects_intruder_in_nested_created_directory(
     draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
