@@ -442,6 +442,65 @@ def test_terminal_recovery_idempotent_when_payload_missing(
     assert not _package_exists(root, pending.operation_id)
 
 
+def test_terminal_recovery_rejects_empty_mutation_log(
+    draft_factory: DraftFactory,
+) -> None:
+    """空 mutation 的 succeeded 日志：终态恢复必须先验证日志语义，不得写成 completed（回归 H6）。"""
+    import json
+    import shutil
+
+    from draft.operations import acquire_lock, read_journal, with_phase, write_journal
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    journal = read_journal(_journal_path(root, pending.operation_id))
+    write_journal(with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED))
+    acquire_lock(root, pending.operation_id)
+    # 清空 mutation 并把权威包整个移除：物理包缺失只是文件系统状态，不能跳过日志验证。
+    data = json.loads(_journal_path(root, pending.operation_id).read_text(encoding="utf-8"))
+    data["mutations"] = []
+    _journal_path(root, pending.operation_id).write_text(json.dumps(data), encoding="utf-8")
+    shutil.rmtree(root / ".draft/trash/outgoing" / pending.operation_id)
+
+    calls: list[str] = []
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        recover_draft(root, now=PURGE, handoff=calls.append)
+
+    assert calls == []
+    assert (root / ".draft/operation.lock").exists()
+    assert _phase(root, pending.operation_id) == "trash_handoff_succeeded"
+
+
+def test_handoff_not_called_for_third_package_write(
+    draft_factory: DraftFactory,
+) -> None:
+    """第三个包内 WRITE（物理文件缺失）：handoff 前置验证拒绝，spy 调用次数为 0（回归 H6）。"""
+    import json
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    path = _journal_path(root, pending.operation_id)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["mutations"].append(
+        {
+            "path": f".draft/trash/outgoing/{pending.operation_id}/payload/extra.md",
+            "kind": "write",
+            "before_sha256": None,
+            "after_sha256": "a" * 64,
+            "original": None,
+            "staged": f"staged/{len(data['mutations']):04d}.bin",
+            "applied": False,
+        }
+    )
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    calls: list[str] = []
+    report = advance_trash_lifecycle(root, now=EXPIRY, handoff=calls.append)
+    assert report.error is not None
+    assert report.error.code == CheckCode.TRASH_PACKAGE_CORRUPT.value
+    assert calls == []
+
+
 def test_recover_cli_never_exposes_internal_paths(
     draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
 ) -> None:

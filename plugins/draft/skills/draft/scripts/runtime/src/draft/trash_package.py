@@ -44,6 +44,30 @@ _MANIFEST_FIELDS = frozenset(
 
 
 @dataclass(frozen=True)
+class PackageAuthorization:
+    """从原 T 日志纯语义派生的受约束包授权（H6）。
+
+    信任根是日志本身：恰好一个 package.json WRITE 与恰好一个 payload WRITE，
+    均 before=None、after=合法摘要，无其他包内 mutation；非包 DELETE 必须 1-2 个
+    （页面 + 可选折叠集线），非包 before=None WRITE（折叠集线叶）至多一个。
+    任何包 I/O、外部 handoff 或"缺失即幂等"分支之前都必须先通过此解析。
+    """
+
+    package_relative: Path
+    package_json_path: Path
+    package_json_digest: str
+    payload_path: Path
+    payload_relative: Path
+    payload_digest: str
+
+    def leaves(self) -> tuple[tuple[Path, str], ...]:
+        return (
+            (self.package_json_path, self.package_json_digest),
+            (self.payload_path, self.payload_digest),
+        )
+
+
+@dataclass(frozen=True)
 class VerifiedTrashPackage:
     operation_id: str
     directory: Path
@@ -60,6 +84,66 @@ class VerifiedTrashPackage:
     payload_relative: Path
     manifest_bytes: bytes
     observations: ObservationManifest
+
+
+def parse_package_authorization(journal: Journal, code_path: Path) -> PackageAuthorization:
+    """纯语义解析：从 T 日志产生受约束的包授权，不访问文件系统（回归 H6）。
+
+    物理包缺失只是文件系统状态，不能跳过日志协议验证：空 mutation、缺 package
+    write、零/多个 payload、第三个包内 WRITE 或非法组合都必须在任何包 I/O、外部
+    handoff 或"缺失即幂等成功"分支之前失败并保留锁。调用点：
+
+    - ``load_verified_package``：验证前门；
+    - ``clean_authoritative_package``：在 ``package_dir.exists()`` 早退之前；
+    - attempt 终态恢复：``_attempt_authorized_from_journal`` 从同一受约束对象派生。
+    """
+    if journal.kind is not OperationKind.TRASH:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+    package_relative = OUTGOING_RELATIVE / journal.operation_id
+    package_writes: list[JournalMutation] = []
+    outside_deletes = 0
+    outside_new_writes = 0
+    for mutation in journal.mutations:
+        if mutation.path.is_relative_to(package_relative):
+            # 包内只允许两个新建文件：任何 DELETE、改写（before!=None）或更多
+            # WRITE 都是恶意/损坏日志。
+            if mutation.kind is not MutationKind.WRITE or mutation.before_sha256 is not None:
+                raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+            package_writes.append(mutation)
+        elif mutation.kind is MutationKind.DELETE:
+            outside_deletes += 1
+        elif mutation.before_sha256 is None:
+            # 折叠集线叶新建文件：合法组合至多一个（非折叠为零）。
+            outside_new_writes += 1
+    if len(package_writes) != 2:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+    package_json: JournalMutation | None = None
+    payload: JournalMutation | None = None
+    for mutation in package_writes:
+        if mutation.path == package_relative / "package.json":
+            if package_json is not None:
+                raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+            package_json = mutation
+        elif mutation.path.is_relative_to(package_relative / "payload"):
+            if payload is not None:
+                raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+            payload = mutation
+        else:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+    if package_json is None or payload is None:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+    if not 1 <= outside_deletes <= 2 or outside_new_writes > 1:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+    assert package_json.after_sha256 is not None
+    assert payload.after_sha256 is not None
+    return PackageAuthorization(
+        package_relative=package_relative,
+        package_json_path=package_relative / "package.json",
+        package_json_digest=package_json.after_sha256,
+        payload_path=payload.path,
+        payload_relative=payload.path.relative_to(package_relative),
+        payload_digest=payload.after_sha256,
+    )
 
 
 def require_journal_write(journal: Journal, relative_path: Path) -> JournalMutation:
@@ -225,6 +309,9 @@ def _load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashP
     package_dir = root / package_relative
     if trash_journal.kind is not OperationKind.TRASH:
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, package_dir)
+    # 先验证日志协议（恰好两个包内新建文件等），再做任何包 I/O（回归 H6）：
+    # 第三个包内 WRITE、空 mutation 等在读取 manifest 前就被拒绝。
+    parse_package_authorization(trash_journal, package_dir)
 
     reject_symlink_components(root, OUTGOING_RELATIVE)
     _reject_symlink(package_dir)
@@ -311,33 +398,13 @@ def _load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashP
     )
 
 
-def _authorized_leaves(
-    trash_journal: Journal, package_relative: Path, code_path: Path
-) -> list[tuple[Path, str]]:
-    """从原 T 日志派生授权叶节点：恰好 package.json 与一个 payload 新建文件。
+def _authorized_leaves(trash_journal: Journal, code_path: Path) -> list[tuple[Path, str]]:
+    """从 T 日志派生授权叶节点：恰好 package.json 与一个 payload 新建文件。
 
     包内 mutation 只允许这两个精确新建文件；额外包内 WRITE（恶意日志）或形状
     不符即损坏。已授权条目部分缺失（提交点后幂等清理）由删除阶段容忍。
     """
-    authorized: list[tuple[Path, str]] = []
-    for mutation in trash_journal.mutations:
-        if not mutation.path.is_relative_to(package_relative):
-            continue
-        if (
-            mutation.kind is not MutationKind.WRITE
-            or mutation.before_sha256 is not None
-            or mutation.after_sha256 is None
-        ):
-            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
-        authorized.append((mutation.path, mutation.after_sha256))
-    if len(authorized) != 2:
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
-    payload_paths = [
-        relative for relative, _ in authorized if relative != package_relative / "package.json"
-    ]
-    if len(payload_paths) != 1 or not payload_paths[0].is_relative_to(package_relative / "payload"):
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
-    return authorized
+    return list(parse_package_authorization(trash_journal, code_path).leaves())
 
 
 def _package_directories(
@@ -440,14 +507,15 @@ def clean_authoritative_package(root: Path, trash_journal: Journal) -> None:
 
     reject_symlink_components(root, OUTGOING_RELATIVE)
     package_dir = root / OUTGOING_RELATIVE / trash_journal.operation_id
+    # 先验证日志协议再碰包：物理包缺失只是文件系统状态，不能跳过日志语义验证
+    # （回归 H6）——空 mutation、缺 package write、第三个包内 WRITE 都必须报损坏。
+    authorized = _authorized_leaves(trash_journal, package_dir)
     if not package_dir.exists():
         return
     _reject_symlink(package_dir)
     if not package_dir.is_dir():
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package_dir)
 
-    package_relative = OUTGOING_RELATIVE / trash_journal.operation_id
-    authorized = _authorized_leaves(trash_journal, package_relative, package_dir)
     _precheck_package_tree(root, package_dir, authorized, package_dir)
     for relative, digest in sorted(authorized):
         _remove_verified_leaf(root, relative, digest, package_dir)

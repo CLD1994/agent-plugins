@@ -15,7 +15,6 @@ from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import (
     LifecycleWarning,
-    MutationKind,
     OperationKind,
     OperationPhase,
     OperationResult,
@@ -124,24 +123,20 @@ def _attempt_authorized(package: VerifiedTrashPackage, attempt: Path) -> list[tu
 
 
 def _attempt_authorized_from_journal(journal: Journal, attempt: Path) -> list[tuple[Path, str]]:
-    """从原 T 日志派生 attempt 应含的精确叶节点（package.json + payload/页面）。
+    """从同一受约束包授权对象派生 attempt 的精确叶节点（package.json + payload/页面）。
 
-    终态恢复（succeeded/purge_committed）不重新加载权威包（可能已被消费），
-    直接以 T 的包内 WRITE mutation 锚定 attempt 的授权内容与摘要。
+    终态恢复（succeeded/purge_committed）不重新加载权威包（可能已被消费），直接以
+    ``parse_package_authorization`` 的授权集合锚定 attempt 内容与摘要；空 mutation、
+    第三个包内 WRITE 等非法日志在同一解析边界被拒绝，绝不在 attempt 清理中接受
+    任意扫描结果（回归 H6）。
     """
-    package_relative = OUTGOING_RELATIVE / journal.operation_id
-    authorized: list[tuple[Path, str]] = []
-    for mutation in journal.mutations:
-        if not mutation.path.is_relative_to(package_relative):
-            continue
-        if mutation.kind is not MutationKind.WRITE or mutation.after_sha256 is None:
-            continue
-        if mutation.path == package_relative / "package.json":
-            authorized.append((attempt / "package.json", mutation.after_sha256))
-        elif mutation.path.is_relative_to(package_relative / "payload"):
-            relative = mutation.path.relative_to(package_relative)
-            authorized.append((attempt / relative, mutation.after_sha256))
-    return authorized
+    from draft.trash_package import parse_package_authorization
+
+    auth = parse_package_authorization(journal, attempt)
+    return [
+        (attempt / "package.json", auth.package_json_digest),
+        (attempt / auth.payload_relative, auth.payload_digest),
+    ]
 
 
 def _clean_attempt_tree(attempt: Path, authorized: list[tuple[Path, str]], code_path: Path) -> None:

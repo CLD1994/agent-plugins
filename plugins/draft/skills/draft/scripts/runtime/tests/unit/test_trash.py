@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import uuid as uuid_module
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from pytest_mock import MockerFixture
 
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import (
     CONCLUSIONS_PAGE,
@@ -30,6 +32,7 @@ from draft.models import (
 from draft.observations import EMPTY_OBSERVATIONS
 from draft.operations import (
     Journal,
+    JournalMutation,
     TrashDeadlines,
     sha256_bytes,
 )
@@ -731,3 +734,257 @@ def test_require_retained_restore_window_returns_same_deadlines_for_any_valid_no
 
     assert early_result == late_result
     assert early_result.restore_expires_at == RESTORE_EXPIRES
+
+
+# ---------------------------------------------------------------------------
+# parse_package_authorization：T 日志包授权的纯语义解析（回归 H6）
+# ---------------------------------------------------------------------------
+
+
+def _auth_mutation(
+    relative: Path,
+    *,
+    kind: MutationKind = MutationKind.WRITE,
+    before: str | None = None,
+    after: str | None = None,
+    original: Path | None = None,
+    staged: Path | None = None,
+) -> JournalMutation:
+    return JournalMutation(
+        path=relative,
+        kind=kind,
+        before_sha256=before,
+        after_sha256=after,
+        original=original,
+        staged=staged,
+        applied=False,
+    )
+
+
+def _package_auth_journal(*mutations: JournalMutation) -> Journal:
+    return Journal(
+        operation_id=FIXED_OPERATION_ID,
+        kind=OperationKind.TRASH,
+        phase=OperationPhase.TRASH_RETAINED,
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
+        mutations=tuple(mutations),
+        remove_empty_directories=(),
+        metadata={},
+        directory=Path("/draft/.draft/operations") / FIXED_OPERATION_ID,
+    )
+
+
+def _valid_package_auth_mutations() -> tuple[JournalMutation, ...]:
+    pkg = OUTGOING_RELATIVE / FIXED_OPERATION_ID
+    return (
+        _auth_mutation(pkg / "package.json", after="b" * 64, staged=Path("staged/0000.bin")),
+        _auth_mutation(pkg / "payload/pages/x.md", after="c" * 64, staged=Path("staged/0001.bin")),
+        _auth_mutation(
+            Path("index.md"),
+            before="f" * 64,
+            after="g" * 64,
+            original=Path("originals/0002.bin"),
+            staged=Path("staged/0002.bin"),
+        ),
+        _auth_mutation(
+            Path("pages/x.md"),
+            kind=MutationKind.DELETE,
+            before="d" * 64,
+            original=Path("originals/0003.bin"),
+        ),
+    )
+
+
+def test_package_authorization_valid_trash_journal() -> None:
+    from draft.trash_package import parse_package_authorization
+
+    auth = parse_package_authorization(
+        _package_auth_journal(*_valid_package_auth_mutations()), Path("/draft")
+    )
+    pkg = OUTGOING_RELATIVE / FIXED_OPERATION_ID
+    assert auth.package_json_path == pkg / "package.json"
+    assert auth.package_json_digest == "b" * 64
+    assert auth.payload_path == pkg / "payload/pages/x.md"
+    assert auth.payload_relative == Path("payload/pages/x.md")
+    assert auth.payload_digest == "c" * 64
+
+
+def test_package_authorization_accepts_collapsed_hub_deletes_and_leaf_write() -> None:
+    from draft.trash_package import parse_package_authorization
+
+    pkg = OUTGOING_RELATIVE / FIXED_OPERATION_ID
+    mutations = (
+        _auth_mutation(pkg / "package.json", after="b" * 64, staged=Path("staged/0.bin")),
+        _auth_mutation(pkg / "payload/pages/x.md", after="c" * 64, staged=Path("staged/1.bin")),
+        # 折叠集线叶：包外 before=None WRITE 恰好一个。
+        _auth_mutation(Path("pages.md"), after="g" * 64, staged=Path("staged/2.bin")),
+        _auth_mutation(
+            Path("pages/x.md"),
+            kind=MutationKind.DELETE,
+            before="d" * 64,
+            original=Path("originals/3.bin"),
+        ),
+        _auth_mutation(
+            Path("pages/topic/index.md"),
+            kind=MutationKind.DELETE,
+            before="e" * 64,
+            original=Path("originals/4.bin"),
+        ),
+    )
+    auth = parse_package_authorization(_package_auth_journal(*mutations), Path("/draft"))
+    assert auth.payload_relative == Path("payload/pages/x.md")
+
+
+@pytest.mark.parametrize(
+    "mutations",
+    [
+        # 空 mutation：终态恢复不得接受并写成 completed。
+        (),
+        # 缺 package write。
+        (
+            _auth_mutation(
+                OUTGOING_RELATIVE / FIXED_OPERATION_ID / "payload/pages/x.md",
+                after="c" * 64,
+                staged=Path("staged/0000.bin"),
+            ),
+            _auth_mutation(
+                Path("pages/x.md"),
+                kind=MutationKind.DELETE,
+                before="d" * 64,
+                original=Path("originals/0001.bin"),
+            ),
+        ),
+        # 缺 payload。
+        (
+            _auth_mutation(
+                OUTGOING_RELATIVE / FIXED_OPERATION_ID / "package.json",
+                after="b" * 64,
+                staged=Path("staged/0000.bin"),
+            ),
+            _auth_mutation(
+                Path("pages/x.md"),
+                kind=MutationKind.DELETE,
+                before="d" * 64,
+                original=Path("originals/0001.bin"),
+            ),
+        ),
+        # 零个外部 DELETE（垃圾日志）。
+        (
+            _auth_mutation(
+                OUTGOING_RELATIVE / FIXED_OPERATION_ID / "package.json",
+                after="b" * 64,
+                staged=Path("staged/0000.bin"),
+            ),
+            _auth_mutation(
+                OUTGOING_RELATIVE / FIXED_OPERATION_ID / "payload/pages/x.md",
+                after="c" * 64,
+                staged=Path("staged/0001.bin"),
+            ),
+        ),
+    ],
+)
+def test_package_authorization_rejects_structural_missing(
+    mutations: tuple[JournalMutation, ...],
+) -> None:
+    from draft.trash_package import parse_package_authorization
+
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        parse_package_authorization(_package_auth_journal(*mutations), Path("/draft"))
+
+
+def _extra_payload_write(pkg: Path) -> JournalMutation:
+    return _auth_mutation(pkg / "payload/extra.md", after="a" * 64, staged=Path("staged/0099.bin"))
+
+
+def _extra_rewrite_package_json(pkg: Path) -> JournalMutation:
+    return _auth_mutation(
+        pkg / "package.json",
+        before="f" * 64,
+        after="b" * 64,
+        original=Path("originals/0000.bin"),
+        staged=Path("staged/0000.bin"),
+    )
+
+
+def _extra_delete_package_json(pkg: Path) -> JournalMutation:
+    return _auth_mutation(
+        pkg / "package.json",
+        kind=MutationKind.DELETE,
+        before="f" * 64,
+        original=Path("originals/0000.bin"),
+    )
+
+
+def _extra_unexpected_package_write(pkg: Path) -> JournalMutation:
+    return _auth_mutation(pkg / "unexpected.txt", after="a" * 64, staged=Path("staged/0099.bin"))
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        _extra_payload_write,
+        _extra_rewrite_package_json,
+        _extra_delete_package_json,
+        _extra_unexpected_package_write,
+    ],
+)
+def test_package_authorization_rejects_third_or_illegal_package_mutation(
+    extra: Callable[[Path], JournalMutation],
+) -> None:
+    from draft.trash_package import parse_package_authorization
+
+    pkg = OUTGOING_RELATIVE / FIXED_OPERATION_ID
+    mutations = list(_valid_package_auth_mutations())
+    mutations.append(extra(pkg))
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        parse_package_authorization(_package_auth_journal(*mutations), Path("/draft"))
+
+
+def test_package_authorization_rejects_two_outside_new_writes() -> None:
+    """两个包外 before=None WRITE（合法折叠集线只允许一个）→ 损坏。"""
+    from draft.trash_package import parse_package_authorization
+
+    mutations = list(_valid_package_auth_mutations())
+    mutations.append(
+        _auth_mutation(Path("other.md"), after="h" * 64, staged=Path("staged/0100.bin"))
+    )
+    mutations.append(
+        _auth_mutation(Path("another.md"), after="i" * 64, staged=Path("staged/0101.bin"))
+    )
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        parse_package_authorization(_package_auth_journal(*mutations), Path("/draft"))
+
+
+def test_package_authorization_rejects_three_deletes() -> None:
+    """三个 DELETE（合法组合只允许页面 + 可选折叠集线两个）→ 损坏。"""
+    from draft.trash_package import parse_package_authorization
+
+    mutations = list(_valid_package_auth_mutations())
+    mutations.append(
+        _auth_mutation(
+            Path("pages/y.md"),
+            kind=MutationKind.DELETE,
+            before="e" * 64,
+            original=Path("originals/0099.bin"),
+        )
+    )
+    mutations.append(
+        _auth_mutation(
+            Path("pages/z.md"),
+            kind=MutationKind.DELETE,
+            before="e" * 64,
+            original=Path("originals/0100.bin"),
+        )
+    )
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        parse_package_authorization(_package_auth_journal(*mutations), Path("/draft"))
+
+
+def test_package_authorization_rejects_non_trash_kind() -> None:
+    from draft.trash_package import parse_package_authorization
+
+    journal = _package_auth_journal(*_valid_package_auth_mutations())
+    journal = dataclasses.replace(journal, kind=OperationKind.MOVE)
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        parse_package_authorization(journal, Path("/draft"))
