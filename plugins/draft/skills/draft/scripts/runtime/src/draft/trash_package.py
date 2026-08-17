@@ -616,10 +616,7 @@ def _keep_evidence_actions(
     if final is EvidenceNodeState.VALID and pending is EvidenceNodeState.MISSING:
         if quarantine is EvidenceNodeState.MISSING:
             return (CleanupEvidenceAction.READY,)
-        if (
-            quarantine is EvidenceNodeState.VALID
-            and final_quarantine_same_node
-        ):
+        if quarantine is EvidenceNodeState.VALID and final_quarantine_same_node:
             # 同一次隔离的精确节点：消费陈旧 quarantine，保留 final。
             return (CleanupEvidenceAction.CONSUME_QUARANTINE, CleanupEvidenceAction.READY)
         return (CleanupEvidenceAction.CORRUPT,)
@@ -1002,9 +999,7 @@ def _consume_cleanup_evidence_name(journal: Journal, relative: Path) -> None:
         _fsync_dir_fd(leaf.parent_fd, code_path)
 
 
-def _publish_cleanup_evidence_name(
-    journal: Journal, source: str, *, code_path: Path
-) -> None:
+def _publish_cleanup_evidence_name(journal: Journal, source: str, *, code_path: Path) -> None:
     """把授权 pending/quarantine（源名）no-clobber 发布为 final 并消费源名（回归 H1/H3）。"""
     import os as os_module
 

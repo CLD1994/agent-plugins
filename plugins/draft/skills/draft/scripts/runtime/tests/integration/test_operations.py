@@ -717,9 +717,7 @@ def test_recover_forwards_interrupted_rewrite_from_artifacts(
     assert read_lock(root) is None
 
 
-def _write_prepared_rewrite_journal(
-    root: Path, op_id: str, *, before: bytes, after: bytes
-) -> Path:
+def _write_prepared_rewrite_journal(root: Path, op_id: str, *, before: bytes, after: bytes) -> Path:
     """写入 PREPARED、rewrite WRITE 的日志（含 originals/staged）；用于正向中断现场。"""
     import json as json_module
 
@@ -1430,9 +1428,7 @@ def test_registered_validation_failure_rolls_back_and_restores(
         execute_plan(plan)
     assert (root / "pages/a.md").read_bytes() == old_a
     assert not (root / ".draft/operation.lock").exists()
-    journal_dir = next(
-        entry for entry in (root / ".draft/operations").iterdir() if entry.is_dir()
-    )
+    journal_dir = next(entry for entry in (root / ".draft/operations").iterdir() if entry.is_dir())
     journal = read_journal(journal_dir / "journal.json")
     assert journal.phase is OperationPhase.ROLLED_BACK
 
@@ -1462,9 +1458,7 @@ def test_rollback_writes_intent_before_first_mutation(
         execute_plan(plan)
     monkeypatch.undo()
 
-    journal_dir = next(
-        entry for entry in (root / ".draft/operations").iterdir() if entry.is_dir()
-    )
+    journal_dir = next(entry for entry in (root / ".draft/operations").iterdir() if entry.is_dir())
     journal = read_journal(journal_dir / "journal.json")
     assert journal.phase is OperationPhase.ROLLING_BACK
     # 删除已应用、尚未回滚：目标处于回滚前的 after（缺失）状态，锁仍持有。
@@ -2381,7 +2375,10 @@ def test_resolve_journal_pending_rejects_mutation_replaced_successor(
 
 
 def test_resolve_journal_pending_rejects_phase_regression(operation_draft: Path) -> None:
-    """旧 journal 存在 + pending 阶段倒退：保留 old+pending，报损坏（回归 H1）。"""
+    """旧 journal 存在 + pending 阶段倒退：保留 old+pending，报损坏（回归 H1）。
+
+    prepared/applying 中段日志携带真实非空 mutation（协议合法，L1 修正）。
+    """
     import json as json_module
 
     from draft.operations import resolve_journal_pending
@@ -2392,7 +2389,7 @@ def test_resolve_journal_pending_rejects_phase_regression(operation_draft: Path)
     journal_dir.mkdir(parents=True)
     target = journal_dir / "journal.json"
 
-    def _journal_bytes(phase: str) -> bytes:
+    def _journal_bytes(phase: str, *, mutations: list[dict[str, object]]) -> bytes:
         payload: dict[str, object] = {
             "journal_version": JOURNAL_VERSION,
             "operation_id": op_id,
@@ -2400,14 +2397,23 @@ def test_resolve_journal_pending_rejects_phase_regression(operation_draft: Path)
             "phase": phase,
             "root_state": "registered",
             "observations": [],
-            "mutations": [],
+            "mutations": mutations,
             "remove_empty_directories": [],
             "metadata": {},
         }
         return (json_module.dumps(payload) + "\n").encode("utf-8")
 
-    old_bytes = _journal_bytes("applying")
-    pending_bytes = _journal_bytes("allocating")  # 倒退回分配期。
+    mutation: dict[str, object] = {
+        "path": "pages/a.md",
+        "kind": "write",
+        "before_sha256": None,
+        "after_sha256": "b" * 64,
+        "original": None,
+        "staged": "staged/0000.bin",
+        "applied": True,
+    }
+    old_bytes = _journal_bytes("applying", mutations=[mutation])
+    pending_bytes = _journal_bytes("allocating", mutations=[])  # 倒退回分配期。
     target.write_bytes(old_bytes)
     (journal_dir / "journal.json.pending").write_bytes(pending_bytes)
 
@@ -2419,7 +2425,10 @@ def test_resolve_journal_pending_rejects_phase_regression(operation_draft: Path)
 
 
 def test_resolve_journal_pending_rejects_identity_rewrite(operation_draft: Path) -> None:
-    """旧 journal 存在 + pending 改写 kind：保留 old+pending，报损坏（回归 H1）。"""
+    """旧 journal 存在 + pending 改写 kind：保留 old+pending，报损坏（回归 H1）。
+
+    prepared 中段日志携带真实非空 mutation（协议合法，L1 修正）。
+    """
     import json as json_module
 
     from draft.operations import resolve_journal_pending
@@ -2438,7 +2447,17 @@ def test_resolve_journal_pending_rejects_identity_rewrite(operation_draft: Path)
             "phase": "prepared",
             "root_state": "registered",
             "observations": [],
-            "mutations": [],
+            "mutations": [
+                {
+                    "path": "pages/a.md",
+                    "kind": "write",
+                    "before_sha256": "c" * 64,
+                    "after_sha256": "b" * 64,
+                    "original": "originals/0000.bin",
+                    "staged": "staged/0000.bin",
+                    "applied": False,
+                }
+            ],
             "remove_empty_directories": [],
             "metadata": {},
         }

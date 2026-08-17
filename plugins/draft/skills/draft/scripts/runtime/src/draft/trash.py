@@ -396,10 +396,7 @@ def restore_recovery_decision(
         return RestoreRecoveryAction.INCONSISTENT
     if restore_phase is OperationPhase.ROLLED_BACK:
         return RestoreRecoveryAction.ABANDON_UNAPPLIED
-    if (
-        restore_phase in (OperationPhase.ALLOCATING, OperationPhase.PREPARED)
-        and proven_unapplied
-    ):
+    if restore_phase in (OperationPhase.ALLOCATING, OperationPhase.PREPARED) and proven_unapplied:
         return RestoreRecoveryAction.ABANDON_UNAPPLIED
     return RestoreRecoveryAction.INCONSISTENT
 

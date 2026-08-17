@@ -846,6 +846,7 @@ def _complete_restore_then_crash(
 ) -> str:
     """完成 restore（R=completed、T=rolled_back）后在指定清理点崩溃，返回 R operation_id。"""
     if crash_after_t_commit:
+
         def crash_clean(*args: object, **kwargs: object) -> None:
             raise RuntimeError("injected crash at clean")
 
@@ -870,14 +871,17 @@ def _complete_restore_then_crash(
             real_remove(root, relative, expected_digest, code_path)
 
         monkeypatch.setattr(
-            "draft.trash_package._remove_verified_leaf", crash_leaf  # pyright: ignore[reportPrivateUsage]
+            "draft.trash_package._remove_verified_leaf",
+            crash_leaf,  # pyright: ignore[reportPrivateUsage]
         )
     elif crash_before_evidence_clear:
+
         def crash_clear(*args: object, **kwargs: object) -> None:
             raise RuntimeError("injected crash before evidence clear")
 
         monkeypatch.setattr("draft.trash_package.converge_cleanup_evidence", crash_clear)
     elif crash_before_release:
+
         def crash_release(*args: object, **kwargs: object) -> None:
             raise RuntimeError("injected crash before release")
 
@@ -960,8 +964,6 @@ def test_verify_commit_branch_still_requires_complete_package(
     assert (root / ".draft/operation.lock").exists()
 
     # 提交前破坏权威包。
-    import json as json_module
-
     manifest = root / ".draft/trash/outgoing" / pending.operation_id / "package.json"
     manifest.write_text("{corrupted", encoding="utf-8")
 

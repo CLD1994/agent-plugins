@@ -1009,7 +1009,7 @@ def test_cleanup_evidence_invalid_pending_preserves_scene(
     evidence = _committed_evidence(root, pending.operation_id)
     evidence.unlink()  # final 缺失（发布前崩溃现场）。
     evidence_pending = evidence.with_name(evidence.name + ".pending")
-    evidence_pending.write_bytes(b"{\"garbage\": true}")
+    evidence_pending.write_bytes(b'{"garbage": true}')
     before = _leaf_snapshot(package)
 
     with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
@@ -1020,7 +1020,7 @@ def test_cleanup_evidence_invalid_pending_preserves_scene(
             ),
         )
 
-    assert evidence_pending.read_bytes() == b"{\"garbage\": true}"
+    assert evidence_pending.read_bytes() == b'{"garbage": true}'
     assert not evidence.exists()
     assert _leaf_snapshot(package) == before
 

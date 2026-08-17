@@ -1506,19 +1506,22 @@ def test_journal_transition_generic_rollback_requires_intent() -> None:
             old = _j(phase, kind=kind, mutations=frozen)
             with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
                 validate_journal_transition(
-                    old, _j(OperationPhase.ROLLED_BACK, kind=kind, mutations=frozen),
+                    old,
+                    _j(OperationPhase.ROLLED_BACK, kind=kind, mutations=frozen),
                     path=Path("journal.json"),
                 )
             rolling = _j(OperationPhase.ROLLING_BACK, kind=kind, mutations=frozen)
             validate_journal_transition(old, rolling, path=Path("journal.json"))
             validate_journal_transition(rolling, rolling, path=Path("journal.json"))
             validate_journal_transition(
-                rolling, _j(OperationPhase.ROLLED_BACK, kind=kind, mutations=frozen),
+                rolling,
+                _j(OperationPhase.ROLLED_BACK, kind=kind, mutations=frozen),
                 path=Path("journal.json"),
             )
             with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
                 validate_journal_transition(
-                    rolling, _j(OperationPhase.COMPLETED, kind=kind, mutations=frozen),
+                    rolling,
+                    _j(OperationPhase.COMPLETED, kind=kind, mutations=frozen),
                     path=Path("journal.json"),
                 )
 
@@ -1581,9 +1584,7 @@ def test_artifact_plan_time_absent() -> None:
         EMPTY_OBSERVATIONS, Path("pages/a.md.pending"), planned_created_directories=frozenset()
     )
     # 父为 FILE/SYMLINK/OTHER：不拥有。
-    file_parent = ObservationManifest(
-        entries=(file_observation(Path("pages/a.md"), b"a"),)
-    )
+    file_parent = ObservationManifest(entries=(file_observation(Path("pages/a.md"), b"a"),))
     assert not artifact_plan_time_absent(
         file_parent, Path("pages/a.md/x.pending"), planned_created_directories=frozenset()
     )
@@ -1666,15 +1667,21 @@ def test_mutation_artifact_actions_forward() -> None:
     assert act(MutationRole.REWRITE_WRITE, S.BEFORE, S.MISSING, S.MISSING) == (R,)
     assert act(MutationRole.REWRITE_WRITE, S.BEFORE, S.MISSING, S.BEFORE, qo=True) == (Cq, R)
     assert act(MutationRole.REWRITE_WRITE, S.MISSING, S.MISSING, S.BEFORE, qo=True) == (
-        Pk, Cq, Done,
+        Pk,
+        Cq,
+        Done,
     )
-    assert act(
-        MutationRole.REWRITE_WRITE, S.MISSING, S.AFTER, S.BEFORE, po=True, qo=True
-    ) == (P, Cq, Done)
+    assert act(MutationRole.REWRITE_WRITE, S.MISSING, S.AFTER, S.BEFORE, po=True, qo=True) == (
+        P,
+        Cq,
+        Done,
+    )
     assert act(MutationRole.REWRITE_WRITE, S.AFTER, S.MISSING, S.BEFORE, qo=True) == (Cq, Done)
-    assert act(
-        MutationRole.REWRITE_WRITE, S.AFTER, S.AFTER, S.BEFORE, po=True, qo=True
-    ) == (Cp, Cq, Done)
+    assert act(MutationRole.REWRITE_WRITE, S.AFTER, S.AFTER, S.BEFORE, po=True, qo=True) == (
+        Cp,
+        Cq,
+        Done,
+    )
     assert act(MutationRole.REWRITE_WRITE, S.AFTER, S.MISSING, S.MISSING) == (Done,)
     assert act(MutationRole.REWRITE_WRITE, S.AFTER, S.AFTER, S.MISSING, po=True) == (Cp, Done)
     assert act(MutationRole.REWRITE_WRITE, S.AFTER, S.MISSING, S.BEFORE, qo=False) == (Ex,)
@@ -1738,15 +1745,21 @@ def test_mutation_artifact_actions_rollback() -> None:
     assert act(MutationRole.REWRITE_WRITE, S.AFTER, S.MISSING, S.MISSING) == (R,)
     assert act(MutationRole.REWRITE_WRITE, S.AFTER, S.MISSING, S.AFTER, qo=True) == (Cq, R)
     assert act(MutationRole.REWRITE_WRITE, S.MISSING, S.MISSING, S.AFTER, qo=True) == (
-        Po, Cq, Done,
+        Po,
+        Cq,
+        Done,
     )
-    assert act(
-        MutationRole.REWRITE_WRITE, S.MISSING, S.BEFORE, S.AFTER, po=True, qo=True
-    ) == (P, Cq, Done)
+    assert act(MutationRole.REWRITE_WRITE, S.MISSING, S.BEFORE, S.AFTER, po=True, qo=True) == (
+        P,
+        Cq,
+        Done,
+    )
     assert act(MutationRole.REWRITE_WRITE, S.BEFORE, S.MISSING, S.AFTER, qo=True) == (Cq, Done)
-    assert act(
-        MutationRole.REWRITE_WRITE, S.BEFORE, S.BEFORE, S.AFTER, po=True, qo=True
-    ) == (Cp, Cq, Done)
+    assert act(MutationRole.REWRITE_WRITE, S.BEFORE, S.BEFORE, S.AFTER, po=True, qo=True) == (
+        Cp,
+        Cq,
+        Done,
+    )
     assert act(MutationRole.REWRITE_WRITE, S.BEFORE, S.MISSING, S.MISSING) == (Done,)
     assert act(MutationRole.REWRITE_WRITE, S.AFTER, S.BEFORE, S.MISSING, po=True) == (Ex,)
     assert act(MutationRole.REWRITE_WRITE, S.MISSING, S.BEFORE, S.AFTER, po=False, qo=True) == (Ex,)

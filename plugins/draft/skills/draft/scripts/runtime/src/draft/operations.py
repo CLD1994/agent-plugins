@@ -1309,8 +1309,7 @@ _PHASES_BY_KIND[OperationKind.TRASH] = frozenset(
 _PHASES_BY_KIND[OperationKind.RECOVER] = frozenset()
 
 _EDGES_BY_KIND: dict[OperationKind, frozenset[tuple[OperationPhase, OperationPhase]]] = {
-    kind: _COMMON_PRE_COMMIT_EDGES | _FORWARD_COMPLETE_EDGE
-    for kind in _GENERIC_STRUCTURAL_KINDS
+    kind: _COMMON_PRE_COMMIT_EDGES | _FORWARD_COMPLETE_EDGE for kind in _GENERIC_STRUCTURAL_KINDS
 }
 _EDGES_BY_KIND[OperationKind.ADOPT] = _EDGES_BY_KIND[OperationKind.CREATE] | frozenset(
     {
@@ -2081,7 +2080,11 @@ def _clean_recovery_copies(journal: Journal) -> None:
     for sub in ("originals", "staged"):
         directory = journal.directory / sub
         # lstat 分类：悬空符号链接是 link 不是 missing，不得折叠成幂等缺失后继续解锁。
-        directory_node = classify_node(directory)
+        directory_node = classify_node_or_error(
+            directory,
+            code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+            code_path=directory,
+        )
         if directory_node is EntryKind.MISSING:
             continue
         if directory_node is not EntryKind.DIRECTORY:
@@ -2138,7 +2141,14 @@ def _clean_recovery_copies(journal: Journal) -> None:
                 # 隔离→验证→删除：验证与删除同一锚定句柄（回归 H3）。
                 leaf.quarantine_delete(registered[sub][relative.name])
         directory = journal.directory / sub
-        if classify_node(directory) is EntryKind.DIRECTORY:
+        if (
+            classify_node_or_error(
+                directory,
+                code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                code_path=directory,
+            )
+            is EntryKind.DIRECTORY
+        ):
             with anchored_leaf(
                 journal.directory,
                 Path(sub),
@@ -3400,7 +3410,14 @@ def _recover_managed_temp_quarantines(root: Path, journal: Journal) -> None:
             continue
         relative = _mutation_temporary_path(mutation.path, journal.operation_id, index)
         quarantine_path = relative.with_name(_quarantine_name(relative.name))
-        if classify_node(root / quarantine_path) is EntryKind.MISSING:
+        if (
+            classify_node_or_error(
+                root / quarantine_path,
+                code="operation.external_change",
+                code_path=root / quarantine_path,
+            )
+            is EntryKind.MISSING
+        ):
             continue
         # 所有权证明：managed temp 路径也必须计划时缺失才可消费（回归 H4）。
         if not artifact_plan_time_absent(
@@ -3826,7 +3843,15 @@ def recover(root_path: Path) -> OperationResult:
         if not journal_path.is_file():
             # 操作目录无 journal：只剩崩溃遗留 pending 时发布有效日志后继续处理；
             # 非法 pending 报损坏（不按文件名删除）；既无 journal 也无 pending 跳过。
-            if classify_node(entry / _pending_name("journal.json")) is EntryKind.MISSING:
+            pending_path = entry / _pending_name("journal.json")
+            if (
+                classify_node_or_error(
+                    pending_path,
+                    code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+                    code_path=pending_path,
+                )
+                is EntryKind.MISSING
+            ):
                 continue
             resolve_journal_pending(journal_path)
         else:

@@ -154,10 +154,14 @@ def _clean_attempt_tree(attempt: Path, authorized: list[tuple[Path, str]], code_
     import os
 
     from draft.observations import EntryKind
-    from draft.operations import anchored_leaf, classify_node
+    from draft.operations import anchored_leaf, classify_node_or_error
 
     # lstat 分类：悬空符号链接是 link 不是 missing，不得折叠成幂等缺失（回归 M2）。
-    attempt_node = classify_node(attempt)
+    attempt_node = classify_node_or_error(
+        attempt,
+        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+        code_path=code_path,
+    )
     if attempt_node is EntryKind.MISSING:
         return
     if attempt_node is not EntryKind.DIRECTORY:
@@ -252,7 +256,7 @@ def make_attempt_copy(package: VerifiedTrashPackage) -> Path:
     精确树形协议预检并清理旧 attempt：未知内容使重试停止保留，不递归删除（回归 M1）。
     """
     from draft.observations import EntryKind
-    from draft.operations import classify_node
+    from draft.operations import classify_node_or_error
 
     root = _root_from_package(package)
     reject_symlink_components(root, OUTGOING_RELATIVE)
@@ -261,7 +265,11 @@ def make_attempt_copy(package: VerifiedTrashPackage) -> Path:
     attempt = root / attempt_relative
     # lstat 分类：悬空符号链接是 link 不是 missing，不能绕过清理后由 mkdir 泄漏
     # 原始 FileExistsError（回归 M2）。
-    attempt_node = classify_node(attempt)
+    attempt_node = classify_node_or_error(
+        attempt,
+        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+        code_path=attempt,
+    )
     if attempt_node is EntryKind.DIRECTORY:
         _clean_attempt_tree(attempt, _attempt_authorized(package, attempt), attempt)
     elif attempt_node is not EntryKind.MISSING:
