@@ -215,6 +215,41 @@ def test_operations_path_as_regular_file_is_reported(
     assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
 
 
+@pytest.mark.parametrize("root_state", tuple(RootState))
+def test_trash_path_as_regular_file_is_reported(
+    draft_factory: DraftFactory,
+    root_state: RootState,
+) -> None:
+    """``.draft/trash`` 本身是普通文件时报告内部形状损坏。"""
+    import shutil
+
+    root = draft_factory(healthy(), root_state=root_state)
+    trash = root / ".draft" / "trash"
+    if trash.exists():
+        shutil.rmtree(trash)
+    trash.write_text("not a directory", encoding="utf-8")
+
+    report = check_draft(root)
+
+    assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
+
+
+@pytest.mark.parametrize("root_state", tuple(RootState))
+def test_orphan_trash_package_without_holding_journal_is_reported(
+    draft_factory: DraftFactory,
+    root_state: RootState,
+) -> None:
+    """未被任何持有中 trash 日志引用的权威包是孤儿：反向闭合扫描必须报告。"""
+    root = draft_factory(healthy(), root_state=root_state)
+    package = root / ".draft/trash/outgoing" / ("a" * 32)
+    package.mkdir(parents=True)
+    (package / "package.json").write_text("{}", encoding="utf-8")
+
+    report = check_draft(root)
+
+    assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
+
+
 def test_provisional_shape_in_final_marker_is_invalid(
     draft_factory: DraftFactory,
 ) -> None:

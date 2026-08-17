@@ -22,6 +22,7 @@ from draft.models import (
     CheckIssue,
     CheckReport,
     IssueSeverity,
+    OperationKind,
     OperationPhase,
 )
 from draft.operations import (
@@ -29,6 +30,7 @@ from draft.operations import (
     TrashDeadlines,
     has_handoff_failure,
     operation_journal_path,
+    read_journal,
     reject_symlink_components,
 )
 from draft.paths import physical_parent, resolve_draft_root
@@ -451,6 +453,7 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
             issues.append(
                 _error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, Path(INTERNAL_DIR) / "operations")
             )
+        _check_orphan_trash_packages(root, issues)
         return issues
     reject_symlink_components(root, Path(INTERNAL_DIR) / "operations")
     for entry in sorted(operations.iterdir()):
@@ -496,7 +499,40 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
             issues.extend(_check_trash_retained(root, journal_path, journal, relative))
         elif phase is OperationPhase.TRASH_HANDOFF_PENDING:
             issues.extend(_check_trash_handoff_pending(root, journal_path, journal, relative))
+    _check_orphan_trash_packages(root, issues)
     return issues
+
+
+def _check_orphan_trash_packages(root: Path, issues: list[CheckIssue]) -> None:
+    """反向闭合：.draft/trash/outgoing/ 下未被任何持有中 trash 日志引用的包是孤儿。
+
+    权威删除包必须被某个 trash_retained / trash_handoff_pending 日志持有；无对应
+    持有日志的包目录是内部命名空间的非法形状（规格 §5.4）。
+    """
+    from draft.trash_package import OUTGOING_RELATIVE
+
+    held: set[str] = set()
+    operations = root / INTERNAL_DIR / "operations"
+    if operations.is_dir():
+        for entry in sorted(operations.iterdir()):
+            if not entry.is_dir():
+                continue
+            try:
+                journal = read_journal(operation_journal_path(root, entry.name))
+            except DraftError:
+                continue
+            if journal.kind is OperationKind.TRASH and journal.phase in (
+                OperationPhase.TRASH_RETAINED,
+                OperationPhase.TRASH_HANDOFF_PENDING,
+            ):
+                held.add(entry.name)
+    outgoing = root / OUTGOING_RELATIVE
+    if not outgoing.is_dir():
+        return
+    for package in sorted(outgoing.iterdir()):
+        if not package.is_dir() or package.name in held:
+            continue
+        issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, package.relative_to(root)))
 
 
 _MID_WRITE_PHASES = (
@@ -616,6 +652,14 @@ _ALLOWED_INTERNAL_ENTRIES = frozenset(
     }
 )
 
+# 内部协议目录：operations 与 trash 必须是目录，普通文件是非法形状。
+_ALLOWED_INTERNAL_DIRECTORIES = frozenset(
+    {
+        Path(INTERNAL_DIR) / "operations",
+        Path(INTERNAL_DIR) / "trash",
+    }
+)
+
 
 def _check_internal_namespace(resolved: Path) -> list[CheckIssue]:
     """受管内部命名空间检查：candidate 与 registered 共享同一协议（规格 §5.4）。
@@ -640,6 +684,9 @@ def _check_internal_namespace(resolved: Path) -> list[CheckIssue]:
             issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
         elif entry.is_symlink():
             issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, relative))
+        elif relative in _ALLOWED_INTERNAL_DIRECTORIES and not entry.is_dir():
+            # operations/trash 必须是目录：普通文件是内部命名空间非法形状。
+            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
     return issues
 
 

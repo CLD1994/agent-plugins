@@ -321,14 +321,19 @@ def test_adopt_rejects_concurrent_internal_protocol_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """adopt 锁内复核发现内部协议文件并发变化时不应用 marker 变更（规格 §12.1）。"""
+    from datetime import UTC, datetime
+
     import draft.operations as ops_module
+    from draft.trash import trash_page
+    from tests.integration.support import add_valid_child
 
     root = tmp_path / "candidate"
     build_valid_candidate(root)
-    # 既有权威删除包：adopt 必须观察它。
-    package = root / ".draft/trash/outgoing" / ("a" * 32) / "package.json"
-    package.parent.mkdir(parents=True)
-    package.write_text('{"version":1}\n', encoding="utf-8")
+    # 建立合法持有中的权威删除包：trash 一个候选页（orphan 包会被 check 拒绝）。
+    add_valid_child(root, Path("pages/obsolete.md"))
+    pending = trash_page(root, Path("pages/obsolete.md"), now=datetime(2026, 7, 21, 12, tzinfo=UTC))
+    package = root / ".draft/trash/outgoing" / pending.operation_id / "package.json"
+    assert package.is_file()
 
     from draft.models import OperationPlan
     from draft.operations import Journal
@@ -336,7 +341,9 @@ def test_adopt_rejects_concurrent_internal_protocol_change(
     original_verify = ops_module._verify_plan_observations  # pyright: ignore[reportPrivateUsage]
 
     def verify_then_edit(root_path: Path, plan: OperationPlan, journal: Journal) -> None:
-        package.write_text('{"version":2}\n', encoding="utf-8")
+        package.write_text(
+            package.read_text(encoding="utf-8") + "\n// 外部修改\n", encoding="utf-8"
+        )
         original_verify(root_path, plan, journal)
 
     monkeypatch.setattr(ops_module, "_verify_plan_observations", verify_then_edit)

@@ -350,6 +350,8 @@ def _parse_observations(data: object, journal_path: Path) -> ObservationManifest
         item = cast("dict[str, object]", raw)
         kind = EntryKind(_expect_str(item.get("kind"), journal_path))
         sha256 = _expect_optional_str(item.get("sha256"), journal_path)
+        if sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
         members_raw = item.get("members")
         if not isinstance(members_raw, list) or not all(
             isinstance(member, str) for member in cast("list[object]", members_raw)

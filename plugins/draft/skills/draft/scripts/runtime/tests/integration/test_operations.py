@@ -234,6 +234,8 @@ def test_read_journal_rejects_duplicate_observation_paths(operation_draft: Path)
         {"path": "pages/a.md", "kind": "file", "sha256": None, "members": []},
         # 缺失条目带摘要：MISSING 不得携带摘要或成员。
         {"path": "pages/a.md", "kind": "missing", "sha256": "a" * 64, "members": []},
+        # 摘要不是 64 位十六进制：FILE 摘要形状非法。
+        {"path": "pages/a.md", "kind": "file", "sha256": "x", "members": []},
     ],
 )
 def test_read_journal_rejects_illegal_observation_shapes(
