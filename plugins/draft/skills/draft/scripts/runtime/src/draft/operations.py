@@ -10,6 +10,7 @@ from collections.abc import Callable, Mapping, Set
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol, cast
 
@@ -65,6 +66,52 @@ _MID_WRITE_PHASES = frozenset(
         OperationPhase.ROLLING_BACK,
     }
 )
+
+
+class MutationDirection(StrEnum):
+    """mutation artifact 恢复方向：正向应用或回滚（第十轮 H3）。"""
+
+    FORWARD = "forward"
+    ROLLBACK = "rollback"
+
+
+class MutationRole(StrEnum):
+    """mutation 角色：新建 WRITE / 改写 WRITE / 删除。"""
+
+    NEW_WRITE = "new_write"
+    REWRITE_WRITE = "rewrite_write"
+    DELETE = "delete"
+
+
+class ArtifactState(StrEnum):
+    """目标/pending/quarantine 节点的授权分类：缺失/等于 before/等于 after/摘要不符/非文件。"""
+
+    MISSING = "missing"
+    BEFORE = "before"
+    AFTER = "after"
+    WRONG = "wrong"
+    NON_FILE = "non_file"
+
+
+class MutationRecoveryAction(StrEnum):
+    """方向感知 artifact 恢复的按序动作：发布/消费/继续/完成/外部变化。"""
+
+    PUBLISH_PENDING = "publish_pending"
+    PUBLISH_STAGED = "publish_staged"
+    PUBLISH_ORIGINAL = "publish_original"
+    CONSUME_PENDING = "consume_pending"
+    CONSUME_QUARANTINE = "consume_quarantine"
+    RETRY_APPLY = "retry_apply"
+    DONE = "done"
+    EXTERNAL = "external"
+
+
+def _mutation_role(mutation: JournalMutation) -> MutationRole:
+    if mutation.kind is MutationKind.DELETE:
+        return MutationRole.DELETE
+    if mutation.before_sha256 is None:
+        return MutationRole.NEW_WRITE
+    return MutationRole.REWRITE_WRITE
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -3070,6 +3117,276 @@ def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> Operation
     return _finish_forward(root, journal, changed_paths=(MARKER_PATH,))
 
 
+def _planned_created_directory_closure(
+    observations: ObservationManifest, mutations: tuple[JournalMutation, ...]
+) -> frozenset[Path]:
+    """推导本操作获准创建的目录闭包：目标祖先中计划时缺失的目录（纯函数）。
+
+    只包含 plan-time 可证明缺失的祖先；缺失祖先链必须整条由 mutation 目标覆盖，
+    不与"存在但未观察的共享目录"混淆。``artifact_plan_time_absent`` 依赖它判定
+    缺失祖先下的协议节点所有权。
+    """
+    is_missing = _plan_time_missing_index(observations)
+    created: set[Path] = set()
+    for mutation in mutations:
+        cursor = mutation.path.parent
+        while cursor.parts:
+            if not is_missing(cursor):
+                break
+            created.add(cursor)
+            parent = cursor.parent
+            if parent == cursor:
+                break
+            cursor = parent
+    return frozenset(created)
+
+
+def artifact_plan_time_absent(
+    observations: ObservationManifest,
+    artifact: Path,
+    *,
+    planned_created_directories: frozenset[Path],
+) -> bool:
+    """协议节点（pending/quarantine/temp）是否由本操作创建（回归第十轮 H4）。
+
+    确定性名字与匹配摘要不是所有权证据。只有 plan-time 精确缺失才可拥有：精确路径
+    可证明缺失，且其祖先链要么是已观察 DIRECTORY（受管目录内创建），要么整条缺失
+    祖先链都由本操作计划创建闭包覆盖。没有观察、父为 FILE/SYMLINK/OTHER、或缺失
+    祖先不在创建闭包内的一律返回 False——"路径计划时不可能存在"与"本操作获准在这里
+    创建协议节点"不是同一事实。
+    """
+    is_missing = _plan_time_missing_index(observations)
+    if not is_missing(artifact):
+        return False
+    by_path = {entry.path: entry for entry in observations.entries}
+    cursor = artifact.parent
+    while cursor.parts:
+        entry = by_path.get(cursor)
+        if entry is not None and entry.kind is not EntryKind.MISSING:
+            # 到达已观察非缺失祖先：只有明确 DIRECTORY 才允许子协议节点。
+            return entry.kind is EntryKind.DIRECTORY
+        if entry is None and not is_missing(cursor):
+            break  # 无存在性证据的祖先：保守停止，缺失链已全部验证。
+        if cursor not in planned_created_directories:
+            return False  # 缺失祖先不在本操作创建闭包内。
+        parent = cursor.parent
+        if parent == cursor:
+            break
+        cursor = parent
+    # 缺失链整条都在本操作创建闭包内：本操作创建了父目录，协议节点归它所有。
+    return True
+
+
+def mutation_artifact_actions(
+    *,
+    direction: MutationDirection,
+    role: MutationRole,
+    target: ArtifactState,
+    pending: ArtifactState,
+    quarantine: ArtifactState,
+    pending_owned: bool,
+    quarantine_owned: bool,
+) -> tuple[MutationRecoveryAction, ...]:
+    """方向感知的 mutation artifact 恢复决策（纯函数，第十轮 H3）。
+
+    输入 target/pending/quarantine 的类型与摘要分类、pending/quarantine 的所有权布尔。
+    输出有序动作序列；表外组合一律 ``EXTERNAL``（保留现场）。任何存在的 artifact
+    若未被证明由本操作创建（``pending_owned``/``quarantine_owned`` 为 False）也报
+    外部变化，绝不消费或发布计划前既有的同名文件。禁止在 I/O helper 中再按
+    ``before is None`` 等启发式猜方向。
+    """
+    if pending is not ArtifactState.MISSING and not pending_owned:
+        return (MutationRecoveryAction.EXTERNAL,)
+    if quarantine is not ArtifactState.MISSING and not quarantine_owned:
+        return (MutationRecoveryAction.EXTERNAL,)
+    if direction is MutationDirection.FORWARD:
+        return _forward_artifact_actions(role, target, pending, quarantine)
+    return _rollback_artifact_actions(role, target, pending, quarantine)
+
+
+def _forward_artifact_actions(
+    role: MutationRole,
+    target: ArtifactState,
+    pending: ArtifactState,
+    quarantine: ArtifactState,
+) -> tuple[MutationRecoveryAction, ...]:
+    if role is MutationRole.NEW_WRITE:
+        if quarantine is not ArtifactState.MISSING:
+            return (MutationRecoveryAction.EXTERNAL,)
+        if target is ArtifactState.MISSING and pending is ArtifactState.MISSING:
+            return (MutationRecoveryAction.RETRY_APPLY,)
+        if target is ArtifactState.MISSING and pending is ArtifactState.AFTER:
+            return (MutationRecoveryAction.PUBLISH_PENDING, MutationRecoveryAction.DONE)
+        if target is ArtifactState.AFTER and pending is ArtifactState.MISSING:
+            return (MutationRecoveryAction.DONE,)
+        if target is ArtifactState.AFTER and pending is ArtifactState.AFTER:
+            return (MutationRecoveryAction.CONSUME_PENDING, MutationRecoveryAction.DONE)
+        return (MutationRecoveryAction.EXTERNAL,)
+    if role is MutationRole.DELETE:
+        if pending is not ArtifactState.MISSING:
+            return (MutationRecoveryAction.EXTERNAL,)
+        if target is ArtifactState.BEFORE and quarantine is ArtifactState.MISSING:
+            return (MutationRecoveryAction.RETRY_APPLY,)
+        if target is ArtifactState.BEFORE and quarantine is ArtifactState.BEFORE:
+            return (MutationRecoveryAction.CONSUME_QUARANTINE, MutationRecoveryAction.RETRY_APPLY)
+        if target is ArtifactState.MISSING and quarantine is ArtifactState.BEFORE:
+            return (MutationRecoveryAction.CONSUME_QUARANTINE, MutationRecoveryAction.DONE)
+        if target is ArtifactState.MISSING and quarantine is ArtifactState.MISSING:
+            return (MutationRecoveryAction.DONE,)
+        return (MutationRecoveryAction.EXTERNAL,)
+    # REWRITE_WRITE 正向。
+    if (
+        target is ArtifactState.BEFORE
+        and quarantine is ArtifactState.MISSING
+        and pending is ArtifactState.MISSING
+    ):
+        return (MutationRecoveryAction.RETRY_APPLY,)
+    if (
+        target is ArtifactState.BEFORE
+        and quarantine is ArtifactState.BEFORE
+        and pending is ArtifactState.MISSING
+    ):
+        return (MutationRecoveryAction.CONSUME_QUARANTINE, MutationRecoveryAction.RETRY_APPLY)
+    if (
+        target is ArtifactState.MISSING
+        and quarantine is ArtifactState.BEFORE
+        and pending is ArtifactState.MISSING
+    ):
+        return (
+            MutationRecoveryAction.PUBLISH_STAGED,
+            MutationRecoveryAction.CONSUME_QUARANTINE,
+            MutationRecoveryAction.DONE,
+        )
+    if (
+        target is ArtifactState.MISSING
+        and quarantine is ArtifactState.BEFORE
+        and pending is ArtifactState.AFTER
+    ):
+        return (
+            MutationRecoveryAction.PUBLISH_PENDING,
+            MutationRecoveryAction.CONSUME_QUARANTINE,
+            MutationRecoveryAction.DONE,
+        )
+    if (
+        target is ArtifactState.AFTER
+        and quarantine is ArtifactState.BEFORE
+        and pending is ArtifactState.MISSING
+    ):
+        return (MutationRecoveryAction.CONSUME_QUARANTINE, MutationRecoveryAction.DONE)
+    if (
+        target is ArtifactState.AFTER
+        and quarantine is ArtifactState.BEFORE
+        and pending is ArtifactState.AFTER
+    ):
+        return (
+            MutationRecoveryAction.CONSUME_PENDING,
+            MutationRecoveryAction.CONSUME_QUARANTINE,
+            MutationRecoveryAction.DONE,
+        )
+    if (
+        target is ArtifactState.AFTER
+        and quarantine is ArtifactState.MISSING
+        and pending is ArtifactState.MISSING
+    ):
+        return (MutationRecoveryAction.DONE,)
+    if (
+        target is ArtifactState.AFTER
+        and quarantine is ArtifactState.MISSING
+        and pending is ArtifactState.AFTER
+    ):
+        return (MutationRecoveryAction.CONSUME_PENDING, MutationRecoveryAction.DONE)
+    return (MutationRecoveryAction.EXTERNAL,)
+
+
+def _rollback_artifact_actions(
+    role: MutationRole,
+    target: ArtifactState,
+    pending: ArtifactState,
+    quarantine: ArtifactState,
+) -> tuple[MutationRecoveryAction, ...]:
+    if role is MutationRole.NEW_WRITE:
+        if pending is not ArtifactState.MISSING:
+            return (MutationRecoveryAction.EXTERNAL,)
+        if target is ArtifactState.AFTER and quarantine is ArtifactState.MISSING:
+            return (MutationRecoveryAction.RETRY_APPLY,)
+        if target is ArtifactState.AFTER and quarantine is ArtifactState.AFTER:
+            return (MutationRecoveryAction.CONSUME_QUARANTINE, MutationRecoveryAction.RETRY_APPLY)
+        if target is ArtifactState.MISSING and quarantine is ArtifactState.AFTER:
+            return (MutationRecoveryAction.CONSUME_QUARANTINE, MutationRecoveryAction.DONE)
+        if target is ArtifactState.MISSING and quarantine is ArtifactState.MISSING:
+            return (MutationRecoveryAction.DONE,)
+        return (MutationRecoveryAction.EXTERNAL,)
+    if role is MutationRole.DELETE:
+        if quarantine is not ArtifactState.MISSING:
+            return (MutationRecoveryAction.EXTERNAL,)
+        if target is ArtifactState.MISSING and pending is ArtifactState.MISSING:
+            return (MutationRecoveryAction.RETRY_APPLY,)
+        if target is ArtifactState.MISSING and pending is ArtifactState.BEFORE:
+            return (MutationRecoveryAction.PUBLISH_PENDING, MutationRecoveryAction.DONE)
+        if target is ArtifactState.BEFORE and pending is ArtifactState.MISSING:
+            return (MutationRecoveryAction.DONE,)
+        if target is ArtifactState.BEFORE and pending is ArtifactState.BEFORE:
+            return (MutationRecoveryAction.CONSUME_PENDING, MutationRecoveryAction.DONE)
+        return (MutationRecoveryAction.EXTERNAL,)
+    # REWRITE_WRITE 回滚：把正向表中的 BEFORE/AFTER 互换，quarantine 保存 AFTER、
+    # pending 保存 BEFORE。
+    if (
+        target is ArtifactState.AFTER
+        and quarantine is ArtifactState.MISSING
+        and pending is ArtifactState.MISSING
+    ):
+        return (MutationRecoveryAction.RETRY_APPLY,)
+    if (
+        target is ArtifactState.AFTER
+        and quarantine is ArtifactState.AFTER
+        and pending is ArtifactState.MISSING
+    ):
+        return (MutationRecoveryAction.CONSUME_QUARANTINE, MutationRecoveryAction.RETRY_APPLY)
+    if (
+        target is ArtifactState.MISSING
+        and quarantine is ArtifactState.AFTER
+        and pending is ArtifactState.MISSING
+    ):
+        return (
+            MutationRecoveryAction.PUBLISH_ORIGINAL,
+            MutationRecoveryAction.CONSUME_QUARANTINE,
+            MutationRecoveryAction.DONE,
+        )
+    if (
+        target is ArtifactState.MISSING
+        and quarantine is ArtifactState.AFTER
+        and pending is ArtifactState.BEFORE
+    ):
+        return (
+            MutationRecoveryAction.PUBLISH_PENDING,
+            MutationRecoveryAction.CONSUME_QUARANTINE,
+            MutationRecoveryAction.DONE,
+        )
+    if (
+        target is ArtifactState.BEFORE
+        and quarantine is ArtifactState.AFTER
+        and pending is ArtifactState.MISSING
+    ):
+        return (MutationRecoveryAction.CONSUME_QUARANTINE, MutationRecoveryAction.DONE)
+    if (
+        target is ArtifactState.BEFORE
+        and quarantine is ArtifactState.AFTER
+        and pending is ArtifactState.BEFORE
+    ):
+        return (
+            MutationRecoveryAction.CONSUME_PENDING,
+            MutationRecoveryAction.CONSUME_QUARANTINE,
+            MutationRecoveryAction.DONE,
+        )
+    if (
+        target is ArtifactState.BEFORE
+        and quarantine is ArtifactState.MISSING
+        and pending is ArtifactState.MISSING
+    ):
+        return (MutationRecoveryAction.DONE,)
+    return (MutationRecoveryAction.EXTERNAL,)
+
+
 def _recover_managed_temp_quarantines(root: Path, journal: Journal) -> None:
     """恢复前把崩溃遗留的 managed temp quarantine 收敛（回归 H3）。
 
@@ -3077,6 +3394,7 @@ def _recover_managed_temp_quarantines(root: Path, journal: Journal) -> None:
     复核当成无法解释的新文件；先按授权摘要精确分类（精确→删除完成，不符→恢复原名
     并报错），让观察复核在干净树上前进。
     """
+    planned_dirs = _planned_created_directory_closure(journal.observations, journal.mutations)
     for index, mutation in enumerate(journal.mutations):
         if mutation.kind is not MutationKind.WRITE or mutation.after_sha256 is None:
             continue
@@ -3084,6 +3402,13 @@ def _recover_managed_temp_quarantines(root: Path, journal: Journal) -> None:
         quarantine_path = relative.with_name(_quarantine_name(relative.name))
         if classify_node(root / quarantine_path) is EntryKind.MISSING:
             continue
+        # 所有权证明：managed temp 路径也必须计划时缺失才可消费（回归 H4）。
+        if not artifact_plan_time_absent(
+            journal.observations,
+            quarantine_path,
+            planned_created_directories=planned_dirs,
+        ):
+            raise DraftError("operation.external_change", root / quarantine_path)
         recover_quarantine(
             root,
             relative,
@@ -3093,86 +3418,287 @@ def _recover_managed_temp_quarantines(root: Path, journal: Journal) -> None:
         )
 
 
-def _recover_apply_transaction_artifacts(root: Path, journal: Journal) -> None:
-    """恢复前收敛受管写/删应用的崩溃遗留 pending/quarantine（回归 H4）。
-
-    改写/删除应用先把旧节点隔离到 ``{目标}.quarantine``（隔离名保持到新内容耐久发布
-    后才消费），发布用 create-only 产生 ``{目标}.pending``；崩溃后观察复核前先按授权
-    摘要分类收敛，让前向重放从干净状态继续，未登记同形名字仍当外部内容。
-    """
-    for mutation in journal.mutations:
-        relative = mutation.path
-        if mutation.after_sha256 is not None:
-            pending_path = relative.with_name(_pending_name(relative.name))
-            if classify_node(root / pending_path) is not EntryKind.MISSING:
-                recover_digest_pending(
-                    root,
-                    relative,
-                    mutation.after_sha256,
-                    code="operation.external_change",
-                    code_path=root / relative,
-                )
-        if mutation.before_sha256 is None:
-            continue
-        quarantine_path = relative.with_name(_quarantine_name(relative.name))
-        if classify_node(root / quarantine_path) is EntryKind.MISSING:
-            continue
-        _recover_apply_target_quarantine(root, journal, mutation)
+def _artifact_state_of(
+    kind: EntryKind, digest: str | None, *, before: str | None, after: str | None
+) -> ArtifactState:
+    """节点类型+摘要分类为 ArtifactState（纯函数）。"""
+    if kind is EntryKind.MISSING:
+        return ArtifactState.MISSING
+    if kind is not EntryKind.FILE:
+        return ArtifactState.NON_FILE
+    if after is not None and digest == after:
+        return ArtifactState.AFTER
+    if before is not None and digest == before:
+        return ArtifactState.BEFORE
+    return ArtifactState.WRONG
 
 
-def _recover_apply_target_quarantine(
-    root: Path, journal: Journal, mutation: JournalMutation
+def _consume_named_artifact(
+    root: Path, relative: Path, *, name: str, expected_digest: str, code_path: Path
 ) -> None:
-    """目标 quarantine 收敛：隔离名必须是授权 before 节点。
+    """inode+内容复核后消费（删除）崩溃遗留 artifact 名（回归 H3/H4）。
 
-    目标处于 before（隔离后未删原名）时 delete_stale；目标缺失且为 WRITE（before 已
-    消费、after 未发布）时从登记 staged 补发 after 再删除隔离名；目标缺失且为 DELETE
-    （删除已消费 before）或目标处于 after（改写已完成）时按 inode 复核删除隔离名；
-    其余目标状态保留现场报外部变化。
+    只删除我们验证过的同一节点；缺失幂等容忍，类型/摘要不符保留现场报外部变化。
     """
-    relative = mutation.path
-    before = cast("str", mutation.before_sha256)
-    code_path = root / relative
     with anchored_leaf(
         root, relative, code="operation.external_change", code_path=code_path
     ) as target:
         if isinstance(target, _MissingLeaf):
             return
-        quarantine = _AnchoredLeaf(
+        artifact = _AnchoredLeaf(
+            target.parent_fd, name, relative, "operation.external_change", code_path
+        )
+        verified = _name_node(target.parent_fd, artifact.name)
+        if verified is None:
+            return  # 已不存在：幂等。
+        kind = artifact.classify()
+        if kind is not EntryKind.FILE or sha256_bytes(artifact.read()) != expected_digest:
+            raise DraftError("operation.external_change", code_path)
+        if not _same_name_node(target.parent_fd, artifact.name, verified):
+            raise DraftError("operation.external_change", code_path)
+        try:
+            os.unlink(artifact.name, dir_fd=target.parent_fd)
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+        _fsync_dir_fd(target.parent_fd, code_path)
+
+
+def _publish_pending_to_target(
+    root: Path, relative: Path, *, expected_digest: str, code_path: Path
+) -> None:
+    """把授权 pending（内容摘要=expected）create-only 发布为目标并消费 pending（回归 H3）。
+
+    目标必须缺失（no-clobber link）：发布瞬间目标已出现即外部变化。发布后复核内容
+    仍是授权内容且 pending 未被替换，再删除 pending。pending 与目标在同一锚定句柄内。
+    """
+    with anchored_leaf(
+        root, relative, code="operation.external_change", code_path=code_path
+    ) as target:
+        if isinstance(target, _MissingLeaf):
+            raise DraftError("operation.external_change", code_path)
+        if target.classify() is not EntryKind.MISSING:
+            raise DraftError("operation.external_change", code_path)
+        pending = _AnchoredLeaf(
             target.parent_fd,
-            _quarantine_name(target.name),
+            _pending_name(target.name),
             relative,
             "operation.external_change",
             code_path,
         )
-        qk = quarantine.classify()
-        tk = target.classify()
-        # 先捕获 inode 再读内容验摘要：消费前复核隔离名仍指向刚验证的节点。
-        verified_node = _name_node(target.parent_fd, quarantine.name)
-        qd = sha256_bytes(quarantine.read()) if qk is EntryKind.FILE else None
-        if qk is not EntryKind.FILE or qd != before:
+        if pending.classify() is not EntryKind.FILE:
             raise DraftError("operation.external_change", code_path)
-        td = sha256_bytes(target.read()) if tk is EntryKind.FILE else None
-        if tk is EntryKind.MISSING:
-            if mutation.kind is MutationKind.WRITE:
-                # before 已消费、after 未发布：从登记 staged 补发（create-only）。
-                staged = journal.directory / cast("Path", mutation.staged)
-                target.write(staged.read_bytes())
-        elif mutation.after_sha256 is not None and td == mutation.after_sha256:
-            pass  # 改写已完成：陈旧隔离名直接删除。
-        elif td == before:
-            # 目标仍在 before：隔离名已消费（delete_stale），直接删除。
-            pass
-        else:
-            raise DraftError("operation.external_change", code_path)
-        # 消费（删除）隔离名：inode 复核后删除。
-        if not _same_name_node(target.parent_fd, quarantine.name, verified_node):
+        content = pending.read()
+        if sha256_bytes(content) != expected_digest:
             raise DraftError("operation.external_change", code_path)
         try:
-            os.unlink(quarantine.name, dir_fd=target.parent_fd)
-        except OSError as exc:
+            os.link(
+                pending.name,
+                target.name,
+                src_dir_fd=target.parent_fd,
+                dst_dir_fd=target.parent_fd,
+            )
+        except FileExistsError as exc:
             raise DraftError("operation.external_change", code_path) from exc
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
         _fsync_dir_fd(target.parent_fd, code_path)
+        if sha256_bytes(
+            _read_name_bytes(target.parent_fd, target.name, code_path=code_path)
+        ) != expected_digest or not _same_name_node(
+            target.parent_fd, pending.name, _name_node(target.parent_fd, target.name)
+        ):
+            raise DraftError("operation.external_change", code_path)
+        try:
+            os.unlink(pending.name, dir_fd=target.parent_fd)
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+        _fsync_dir_fd(target.parent_fd, code_path)
+
+
+def _publish_recovery_content_to_target(
+    root: Path,
+    mutation: JournalMutation,
+    *,
+    content: bytes,
+    expected_digest: str,
+    code_path: Path,
+) -> None:
+    """create-only 把恢复内容（staged=after / original=before）发布为目标。"""
+    with anchored_leaf(
+        root, mutation.path, code="operation.external_change", code_path=code_path
+    ) as target:
+        if isinstance(target, _MissingLeaf):
+            raise DraftError("operation.external_change", code_path)
+        if target.classify() is not EntryKind.MISSING:
+            raise DraftError("operation.external_change", code_path)
+        if sha256_bytes(content) != expected_digest:
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, code_path)
+        _create_only_publish(target.parent_fd, target.name, content, code_path=code_path)
+
+
+def _execute_mutation_artifact_actions(
+    root: Path,
+    journal: Journal,
+    mutation: JournalMutation,
+    relative: Path,
+    *,
+    direction: MutationDirection,
+    actions: tuple[MutationRecoveryAction, ...],
+    code_path: Path,
+) -> None:
+    """按纯决策表动作执行 artifact 收敛（I/O 层；回归 H3）。
+
+    摘要来源固定：pending=after（正向）/before（回滚）、staged=after、original=before。
+    不在此处按 before/after 是否为空猜方向。
+    """
+    for action in actions:
+        if action is MutationRecoveryAction.RETRY_APPLY:
+            continue  # 无 artifact 收敛，交给阶段流继续应用。
+        if action is MutationRecoveryAction.DONE:
+            continue  # 目标已是正确状态。
+        if action is MutationRecoveryAction.EXTERNAL:
+            raise DraftError("operation.external_change", code_path)
+        if action in (
+            MutationRecoveryAction.PUBLISH_PENDING,
+            MutationRecoveryAction.CONSUME_PENDING,
+        ):
+            expected = (
+                mutation.after_sha256
+                if direction is MutationDirection.FORWARD
+                else mutation.before_sha256
+            )
+            if expected is None:
+                raise DraftError("operation.external_change", code_path)
+            if action is MutationRecoveryAction.PUBLISH_PENDING:
+                _publish_pending_to_target(
+                    root, relative, expected_digest=expected, code_path=code_path
+                )
+            else:
+                _consume_named_artifact(
+                    root,
+                    relative,
+                    name=_pending_name(relative.name),
+                    expected_digest=expected,
+                    code_path=code_path,
+                )
+        elif action is MutationRecoveryAction.CONSUME_QUARANTINE:
+            expected = (
+                mutation.before_sha256
+                if direction is MutationDirection.FORWARD
+                else mutation.after_sha256
+            )
+            if expected is None:
+                raise DraftError("operation.external_change", code_path)
+            _consume_named_artifact(
+                root,
+                relative,
+                name=_quarantine_name(relative.name),
+                expected_digest=expected,
+                code_path=code_path,
+            )
+        elif action is MutationRecoveryAction.PUBLISH_STAGED:
+            staged = journal.directory / cast("Path", mutation.staged)
+            try:
+                content = staged.read_bytes()
+            except OSError as exc:
+                raise DraftError("operation.external_change", code_path) from exc
+            _publish_recovery_content_to_target(
+                root,
+                mutation,
+                content=content,
+                expected_digest=cast("str", mutation.after_sha256),
+                code_path=code_path,
+            )
+        elif action is MutationRecoveryAction.PUBLISH_ORIGINAL:
+            original = journal.directory / cast("Path", mutation.original)
+            try:
+                content = original.read_bytes()
+            except OSError as exc:
+                raise DraftError("operation.external_change", code_path) from exc
+            _publish_recovery_content_to_target(
+                root,
+                mutation,
+                content=content,
+                expected_digest=cast("str", mutation.before_sha256),
+                code_path=code_path,
+            )
+
+
+def _recover_mutation_artifacts(
+    root: Path, journal: Journal, *, direction: MutationDirection
+) -> None:
+    """方向感知收敛受管写/删应用的崩溃遗留 pending/quarantine（第十轮 H3/H4）。
+
+    正向与回滚共用 ``{目标}.pending/.quarantine`` 后缀，但代表不同授权摘要：正向
+    quarantine 保存 before、pending 保存 after；回滚 quarantine 保存 after、pending
+    保存 before。方向由 journal phase（ROLLING_BACK=回滚）决定，纯决策表
+    ``mutation_artifact_actions`` 输出按序动作，I/O 层只执行。任何存在的 artifact 必须
+    由计划时缺失证明（``artifact_plan_time_absent``）才可消费或发布：计划前既有节点
+    即使字节恰好相同也不移动、不删除、不覆盖（回归 H4）。
+    """
+    planned_dirs = _planned_created_directory_closure(journal.observations, journal.mutations)
+    for mutation in journal.mutations:
+        relative = mutation.path
+        code_path = root / relative
+        pending_path = relative.with_name(_pending_name(relative.name))
+        quarantine_path = relative.with_name(_quarantine_name(relative.name))
+        with anchored_leaf(
+            root, relative, code="operation.external_change", code_path=code_path
+        ) as target:
+            if isinstance(target, _MissingLeaf):
+                continue  # 父目录缺失：无 artifact 可收敛，交给阶段流重建目录链。
+            pending = _AnchoredLeaf(
+                target.parent_fd,
+                _pending_name(target.name),
+                relative,
+                "operation.external_change",
+                code_path,
+            )
+            quarantine = _AnchoredLeaf(
+                target.parent_fd,
+                _quarantine_name(target.name),
+                relative,
+                "operation.external_change",
+                code_path,
+            )
+            tk = target.classify()
+            pk = pending.classify()
+            qk = quarantine.classify()
+            td = sha256_bytes(target.read()) if tk is EntryKind.FILE else None
+            pd = sha256_bytes(pending.read()) if pk is EntryKind.FILE else None
+            qd = sha256_bytes(quarantine.read()) if qk is EntryKind.FILE else None
+        actions = mutation_artifact_actions(
+            direction=direction,
+            role=_mutation_role(mutation),
+            target=_artifact_state_of(
+                tk, td, before=mutation.before_sha256, after=mutation.after_sha256
+            ),
+            pending=_artifact_state_of(
+                pk, pd, before=mutation.before_sha256, after=mutation.after_sha256
+            ),
+            quarantine=_artifact_state_of(
+                qk, qd, before=mutation.before_sha256, after=mutation.after_sha256
+            ),
+            pending_owned=artifact_plan_time_absent(
+                journal.observations,
+                pending_path,
+                planned_created_directories=planned_dirs,
+            ),
+            quarantine_owned=artifact_plan_time_absent(
+                journal.observations,
+                quarantine_path,
+                planned_created_directories=planned_dirs,
+            ),
+        )
+        _execute_mutation_artifact_actions(
+            root,
+            journal,
+            mutation,
+            relative,
+            direction=direction,
+            actions=actions,
+            code_path=code_path,
+        )
 
 
 def _clean_owned_temp_artifacts(
@@ -3185,6 +3711,7 @@ def _clean_owned_temp_artifacts(
     mutation 的 after 摘要一致，类型不符或摘要不符（决策与清理之间被外部改写）即
     外部篡改，停止并保留现场。不扫描父目录猜测候选。
     """
+    planned_dirs = _planned_created_directory_closure(journal.observations, journal.mutations)
     for index, mutation in enumerate(journal.mutations):
         if mutation.kind is not MutationKind.WRITE or mutation.after_sha256 is None:
             continue
@@ -3192,6 +3719,13 @@ def _clean_owned_temp_artifacts(
         if relative not in consume_temps:
             continue
         temporary = root / relative
+        # 所有权证明：managed temp 路径必须计划时缺失才可消费（回归 H4）。
+        if not artifact_plan_time_absent(
+            journal.observations,
+            relative,
+            planned_created_directories=planned_dirs,
+        ):
+            raise DraftError("operation.external_change", temporary)
         # 锚定隔离→验证→删除（回归 H3）：不再用普通 Path.unlink 旁路。
         with anchored_leaf(
             root,
@@ -3236,9 +3770,10 @@ def _recover_locked(root: Path, operation_id: str) -> OperationResult:
         )
     _verify_recovery_material(journal)
     if journal.phase is OperationPhase.ROLLING_BACK:
-        # 回滚意图已耐久：继续回滚而不是前向完成。_rollback 幂等跳过已恢复目标，
-        # 全部恢复后终态化为 rolled_back 并释放锁。方向感知的 artifact 收敛由
-        # Task 3 的 mutation_artifact_actions 负责；此处保证方向正确且正常回滚可收敛。
+        # 回滚意图已耐久：先按方向收敛回滚 artifact（quarantine 保存 after、pending
+        # 保存 before），再继续回滚。_rollback 幂等跳过已恢复目标，全部恢复后终态化
+        # 为 rolled_back 并释放锁。
+        _recover_mutation_artifacts(root, journal, direction=MutationDirection.ROLLBACK)
         return _rollback(
             root,
             journal,
@@ -3247,10 +3782,10 @@ def _recover_locked(root: Path, operation_id: str) -> OperationResult:
     # 先把崩溃遗留的 managed temp quarantine 收敛（回归 H3）：被中断的 consume 删除
     # 留下的 ``{temp}.quarantine`` 若不在观察复核前处理，会被当成无法解释的新文件。
     _recover_managed_temp_quarantines(root, journal)
-    # 再收敛受管写/删应用的崩溃遗留 pending/quarantine（回归 H4）：被中断的改写/删除
-    # 隔离与发布留下的 ``{目标}.pending/.quarantine`` 会让目标短暂缺失/带残留名，必须
-    # 在 _classify 与观察复核前按授权摘要收敛，否则会误判为无法解释的外部变化。
-    _recover_apply_transaction_artifacts(root, journal)
+    # 再按方向收敛受管写/删应用的崩溃遗留 pending/quarantine（正向：quarantine 保存
+    # before、pending 保存 after；回归 H4/H3）：在 _classify 与观察复核前收敛，否则
+    # 会被误判为无法解释的外部变化。只有计划时证明缺失的 artifact 才可消费/发布。
+    _recover_mutation_artifacts(root, journal, direction=MutationDirection.FORWARD)
     for mutation in journal.mutations:
         if _classify(root, mutation) == "unknown":
             raise DraftError("operation.external_change", root / mutation.path)
@@ -3262,8 +3797,14 @@ def _recover_locked(root: Path, operation_id: str) -> OperationResult:
     )
     if changed:
         raise DraftError("operation.external_change", root / changed[0])
-    _clean_owned_temp_artifacts(root, journal, consume_temps)
-    return _finish_forward(root, journal, changed_paths=_recover_changed_paths(journal))
+    current = journal
+    if current.phase is OperationPhase.PREPARED:
+        # prepared 崩溃（originals/staged 已登记但应用未开始）：先耐久进入 applying，
+        # 再按 _finish_forward 逐条应用；prepared→validating 不是合法阶段边。
+        current = _with_phase(current, OperationPhase.APPLYING)
+        write_journal(current)
+    _clean_owned_temp_artifacts(root, current, consume_temps)
+    return _finish_forward(root, current, changed_paths=_recover_changed_paths(current))
 
 
 def recover(root_path: Path) -> OperationResult:

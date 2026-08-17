@@ -1553,6 +1553,242 @@ def test_parse_journal_rejects_recover_kind() -> None:
         _parse_journal(payload, _parse_path())
 
 
+def test_artifact_plan_time_absent() -> None:
+    """计划时缺失证明：只有正向证据且祖先链由本操作创建才拥有（第十轮 H4）。"""
+    from draft.operations import (
+        _planned_created_directory_closure,  # pyright: ignore[reportPrivateUsage]
+        artifact_plan_time_absent,
+    )
+
+    dir_obs = ObservationManifest(
+        entries=(
+            Observation(path=Path("pages"), kind=EntryKind.DIRECTORY, members=("a.md",)),
+            file_observation(Path("pages/a.md"), b"a"),
+        )
+    )
+    planned = _planned_created_directory_closure(dir_obs, ())
+    assert planned == frozenset()
+    # 父目录已观察 DIRECTORY 且不含该名字：精确缺失即拥有。
+    assert artifact_plan_time_absent(
+        dir_obs, Path("pages/a.md.pending"), planned_created_directories=planned
+    )
+    # 父目录明确含名字：不拥有。
+    assert not artifact_plan_time_absent(
+        dir_obs, Path("pages/a.md"), planned_created_directories=planned
+    )
+    # 没有观察：无证据，不拥有。
+    assert not artifact_plan_time_absent(
+        EMPTY_OBSERVATIONS, Path("pages/a.md.pending"), planned_created_directories=frozenset()
+    )
+    # 父为 FILE/SYMLINK/OTHER：不拥有。
+    file_parent = ObservationManifest(
+        entries=(file_observation(Path("pages/a.md"), b"a"),)
+    )
+    assert not artifact_plan_time_absent(
+        file_parent, Path("pages/a.md/x.pending"), planned_created_directories=frozenset()
+    )
+    # 缺失祖先不在创建闭包内：不拥有。
+    no_obs = ObservationManifest(
+        entries=(Observation(path=Path("pages/foo"), kind=EntryKind.MISSING),)
+    )
+    assert not artifact_plan_time_absent(
+        no_obs, Path("pages/foo/x.pending"), planned_created_directories=frozenset()
+    )
+    # 缺失祖先在本操作创建闭包内：拥有。
+    assert artifact_plan_time_absent(
+        no_obs,
+        Path("pages/foo/x.pending"),
+        planned_created_directories=frozenset({Path("pages/foo")}),
+    )
+    # 创建闭包只包含 mutation 目标缺失祖先。
+    mutated = ObservationManifest(
+        entries=(
+            Observation(path=Path("pages"), kind=EntryKind.DIRECTORY, members=()),
+            Observation(path=Path("pages/foo"), kind=EntryKind.MISSING),
+        )
+    )
+    from draft.operations import JournalMutation as _JM  # pyright: ignore[reportPrivateUsage]
+
+    planned2 = _planned_created_directory_closure(
+        mutated,
+        (_JM(Path("pages/foo/leaf.md"), MutationKind.WRITE, None, "a" * 64, None, None, False),),
+    )
+    assert planned2 == frozenset({Path("pages/foo")})
+
+
+def test_mutation_artifact_actions_forward() -> None:
+    """正向应用的方向感知决策表（第十轮 H3）。"""
+    from draft.operations import (  # pyright: ignore[reportPrivateUsage]
+        ArtifactState,
+        MutationDirection,
+        MutationRole,
+        mutation_artifact_actions,
+    )
+
+    D = MutationDirection.FORWARD
+    S = ArtifactState
+    P = "publish_pending"
+    Pk = "publish_staged"
+    Cp = "consume_pending"
+    Cq = "consume_quarantine"
+    R = "retry_apply"
+    Done = "done"
+    Ex = "external"
+
+    def act(
+        role: MutationRole,
+        t: ArtifactState,
+        p: ArtifactState,
+        q: ArtifactState,
+        *,
+        po: bool = False,
+        qo: bool = False,
+    ) -> tuple[object, ...]:
+        return mutation_artifact_actions(
+            direction=D,
+            role=role,
+            target=t,
+            pending=p,
+            quarantine=q,
+            pending_owned=po,
+            quarantine_owned=qo,
+        )
+
+    # forward NEW_WRITE。
+    assert act(MutationRole.NEW_WRITE, S.MISSING, S.MISSING, S.MISSING) == (R,)
+    assert act(MutationRole.NEW_WRITE, S.MISSING, S.AFTER, S.MISSING, po=True) == (P, Done)
+    assert act(MutationRole.NEW_WRITE, S.AFTER, S.MISSING, S.MISSING) == (Done,)
+    assert act(MutationRole.NEW_WRITE, S.AFTER, S.AFTER, S.MISSING, po=True) == (Cp, Done)
+    assert act(MutationRole.NEW_WRITE, S.MISSING, S.AFTER, S.MISSING, po=False) == (Ex,)
+    assert act(MutationRole.NEW_WRITE, S.AFTER, S.MISSING, S.AFTER) == (Ex,)
+    assert act(MutationRole.NEW_WRITE, S.WRONG, S.MISSING, S.MISSING) == (Ex,)
+    # forward REWRITE_WRITE。
+    assert act(MutationRole.REWRITE_WRITE, S.BEFORE, S.MISSING, S.MISSING) == (R,)
+    assert act(MutationRole.REWRITE_WRITE, S.BEFORE, S.MISSING, S.BEFORE, qo=True) == (Cq, R)
+    assert act(MutationRole.REWRITE_WRITE, S.MISSING, S.MISSING, S.BEFORE, qo=True) == (
+        Pk, Cq, Done,
+    )
+    assert act(
+        MutationRole.REWRITE_WRITE, S.MISSING, S.AFTER, S.BEFORE, po=True, qo=True
+    ) == (P, Cq, Done)
+    assert act(MutationRole.REWRITE_WRITE, S.AFTER, S.MISSING, S.BEFORE, qo=True) == (Cq, Done)
+    assert act(
+        MutationRole.REWRITE_WRITE, S.AFTER, S.AFTER, S.BEFORE, po=True, qo=True
+    ) == (Cp, Cq, Done)
+    assert act(MutationRole.REWRITE_WRITE, S.AFTER, S.MISSING, S.MISSING) == (Done,)
+    assert act(MutationRole.REWRITE_WRITE, S.AFTER, S.AFTER, S.MISSING, po=True) == (Cp, Done)
+    assert act(MutationRole.REWRITE_WRITE, S.AFTER, S.MISSING, S.BEFORE, qo=False) == (Ex,)
+    assert act(MutationRole.REWRITE_WRITE, S.MISSING, S.AFTER, S.BEFORE, po=False, qo=True) == (Ex,)
+    assert act(MutationRole.REWRITE_WRITE, S.BEFORE, S.AFTER, S.MISSING, po=True) == (Ex,)
+    # forward DELETE。
+    assert act(MutationRole.DELETE, S.BEFORE, S.MISSING, S.MISSING) == (R,)
+    assert act(MutationRole.DELETE, S.BEFORE, S.MISSING, S.BEFORE, qo=True) == (Cq, R)
+    assert act(MutationRole.DELETE, S.MISSING, S.MISSING, S.BEFORE, qo=True) == (Cq, Done)
+    assert act(MutationRole.DELETE, S.MISSING, S.MISSING, S.MISSING) == (Done,)
+    assert act(MutationRole.DELETE, S.BEFORE, S.AFTER, S.MISSING, po=True) == (Ex,)
+    assert act(MutationRole.DELETE, S.MISSING, S.MISSING, S.BEFORE, qo=False) == (Ex,)
+
+
+def test_mutation_artifact_actions_rollback() -> None:
+    """回滚方向的方向感知决策表（第十轮 H3）：quarantine 保存 AFTER、pending 保存 BEFORE。"""
+    from draft.operations import (  # pyright: ignore[reportPrivateUsage]
+        ArtifactState,
+        MutationDirection,
+        MutationRole,
+        mutation_artifact_actions,
+    )
+
+    D = MutationDirection.ROLLBACK
+    S = ArtifactState
+    P = "publish_pending"
+    Po = "publish_original"
+    Cp = "consume_pending"
+    Cq = "consume_quarantine"
+    R = "retry_apply"
+    Done = "done"
+    Ex = "external"
+
+    def act(
+        role: MutationRole,
+        t: ArtifactState,
+        p: ArtifactState,
+        q: ArtifactState,
+        *,
+        po: bool = False,
+        qo: bool = False,
+    ) -> tuple[object, ...]:
+        return mutation_artifact_actions(
+            direction=D,
+            role=role,
+            target=t,
+            pending=p,
+            quarantine=q,
+            pending_owned=po,
+            quarantine_owned=qo,
+        )
+
+    # rollback NEW_WRITE（删除 after）。
+    assert act(MutationRole.NEW_WRITE, S.AFTER, S.MISSING, S.MISSING) == (R,)
+    assert act(MutationRole.NEW_WRITE, S.AFTER, S.MISSING, S.AFTER, qo=True) == (Cq, R)
+    assert act(MutationRole.NEW_WRITE, S.MISSING, S.MISSING, S.AFTER, qo=True) == (Cq, Done)
+    assert act(MutationRole.NEW_WRITE, S.MISSING, S.MISSING, S.MISSING) == (Done,)
+    assert act(MutationRole.NEW_WRITE, S.AFTER, S.MISSING, S.AFTER, qo=False) == (Ex,)
+    assert act(MutationRole.NEW_WRITE, S.MISSING, S.BEFORE, S.MISSING, po=True) == (Ex,)
+    # rollback REWRITE_WRITE。
+    assert act(MutationRole.REWRITE_WRITE, S.AFTER, S.MISSING, S.MISSING) == (R,)
+    assert act(MutationRole.REWRITE_WRITE, S.AFTER, S.MISSING, S.AFTER, qo=True) == (Cq, R)
+    assert act(MutationRole.REWRITE_WRITE, S.MISSING, S.MISSING, S.AFTER, qo=True) == (
+        Po, Cq, Done,
+    )
+    assert act(
+        MutationRole.REWRITE_WRITE, S.MISSING, S.BEFORE, S.AFTER, po=True, qo=True
+    ) == (P, Cq, Done)
+    assert act(MutationRole.REWRITE_WRITE, S.BEFORE, S.MISSING, S.AFTER, qo=True) == (Cq, Done)
+    assert act(
+        MutationRole.REWRITE_WRITE, S.BEFORE, S.BEFORE, S.AFTER, po=True, qo=True
+    ) == (Cp, Cq, Done)
+    assert act(MutationRole.REWRITE_WRITE, S.BEFORE, S.MISSING, S.MISSING) == (Done,)
+    assert act(MutationRole.REWRITE_WRITE, S.AFTER, S.BEFORE, S.MISSING, po=True) == (Ex,)
+    assert act(MutationRole.REWRITE_WRITE, S.MISSING, S.BEFORE, S.AFTER, po=False, qo=True) == (Ex,)
+    # rollback DELETE。
+    assert act(MutationRole.DELETE, S.MISSING, S.MISSING, S.MISSING) == (R,)
+    assert act(MutationRole.DELETE, S.MISSING, S.BEFORE, S.MISSING, po=True) == (P, Done)
+    assert act(MutationRole.DELETE, S.BEFORE, S.MISSING, S.MISSING) == (Done,)
+    assert act(MutationRole.DELETE, S.BEFORE, S.BEFORE, S.MISSING, po=True) == (Cp, Done)
+    assert act(MutationRole.DELETE, S.MISSING, S.BEFORE, S.MISSING, po=False) == (Ex,)
+    assert act(MutationRole.DELETE, S.MISSING, S.MISSING, S.AFTER, qo=True) == (Ex,)
+
+
+def test_mutation_artifact_actions_ownership_required() -> None:
+    """任何存在的 artifact 未证明计划时缺失都报外部变化（第十轮 H4）。"""
+    from draft.operations import (  # pyright: ignore[reportPrivateUsage]
+        ArtifactState,
+        MutationDirection,
+        MutationRecoveryAction,
+        MutationRole,
+        mutation_artifact_actions,
+    )
+
+    S = ArtifactState
+    cases = [
+        (MutationRole.NEW_WRITE, S.MISSING, S.AFTER, S.MISSING, False, False),
+        (MutationRole.REWRITE_WRITE, S.MISSING, S.MISSING, S.BEFORE, False, False),
+        (MutationRole.REWRITE_WRITE, S.AFTER, S.AFTER, S.MISSING, False, False),
+        (MutationRole.DELETE, S.MISSING, S.MISSING, S.BEFORE, False, False),
+    ]
+    for role, t, p, q, po, qo in cases:
+        result = mutation_artifact_actions(
+            direction=MutationDirection.FORWARD,
+            role=role,
+            target=t,
+            pending=p,
+            quarantine=q,
+            pending_owned=po,
+            quarantine_owned=qo,
+        )
+        assert result == (MutationRecoveryAction.EXTERNAL,), (role, t, p, q)
+
+
 def test_pending_decision_matrix() -> None:
     """恢复期 pending 收敛决策表：publish/delete/ignore/external（回归 H2）。"""
     from draft.observations import EntryKind

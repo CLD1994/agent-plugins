@@ -1,3 +1,4 @@
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -110,6 +111,13 @@ def two_write_plan(root: Path) -> tuple[OperationPlan, bytes, bytes, bytes, byte
         ),
     )
     return plan, old_a, old_b, new_a, new_b
+
+
+def _observed_two_write_plan(root: Path) -> tuple[OperationPlan, bytes, bytes, bytes, bytes]:
+    """双写计划带真实读集观察：artifact 所有权证明需要计划时缺失证据（回归 H4）。"""
+    plan, old_a, old_b, new_a, new_b = two_write_plan(root)
+    observed = dataclasses.replace(plan, observations=graph_observations(load_graph(root)))
+    return observed, old_a, old_b, new_a, new_b
 
 
 def crash_on_nth_replace(nth: int) -> object:
@@ -455,7 +463,7 @@ def test_recover_converges_apply_crash_leftover_quarantine(
     import draft.operations as operations_module
 
     root = operation_draft
-    plan, _old_a, old_b, new_a, new_b = two_write_plan(root)
+    plan, _old_a, old_b, new_a, new_b = _observed_two_write_plan(root)
     original_write = operations_module._AnchoredLeaf.write  # pyright: ignore[reportPrivateUsage]
     calls = {"n": 0}
 
@@ -494,7 +502,7 @@ def test_recover_converges_exact_pending_at_after_target(
     import draft.operations as operations_module
 
     root = operation_draft
-    plan, _old_a, _old_b, new_a, _new_b = two_write_plan(root)
+    plan, _old_a, _old_b, new_a, _new_b = _observed_two_write_plan(root)
     monkeypatch.setattr(
         "draft.operations._apply_write",
         crash_after_nth_apply(operations_module, 1),
@@ -541,6 +549,210 @@ def test_recover_rejects_foreign_pending_content(
     assert (root / "pages/a.md").read_bytes() == new_a  # after 目标保留。
     assert foreign.read_bytes() == b"tampered"  # 现场保留。
     assert (root / ".draft/operation.lock").exists()
+
+
+def test_recover_never_consumes_preexisting_pending_artifact(
+    operation_draft: Path,
+) -> None:
+    """计划前既有的 {目标}.pending（即使内容恰好等于 after）不得被消费或发布（回归 H4）。
+
+    所有权证据是计划时缺失观察，不是确定性名字 + 匹配摘要。命令先安全失败，recover
+    必须保留既有 pending，不得把它发布成目标或删除。
+    """
+    root = operation_draft
+    new_bytes = b"# New\n\nfresh page\n"
+    pending = root / "pages/new.md.pending"
+    pending.write_bytes(new_bytes)  # 计划前既有：观察清单会把 pending 列为目录成员。
+    plan = OperationPlan(
+        kind=OperationKind.CREATE,
+        root=root,
+        root_state=RootState.REGISTERED,
+        observations=graph_observations(load_graph(root)),
+        mutations=(
+            FileMutation(
+                Path("pages/new.md"),
+                MutationKind.WRITE,
+                None,
+                sha256_bytes(new_bytes),
+                new_bytes,
+            ),
+        ),
+    )
+    with pytest.raises(DraftError, match="operation.external_change"):
+        execute_plan(plan)
+    with pytest.raises(DraftError, match="operation.external_change"):
+        recover(root)
+    assert pending.read_bytes() == new_bytes  # 原路径、类型、字节完全不变。
+    assert not (root / "pages/new.md").exists()
+    assert (root / ".draft/operation.lock").exists()
+
+
+def test_recover_preserves_preexisting_quarantine_artifact(
+    operation_draft: Path,
+) -> None:
+    """计划前既有的 {目标}.quarantine（摘要等于授权 before）不得被消费（回归 H4）。"""
+    root = operation_draft
+    old_a = (root / "pages/a.md").read_bytes()
+    new_a = old_a + b"\nforward-a\n"
+    quarantine = root / "pages/a.md.quarantine"
+    quarantine.write_bytes(old_a)  # 计划前既有：观察把 quarantine 列为目录成员。
+    plan = OperationPlan(
+        kind=OperationKind.CREATE,
+        root=root,
+        root_state=RootState.REGISTERED,
+        observations=graph_observations(load_graph(root)),
+        mutations=(
+            FileMutation(
+                Path("pages/a.md"),
+                MutationKind.WRITE,
+                sha256_bytes(old_a),
+                sha256_bytes(new_a),
+                new_a,
+            ),
+        ),
+    )
+    with pytest.raises(DraftError, match="operation.external_change"):
+        execute_plan(plan)
+    with pytest.raises(DraftError, match="operation.external_change"):
+        recover(root)
+    assert quarantine.read_bytes() == old_a  # 既有 quarantine 原样保留。
+    assert (root / "pages/a.md").read_bytes() == old_a
+    assert (root / ".draft/operation.lock").exists()
+
+
+def _write_rolling_back_rewrite_journal(
+    root: Path, op_id: str, *, before: bytes, after: bytes
+) -> Path:
+    """写入回滚意图已耐久、rewrite WRITE 的 ROLLING_BACK 日志（含 originals/staged）。"""
+    import json as json_module
+
+    journal_dir = root / ".draft/operations" / op_id
+    (journal_dir / "originals").mkdir(parents=True)
+    (journal_dir / "staged").mkdir()
+    (journal_dir / "originals" / "0000.bin").write_bytes(before)
+    (journal_dir / "staged" / "0000.bin").write_bytes(after)
+    mutations: list[dict[str, object]] = [
+        {
+            "path": "pages/a.md",
+            "kind": "write",
+            "before_sha256": sha256_bytes(before),
+            "after_sha256": sha256_bytes(after),
+            "original": "originals/0000.bin",
+            "staged": "staged/0000.bin",
+            "applied": True,
+        }
+    ]
+    journal: dict[str, object] = {
+        "journal_version": JOURNAL_VERSION,
+        "operation_id": op_id,
+        "kind": OperationKind.CREATE.value,
+        "phase": OperationPhase.ROLLING_BACK.value,
+        "root_state": "registered",
+        "observations": _graph_observations_payload(root),
+        "mutations": mutations,
+        "remove_empty_directories": [],
+        "metadata": {},
+    }
+    journal_path = journal_dir / "journal.json"
+    journal_path.write_text(json_module.dumps(journal), encoding="utf-8")
+    return journal_path
+
+
+def test_recover_rolls_back_interrupted_rewrite_from_artifacts(
+    operation_draft: Path,
+) -> None:
+    """回滚改写中断（quarantine=after、pending=before、target=missing）：方向感知收敛（回归 H3）。
+
+    正向与回滚共用 .pending/.quarantine 后缀但代表不同授权摘要；ROLLING_BACK 日志的
+    恢复必须按回滚方向把 pending 发布为 before、消费 quarantine（after），不得误报外部
+    变化，也不得把回滚 artifact 前向完成。
+    """
+    import draft.operations as ops_module
+    from draft.operations import acquire_lock, read_lock
+
+    root = operation_draft
+    old_a = (root / "pages/a.md").read_bytes()
+    new_a = old_a + b"\nrollback-a\n"
+    op_id = "f" * 32
+    _write_rolling_back_rewrite_journal(root, op_id, before=old_a, after=new_a)
+    acquire_lock(root, op_id)
+    # 构造回滚中断现场：after 已隔离、before 已写 pending、目标缺失。
+    (root / "pages/a.md").unlink()
+    (root / "pages/a.md.quarantine").write_bytes(new_a)
+    (root / "pages/a.md.pending").write_bytes(old_a)
+
+    result = ops_module.recover(root)
+
+    assert result.phase == OperationPhase.ROLLED_BACK
+    assert (root / "pages/a.md").read_bytes() == old_a  # before 恢复。
+    assert not (root / "pages/a.md.quarantine").exists()
+    assert not (root / "pages/a.md.pending").exists()
+    assert read_lock(root) is None
+
+
+def test_recover_forwards_interrupted_rewrite_from_artifacts(
+    operation_draft: Path,
+) -> None:
+    """正向改写中断（quarantine=before、pending=after、target=missing）：前向收敛（回归 H3）。"""
+    import draft.operations as ops_module
+    from draft.operations import acquire_lock, read_lock
+
+    root = operation_draft
+    old_a = (root / "pages/a.md").read_bytes()
+    new_a = old_a + b"\nforward-a\n"
+    op_id = "e" * 32
+    _write_prepared_rewrite_journal(root, op_id, before=old_a, after=new_a)
+    acquire_lock(root, op_id)
+    # 构造正向中断现场：before 已隔离、after 已写 pending、目标缺失。
+    (root / "pages/a.md").unlink()
+    (root / "pages/a.md.quarantine").write_bytes(old_a)
+    (root / "pages/a.md.pending").write_bytes(new_a)
+
+    result = ops_module.recover(root)
+
+    assert result.phase == OperationPhase.COMPLETED
+    assert (root / "pages/a.md").read_bytes() == new_a  # after 发布。
+    assert not (root / "pages/a.md.quarantine").exists()
+    assert not (root / "pages/a.md.pending").exists()
+    assert read_lock(root) is None
+
+
+def _write_prepared_rewrite_journal(
+    root: Path, op_id: str, *, before: bytes, after: bytes
+) -> Path:
+    """写入 PREPARED、rewrite WRITE 的日志（含 originals/staged）；用于正向中断现场。"""
+    import json as json_module
+
+    journal_dir = root / ".draft/operations" / op_id
+    (journal_dir / "originals").mkdir(parents=True)
+    (journal_dir / "staged").mkdir()
+    (journal_dir / "originals" / "0000.bin").write_bytes(before)
+    (journal_dir / "staged" / "0000.bin").write_bytes(after)
+    mutations: list[dict[str, object]] = [
+        {
+            "path": "pages/a.md",
+            "kind": "write",
+            "before_sha256": sha256_bytes(before),
+            "after_sha256": sha256_bytes(after),
+            "original": "originals/0000.bin",
+            "staged": "staged/0000.bin",
+            "applied": False,
+        }
+    ]
+    journal: dict[str, object] = {
+        "journal_version": JOURNAL_VERSION,
+        "operation_id": op_id,
+        "kind": OperationKind.CREATE.value,
+        "phase": OperationPhase.PREPARED.value,
+        "root_state": "registered",
+        "observations": _graph_observations_payload(root),
+        "mutations": mutations,
+        "remove_empty_directories": [],
+        "metadata": {},
+    }
+    journal_path = journal_dir / "journal.json"
+    journal_path.write_text(json_module.dumps(journal), encoding="utf-8")
+    return journal_path
 
 
 def test_recover_stops_on_external_edit(
@@ -1628,9 +1840,17 @@ def testanchored_leaf_rejects_intermediate_symlink(tmp_path: Path) -> None:
 
 
 def _write_journal_with_originals_and_staged(
-    operation_draft: Path, op_id: str, *, extra_sub: str | None
+    operation_draft: Path,
+    op_id: str,
+    *,
+    extra_sub: str | None,
+    observations: object | None = None,
 ) -> Path:
-    """写入 H5 合法的 originals+staged 登记日志；可在 originals 或 staged 注入未知成员。"""
+    """写入 H5 合法的 originals+staged 登记日志；可在 originals 或 staged 注入未知成员。
+
+    ``observations`` 为真实观察清单的 JSON 载荷（默认空）；temp 所有权证明需要计划时
+    缺失证据（回归 H4）。
+    """
     import json as json_module
 
     root = operation_draft
@@ -1658,7 +1878,7 @@ def _write_journal_with_originals_and_staged(
         "kind": OperationKind.CREATE.value,
         "phase": OperationPhase.PREPARED.value,
         "root_state": "registered",
-        "observations": [],
+        "observations": [] if observations is None else observations,
         "mutations": mutations,
         "remove_empty_directories": [],
         "metadata": {},
@@ -1666,6 +1886,20 @@ def _write_journal_with_originals_and_staged(
     journal_path = journal_dir / "journal.json"
     journal_path.write_text(json_module.dumps(journal), encoding="utf-8")
     return journal_path
+
+
+def _graph_observations_payload(root: Path) -> list[dict[str, object]]:
+    """真实图观察清单的 JSON 载荷：管理目录成员枚举（artifact 所有权证据）。"""
+    manifest = graph_observations(load_graph(root))
+    return [
+        {
+            "path": entry.path.as_posix(),
+            "kind": entry.kind.value,
+            "sha256": entry.sha256,
+            "members": list(entry.members),
+        }
+        for entry in manifest.entries
+    ]
 
 
 @pytest.mark.parametrize("extra_sub", ["originals", "staged"])
@@ -2033,7 +2267,9 @@ def test_recover_managed_temp_quarantine_converges(operation_draft: Path) -> Non
 
     root = operation_draft
     op_id = "b" * 32
-    journal_path = _write_journal_with_originals_and_staged(root, op_id, extra_sub=None)
+    journal_path = _write_journal_with_originals_and_staged(
+        root, op_id, extra_sub=None, observations=_graph_observations_payload(root)
+    )
     journal = read_journal(journal_path)
     temp = _mutation_temporary_path(Path("pages/old-0.md"), op_id, 0)
     quarantine = root / temp.with_name(temp.name + ".quarantine")
@@ -2054,7 +2290,9 @@ def test_clean_owned_temp_artifacts_quarantines_exact_temp(operation_draft: Path
 
     root = operation_draft
     op_id = "c" * 32
-    journal_path = _write_journal_with_originals_and_staged(root, op_id, extra_sub=None)
+    journal_path = _write_journal_with_originals_and_staged(
+        root, op_id, extra_sub=None, observations=_graph_observations_payload(root)
+    )
     journal = read_journal(journal_path)
     temp = _mutation_temporary_path(Path("pages/old-0.md"), op_id, 0)
     (root / temp).write_bytes(b"staged0")
