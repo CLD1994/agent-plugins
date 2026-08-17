@@ -22,10 +22,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
 from adapter.bindings import Binding, binding_path
 from adapter.bridge import bridge_paths, publish_context
 from adapter.errors import EXIT_RUNTIME, EXIT_USAGE
-
 from tests.support.paths import ENTRY_FILE
 
 # 以 importlib 导入入口模块，避免 `import draft` 语法与核心 draft 包同名冲突；
@@ -492,7 +492,6 @@ def test_empty_session_with_valid_bridge_binds_and_unbinds(
 
 def test_plugin_entry_loader_does_not_reuse_core_draft_package() -> None:
     import draft as core_package
-
     from tests.support.entry import load_plugin_entry
     from tests.support.paths import ENTRY_FILE
 

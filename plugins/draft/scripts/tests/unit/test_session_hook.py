@@ -17,6 +17,8 @@ from typing import BinaryIO, cast
 from unittest.mock import MagicMock, call
 
 import pytest
+from pytest_mock import MockerFixture
+
 from adapter.bindings import Binding
 from adapter.bridge import PluginContext
 from adapter.errors import AdapterError
@@ -30,7 +32,6 @@ from adapter.session_hook import (
     render_session_fact,
     run_session_start,
 )
-from pytest_mock import MockerFixture
 
 # ---------------------------------------------------------------------------
 # read_hook_payload：载荷读取与校验矩阵（io.BytesIO，不经过真实 stdin）

@@ -14,6 +14,8 @@ from pathlib import Path, PurePosixPath
 from unittest.mock import MagicMock
 
 import pytest
+from pytest_mock import MockerFixture
+
 from adapter.bindings import (
     Binding,
     _binding_json,  # pyright: ignore[reportPrivateUsage]  # 序列化契约：验证三字段 JSON 与尾部换行
@@ -24,7 +26,6 @@ from adapter.bindings import (
     session_id_is_valid,
 )
 from adapter.errors import EXIT_USAGE, AdapterError
-from pytest_mock import MockerFixture
 
 # ---------------------------------------------------------------------------
 # 会话标识验证：合法、空值、控制字符、孤立代理码位、长度边界

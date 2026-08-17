@@ -12,13 +12,14 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from pytest_mock import MockerFixture
+
 from adapter.bridge import (
     BridgePaths,
     _parse_data_dir,  # pyright: ignore[reportPrivateUsage]  # _parse_data_dir 为独立载荷解析契约，直接验证字段与类型分支
     bridge_paths,
 )
 from adapter.errors import AdapterError
-from pytest_mock import MockerFixture
 
 _BRIDGE_PATH = Path("/bridge.json")
 

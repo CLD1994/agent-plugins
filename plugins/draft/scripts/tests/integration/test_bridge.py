@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
 from adapter import bridge as bridge_mod
 from adapter.bridge import (
     BridgePaths,

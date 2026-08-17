@@ -20,11 +20,11 @@ from typing import BinaryIO, Protocol, cast
 from unittest.mock import MagicMock
 
 import pytest
+from pytest_mock import MockerFixture
+
 from adapter.bindings import Binding
 from adapter.bridge import PluginContext
 from adapter.errors import EXIT_RUNTIME, EXIT_USAGE, AdapterError
-from pytest_mock import MockerFixture
-
 from tests.support.entry import load_plugin_entry
 
 # 词法路径值：单元测试不访问真实文件系统，Path 仅作为不可变值参与断言。
