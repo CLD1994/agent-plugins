@@ -66,8 +66,12 @@ def write_raw_journal(
     return journal_path
 
 
-def build_valid_candidate(root: Path) -> None:
-    """构造合法的 candidate-marker 受管根：可被 adopt 接受的候选根。"""
+def build_valid_candidate(root: Path, *, precreate_internal: bool = False) -> None:
+    """构造合法的 candidate-marker 受管根：可被 adopt 接受的候选根。
+
+    默认最小受管根（与真实 init 产物一致），内部按需目录（operations/trash）由
+    操作按需创建；需要直接写入内部目录的测试显式传 ``precreate_internal=True``。
+    """
     root.mkdir()
     (root / "pages").mkdir()
     # 规格 §12.2：候选目录不允许预先存在 conclusions.md（所有权为 not_generated）。
@@ -77,8 +81,9 @@ def build_valid_candidate(root: Path) -> None:
     )
     internal = root / ".draft"
     internal.mkdir()
-    (internal / "operations").mkdir()
-    (internal / "trash" / "outgoing").mkdir(parents=True)
+    if precreate_internal:
+        (internal / "operations").mkdir()
+        (internal / "trash" / "outgoing").mkdir(parents=True)
     (internal / "draft.json").write_text(
         managed_marker_text(root_state=RootState.CANDIDATE),
         encoding="utf-8",

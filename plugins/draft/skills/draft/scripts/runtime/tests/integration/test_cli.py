@@ -119,6 +119,31 @@ def test_check_candidate_root_scans_unified_protocol(
     assert payload["ok"] is True
 
 
+@pytest.mark.parametrize("precreate_internal", [False, True])
+def test_candidate_check_and_adopt_accept_both_internal_layouts(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    precreate_internal: bool,
+) -> None:
+    """候选根按需目录缺失与已存在两类布局，check 与 adopt 都必须正常工作。
+
+    check 检查内部命名空间、adopt 按需创建 operations/trash；目录存在性不得
+    改变任一入口的控制流结果（规格 §12.2 与按需内部目录协议）。
+    """
+    root = tmp_path / "candidate"
+    build_valid_candidate(root, precreate_internal=precreate_internal)
+
+    code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
+    assert code == 0
+    assert payload["ok"] is True
+
+    code, payload = run_json(["adopt", "--root", str(root), "--json"], capsys)
+    assert code == 0
+    assert "ok" not in payload
+    # adopt 按需创建操作目录（最小布局下由 adopt 补建，预建布局下沿用）。
+    assert (root / ".draft/operations").is_dir()
+
+
 def test_check_is_read_only_on_candidate_root(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
