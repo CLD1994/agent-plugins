@@ -390,9 +390,7 @@ def _pair_relation_plan(
             observations=EMPTY_OBSERVATIONS,
             effects=(),
         )
-    return _multi_write_plan(
-        root, OperationKind.RELATION_ADD, edits, graph, root_state=root_state
-    )
+    return _multi_write_plan(root, OperationKind.RELATION_ADD, edits, graph, root_state=root_state)
 
 
 def _supersedes_plan(
@@ -445,9 +443,7 @@ def _supersedes_plan(
             observations=EMPTY_OBSERVATIONS,
             effects=(),
         )
-    return _multi_write_plan(
-        root, OperationKind.RELATION_ADD, edits, graph, root_state=root_state
-    )
+    return _multi_write_plan(root, OperationKind.RELATION_ADD, edits, graph, root_state=root_state)
 
 
 def _resolves_to_page(graph: DraftGraph, source: Path, relation: Relation, target: Path) -> bool:

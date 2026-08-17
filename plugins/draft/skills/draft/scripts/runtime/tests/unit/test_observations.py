@@ -170,13 +170,8 @@ def test_observation_shape_error_rejects_illegal_combinations() -> None:
         observation_shape_error(Observation(path, EntryKind.FILE, sha256="x", members=("a.md",)))
         is not None
     )
+    assert observation_shape_error(Observation(path, EntryKind.DIRECTORY, sha256="x")) is not None
+    assert observation_shape_error(Observation(path, EntryKind.MISSING, sha256="x")) is not None
     assert (
-        observation_shape_error(Observation(path, EntryKind.DIRECTORY, sha256="x")) is not None
-    )
-    assert (
-        observation_shape_error(Observation(path, EntryKind.MISSING, sha256="x")) is not None
-    )
-    assert (
-        observation_shape_error(Observation(path, EntryKind.SYMLINK, members=("a.md",)))
-        is not None
+        observation_shape_error(Observation(path, EntryKind.SYMLINK, members=("a.md",))) is not None
     )

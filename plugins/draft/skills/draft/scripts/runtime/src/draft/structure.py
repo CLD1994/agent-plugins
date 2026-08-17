@@ -6,7 +6,6 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
-from draft.checker import check_graph
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import (
@@ -29,6 +28,7 @@ from draft.models import (
     OperationKind,
     OperationPlan,
     OperationResult,
+    RootState,
     SourceSpan,
 )
 from draft.operations import execute_plan, read_lock, sha256_bytes
@@ -248,19 +248,11 @@ def plan_path_remap(
     parent_changes: Mapping[Path, Path],
     *,
     kind: OperationKind = OperationKind.MOVE,
-    allow_empty_hub: Path | None = None,
+    root_state: RootState,
 ) -> OperationPlan:
-    blocking = [
-        issue
-        for issue in check_graph(graph).errors
-        if not (
-            allow_empty_hub is not None
-            and issue.code == CheckCode.HUB_EMPTY.value
-            and issue.path == allow_empty_hub
-        )
-    ]
-    if blocking:
-        raise DraftError("structure.dirty", graph.root)
+    # 结构变换不把全图 check_graph 结果当门禁：已可解析的无关全局错误不阻止本次
+    # 操作（计划 Task 10 Step 1）。registered 的完整健康门禁由 load_operation_facts
+    # 在规划前强制执行；candidate 只拒绝不可解析页（blocking_paths）。
     expanded = _expand_mapping(graph, page_map)
     final_parents = _final_parents(graph, expanded, parent_changes)
     for page, final_parent in final_parents.items():
@@ -339,14 +331,13 @@ def plan_path_remap(
         key=lambda directory: len(directory.parts),
         reverse=True,
     )
-    from draft.models import RootState
     from draft.observations import graph_observations
 
     return OperationPlan(
         kind=kind,
         root=graph.root,
         mutations=tuple([*writes, *deletes]),
-        root_state=RootState.REGISTERED,
+        root_state=root_state,
         observations=graph_observations(graph),
         remove_empty_directories=tuple(removable),
         effects=tuple(effects),
@@ -389,7 +380,9 @@ def _validate_target(graph: DraftGraph, target: Path) -> Path:
     return target
 
 
-def plan_move(graph: DraftGraph, source: Path, target: Path) -> OperationPlan:
+def plan_move(
+    graph: DraftGraph, source: Path, target: Path, *, root_state: RootState
+) -> OperationPlan:
     _validate_operand(graph, source)
     _validate_target(graph, target)
     if source in (ROOT_PAGE, CONCLUSIONS_PAGE):
@@ -402,10 +395,14 @@ def plan_move(graph: DraftGraph, source: Path, target: Path) -> OperationPlan:
     new_parent = physical_parent(target)
     if new_parent is not None and new_parent != graph.parents.get(source):
         parent_changes[source] = new_parent
-    return plan_path_remap(graph, {source: target}, parent_changes, kind=OperationKind.MOVE)
+    return plan_path_remap(
+        graph, {source: target}, parent_changes, kind=OperationKind.MOVE, root_state=root_state
+    )
 
 
-def plan_promote(graph: DraftGraph, page: Path, children: tuple[Path, ...]) -> OperationPlan:
+def plan_promote(
+    graph: DraftGraph, page: Path, children: tuple[Path, ...], *, root_state: RootState
+) -> OperationPlan:
     _validate_operand(graph, page)
     if page in (ROOT_PAGE, CONCLUSIONS_PAGE) or _is_hub(page):
         raise DraftError("structure.invalid_target", page)
@@ -432,10 +429,12 @@ def plan_promote(graph: DraftGraph, page: Path, children: tuple[Path, ...]) -> O
             raise DraftError("structure.target_exists", target)
         page_map[child] = target
         parent_changes[child] = hub
-    return plan_path_remap(graph, page_map, parent_changes, kind=OperationKind.PROMOTE)
+    return plan_path_remap(
+        graph, page_map, parent_changes, kind=OperationKind.PROMOTE, root_state=root_state
+    )
 
 
-def plan_collapse(graph: DraftGraph, hub: Path) -> OperationPlan:
+def plan_collapse(graph: DraftGraph, hub: Path, *, root_state: RootState) -> OperationPlan:
     _validate_operand(graph, hub)
     if hub == ROOT_PAGE:
         raise DraftError("structure.protected", hub)
@@ -447,16 +446,18 @@ def plan_collapse(graph: DraftGraph, hub: Path) -> OperationPlan:
     if leaf in graph.pages:
         raise DraftError("structure.target_exists", leaf)
     return plan_path_remap(
-        graph, {hub: leaf}, {}, kind=OperationKind.COLLAPSE, allow_empty_hub=hub
+        graph, {hub: leaf}, {}, kind=OperationKind.COLLAPSE, root_state=root_state
     )
 
 
-def _load_clean_graph(root: Path, *, allow_empty_hub: Path | None = None) -> DraftGraph:
+def _load_clean_graph(
+    root: Path, *, allow_empty_hub: Path | None = None
+) -> tuple[DraftGraph, RootState]:
     """结构变换的事实加载：registered 全绿；candidate 全受管页可解析即可。
 
     任一不可解析页面可能隐藏正文链接、正式关系或父导航，因此必须阻止结构变换；
     已可解析的无关全局错误（依赖环、状态/取代不匹配、容量提醒）不阻止本次操作。
-    ``allow_empty_hub`` 供 collapse 容忍目标枢纽的 HUB_EMPTY。
+    ``allow_empty_hub`` 供 collapse 容忍目标枢纽的 HUB_EMPTY。返回图与当前根状态。
     """
     from draft.operation_facts import load_operation_facts
 
@@ -467,7 +468,7 @@ def _load_clean_graph(root: Path, *, allow_empty_hub: Path | None = None) -> Dra
     if facts.blocking_paths:
         details = tuple(path.as_posix() for path in facts.blocking_paths)
         raise DraftError("structure.dirty", resolved, details=details)
-    return facts.graph
+    return facts.graph, facts.root_state
 
 
 def move_page(
@@ -475,8 +476,8 @@ def move_page(
 ) -> OperationResult:
     del now  # 前置推进由 CLI 编排统一完成；领域函数不再重复调用。
     resolved = resolve_draft_root(root)
-    graph = _load_clean_graph(resolved)
-    plan = plan_move(graph, source, target)
+    graph, root_state = _load_clean_graph(resolved)
+    plan = plan_move(graph, source, target, root_state=root_state)
     return execute_plan(plan)
 
 
@@ -485,14 +486,14 @@ def promote_page(
 ) -> OperationResult:
     del now  # 前置推进由 CLI 编排统一完成；领域函数不再重复调用。
     resolved = resolve_draft_root(root)
-    graph = _load_clean_graph(resolved)
-    plan = plan_promote(graph, page, tuple(children))
+    graph, root_state = _load_clean_graph(resolved)
+    plan = plan_promote(graph, page, tuple(children), root_state=root_state)
     return execute_plan(plan)
 
 
 def collapse_hub(root: Path, hub: Path, *, now: datetime | None = None) -> OperationResult:
     del now  # 前置推进由 CLI 编排统一完成；领域函数不再重复调用。
     resolved = resolve_draft_root(root)
-    graph = _load_clean_graph(resolved, allow_empty_hub=hub)
-    plan = plan_collapse(graph, hub)
+    graph, root_state = _load_clean_graph(resolved, allow_empty_hub=hub)
+    plan = plan_collapse(graph, hub, root_state=root_state)
     return execute_plan(plan)

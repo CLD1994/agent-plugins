@@ -127,6 +127,16 @@ def test_not_generated_with_confirmed_creates_page_and_marks_owner() -> None:
     assert all(not p.as_posix().startswith(".draft/") for p in paths)  # type: ignore[union-attr]
 
 
+def test_plan_generation_preserves_root_state() -> None:
+    """生成计划必须携带当前根状态，不能硬编码 registered（计划 Task 11 Step 4）。"""
+    graph = _draft_with_confirmed(state=ConclusionsState.NOT_GENERATED)
+    plan = plan_generation(
+        graph, state=ConclusionsState.NOT_GENERATED, root_state=RootState.CANDIDATE
+    )
+    assert plan.operation is not None
+    assert plan.operation.root_state is RootState.CANDIDATE
+
+
 def test_generated_unchanged_produces_no_effect() -> None:
     graph = _draft_generated_with_nav()
     plan = plan_generation(graph, state=ConclusionsState.GENERATED, root_state=RootState.REGISTERED)

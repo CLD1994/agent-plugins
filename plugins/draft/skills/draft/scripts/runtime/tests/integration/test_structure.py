@@ -6,6 +6,7 @@ import pytest
 from draft.checker import check_draft
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
+from draft.models import RootState
 from draft.operations import recover
 from draft.structure import collapse_hub, move_page, promote_page
 from draft.trash import trash_page
@@ -192,6 +193,33 @@ def test_move_overwrite_fails(draft_factory: DraftFactory) -> None:
 
     with pytest.raises(DraftError, match="structure.target_exists"):
         move_page(root, Path("pages/old/a.md"), Path("pages/new/b.md"))
+
+
+def test_candidate_move_succeeds_with_unrelated_parseable_error(
+    draft_factory: DraftFactory,
+) -> None:
+    """候选根中无关的已可解析全局错误不阻止结构移动（计划 Task 10 Step 1）。"""
+    root = draft_factory(
+        {
+            "index.md": INDEX,
+            "conclusions.md": CONCLUSIONS,
+            "pages/old/index.md": OLD_HUB,
+            "pages/old/a.md": A_PAGE,
+            "pages/old/keep.md": KEEP,
+            "pages/new/index.md": NEW_HUB,
+            "pages/new/b.md": B_PAGE,
+        },
+        root_state=RootState.CANDIDATE,
+    )
+    # 无关页面父级合法但未被根导航声明：PARENT_NAVIGATION_MISSING，可解析但全局不健康。
+    (root / "pages/broken.md").write_text(
+        "# 孤儿\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n\n正文。\n",
+        encoding="utf-8",
+    )
+
+    move_page(root, Path("pages/old/a.md"), Path("pages/new/a.md"))
+
+    assert (root / "pages/new/a.md").is_file()
 
 
 def test_move_with_dirty_graph_fails(draft_factory: DraftFactory) -> None:

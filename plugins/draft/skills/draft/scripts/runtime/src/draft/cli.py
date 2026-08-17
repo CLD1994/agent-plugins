@@ -764,7 +764,9 @@ def _dispatch(
                 args,
                 root=root,
                 operation=DryRunOperation.MOVE,
-                build=lambda facts: plan_move(facts.graph, source, target),
+                build=lambda facts: plan_move(
+                    facts.graph, source, target, root_state=facts.root_state
+                ),
             )
         _reject_pagination_without_dry_run(args)
         result = move_page(root, source, target)
@@ -781,7 +783,9 @@ def _dispatch(
                 args,
                 root=root,
                 operation=DryRunOperation.PROMOTE,
-                build=lambda facts: plan_promote(facts.graph, page, tuple(children)),
+                build=lambda facts: plan_promote(
+                    facts.graph, page, tuple(children), root_state=facts.root_state
+                ),
             )
         _reject_pagination_without_dry_run(args)
         result = promote_page(root, page, children)
@@ -797,7 +801,7 @@ def _dispatch(
                 args,
                 root=root,
                 operation=DryRunOperation.COLLAPSE,
-                build=lambda facts: plan_collapse(facts.graph, hub),
+                build=lambda facts: plan_collapse(facts.graph, hub, root_state=facts.root_state),
             )
         _reject_pagination_without_dry_run(args)
         result = collapse_hub(root, hub)

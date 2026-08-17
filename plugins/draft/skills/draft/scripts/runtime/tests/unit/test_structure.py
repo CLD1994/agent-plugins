@@ -221,6 +221,16 @@ _B_LINKS_A = """# 乙
 提到 [甲](a.md)。
 """
 
+# 乙声明父主题为根，但 _INDEX 导航未声明它：制造 PARENT_NAVIGATION_MISSING 无关错误。
+_B_MISSING_NAV = """# 乙
+
+> 状态：`待讨论`
+>
+> 父主题：[根](../index.md)
+
+乙的正文，与甲无关。
+"""
+
 # 枢纽图：子树移动与折叠
 _HUB_INDEX = """# 根
 
@@ -347,7 +357,7 @@ def test_plan_move_leaf_rewrites_inbound_links() -> None:
         }
     )
 
-    plan = plan_move(graph, Path("pages/a.md"), Path("pages/c.md"))
+    plan = plan_move(graph, Path("pages/a.md"), Path("pages/c.md"), root_state=RootState.REGISTERED)
 
     expected_index = _INDEX_WITH_B.replace("pages/a.md", "pages/c.md")
     expected_b = _B_LINKS_A.replace("](a.md)", "](c.md)")
@@ -381,7 +391,7 @@ def test_plan_move_leaf_to_same_directory_omits_unchanged_pages() -> None:
         }
     )
 
-    plan = plan_move(graph, Path("pages/a.md"), Path("pages/b.md"))
+    plan = plan_move(graph, Path("pages/a.md"), Path("pages/b.md"), root_state=RootState.REGISTERED)
 
     expected_index = _INDEX.replace("pages/a.md", "pages/b.md")
     expected = _plan(
@@ -421,7 +431,12 @@ def test_plan_move_subtree_relocates_complete_subtree() -> None:
         }
     )
 
-    plan = plan_move(graph, Path("pages/old/index.md"), Path("pages/archive/index.md"))
+    plan = plan_move(
+        graph,
+        Path("pages/old/index.md"),
+        Path("pages/archive/index.md"),
+        root_state=RootState.REGISTERED,
+    )
 
     mutation_paths = {m.path for m in plan.mutations}
     # 子树整体迁移：枢纽与子页都出现在变更中
@@ -452,7 +467,9 @@ def test_plan_move_missing_source_raises_unknown_page() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        plan_move(graph, Path("pages/missing.md"), Path("pages/b.md"))
+        plan_move(
+            graph, Path("pages/missing.md"), Path("pages/b.md"), root_state=RootState.REGISTERED
+        )
     assert caught.value.code == "structure.unknown_page"
 
 
@@ -465,7 +482,7 @@ def test_plan_move_target_outside_pages_raises_invalid_target() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        plan_move(graph, Path("pages/a.md"), Path("other.md"))
+        plan_move(graph, Path("pages/a.md"), Path("other.md"), root_state=RootState.REGISTERED)
     assert caught.value.code == "structure.invalid_target"
 
 
@@ -479,7 +496,7 @@ def test_plan_move_target_already_exists_raises_target_exists() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        plan_move(graph, Path("pages/a.md"), Path("pages/b.md"))
+        plan_move(graph, Path("pages/a.md"), Path("pages/b.md"), root_state=RootState.REGISTERED)
     assert caught.value.code == "structure.target_exists"
 
 
@@ -497,6 +514,7 @@ def test_plan_move_into_descendant_raises_descendant() -> None:
             graph,
             Path("pages/old/index.md"),
             Path("pages/old/sub/index.md"),
+            root_state=RootState.REGISTERED,
         )
     assert caught.value.code == "structure.descendant"
 
@@ -510,7 +528,7 @@ def test_plan_move_protected_root_raises_protected() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        plan_move(graph, ROOT_PAGE, Path("pages/b.md"))
+        plan_move(graph, ROOT_PAGE, Path("pages/b.md"), root_state=RootState.REGISTERED)
     assert caught.value.code == "structure.protected"
 
 
@@ -535,6 +553,7 @@ def test_plan_promote_creates_hub_and_reparents_selected_children() -> None:
         graph,
         Path("pages/topic.md"),
         (Path("pages/child-a.md"), Path("pages/child-b.md")),
+        root_state=RootState.REGISTERED,
     )
 
     mutation_paths = {m.path for m in plan.mutations}
@@ -564,9 +583,7 @@ def test_plan_promote_preserves_unselected_children() -> None:
     )
 
     plan = plan_promote(
-        graph,
-        Path("pages/topic.md"),
-        (Path("pages/child-a.md"),),
+        graph, Path("pages/topic.md"), (Path("pages/child-a.md"),), root_state=RootState.REGISTERED
     )
 
     mutation_paths = {m.path for m in plan.mutations}
@@ -589,7 +606,7 @@ def test_plan_promote_requires_at_least_one_child() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        plan_promote(graph, Path("pages/topic.md"), ())
+        plan_promote(graph, Path("pages/topic.md"), (), root_state=RootState.REGISTERED)
     assert caught.value.code == "structure.missing_child"
 
 
@@ -607,6 +624,7 @@ def test_plan_promote_rejects_page_with_children() -> None:
             graph,
             Path("pages/old/index.md"),
             (Path("pages/old/a.md"),),
+            root_state=RootState.REGISTERED,
         )
     assert caught.value.code == "structure.invalid_target"
 
@@ -626,7 +644,7 @@ def test_plan_collapse_empty_hub_produces_leaf() -> None:
         }
     )
 
-    plan = plan_collapse(graph, Path("pages/sub/index.md"))
+    plan = plan_collapse(graph, Path("pages/sub/index.md"), root_state=RootState.REGISTERED)
 
     expected_index = _EMPTY_HUB_INDEX.replace("pages/sub/index.md", "pages/sub.md")
     expected_leaf = _EMPTY_HUB.replace("(../../index.md)", "(../index.md)")
@@ -661,7 +679,7 @@ def test_plan_collapse_rejects_non_empty_hub() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        plan_collapse(graph, Path("pages/old/index.md"))
+        plan_collapse(graph, Path("pages/old/index.md"), root_state=RootState.REGISTERED)
     assert caught.value.code == "structure.hub_not_empty"
 
 
@@ -674,7 +692,7 @@ def test_plan_collapse_rejects_non_hub_page() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        plan_collapse(graph, Path("pages/a.md"))
+        plan_collapse(graph, Path("pages/a.md"), root_state=RootState.REGISTERED)
     assert caught.value.code == "structure.not_hub"
 
 
@@ -687,7 +705,7 @@ def test_plan_collapse_rejects_root() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        plan_collapse(graph, ROOT_PAGE)
+        plan_collapse(graph, ROOT_PAGE, root_state=RootState.REGISTERED)
     assert caught.value.code == "structure.protected"
 
 
@@ -711,6 +729,7 @@ def test_plan_path_remap_orders_writes_before_deletes_by_path() -> None:
         {Path("pages/a.md"): Path("pages/z.md")},
         {},
         kind=OperationKind.MOVE,
+        root_state=RootState.REGISTERED,
     )
 
     kinds = [m.kind for m in plan.mutations]
@@ -740,6 +759,7 @@ def test_plan_path_remap_omits_unchanged_pages() -> None:
         {Path("pages/a.md"): Path("pages/b.md")},
         {},
         kind=OperationKind.MOVE,
+        root_state=RootState.REGISTERED,
     )
 
     mutation_paths = {m.path for m in plan.mutations}
@@ -747,10 +767,53 @@ def test_plan_path_remap_omits_unchanged_pages() -> None:
     assert Path("conclusions.md") not in mutation_paths
 
 
-def test_plan_path_remap_dirty_graph_raises() -> None:
-    """图有检查错误时，规划被拒绝。"""
-    # 构造缺少 conclusions.md 的图（root.missing_file 由 check_draft 报告，
-    # 但 check_graph 只检查图内规则）。改为构造一个有 hub.empty 错误的图。
+def test_plan_path_remap_ignores_unrelated_graph_errors() -> None:
+    """已可解析的无关全局错误（别页缺父导航）不阻止结构规划（计划 Task 10 Step 1）。"""
+    graph = _graph_from_texts(
+        {
+            Path("index.md"): _INDEX,
+            Path("conclusions.md"): _CONCLUSIONS,
+            Path("pages/a.md"): _A,
+            # 乙声明父主题为根，但根导航未声明它：PARENT_NAVIGATION_MISSING，与移动甲无关。
+            Path("pages/b.md"): _B_MISSING_NAV,
+        }
+    )
+    plan = plan_path_remap(
+        graph,
+        {Path("pages/a.md"): Path("pages/topic.md")},
+        {},
+        kind=OperationKind.MOVE,
+        root_state=RootState.REGISTERED,
+    )
+    assert any(m.path == Path("pages/topic.md") for m in plan.mutations)
+
+
+def test_plan_path_remap_carries_root_state() -> None:
+    """结构计划必须携带传入的根状态，不能硬编码 registered。"""
+    graph = _graph_from_texts(
+        {
+            Path("index.md"): _INDEX,
+            Path("conclusions.md"): _CONCLUSIONS,
+            Path("pages/a.md"): _A,
+        }
+    )
+    plan = plan_path_remap(
+        graph,
+        {Path("pages/a.md"): Path("pages/topic.md")},
+        {},
+        kind=OperationKind.MOVE,
+        root_state=RootState.CANDIDATE,
+    )
+    assert plan.root_state is RootState.CANDIDATE
+
+
+# ===========================================================================
+# plan_collapse：空枢纽折叠不再依赖 check_graph 全量门禁
+# ===========================================================================
+
+
+def test_plan_collapse_empty_hub_succeeds_without_graph_gate() -> None:
+    """空枢纽折叠在不再运行全量 check_graph 后直接成功。"""
     graph = _graph_from_texts(
         {
             Path("index.md"): _EMPTY_HUB_INDEX,
@@ -758,32 +821,6 @@ def test_plan_path_remap_dirty_graph_raises() -> None:
             Path("pages/sub/index.md"): _EMPTY_HUB,
         }
     )
-    with pytest.raises(DraftError) as caught:
-        plan_path_remap(
-            graph,
-            {Path("pages/sub/index.md"): Path("pages/sub.md")},
-            {},
-            kind=OperationKind.COLLAPSE,
-        )
-    assert caught.value.code == "structure.dirty"
-
-
-# ===========================================================================
-# plan_collapse: allow_empty_hub 抑制 hub.empty
-# ===========================================================================
-
-
-def test_plan_collapse_allow_empty_hub_suppresses_hub_empty_error() -> None:
-    """plan_collapse 通过 allow_empty_hub 抑制 hub.empty，使规划成功。"""
-    graph = _graph_from_texts(
-        {
-            Path("index.md"): _EMPTY_HUB_INDEX,
-            Path("conclusions.md"): _CONCLUSIONS,
-            Path("pages/sub/index.md"): _EMPTY_HUB,
-        }
-    )
-    # 直接调用 plan_path_remap 不带 allow_empty_hub 会失败（上一个测试证明），
-    # 但 plan_collapse 内部传了 allow_empty_hub=hub，所以成功。
-    plan = plan_collapse(graph, Path("pages/sub/index.md"))
-    assert plan.kind == "collapse"
+    plan = plan_collapse(graph, Path("pages/sub/index.md"), root_state=RootState.REGISTERED)
+    assert plan.kind is OperationKind.COLLAPSE
     assert any(m.path == Path("pages/sub.md") for m in plan.mutations)
