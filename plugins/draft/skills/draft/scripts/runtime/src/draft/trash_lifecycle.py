@@ -595,6 +595,14 @@ def _handle_no_lock_dir(
         resolve_journal_pending(journal_path)
     journal = read_journal(journal_path)
     if journal.kind is OperationKind.RESTORE:
+        if journal.phase in (
+            OperationPhase.COMPLETED,
+            OperationPhase.ROLLED_BACK,
+        ):
+            # 无锁终态 R：终态先于 T 提交/解关联且先于释放锁写入，因此无锁终态 R
+            # 必然意味着 T 已一致（rolled_back 或已解关联），是完整完成的审计记录
+            # （第十轮 H2）。剩余 T 认领只是审计痕迹，不是可恢复现场。
+            return None
         # 孤儿未关联 R（allocating、无 mutation、无 T 反向关联）：安全放弃为 rolled_back。
         if (
             journal.phase is OperationPhase.ALLOCATING
@@ -655,6 +663,43 @@ def _restore_linked_back(root: Path, restore_journal: Journal) -> bool:
     return False
 
 
+def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleResult:
+    """按 R/T 提交状态恢复锁内 restore（第十轮 H2）。
+
+    先调用纯决策 ``restore_recovery_decision``，再按分支加载所需证据：只有提交前分支
+    （T 仍为 trash_retained，需要复核 restore 后置状态）加载并验证完整包；提交后分支
+    （T 已 rolled_back）凭提交状态和 cleanup evidence 继续清理，绝不重新要求已经获准
+    删除的完整包。关联不匹配或 R 处于中间写阶段时保留锁和现场报 inconsistent。
+    """
+    from draft.trash import (
+        RestoreRecoveryAction,
+        _proven_unapplied_restore,  # pyright: ignore[reportPrivateUsage]
+        restore_recovery_decision,
+    )
+
+    trash_journal = validate_restore_link(root, restore_journal)
+    decision = restore_recovery_decision(
+        restore_phase=restore_journal.phase,
+        trash_phase=trash_journal.phase,
+        links_match=True,
+        proven_unapplied=_proven_unapplied_restore(root, restore_journal),
+    )
+    if decision is RestoreRecoveryAction.INCONSISTENT:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, restore_journal.directory)
+    if decision is RestoreRecoveryAction.VERIFY_AND_COMMIT_CLEANUP:
+        package: VerifiedTrashPackage | None = load_verified_package(root, trash_journal)
+    else:
+        package = None
+    return resolve_restore_execution(
+        root,
+        trash_id=trash_journal.operation_id,
+        restore_id=restore_journal.operation_id,
+        package=package,
+        execution_result=None,
+        execution_error=None,
+    )
+
+
 def recover_draft(
     root: Path,
     *,
@@ -673,18 +718,7 @@ def recover_draft(
         if journal.operation_id != locked:
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
         if journal.kind is OperationKind.RESTORE:
-            trash_journal = validate_restore_link(resolved, journal)
-            package = load_verified_package(resolved, trash_journal)
-            results.append(
-                resolve_restore_execution(
-                    resolved,
-                    trash_id=trash_journal.operation_id,
-                    restore_id=locked,
-                    package=package,
-                    execution_result=None,
-                    execution_error=None,
-                )
-            )
+            results.append(_recover_locked_restore(resolved, journal))
         elif journal.kind is OperationKind.TRASH:
             result = _recover_locked_trash(
                 resolved, journal, now=normalized_now, handoff=active_handoff
@@ -806,18 +840,7 @@ def recover_interrupted_operations(
         if journal.operation_id != locked:
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
         if journal.kind is OperationKind.RESTORE:
-            trash_journal = validate_restore_link(resolved, journal)
-            package = load_verified_package(resolved, trash_journal)
-            results.append(
-                resolve_restore_execution(
-                    resolved,
-                    trash_id=trash_journal.operation_id,
-                    restore_id=locked,
-                    package=package,
-                    execution_result=None,
-                    execution_error=None,
-                )
-            )
+            results.append(_recover_locked_restore(resolved, journal))
         elif journal.kind is OperationKind.TRASH:
             result = _recover_locked_trash(
                 resolved, journal, now=normalized_now, handoff=active_handoff

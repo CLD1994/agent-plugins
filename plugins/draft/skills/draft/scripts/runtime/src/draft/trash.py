@@ -4,6 +4,7 @@ import dataclasses
 import json
 import uuid
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 
 from draft.checker import check_draft
@@ -361,6 +362,46 @@ def _proven_unapplied_restore(root: Path, journal: Journal) -> bool:
         if sha256_file(root / mutation.path) != mutation.before_sha256:
             return False
     return True
+
+
+class RestoreRecoveryAction(StrEnum):
+    """R/T 双日志恢复决策结果（第十轮 H2）。"""
+
+    VERIFY_AND_COMMIT_CLEANUP = "verify_and_commit_cleanup"
+    RESUME_COMMITTED_CLEANUP = "resume_committed_cleanup"
+    ABANDON_UNAPPLIED = "abandon_unapplied"
+    INCONSISTENT = "inconsistent"
+
+
+def restore_recovery_decision(
+    *,
+    restore_phase: OperationPhase,
+    trash_phase: OperationPhase,
+    links_match: bool,
+    proven_unapplied: bool,
+) -> RestoreRecoveryAction:
+    """restore 双日志恢复决策（纯函数，第十轮 H2）。
+
+    恢复所需证据由耐久状态决定：提交前需要完整包证明 restore 内容，提交后必须以耐久
+    R/T 和 cleanup evidence 恢复删除，不能重新要求已经获准删除的包仍然完整。关联不
+    匹配、R 处于中间写阶段或 T 阶段与 R 阶段矛盾时一律 INCONSISTENT（保留现场）。
+    """
+    if not links_match:
+        return RestoreRecoveryAction.INCONSISTENT
+    if restore_phase is OperationPhase.COMPLETED:
+        if trash_phase is OperationPhase.TRASH_RETAINED:
+            return RestoreRecoveryAction.VERIFY_AND_COMMIT_CLEANUP
+        if trash_phase is OperationPhase.ROLLED_BACK:
+            return RestoreRecoveryAction.RESUME_COMMITTED_CLEANUP
+        return RestoreRecoveryAction.INCONSISTENT
+    if restore_phase is OperationPhase.ROLLED_BACK:
+        return RestoreRecoveryAction.ABANDON_UNAPPLIED
+    if (
+        restore_phase in (OperationPhase.ALLOCATING, OperationPhase.PREPARED)
+        and proven_unapplied
+    ):
+        return RestoreRecoveryAction.ABANDON_UNAPPLIED
+    return RestoreRecoveryAction.INCONSISTENT
 
 
 def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackage) -> OperationPlan:
@@ -854,11 +895,17 @@ def resolve_restore_execution(
     *,
     trash_id: str,
     restore_id: str,
-    package: VerifiedTrashPackage,
+    package: VerifiedTrashPackage | None,
     execution_result: OperationResult | None,
     execution_error: DraftError | None,
 ) -> OperationResult:
-    """同一终态解决器：重读 R 与 T，证明终态后再解关联、清理、释放。"""
+    """同一终态解决器：重读 R 与 T，证明终态后再解关联、清理、释放。
+
+    恢复所需证据由耐久状态决定（第十轮 H2）：只有提交前分支（T 仍为 trash_retained，
+    需要复核 restore 后置状态）才要求完整包；T 已 rolled_back 时凭提交状态和 cleanup
+    evidence 继续清理，不重新加载/验证已获准删除的完整包。``package`` 为可选；提交前
+    分支缺失时按需加载（提交后分支不加载）。
+    """
     resolve_journal_pending(operation_journal_path(root, restore_id))
     terminal_restore = read_journal(operation_journal_path(root, restore_id))
     current_trash = validate_restore_link(root, terminal_restore)
@@ -869,8 +916,16 @@ def resolve_restore_execution(
             raise DraftError(
                 CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory
             )
-        verify_restore_after_state(root, current_trash, terminal_restore, package)
-        write_journal(with_phase(current_trash, OperationPhase.ROLLED_BACK))
+        if current_trash.phase is OperationPhase.TRASH_RETAINED:
+            # 提交前：必须证明 restore 内容完整后才把 T 提交为 rolled_back。
+            if package is None:
+                package = load_verified_package(root, current_trash)
+            verify_restore_after_state(root, current_trash, terminal_restore, package)
+            write_journal(with_phase(current_trash, OperationPhase.ROLLED_BACK))
+        elif current_trash.phase is not OperationPhase.ROLLED_BACK:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory
+            )
         # M1：restore 清理授权从锁内重读的已提交 T journal 派生（rolled_back 已耐久
         # 写入）；当前锁属于 R 操作（restore_id），双向关联已由 validate_restore_link 证明。
         clean_authoritative_package(

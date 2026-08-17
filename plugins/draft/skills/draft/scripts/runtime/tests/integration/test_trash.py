@@ -833,6 +833,147 @@ def test_crash_between_r_completed_and_t_rolled_back_recovers(
     assert (root / "pages/obsolete.md").read_text(encoding="utf-8") == OBSOLETE
 
 
+def _complete_restore_then_crash(
+    root: Path,
+    operation_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    crash_after_t_commit: bool = False,
+    crash_before_first_leaf: bool = False,
+    crash_after_first_leaf: bool = False,
+    crash_before_evidence_clear: bool = False,
+    crash_before_release: bool = False,
+) -> str:
+    """完成 restore（R=completed、T=rolled_back）后在指定清理点崩溃，返回 R operation_id。"""
+    if crash_after_t_commit:
+        def crash_clean(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("injected crash at clean")
+
+        monkeypatch.setattr("draft.trash.clean_authoritative_package", crash_clean)
+    elif crash_before_first_leaf or crash_after_first_leaf:
+        import draft.trash_package as tp_module
+
+        real_remove = tp_module._remove_verified_leaf  # pyright: ignore[reportPrivateUsage]
+        calls = {"n": 0}
+
+        def crash_leaf(
+            root: Path,
+            relative: Path,
+            expected_digest: str,
+            code_path: Path,
+        ) -> None:
+            calls["n"] += 1
+            if crash_before_first_leaf and calls["n"] == 1:
+                raise RuntimeError("injected crash before first leaf")
+            if crash_after_first_leaf and calls["n"] == 2:
+                raise RuntimeError("injected crash after first leaf")
+            real_remove(root, relative, expected_digest, code_path)
+
+        monkeypatch.setattr(
+            "draft.trash_package._remove_verified_leaf", crash_leaf  # pyright: ignore[reportPrivateUsage]
+        )
+    elif crash_before_evidence_clear:
+        def crash_clear(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("injected crash before evidence clear")
+
+        monkeypatch.setattr("draft.trash_package.converge_cleanup_evidence", crash_clear)
+    elif crash_before_release:
+        def crash_release(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("injected crash before release")
+
+        monkeypatch.setattr("draft.trash.release_lock", crash_release)
+
+    with pytest.raises(RuntimeError, match="injected crash"):
+        restore_retained_trash(root, operation_id, now=NOW)
+    monkeypatch.undo()
+    return _other_operation_dirs(root, operation_id)[0].name
+
+
+@pytest.mark.parametrize(
+    ("crash_point",),
+    [
+        ("crash_after_t_commit",),
+        ("crash_before_first_leaf",),
+        ("crash_after_first_leaf",),
+        ("crash_before_evidence_clear",),
+        ("crash_before_release",),
+    ],
+)
+def test_committed_cleanup_recovers_from_crash_point(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_point: str,
+) -> None:
+    """R=completed、T=rolled_back 后任意清理点崩溃：recover 凭提交状态收敛，不要求完整包。
+
+    已提交清理现场包可能 exact/partial/missing，恢复不得因缺失 package.json 报
+    trash.package_corrupt，也不得重新验证完整包（第十轮 H2）。两个公开恢复入口都要
+    幂等收敛。
+    """
+    from draft.trash_lifecycle import recover_interrupted_operations
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    _complete_restore_then_crash(
+        root,
+        pending.operation_id,
+        monkeypatch,
+        **{crash_point: True},
+    )
+    assert _read_journal(root, pending.operation_id)["phase"] == "rolled_back"
+    assert (root / ".draft/operation.lock").exists()
+
+    report = recover_draft(root)
+    assert any(result.phase is OperationPhase.COMPLETED for result in report.results)
+    assert not (root / ".draft/trash/outgoing" / pending.operation_id).exists()
+    assert not (root / ".draft/operation.lock").exists()
+    assert (root / "pages/obsolete.md").read_text(encoding="utf-8") == OBSOLETE
+
+    # recover_interrupted_operations 必须同样幂等收敛（第二个公开入口，返回元组）：
+    # 首次恢复已清理全部现场，第二次调用无事可做但绝不因缺失 package.json 报损坏。
+    report2 = recover_interrupted_operations(root)
+    assert report2 == ()
+    assert not (root / ".draft/operation.lock").exists()
+
+
+def test_verify_commit_branch_still_requires_complete_package(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R=completed、T=trash_retained（提交前）时包损坏仍是硬要求：recover 必须拒绝。
+
+    延迟加载不能放宽提交前证明：完整包是 restore 内容与提交的信任根（第十轮 H2）。
+    """
+    from draft.trash_lifecycle import recover_interrupted_operations
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+
+    # R=completed 后、T 翻转前崩溃：保留 R 锁、T=trash_retained、权威包。
+    def crash_verify(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("injected crash after R completed")
+
+    monkeypatch.setattr("draft.trash.verify_restore_after_state", crash_verify)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        restore_retained_trash(root, pending.operation_id, now=NOW)
+    monkeypatch.undo()
+    assert _read_journal(root, pending.operation_id)["phase"] == "trash_retained"
+    assert (root / ".draft/operation.lock").exists()
+
+    # 提交前破坏权威包。
+    import json as json_module
+
+    manifest = root / ".draft/trash/outgoing" / pending.operation_id / "package.json"
+    manifest.write_text("{corrupted", encoding="utf-8")
+
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        recover_draft(root)
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        recover_interrupted_operations(root)
+    # 保留 R/T 关联、锁与包现场，等待人工处理。
+    assert (root / ".draft/operation.lock").exists()
+    assert _read_journal(root, pending.operation_id)["phase"] == "trash_retained"
+
+
 def test_completed_restore_with_extra_mutation_is_rejected(
     draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:

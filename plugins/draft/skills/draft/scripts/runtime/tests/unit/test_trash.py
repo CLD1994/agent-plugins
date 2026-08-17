@@ -988,3 +988,111 @@ def test_package_authorization_rejects_non_trash_kind() -> None:
     journal = dataclasses.replace(journal, kind=OperationKind.MOVE)
     with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
         parse_package_authorization(journal, Path("/draft"))
+
+
+def _restore_decision(
+    restore_phase: OperationPhase,
+    trash_phase: OperationPhase,
+    *,
+    links_match: bool = True,
+    proven_unapplied: bool = False,
+) -> object:
+    from draft.trash import restore_recovery_decision
+
+    return restore_recovery_decision(
+        restore_phase=restore_phase,
+        trash_phase=trash_phase,
+        links_match=links_match,
+        proven_unapplied=proven_unapplied,
+    )
+
+
+def test_restore_recovery_decision_committed_cleanup() -> None:
+    """R=completed 且 T=rolled_back：凭提交状态继续清理，不重新要求完整包（第十轮 H2）。"""
+    from draft.trash import RestoreRecoveryAction
+
+    assert (
+        _restore_decision(OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK)
+        is RestoreRecoveryAction.RESUME_COMMITTED_CLEANUP
+    )
+
+
+def test_restore_recovery_decision_verify_and_commit() -> None:
+    """R=completed 且 T=trash_retained：提交前必须复核完整包。"""
+    from draft.trash import RestoreRecoveryAction
+
+    assert (
+        _restore_decision(OperationPhase.COMPLETED, OperationPhase.TRASH_RETAINED)
+        is RestoreRecoveryAction.VERIFY_AND_COMMIT_CLEANUP
+    )
+
+
+def test_restore_recovery_decision_abandon_unapplied() -> None:
+    """R=rolled_back 或 allocating/prepared 且可证明未应用：安全解关联。"""
+    from draft.trash import RestoreRecoveryAction
+
+    assert (
+        _restore_decision(OperationPhase.ROLLED_BACK, OperationPhase.TRASH_RETAINED)
+        is RestoreRecoveryAction.ABANDON_UNAPPLIED
+    )
+    assert (
+        _restore_decision(
+            OperationPhase.ALLOCATING,
+            OperationPhase.TRASH_RETAINED,
+            proven_unapplied=True,
+        )
+        is RestoreRecoveryAction.ABANDON_UNAPPLIED
+    )
+    assert (
+        _restore_decision(
+            OperationPhase.PREPARED,
+            OperationPhase.TRASH_RETAINED,
+            proven_unapplied=True,
+        )
+        is RestoreRecoveryAction.ABANDON_UNAPPLIED
+    )
+
+
+def test_restore_recovery_decision_not_proven_unapplied_is_inconsistent() -> None:
+    """R=allocating/prepared 但不能证明未应用：不猜测，保留现场。"""
+    from draft.trash import RestoreRecoveryAction
+
+    assert (
+        _restore_decision(OperationPhase.ALLOCATING, OperationPhase.TRASH_RETAINED)
+        is RestoreRecoveryAction.INCONSISTENT
+    )
+    assert (
+        _restore_decision(OperationPhase.PREPARED, OperationPhase.TRASH_RETAINED)
+        is RestoreRecoveryAction.INCONSISTENT
+    )
+
+
+def test_restore_recovery_decision_mid_write_or_broken_link_is_inconsistent() -> None:
+    """R 处于中间写阶段或关联不匹配：一律 INCONSISTENT，保留锁、R/T、包/evidence。"""
+    from draft.trash import RestoreRecoveryAction
+
+    for phase in (
+        OperationPhase.APPLYING,
+        OperationPhase.VALIDATING,
+        OperationPhase.ROLLING_BACK,
+    ):
+        assert (
+            _restore_decision(phase, OperationPhase.TRASH_RETAINED)
+            is RestoreRecoveryAction.INCONSISTENT
+        )
+        assert (
+            _restore_decision(phase, OperationPhase.ROLLED_BACK)
+            is RestoreRecoveryAction.INCONSISTENT
+        )
+    assert (
+        _restore_decision(
+            OperationPhase.COMPLETED,
+            OperationPhase.TRASH_RETAINED,
+            links_match=False,
+        )
+        is RestoreRecoveryAction.INCONSISTENT
+    )
+    assert (
+        _restore_decision(OperationPhase.COMPLETED, OperationPhase.ALLOCATING)
+        is RestoreRecoveryAction.INCONSISTENT
+    )
