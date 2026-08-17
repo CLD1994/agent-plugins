@@ -5,19 +5,22 @@ import pytest
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
+from draft.graph import load_graph
 from draft.models import (
     FileMutation,
     MutationKind,
     OperationKind,
+    OperationPhase,
     OperationPlan,
     RootState,
 )
-from draft.observations import EMPTY_OBSERVATIONS
+from draft.observations import EMPTY_OBSERVATIONS, graph_observations
 from draft.operations import (
     JOURNAL_VERSION,
     execute_plan,
     preallocate_journal,
     read_journal,
+    read_lock,
     recover,
     sha256_bytes,
 )
@@ -747,6 +750,90 @@ def test_completed_journal_with_external_edit_keeps_lock(
 
     assert (root / ".draft/operation.lock").exists()
     assert (root / "pages/a.md").read_text(encoding="utf-8") == "human edit"
+
+
+def _plan_with_observed_inputs(root: Path) -> OperationPlan:
+    """构造带真实读集观察的双写计划：观察清单覆盖 index、两页与 marker。"""
+    graph = load_graph(root)
+    old_a = (root / "pages/a.md").read_bytes()
+    old_b = (root / "pages/b.md").read_bytes()
+    new_a = old_a + b"\nforward-a\n"
+    new_b = old_b + b"\nforward-b\n"
+    return OperationPlan(
+        kind=OperationKind.CREATE,
+        root=root,
+        root_state=RootState.REGISTERED,
+        observations=graph_observations(graph),
+        mutations=(
+            FileMutation(
+                Path("pages/a.md"),
+                MutationKind.WRITE,
+                sha256_bytes(old_a),
+                sha256_bytes(new_a),
+                new_a,
+            ),
+            FileMutation(
+                Path("pages/b.md"),
+                MutationKind.WRITE,
+                sha256_bytes(old_b),
+                sha256_bytes(new_b),
+                new_b,
+            ),
+        ),
+    )
+
+
+def test_execute_plan_observation_conflict_finalizes_journal_and_releases_lock(
+    operation_draft: Path,
+) -> None:
+    """首次业务变更前复核失败：终态化本次准备日志并释放锁，不遗留锁或中段日志。"""
+    root = operation_draft
+    plan = _plan_with_observed_inputs(root)
+    # 修改一个被观察但未参与 mutation 的页面（index.md 属于读集）。
+    (root / "index.md").write_text("external edit", encoding="utf-8")
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        execute_plan(plan)
+
+    assert read_lock(root) is None
+    operations = root / ".draft/operations"
+    remaining = [entry for entry in operations.iterdir() if entry.is_dir()]
+    assert len(remaining) == 1
+    journal = read_journal(remaining[0] / "journal.json")
+    assert journal.phase is OperationPhase.ROLLED_BACK
+
+
+def test_recover_mid_write_verifies_observed_inputs_and_keeps_scene(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """中段恢复必须复核观察清单：被观察但未参与 mutation 的页面变化不能静默通过。"""
+    root = operation_draft
+    plan = _plan_with_observed_inputs(root)
+    original_write_journal = __import__(
+        "draft.operations", fromlist=["write_journal"]
+    ).write_journal
+
+    def crash_on_applying(journal: object) -> None:
+        if getattr(journal, "phase", None) is OperationPhase.APPLYING:
+            raise RuntimeError("injected crash at applying")
+        original_write_journal(journal)
+
+    monkeypatch.setattr("draft.operations.write_journal", crash_on_applying)
+    with pytest.raises(RuntimeError, match="injected crash at applying"):
+        execute_plan(plan)
+    monkeypatch.undo()
+    assert (root / ".draft/operation.lock").exists()
+
+    # 外部编辑一个被观察但非 mutation 的页面：保持结构合法，只改变读集摘要
+    # （否则 registered 后置完整检查会先拦截，无法独立证明观察复核缺口）。
+    index = (root / "index.md").read_text(encoding="utf-8")
+    (root / "index.md").write_text(index.replace("# Topic", "# Topic edited"), encoding="utf-8")
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        recover(root)
+
+    # 无法解释的读集变化：保留锁、日志和恢复材料，等待人工处理。
+    assert (root / ".draft/operation.lock").exists()
 
 
 def test_abandoned_allocating_cleans_recovery_copies(

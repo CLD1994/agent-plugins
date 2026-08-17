@@ -56,6 +56,13 @@ _MID_WRITE_PHASES = frozenset(
     }
 )
 
+# _apply_write 先写同名 .tmp-<32hex> 再替换；崩溃可能遗留这些瞬态文件。
+_TEMP_ARTIFACT = re.compile(r"\.tmp-[0-9a-f]{32}$")
+
+
+def _is_temp_artifact(name: str) -> bool:
+    return _TEMP_ARTIFACT.search(name) is not None
+
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
@@ -902,7 +909,15 @@ def execute_plan(plan: OperationPlan) -> OperationResult:
             metadata=dict(plan.metadata),
         )
     acquire_lock(root, operation_id)
-    _verify_plan_observations(root, plan, journal)
+    try:
+        _verify_plan_observations(root, plan, journal)
+    except DraftError:
+        # 首次业务变更前的复核失败：本次准备日志尚未授权任何根变更，安全终态化
+        # 并释放锁，不遗留锁或中段日志（计划 Task 7 Step 4）。
+        write_journal(with_phase(journal, OperationPhase.ROLLED_BACK))
+        _clean_recovery_copies(journal)
+        release_lock(root, operation_id)
+        raise
     return _execute_allocated_plan(
         plan, journal, lock_already_held=True, retain_terminal_lock=False
     )
@@ -1133,23 +1148,72 @@ def _recover_terminal(root: Path, journal: Journal, operation_id: str) -> Operat
 def _verify_observations_for_recovery(
     root: Path, journal: Journal, explained_mutations: tuple[_MutationLike, ...]
 ) -> tuple[Path, ...]:
-    """恢复时复核观察：只排除本操作目录、锁与 explained mutation 路径。"""
+    """恢复时复核观察：只排除本操作目录、锁与 explained mutation 路径。
+
+    本操作新增/删除文件会改变受观察目录的成员集合，这是可解释变化；恢复时把目录
+    观察成员调整为"若只发生本操作 mutation 应有的成员"，再与当前状态比较，避免把
+    操作自身副作用误判为外部修改，同时仍能发现操作范围之外的目录变化。
+    """
     from draft.observations import (
+        EntryKind,
         FilesystemObservationProbe,
+        Observation,
         ObservationManifest,
+        directory_observation,
         verify_observations,
     )
 
     excluded = {journal.directory.relative_to(root), LOCK_RELATIVE}
-    entries = tuple(
-        observation
-        for observation in journal.observations.entries
-        if observation.path not in excluded
-    )
+    explained = {mutation.path for mutation in explained_mutations}
+    # 只解释本操作实际已应用的 mutation 对目录成员的改变：崩溃可能只应用了部分
+    # 文件变更，目录成员必须按 applied 标志而不是按完整计划调整。remove_empty_directories
+    # 只在终态推进时执行，中段恢复时对应目录仍存在，不应计入。
+    added: dict[Path, set[str]] = {}
+    removed: dict[Path, set[str]] = {}
+    for mutation in journal.mutations:
+        if not mutation.applied:
+            continue
+        parent = mutation.path.parent
+        if mutation.kind is MutationKind.WRITE and mutation.before_sha256 is None:
+            added.setdefault(parent, set()).add(mutation.path.name)
+        elif mutation.kind is MutationKind.DELETE:
+            removed.setdefault(parent, set()).add(mutation.path.name)
+
+    adjusted: list[Observation] = []
+    for observation in journal.observations.entries:
+        if observation.path in excluded or observation.path in explained:
+            continue
+        if observation.kind is EntryKind.DIRECTORY:
+            planned = set(observation.members)
+            expected = tuple(
+                sorted(
+                    (planned - removed.get(observation.path, set()))
+                    | added.get(observation.path, set())
+                )
+            )
+            adjusted.append(directory_observation(observation.path, expected))
+        else:
+            adjusted.append(observation)
+
+    class _RecoveryProbe:
+        """复核探针：忽略本操作崩溃遗留的 .tmp-<hex> 瞬态文件（可解释残留）。"""
+
+        def __init__(self, probe: FilesystemObservationProbe) -> None:
+            self._probe = probe
+
+        def observe(self, path: Path) -> Observation:
+            observed = self._probe.observe(path)
+            if observed.kind is EntryKind.DIRECTORY:
+                members = tuple(
+                    member for member in observed.members if not _is_temp_artifact(member)
+                )
+                return Observation(path=path, kind=EntryKind.DIRECTORY, members=members)
+            return observed
+
     return verify_observations(
-        FilesystemObservationProbe(root),
-        ObservationManifest(entries=entries),
-        explained_mutations=explained_mutations,
+        _RecoveryProbe(FilesystemObservationProbe(root)),
+        ObservationManifest(entries=tuple(adjusted)),
+        explained_mutations=(),
     )
 
 
@@ -1237,6 +1301,14 @@ def _recover_locked(root: Path, operation_id: str) -> OperationResult:
     for mutation in journal.mutations:
         if _classify(root, mutation) == "unknown":
             raise DraftError("operation.external_change", root / mutation.path)
+    # 恢复前向完成必须复核观察清单：mutation 的 before/after 分类是可解释变化，
+    # 其余被观察文件或目录成员的差异是无法解释的外部修改，保留现场（计划 Task 7
+    # Step 4），不能把依赖旧读集语义的结果静默提交。
+    changed = _verify_observations_for_recovery(
+        root, journal, explained_mutations=journal.mutations
+    )
+    if changed:
+        raise DraftError("operation.external_change", root / changed[0])
     return _finish_forward(root, journal, changed_paths=_recover_changed_paths(journal))
 
 
