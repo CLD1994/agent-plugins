@@ -131,6 +131,51 @@ def test_handoff_blocked_when_manifest_changed_after_verification(
     assert _package_exists(root, pending.operation_id)
 
 
+def test_attempt_retry_rejects_unknown_existing_content(
+    draft_factory: DraftFactory,
+) -> None:
+    """已有 attempt 含未知内容：重试不得递归删除未知文件（回归 M1）。"""
+    from draft.operations import read_journal
+    from draft.trash_lifecycle import make_attempt_copy
+    from draft.trash_package import load_verified_package
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    journal = read_journal(_journal_path(root, pending.operation_id))
+    verified = load_verified_package(root, journal)
+    attempt = make_attempt_copy(verified)
+    unknown = attempt / "unknown.txt"
+    unknown.write_text("unknown\n", encoding="utf-8")
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        make_attempt_copy(verified)
+
+    assert unknown.is_file()
+    assert (attempt / "package.json").is_file()
+
+
+def test_remove_attempt_copy_rejects_unknown_content(
+    draft_factory: DraftFactory,
+) -> None:
+    """清理 attempt 时遇到未知内容必须保留，不得递归删除（回归 M1）。"""
+    from draft.operations import read_journal
+    from draft.trash_lifecycle import make_attempt_copy, remove_attempt_copy
+    from draft.trash_package import load_verified_package
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    journal = read_journal(_journal_path(root, pending.operation_id))
+    verified = load_verified_package(root, journal)
+    attempt = make_attempt_copy(verified)
+    unknown = attempt / "unknown.txt"
+    unknown.write_text("unknown\n", encoding="utf-8")
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        remove_attempt_copy(verified, attempt)
+
+    assert unknown.is_file()
+
+
 def test_attempt_copy_uses_verified_payload_relative(
     draft_factory: DraftFactory,
 ) -> None:
@@ -536,7 +581,7 @@ def test_attempt_copy_only_contains_verified_files(
     assert files == {"package.json", "payload/pages/obsolete.md"}
     from draft.trash_lifecycle import remove_attempt_copy
 
-    remove_attempt_copy(attempt)
+    remove_attempt_copy(package, attempt)
 
 
 def test_package_with_extra_symlink_entry_is_rejected(

@@ -15,6 +15,7 @@ from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import (
     LifecycleWarning,
+    MutationKind,
     OperationKind,
     OperationPhase,
     OperationResult,
@@ -39,6 +40,7 @@ from draft.operations import (
     recover,
     reject_symlink_components,
     release_lock,
+    sha256_bytes,
     validate_operation_id,
     validate_restore_link,
     with_metadata,
@@ -48,7 +50,6 @@ from draft.operations import (
 from draft.paths import resolve_draft_root
 from draft.trash import (
     OPERATIONS_RELATIVE,
-    remove_tree,
     resolve_restore_execution,
 )
 from draft.trash_package import (
@@ -114,23 +115,103 @@ def _root_from_package(package: VerifiedTrashPackage) -> Path:
     return package.directory.parents[len(OUTGOING_RELATIVE.parts)]
 
 
+def _attempt_authorized(package: VerifiedTrashPackage, attempt: Path) -> list[tuple[Path, str]]:
+    """attempt 精确树形协议的授权叶节点（绝对路径 + 锚定摘要）。"""
+    return [
+        (attempt / "package.json", sha256_bytes(package.manifest_bytes)),
+        (attempt / package.payload_relative, package.page_sha256),
+    ]
+
+
+def _attempt_authorized_from_journal(journal: Journal, attempt: Path) -> list[tuple[Path, str]]:
+    """从原 T 日志派生 attempt 应含的精确叶节点（package.json + payload/页面）。
+
+    终态恢复（succeeded/purge_committed）不重新加载权威包（可能已被消费），
+    直接以 T 的包内 WRITE mutation 锚定 attempt 的授权内容与摘要。
+    """
+    package_relative = OUTGOING_RELATIVE / journal.operation_id
+    authorized: list[tuple[Path, str]] = []
+    for mutation in journal.mutations:
+        if not mutation.path.is_relative_to(package_relative):
+            continue
+        if mutation.kind is not MutationKind.WRITE or mutation.after_sha256 is None:
+            continue
+        if mutation.path == package_relative / "package.json":
+            authorized.append((attempt / "package.json", mutation.after_sha256))
+        elif mutation.path.is_relative_to(package_relative / "payload"):
+            relative = mutation.path.relative_to(package_relative)
+            authorized.append((attempt / relative, mutation.after_sha256))
+    return authorized
+
+
+def _clean_attempt_tree(attempt: Path, authorized: list[tuple[Path, str]], code_path: Path) -> None:
+    """attempt 精确树形协议清理：只删授权叶节点与空父目录，未知内容/符号链接拒绝。
+
+    attempt 是可重建副本，但"可重建"只授权覆盖本操作记录的精确快照文件，不授权
+    递归删除后来出现的任意条目。预检整个 attempt 树，任何未知成员、符号链接、
+    错误类型或摘要不符都以 operation.inconsistent_state 停止并保留（回归 M1）。
+    授权叶节点部分缺失（提交点后已移走）幂等容忍。
+    """
+    import os
+
+    if attempt.is_symlink():
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
+    if not attempt.exists():
+        return
+    if not attempt.is_dir():
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
+    allowed_dirs = {attempt}
+    for leaf, _ in authorized:
+        cursor = leaf.parent
+        while cursor not in allowed_dirs:
+            allowed_dirs.add(cursor)
+            cursor = cursor.parent
+    allowed_leaves = {leaf for leaf, _ in authorized}
+    digest_by_path = dict(authorized)
+    for dirpath, dirnames, filenames in os.walk(attempt, followlinks=False):
+        directory = Path(dirpath)
+        if directory.is_symlink() or directory not in allowed_dirs:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, directory)
+        for name in dirnames:
+            child = directory / name
+            if child.is_symlink() or child not in allowed_dirs:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, child)
+        for name in filenames:
+            leaf = directory / name
+            if leaf.is_symlink() or leaf not in allowed_leaves or not leaf.is_file():
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, leaf)
+            if sha256_bytes(leaf.read_bytes()) != digest_by_path[leaf]:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, leaf)
+    for leaf, digest in sorted(authorized):
+        if not leaf.exists():
+            continue  # 提交点后已移走：幂等容忍。
+        if leaf.is_symlink() or not leaf.is_file():
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, leaf)
+        if sha256_bytes(leaf.read_bytes()) != digest:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, leaf)
+        leaf.unlink()
+    for directory in sorted(allowed_dirs, key=lambda path: len(path.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, directory) from exc
+
+
 def make_attempt_copy(package: VerifiedTrashPackage) -> Path:
     """从已验证快照制作操作内一次性副本。
 
     只使用 load_verified_package 验证时刻的不可变字节（manifest_bytes、page_bytes）
     与已验证的 payload_relative：绝不再读取 live 权威包文件，也不重新用 page_path
-    猜测 payload 路径；逐文件耐久写入并同步目录，再交给外部适配器。符号链接或
-    错误类型的旧 attempt 视为损坏。
+    猜测 payload 路径；逐文件耐久写入并同步目录，再交给外部适配器。重建前先按
+    精确树形协议预检并清理旧 attempt：未知内容使重试停止保留，不递归删除（回归 M1）。
     """
     root = _root_from_package(package)
     reject_symlink_components(root, OUTGOING_RELATIVE)
     attempt_relative = OPERATIONS_RELATIVE / package.operation_id / "attempt"
     reject_symlink_components(root, attempt_relative.parent)
     attempt = root / attempt_relative
-    if attempt.is_symlink() or (attempt.exists() and not attempt.is_dir()):
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, attempt)
-    if attempt.is_dir():
-        remove_tree(attempt)
+    if attempt.exists():
+        _clean_attempt_tree(attempt, _attempt_authorized(package, attempt), attempt)
     attempt.mkdir(parents=True, exist_ok=False)
     durable_write(attempt / "package.json", package.manifest_bytes)
     durable_write(attempt / package.payload_relative, package.page_bytes)
@@ -138,10 +219,9 @@ def make_attempt_copy(package: VerifiedTrashPackage) -> Path:
     return attempt
 
 
-def remove_attempt_copy(path: Path) -> None:
-    """幂等清理一次性副本。"""
-    if path.exists() or path.is_symlink():
-        remove_tree(path)
+def remove_attempt_copy(package: VerifiedTrashPackage, path: Path) -> None:
+    """幂等清理一次性副本：按精确树形协议清理，不递归删除未知内容。"""
+    _clean_attempt_tree(path, _attempt_authorized(package, path), path)
 
 
 def with_disposition(journal: Journal, disposition: str, phase: OperationPhase) -> Journal:
@@ -228,7 +308,7 @@ def _attempt_handoff_locked(
             )
             write_journal(failed)
             clean_authoritative_package(root, journal)
-            remove_attempt_copy(attempt)
+            remove_attempt_copy(verified_package, attempt)
             write_journal(
                 with_disposition(failed, EXPIRED_PURGE_DISPOSITION, OperationPhase.COMPLETED)
             )
@@ -247,7 +327,7 @@ def _attempt_handoff_locked(
             phase=OperationPhase.TRASH_HANDOFF_PENDING,
         )
         write_journal(failed)
-        remove_attempt_copy(attempt)
+        remove_attempt_copy(verified_package, attempt)
         release_lock(root, operation_id)
         return TrashResult(
             operation_id=operation_id,
@@ -265,7 +345,7 @@ def _attempt_handoff_locked(
     succeeded = with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED)
     write_journal(succeeded)
     clean_authoritative_package(root, journal)
-    remove_attempt_copy(attempt)
+    remove_attempt_copy(verified_package, attempt)
     write_journal(with_disposition(succeeded, SYSTEM_TRASH_DISPOSITION, OperationPhase.COMPLETED))
     release_lock(root, operation_id)
     return TrashResult(
@@ -395,7 +475,7 @@ def _recover_locked_trash(
         # 从 T 日志派生授权条目逐个复核删除，未知内容使清理拒绝并保留现场。
         clean_authoritative_package(root, journal)
         attempt = root / OPERATIONS_RELATIVE / operation_id / "attempt"
-        remove_attempt_copy(attempt)
+        _clean_attempt_tree(attempt, _attempt_authorized_from_journal(journal, attempt), attempt)
         terminal = with_disposition(
             journal,
             EXPIRED_PURGE_DISPOSITION
