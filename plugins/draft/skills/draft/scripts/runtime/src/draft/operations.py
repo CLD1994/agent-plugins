@@ -916,6 +916,7 @@ def execute_plan(plan: OperationPlan) -> OperationResult:
         existing = read_journal(existing_journal_path)
         validate_preallocated_journal(plan, existing)
         journal = existing
+        created_journal = False
     else:
         journal = preallocate_journal(
             root,
@@ -925,13 +926,17 @@ def execute_plan(plan: OperationPlan) -> OperationResult:
             observations=plan.observations,
             metadata=dict(plan.metadata),
         )
+        created_journal = True
     try:
         acquire_lock(root, operation_id)
     except DraftError:
-        # 锁竞争失败（另一进程抢先取得锁）：本次预分配日志尚未授权任何根变更，
-        # 终态化并清理，不留 orphan（计划 Task 7 Step 4）。
-        write_journal(with_phase(journal, OperationPhase.ROLLED_BACK))
-        _clean_recovery_copies(journal)
+        # 锁竞争失败（另一进程抢先取得锁）。只有"本次创建且锁属其他操作"时才可
+        # 终态化本次未授权日志；采用既有日志或锁属同一操作时不得改写共享日志或
+        # 清理副本（可能破坏获胜者的恢复证据），一律报告恢复未决。
+        holder = read_lock(root)
+        if created_journal and holder is not None and holder != operation_id:
+            write_journal(with_phase(journal, OperationPhase.ROLLED_BACK))
+            _clean_recovery_copies(journal)
         raise
     try:
         _verify_plan_observations(root, plan, journal)

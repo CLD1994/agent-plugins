@@ -18,6 +18,7 @@ from draft.observations import EMPTY_OBSERVATIONS, graph_observations
 from draft.operations import (
     JOURNAL_VERSION,
     execute_plan,
+    operation_journal_path,
     preallocate_journal,
     read_journal,
     read_lock,
@@ -820,27 +821,84 @@ def test_graph_observations_covers_empty_managed_directory(
 def test_execute_plan_lock_competition_finalizes_preallocated_journal(
     operation_draft: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """锁竞争失败（另一进程抢先取得锁）时，本次预分配日志必须终态化，不留 orphan。"""
+    """锁竞争失败（另一进程抢先取得锁）时，本次新建日志必须终态化，不留 orphan。"""
     import draft.operations as ops_module
 
     root = operation_draft
-    plan = _plan_with_observed_inputs(root)
+    our_id = "c" * 32
+    competitor_id = "d" * 32
+    plan = OperationPlan(
+        kind=OperationKind.CREATE,
+        root=root,
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
+        mutations=(),
+        metadata={"operation_id": our_id},
+    )
+    original_read_lock = ops_module.read_lock
 
-    def winning_race(root_path: Path, operation_id: str) -> None:
-        del root_path, operation_id
-        raise DraftError(
-            CheckCode.OPERATION_RECOVERY_REQUIRED.value, root / ".draft/operation.lock"
-        )
+    def race(root_path: Path) -> str | None:
+        result = original_read_lock(root_path)
+        if result is None:
+            # 竞争者抢先取得不同 operation_id 的锁（真实锁文件）。
+            ops_module.acquire_lock(root_path, competitor_id)
+        return result
 
-    monkeypatch.setattr(ops_module, "acquire_lock", winning_race)
+    monkeypatch.setattr(ops_module, "read_lock", race)
     with pytest.raises(DraftError, match=CheckCode.OPERATION_RECOVERY_REQUIRED.value):
         execute_plan(plan)
 
-    remaining = [entry for entry in (root / ".draft/operations").iterdir() if entry.is_dir()]
-    assert len(remaining) == 1
-    journal = read_journal(remaining[0] / "journal.json")
+    # 本次新建日志已终态化，锁仍属竞争者。
+    journal = read_journal(operation_journal_path(root, our_id))
     assert journal.phase is OperationPhase.ROLLED_BACK
-    assert read_lock(root) is None
+    assert read_lock(root) == competitor_id
+
+
+def test_execute_plan_lock_race_does_not_corrupt_adopted_journal(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """锁竞争失败方采用既有预分配日志时，不得改写获胜者日志或清理其恢复材料。"""
+    import draft.operations as ops_module
+
+    root = operation_draft
+    winner_id = "a" * 32
+    preallocate_journal(
+        root,
+        kind=OperationKind.CREATE,
+        operation_id=winner_id,
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
+        metadata={},
+    )
+    plan = OperationPlan(
+        kind=OperationKind.CREATE,
+        root=root,
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
+        mutations=(),
+        metadata={"operation_id": winner_id},
+    )
+    original_read_lock = ops_module.read_lock
+
+    def race(root_path: Path) -> str | None:
+        result = original_read_lock(root_path)
+        if result is None:
+            # 竞争者抢先取得同一 operation_id 的锁。
+            ops_module.acquire_lock(root_path, winner_id)
+        return result
+
+    monkeypatch.setattr(ops_module, "read_lock", race)
+    journal_path = root / ".draft/operations" / winner_id / "journal.json"
+    journal_before = journal_path.read_bytes()
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_RECOVERY_REQUIRED.value):
+        execute_plan(plan)
+
+    # 失败方不得改写日志、不得清理副本；锁仍属获胜者。
+    assert journal_path.read_bytes() == journal_before
+    assert read_lock(root) == winner_id
+    assert not (root / ".draft/operations" / winner_id / "originals").exists()
+    assert not (root / ".draft/operations" / winner_id / "staged").exists()
 
 
 def test_recover_uses_live_file_state_not_stale_applied(
