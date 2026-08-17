@@ -267,8 +267,10 @@ def make_attempt_copy(package: VerifiedTrashPackage) -> Path:
     elif attempt_node is not EntryKind.MISSING:
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, attempt)
     attempt.mkdir(parents=True, exist_ok=False)
-    durable_write(attempt / "package.json", package.manifest_bytes)
-    durable_write(attempt / package.payload_relative, package.page_bytes)
+    # 目录链从 attempt 逐层 no-follow 创建/同步（回归 M2）：嵌套 payload 的父目录
+    # 逐层 mkdirat + fsync，绝不按绝对路径重新解析祖先。
+    durable_write(attempt, Path("package.json"), package.manifest_bytes)
+    durable_write(attempt, package.payload_relative, package.page_bytes)
     fsync_directory(attempt)
     return attempt
 

@@ -78,7 +78,7 @@ def initialize(root: Path, *, root_state: RootState = RootState.REGISTERED) -> N
         created.append(pages)
         create_marker_parent_durably(target)
         created.append(target / INTERNAL_DIR)
-        durable_write(target / MARKER_PATH, marker_bytes(root_state))
+        durable_write(target, MARKER_PATH, marker_bytes(root_state))
         # marker 也纳入通用清理集合：最终检查返回错误或抛异常等任何确定性失败都必须
         # 回滚 marker，不能把"有效 marker + 缺失骨架"伪装成已完成初始化（规格 §6）。
         # 进程级中断（BaseException）不进入 except，保留已完成的根。

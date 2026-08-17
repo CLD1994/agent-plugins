@@ -180,9 +180,11 @@ def fsync_directory(path: Path) -> None:
 
     曾经静默吞掉 OSError（回归 H1）：调用方会把"日志/证据已耐久"的结论建立在未同步
     的目录项上，崩溃后可能同时失去内容与重建证据。作为提交点前置的同步必须可失败。
+    以 no-follow 打开（回归 M2）：同步的必须是此前验证过的同一目录，不是被链接替换
+    后的其他目录。
     """
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as exc:
         raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, path) from exc
     try:
@@ -325,6 +327,53 @@ def _open_parent_dir(path: Path, *, code: str, code_path: Path) -> int:
         return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as exc:
         raise DraftError(code, code_path) from exc
+
+
+def ensure_directory_chain(root: Path, relative: Path, *, code: str, code_path: Path) -> int:
+    """从 root no-follow 逐层打开/创建目录链，每创建一层立即 fsync 父目录（回归 M2）。
+
+    返回最终父目录 fd（调用方负责 close）。缺失目录以 mkdirat 创建后立即 fsync 当前
+    父目录（新目录项耐久），再打开下一层；中间组件为符号链接/非目录/不可打开时以
+    稳定 ``code`` 停止并保留现场。路径组件在同一 no-follow 锚定链上创建与同步，绝不
+    按绝对路径重新解析祖先。``relative`` 为空（"."）时直接打开并返回 root 句柄。
+    """
+    if not relative.parts:
+        return _open_parent_dir(root, code=code, code_path=code_path)
+    try:
+        parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise DraftError(code, code_path) from exc
+    try:
+        for part in relative.parts:
+            try:
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=parent_fd)
+                except OSError as exc:
+                    raise DraftError(code, code_path) from exc
+                # 新目录项耐久后才继续：父目录同步失败即停止，不推进 phase。
+                _fsync_dir_fd(parent_fd, code_path)
+                try:
+                    next_fd = os.open(
+                        part,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=parent_fd,
+                    )
+                except OSError as exc:
+                    raise DraftError(code, code_path) from exc
+            except OSError as exc:
+                raise DraftError(code, code_path) from exc
+            os.close(parent_fd)
+            parent_fd = next_fd
+        return parent_fd
+    except BaseException:
+        os.close(parent_fd)
+        raise
 
 
 def _pending_decision(
@@ -835,21 +884,24 @@ def anchored_leaf(
             os.close(parent_fd)
 
 
-def durable_write(path: Path, value: bytes) -> None:
-    """create-only 严格耐久写（回归 H1/H2/H3）：journal bootstrap、original/staged、
+def durable_write(root: Path, relative: Path, value: bytes) -> None:
+    """create-only 严格耐久写（回归 H1/H2/H3/M2）：journal bootstrap、original/staged、
     attempt、cleanup evidence 等首次创建目标。
 
-    目标与 pending 都必须是 missing 的瞬时状态：O_EXCL 创建确定名 pending（绝不截断
-    未知 pending）+ link 无覆盖发布（发布瞬间目标已出现即外部变化），绝不覆盖既有
-    目标。父目录以 no-follow 打开（发布边界不重新解析路径）；严格同步失败映射
-    operation.durability_failed。
+    目录链从 ``root`` no-follow 逐层打开/创建（回归 M2）：缺失目录 mkdirat 创建后立即
+    fsync 父目录，逐层同步到最终父目录，绝不按绝对路径重新解析祖先。目标与 pending
+    都必须是 missing 的瞬时状态：O_EXCL 创建确定名 pending（绝不截断未知 pending）+
+    link 无覆盖发布（发布瞬间目标已出现即外部变化），绝不覆盖既有目标。严格同步失败
+    映射 operation.durability_failed。
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    parent_fd = _open_parent_dir(
-        path.parent, code=CheckCode.OPERATION_DURABILITY_FAILED.value, code_path=path.parent
+    parent_fd = ensure_directory_chain(
+        root,
+        relative.parent,
+        code=CheckCode.OPERATION_DURABILITY_FAILED.value,
+        code_path=relative.parent,
     )
     try:
-        _create_only_publish(parent_fd, path.name, value, code_path=path)
+        _create_only_publish(parent_fd, relative.name, value, code_path=relative)
     finally:
         os.close(parent_fd)
 
@@ -1520,8 +1572,9 @@ def write_journal(journal: Journal) -> None:
     resolve_journal_pending(path)
     old = _read_optional_journal(path)
     validate_journal_transition(old, journal, path=path)
-    parent_fd = _open_parent_dir(
+    parent_fd = ensure_directory_chain(
         path.parent,
+        Path("."),
         code=CheckCode.OPERATION_DURABILITY_FAILED.value,
         code_path=path.parent,
     )
@@ -1673,7 +1726,15 @@ def _apply_write(root: Path, target: Path, content: bytes, *, temporary: Path) -
         cursor /= part
         if cursor.is_symlink():
             raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, cursor)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    # 目录链从 root no-follow 逐层创建/同步（回归 M2）：多层新目录每层 mkdirat 后
+    # fsync 父目录，绝不按绝对路径重新解析祖先；晚到的组件链接由 O_NOFOLLOW 拒绝。
+    parent_fd = ensure_directory_chain(
+        root,
+        target.parent,
+        code=CheckCode.OPERATION_DURABILITY_FAILED.value,
+        code_path=target.parent,
+    )
+    os.close(parent_fd)
     temporary = root / temporary
     reject_symlink_components(root, temporary.relative_to(root))
     if temporary.exists() or temporary.is_symlink():
@@ -2210,8 +2271,6 @@ def _execute_allocated_plan(
     if lock_already_held and read_lock(root) != operation_id:
         raise DraftError("operation.plan_invalid", root)
 
-    originals = directory / "originals"
-    staged = directory / "staged"
     mutations: list[JournalMutation] = []
     original_contents: dict[int, bytes] = {}
     staged_contents: dict[int, bytes] = {}
@@ -2271,13 +2330,15 @@ def _execute_allocated_plan(
     # 阶段永远不会有未登记文件；崩溃 mid-prepare 留下 PREPARED 日志 + 部分缺失文件，
     # 恢复按登记清单容忍缺失并拒绝任何未登记内容。
     write_journal(prepared)
-    originals.mkdir(exist_ok=True)
-    staged.mkdir(exist_ok=True)
     for index, mutation in enumerate(prepared.mutations):
         if index in original_contents:
-            durable_write(originals / f"{index:04d}.bin", original_contents[index])
+            durable_write(
+                journal.directory, Path("originals") / f"{index:04d}.bin", original_contents[index]
+            )
         if mutation.staged is not None:
-            durable_write(staged / f"{index:04d}.bin", staged_contents[index])
+            durable_write(
+                journal.directory, Path("staged") / f"{index:04d}.bin", staged_contents[index]
+            )
 
     for mutation in prepared.mutations:
         current_hash = sha256_file(root / mutation.path)

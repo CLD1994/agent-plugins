@@ -19,8 +19,8 @@ class SimulatedCrash(BaseException):
 def _crash_initialize_after_final_marker(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     original = lifecycle_module.durable_write
 
-    def write_then_crash(path: Path, value: bytes) -> None:
-        original(path, value)
+    def write_then_crash(root: Path, relative: Path, value: bytes) -> None:
+        original(root, relative, value)
         if value == FINAL_MARKER_BYTES:
             raise SimulatedCrash
 
@@ -92,10 +92,10 @@ def test_initialize_marker_publish_failure_rolls_back(
     root = tmp_path / "new-topic"
     original = lifecycle_module.durable_write
 
-    def fail_on_marker(path: Path, value: bytes) -> None:
-        if path.name == "draft.json":
+    def fail_on_marker(root: Path, relative: Path, value: bytes) -> None:
+        if relative.name == "draft.json":
             raise OSError("disk full")
-        original(path, value)
+        original(root, relative, value)
 
     monkeypatch.setattr(lifecycle_module, "durable_write", fail_on_marker)
 

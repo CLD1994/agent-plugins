@@ -1186,13 +1186,13 @@ def test_crash_during_recovery_copy_creation_is_judgable(
     original_durable = operations_module.durable_write
     calls = {"n": 0}
 
-    def crash_on_second_durable(path: object, value: object) -> None:
+    def crash_on_second_durable(root: object, relative: object, value: object) -> None:
         # journal 写入不再经过 durable_write（回归 H2 发布拆分），副本写入从第 1 次
         # durable_write 起计：第 2 次即第一个 staged 写入处崩溃。
         calls["n"] += 1
         if calls["n"] == 2:  # prepared 日志后第一个 staged 写入处崩溃。
             raise RuntimeError("injected crash during copy creation")
-        original_durable(path, value)  # type: ignore[arg-type]
+        original_durable(root, relative, value)  # type: ignore[arg-type]
 
     monkeypatch.setattr("draft.operations.durable_write", crash_on_second_durable)
     with pytest.raises(RuntimeError, match="injected crash"):
@@ -1686,7 +1686,7 @@ def test_durable_write_file_fsync_failure_leaves_pending_scene(
     target.parent.mkdir(parents=True)
     _fail_fsync_at(monkeypatch, frozenset({1}))
     with pytest.raises(DraftError, match=CheckCode.OPERATION_DURABILITY_FAILED.value):
-        durable_write(target, _valid_journal_bytes("a" * 32))
+        durable_write(target.parent, Path("journal.json"), _valid_journal_bytes("a" * 32))
     monkeypatch.undo()
     assert not target.exists()
     assert (target.parent / "journal.json.pending").is_file()
@@ -1702,7 +1702,7 @@ def test_durable_write_pending_dir_fsync_failure_then_resolve_converges(
     target.parent.mkdir(parents=True)
     _fail_fsync_at(monkeypatch, frozenset({2}))
     with pytest.raises(DraftError, match=CheckCode.OPERATION_DURABILITY_FAILED.value):
-        durable_write(target, _valid_journal_bytes("b" * 32))
+        durable_write(target.parent, Path("journal.json"), _valid_journal_bytes("b" * 32))
     monkeypatch.undo()
     assert not target.exists()
     pending = target.parent / "journal.json.pending"
@@ -1729,7 +1729,7 @@ def test_durable_write_final_dir_fsync_failure_reports_not_durable(
     target.parent.mkdir(parents=True)
     _fail_fsync_at(monkeypatch, frozenset({4}))
     with pytest.raises(DraftError, match=CheckCode.OPERATION_DURABILITY_FAILED.value):
-        durable_write(target, _valid_journal_bytes("c" * 32))
+        durable_write(target.parent, Path("journal.json"), _valid_journal_bytes("c" * 32))
     monkeypatch.undo()
     assert target.is_file()
     assert target.read_bytes() == _valid_journal_bytes("c" * 32)
@@ -1808,7 +1808,7 @@ def test_subprocess_kill_leaves_synced_pending_then_resolve_converges(
         # create-only 发布在 link（no-clobber 发布点）处崩溃：pending 已 fsync。
         "os.link = lambda *a, **k: os.kill(os.getpid(), signal.SIGKILL)\n"
         "from draft.operations import durable_write\n"
-        f"durable_write(Path({str(target)!r}), {payload!r})\n"
+        f"durable_write(Path({str(target)!r}).parent, Path('journal.json'), {payload!r})\n"
     )
     proc = subprocess.run([sys.executable, "-c", script], capture_output=True, timeout=60)
     assert proc.returncode == -signal.SIGKILL
@@ -2393,7 +2393,7 @@ def test_create_only_publish_replaced_pending_between_link_and_consume(
 
     monkeypatch.setattr(os_module, "link", swap_pending)
     with pytest.raises(DraftError, match="operation.external_change"):
-        durable_write(target, b"authorized")
+        durable_write(target.parent, Path("out.txt"), b"authorized")
     monkeypatch.undo()
 
     assert target.read_bytes() == b"authorized"
@@ -2449,3 +2449,49 @@ def test_subprocess_kill_after_quarantine_link_preserves_both_and_converges(
     recover_quarantine(root, Path("managed/leaf.txt"), digest, code="x", code_path=leaf)
     assert leaf.read_bytes() == b"authorized"
     assert not quarantine.exists()
+
+
+@pytest.mark.parametrize("depth", [1, 2, 3])
+def test_durable_write_nested_dir_chain_level_fsync_failure(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch, depth: int
+) -> None:
+    """目录链每一层 mkdirat 后的父目录 fsync 失败：durability_failed，
+    目录保留、目标未发布（回归 M2）。"""
+    from draft.operations import durable_write
+
+    root = operation_draft
+    parts = tuple(f"level{i}" for i in range(depth))
+    relative = Path(*parts) / "file.txt"
+    _fail_fsync_at(monkeypatch, frozenset({depth}))  # 第 depth 次即最深层 mkdirat 后的父 fsync。
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_DURABILITY_FAILED.value):
+        durable_write(root, relative, b"payload")
+    monkeypatch.undo()
+
+    # 已 mkdirat 的目录保留（现场可诊断），目标未发布。
+    cursor = root
+    for part in parts:
+        cursor = cursor / part
+        assert cursor.is_dir()
+    assert not (root / relative).exists()
+    assert not (root / relative.with_name("file.txt.pending")).exists()
+
+
+def test_durable_write_rejects_symlink_ancestor(operation_draft: Path, tmp_path: Path) -> None:
+    """目录链中间组件是符号链接：no-follow 拒绝，根外不产生文件（回归 M2）。"""
+    import shutil
+
+    from draft.operations import durable_write
+
+    root = operation_draft
+    external = tmp_path / "external"
+    external.mkdir()
+    # 把 pages（真实目录）替换为指向外部的链接。
+    pages = root / "pages"
+    shutil.rmtree(pages)
+    pages.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_DURABILITY_FAILED.value):
+        durable_write(root, Path("pages/new/deep/file.md"), b"payload")
+
+    assert not (external / "new").exists()  # 根外无任何文件。
+    assert not (pages / "new").exists()

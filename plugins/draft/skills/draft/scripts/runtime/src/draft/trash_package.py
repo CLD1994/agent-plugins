@@ -705,7 +705,11 @@ def _write_cleanup_evidence(
         "cleanup_phase": journal.phase.value,
         "leaves": entries,
     }
-    durable_write(_cleanup_evidence_path(journal), (json.dumps(payload) + "\n").encode("utf-8"))
+    durable_write(
+        journal.directory,
+        Path(_CLEANUP_EVIDENCE_NAME),
+        (json.dumps(payload) + "\n").encode("utf-8"),
+    )
 
 
 def _clear_cleanup_evidence(root: Path, journal: Journal) -> None:
