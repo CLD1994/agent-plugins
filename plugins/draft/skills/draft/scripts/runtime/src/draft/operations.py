@@ -60,8 +60,16 @@ _MID_WRITE_PHASES = frozenset(
 _TEMP_ARTIFACT = re.compile(r"\.tmp-[0-9a-f]{32}$")
 
 
-def _is_temp_artifact(name: str) -> bool:
-    return _TEMP_ARTIFACT.search(name) is not None
+def _is_owned_temp_artifact(name: str, owned_bases: frozenset[str]) -> bool:
+    """temp-like 成员是否为当前操作崩溃遗留（所有权证据：基础名属于本操作某个 WRITE 目标）。
+
+    文件名形状不是所有权证据：只有基础名恰好是本操作某个 WRITE mutation 的目标名时，
+    才可解释为本操作瞬态副作用；未登记的同名 temp-like 成员一律视为外部内容。
+    """
+    match = _TEMP_ARTIFACT.search(name)
+    if match is None:
+        return False
+    return name[: match.start()] in owned_bases
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -1348,8 +1356,20 @@ def _verify_observations_for_recovery(
         removed=removed,
     )
 
+    owned_temp_bases = frozenset(
+        mutation.path.name
+        for mutation in journal.mutations
+        if mutation.kind is MutationKind.WRITE
+    )
+
     class _RecoveryProbe:
-        """比较探针：统一忽略本操作崩溃遗留的 .tmp-<hex> 瞬态文件（默认与注入一致）。"""
+        """比较探针：只忽略本操作 WRITE 目标同名的 .tmp-<hex> 瞬态文件。
+
+        文件名形状不是所有权证据：预存 temp-like 合法文件不得被过滤（否则计划观察
+        与 live 成员不一致，误报 external_change）；未登记的 temp-like 入侵者必须
+        保留在成员里（否则被静默吸收）。只有基础名属于本操作某个 WRITE 目标、
+        且当前为普通文件的成员才解释为本操作崩溃遗留。
+        """
 
         def __init__(self, inner: ObservationProbe) -> None:
             self._inner = inner
@@ -1358,7 +1378,9 @@ def _verify_observations_for_recovery(
             observed = self._inner.observe(path)
             if observed.kind is EntryKind.DIRECTORY:
                 members = tuple(
-                    member for member in observed.members if not _is_temp_artifact(member)
+                    member
+                    for member in observed.members
+                    if not _is_owned_temp_artifact(member, owned_temp_bases)
                 )
                 return Observation(path=path, kind=EntryKind.DIRECTORY, members=members)
             return observed

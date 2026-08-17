@@ -118,6 +118,46 @@ def test_candidate_status_set_rejects_bad_target_page(
     assert error["code"] == "page.not_found"
 
 
+def test_registered_create_accepts_preexisting_temp_like_file(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """根内预存 .tmp-<32hex> 名称的普通文件不得被临时文件过滤误判为外部变化。
+
+    回归 H3：比较探针若按文件名形状全局过滤，会把 live 成员过滤掉而与计划观察
+    （记录了该成员）不一致，结构命令错误返回 operation.external_change。
+    """
+    root = draft_factory(
+        {
+            "index.md": PAGE_INDEX,
+            "pages/a.md": PAGE_A,
+            "pages/b.md": PAGE_B,
+        }
+    )
+    keep = root / "pages" / f"keep.tmp-{'a' * 32}"
+    keep.write_text("# 保留的正文\n", encoding="utf-8")
+    keep_before = keep.read_bytes()
+    capsys.readouterr()
+
+    code, _payload = run_json(
+        [
+            "create",
+            "--root",
+            str(root),
+            "pages/c.md",
+            "--title",
+            "丙",
+            "--status",
+            "pending",
+            "--json",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    assert (root / "pages/c.md").is_file()
+    assert keep.read_bytes() == keep_before
+
+
 def test_registered_create_rejects_any_global_error(
     draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
 ) -> None:

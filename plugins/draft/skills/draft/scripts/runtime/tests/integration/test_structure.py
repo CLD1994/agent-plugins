@@ -536,12 +536,16 @@ def _inject_intruder(root: Path, entry_type: str) -> Path:
         external = root / ".draft" / "external-target.md"
         external.write_text("# 外部\n", encoding="utf-8")
         path.symlink_to(external)
+    elif entry_type == "tempfile":
+        # temp-like 名称但本操作从未登记：所有权过滤不得放行。
+        path = topic / f"intruder.tmp-{'b' * 32}"
+        path.write_text("# 临时形状入侵者\n", encoding="utf-8")
     else:  # pragma: no cover
         raise AssertionError(entry_type)
     return path
 
 
-@pytest.mark.parametrize("entry_type", ["file", "markdown", "symlink"])
+@pytest.mark.parametrize("entry_type", ["file", "markdown", "symlink", "tempfile"])
 def test_promote_crash_recovery_rejects_intruder_in_created_directory(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
