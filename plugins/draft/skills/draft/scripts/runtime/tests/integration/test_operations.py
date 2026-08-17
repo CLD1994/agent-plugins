@@ -192,6 +192,40 @@ def test_journal_operation_id_must_match_directory(operation_draft: Path) -> Non
         read_journal(journal / "journal.json")
 
 
+def test_journal_unsafe_original_never_touches_external_file(
+    operation_draft: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """日志 original 指向根外绝对路径：read_journal 在解析边界拒绝，绝不读取外部文件。"""
+    sentinel = tmp_path / "external-original.bin"
+    sentinel.write_bytes(b"must never be read")
+    journal_dir = write_journal(operation_draft, "b" * 32, "prepared")
+    data = json.loads((journal_dir / "journal.json").read_text(encoding="utf-8"))
+    data["mutations"] = [
+        {
+            "path": "pages/a.md",
+            "kind": "write",
+            "before_sha256": "c" * 64,
+            "after_sha256": "d" * 64,
+            "original": str(sentinel),
+            "staged": "staged/0000.bin",
+            "applied": False,
+        }
+    ]
+    (journal_dir / "journal.json").write_text(json.dumps(data), encoding="utf-8")
+
+    original_read = Path.read_bytes
+
+    def read_bytes(self: Path) -> bytes:
+        if self == sentinel:
+            raise AssertionError("external original must not be read")
+        return original_read(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        read_journal(journal_dir / "journal.json")
+    assert original_read(sentinel) == b"must never be read"
+
+
 def _write_journal_with_observations(
     root: Path, operation_id: str, observations: list[dict[str, object]]
 ) -> Path:

@@ -267,15 +267,14 @@ def test_adopt_rejects_concurrent_page_change(
 
     root = tmp_path / "candidate"
     build_valid_candidate(root)
-    from draft.models import OperationPlan
     from draft.operations import Journal
 
     original_verify = ops_module._verify_plan_observations  # pyright: ignore[reportPrivateUsage]
 
-    def verify_then_edit(root_path: Path, plan: OperationPlan, journal: Journal) -> None:
+    def verify_then_edit(root_path: Path, journal: Journal) -> None:
         index = root / "index.md"
         index.write_text(index.read_text(encoding="utf-8") + "\n并发补充。\n", encoding="utf-8")
-        original_verify(root_path, plan, journal)
+        original_verify(root_path, journal)
 
     monkeypatch.setattr(ops_module, "_verify_plan_observations", verify_then_edit)
 
@@ -335,16 +334,15 @@ def test_adopt_rejects_concurrent_internal_protocol_change(
     package = root / ".draft/trash/outgoing" / pending.operation_id / "package.json"
     assert package.is_file()
 
-    from draft.models import OperationPlan
     from draft.operations import Journal
 
     original_verify = ops_module._verify_plan_observations  # pyright: ignore[reportPrivateUsage]
 
-    def verify_then_edit(root_path: Path, plan: OperationPlan, journal: Journal) -> None:
+    def verify_then_edit(root_path: Path, journal: Journal) -> None:
         package.write_text(
             package.read_text(encoding="utf-8") + "\n// 外部修改\n", encoding="utf-8"
         )
-        original_verify(root_path, plan, journal)
+        original_verify(root_path, journal)
 
     monkeypatch.setattr(ops_module, "_verify_plan_observations", verify_then_edit)
 

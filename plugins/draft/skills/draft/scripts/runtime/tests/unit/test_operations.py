@@ -22,9 +22,11 @@ from draft.operations import (
     HANDOFF_ATTEMPTED_AT_KEY,
     HANDOFF_ERROR_MESSAGE_KEY,
     HANDOFF_ERROR_TYPE_KEY,
+    JOURNAL_VERSION,
     Journal,
     JournalMutation,
     TrashDeadlines,
+    _parse_journal,  # pyright: ignore[reportPrivateUsage]
     _verify_observations_for_recovery,  # pyright: ignore[reportPrivateUsage]
     adjusted_observation_manifest,
     explained_directory_deltas,
@@ -609,8 +611,8 @@ def _journal() -> Journal:
                 kind=MutationKind.WRITE,
                 before_sha256="before-hash",
                 after_sha256="after-hash",
-                original="originals/0000.bin",
-                staged="staged/0000.bin",
+                original=Path("originals/0000.bin"),
+                staged=Path("staged/0000.bin"),
                 applied=False,
             ),
         ),
@@ -822,3 +824,195 @@ def test_recover_changed_paths_missing_returns_public_mutations_only() -> None:
     result = _recover_changed_paths(_journal_with_metadata({}))
     assert result == (Path("conclusions.md"), Path("index.md"))
     assert all(".draft" not in path.parts for path in result)
+
+
+# ---------------------------------------------------------------------------
+# _parse_journal：单一解析边界的形状与协议验证（回归 H5）
+# ---------------------------------------------------------------------------
+
+
+def _journal_payload(
+    mutations: list[dict[str, object]],
+    *,
+    operation_id: str = "a" * 32,
+) -> dict[str, object]:
+    """构造解析输入；mutation 缺省字段由各用例显式给出，不再复制默认值。"""
+    return {
+        "journal_version": JOURNAL_VERSION,
+        "operation_id": operation_id,
+        "kind": OperationKind.CREATE.value,
+        "phase": OperationPhase.PREPARED.value,
+        "root_state": RootState.REGISTERED.value,
+        "observations": [],
+        "mutations": mutations,
+        "remove_empty_directories": [],
+        "metadata": {},
+    }
+
+
+def _parse_path(operation_id: str = "a" * 32) -> Path:
+    return Path(f"{operation_id}/journal.json")
+
+
+def _write_mutation(
+    index: int,
+    *,
+    path: str = "pages/a.md",
+    before: str | None = None,
+    staged: str | None | object = ...,
+) -> dict[str, object]:
+    return {
+        "path": path,
+        "kind": "write",
+        "before_sha256": before,
+        "after_sha256": "b" * 64,
+        "original": f"originals/{index:04d}.bin" if before is not None else None,
+        "staged": f"staged/{index:04d}.bin" if staged is ... else staged,
+        "applied": False,
+    }
+
+
+def _delete_mutation(
+    index: int,
+    *,
+    path: str = "pages/d.md",
+    original: str | None | object = ...,
+) -> dict[str, object]:
+    return {
+        "path": path,
+        "kind": "delete",
+        "before_sha256": "c" * 64,
+        "after_sha256": None,
+        "original": f"originals/{index:04d}.bin" if original is ... else original,
+        "staged": None,
+        "applied": False,
+    }
+
+
+def test_parse_journal_valid_write_and_delete_yields_constrained_paths() -> None:
+    journal = _parse_journal(
+        _journal_payload(
+            [
+                _write_mutation(0, before="a" * 64),
+                _delete_mutation(1),
+            ]
+        ),
+        _parse_path(),
+    )
+    write, delete = journal.mutations
+    assert write.original == Path("originals/0000.bin")
+    assert write.staged == Path("staged/0000.bin")
+    assert delete.original == Path("originals/0001.bin")
+    assert delete.staged is None
+
+
+def test_parse_journal_accepts_new_write_without_original() -> None:
+    journal = _parse_journal(_journal_payload([_write_mutation(0)]), _parse_path())
+    assert journal.mutations[0].original is None
+    assert journal.mutations[0].staged == Path("staged/0000.bin")
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["/etc/passwd", "../escape.bin", "originals/../x.bin", "staged/0000.bin", "other/0000.bin"],
+)
+def test_parse_journal_rejects_unsafe_original_before_any_io(field: str) -> None:
+    bad = _write_mutation(0, before="a" * 64)
+    bad["original"] = field
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(_journal_payload([bad]), _parse_path())
+
+
+def test_parse_journal_rejects_wrong_original_index() -> None:
+    bad = _write_mutation(0, before="a" * 64)
+    bad["original"] = "originals/0001.bin"
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(_journal_payload([bad]), _parse_path())
+
+
+def test_parse_journal_rejects_staged_on_delete() -> None:
+    bad = _delete_mutation(0)
+    bad["staged"] = "staged/0000.bin"
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(_journal_payload([bad]), _parse_path())
+
+
+def test_parse_journal_rejects_staged_missing_on_write() -> None:
+    bad = _write_mutation(0)
+    bad["staged"] = None
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(_journal_payload([bad]), _parse_path())
+
+
+def test_parse_journal_rejects_original_missing_when_before_present() -> None:
+    bad = _write_mutation(0, before="a" * 64)
+    bad["original"] = None
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(_journal_payload([bad]), _parse_path())
+
+
+def test_parse_journal_rejects_original_present_on_new_write() -> None:
+    bad = _write_mutation(0)
+    bad["original"] = "originals/0000.bin"
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(_journal_payload([bad]), _parse_path())
+
+
+@pytest.mark.parametrize("hash_field", ["before_sha256", "after_sha256"])
+def test_parse_journal_rejects_non_64hex_hash(hash_field: str) -> None:
+    bad = _write_mutation(0)
+    bad[hash_field] = "deadbeef"
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(_journal_payload([bad]), _parse_path())
+
+
+def test_parse_journal_rejects_delete_without_before() -> None:
+    bad = _delete_mutation(0)
+    bad["before_sha256"] = None
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(_journal_payload([bad]), _parse_path())
+
+
+def test_parse_journal_rejects_delete_with_after() -> None:
+    bad = _delete_mutation(0)
+    bad["after_sha256"] = "b" * 64
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(_journal_payload([bad]), _parse_path())
+
+
+def test_parse_journal_rejects_write_without_after() -> None:
+    bad = _write_mutation(0)
+    bad["after_sha256"] = None
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(_journal_payload([bad]), _parse_path())
+
+
+def test_parse_journal_rejects_duplicate_target_path() -> None:
+    mutations = [
+        _write_mutation(0, path="pages/a.md"),
+        _write_mutation(1, path="pages/a.md", before="a" * 64),
+    ]
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(_journal_payload(mutations), _parse_path())
+
+
+def test_parse_journal_rejects_duplicate_original_path() -> None:
+    first = _write_mutation(0, before="a" * 64)
+    second = _write_mutation(1, path="pages/b.md", before="b" * 64)
+    second["original"] = "originals/0000.bin"
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(_journal_payload([first, second]), _parse_path())
+
+
+def test_parse_journal_rejects_duplicate_staged_path() -> None:
+    first = _write_mutation(0)
+    second = _write_mutation(1, path="pages/b.md")
+    second["staged"] = "staged/0000.bin"
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(_journal_payload([first, second]), _parse_path())
+
+
+@pytest.mark.parametrize("path", ["", ".", "./", "pages/."])
+def test_parse_journal_rejects_empty_or_dot_mutation_path(path: str) -> None:
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(_journal_payload([_write_mutation(0, path=path)]), _parse_path())

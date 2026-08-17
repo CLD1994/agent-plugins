@@ -386,19 +386,19 @@ def test_cleanup_rejects_third_package_write(
     journal_path = operation_journal_path(root, pending.operation_id)
     read_journal(journal_path)
     # 追加第三个包内 WRITE（恶意日志）。
+    # 形状合法（H5）但构成第三个包内 WRITE：read_journal 接受，包授权解析器必须拒绝。
+    import json as json_module
+
+    raw = json_module.loads(journal_path.read_text(encoding="utf-8"))
     forged = {
         "path": (package.relative_to(root) / "payload/extra.md").as_posix(),
         "kind": "write",
         "before_sha256": None,
         "after_sha256": "a" * 64,
         "original": None,
-        "staged": None,
+        "staged": f"staged/{len(raw['mutations']):04d}.bin",
         "applied": False,
     }
-    # 直接构造携带该 mutation 的 journal 不可行（frozen dataclass），改用磁盘 JSON 注入。
-    import json as json_module
-
-    raw = json_module.loads(journal_path.read_text(encoding="utf-8"))
     raw["mutations"].append(forged)
     journal_path.write_text(json_module.dumps(raw, ensure_ascii=False), encoding="utf-8")
 

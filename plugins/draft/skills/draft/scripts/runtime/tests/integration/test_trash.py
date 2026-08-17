@@ -267,7 +267,6 @@ def test_restore_rejects_concurrent_package_edit(
 ) -> None:
     """restore 读集观察必须覆盖权威包：并发的 package.json 改动使恢复失败而非静默删除。"""
     import draft.operations as ops_module
-    from draft.models import OperationPlan
     from draft.operations import Journal
 
     root = build_trashable_draft(draft_factory)
@@ -276,12 +275,12 @@ def test_restore_rejects_concurrent_package_edit(
 
     original_verify = ops_module._verify_plan_observations  # pyright: ignore[reportPrivateUsage]
 
-    def verify_then_edit(root_path: Path, plan: OperationPlan, journal: Journal) -> None:
+    def verify_then_edit(root_path: Path, journal: Journal) -> None:
         package_file = package / "package.json"
         package_file.write_text(
             package_file.read_text(encoding="utf-8") + "\n// 外部修改\n", encoding="utf-8"
         )
-        original_verify(root_path, plan, journal)
+        original_verify(root_path, journal)
 
     monkeypatch.setattr(ops_module, "_verify_plan_observations", verify_then_edit)
 
@@ -318,7 +317,6 @@ def test_restore_rejects_concurrent_package_addition(
 ) -> None:
     """restore 观察权威包整棵目录树：计划后新增文件/空目录/符号链接使恢复按冲突中止。"""
     import draft.operations as ops_module
-    from draft.models import OperationPlan
     from draft.operations import Journal
 
     root = build_trashable_draft(draft_factory)
@@ -327,9 +325,9 @@ def test_restore_rejects_concurrent_package_addition(
 
     original_verify = ops_module._verify_plan_observations  # pyright: ignore[reportPrivateUsage]
 
-    def verify_then_add(root_path: Path, plan: OperationPlan, journal: Journal) -> None:
+    def verify_then_add(root_path: Path, journal: Journal) -> None:
         mutate_package(package)
-        original_verify(root_path, plan, journal)
+        original_verify(root_path, journal)
 
     monkeypatch.setattr(ops_module, "_verify_plan_observations", verify_then_add)
 
@@ -860,7 +858,7 @@ def test_completed_restore_with_extra_mutation_is_rejected(
             "kind": "delete",
             "before_sha256": "f" * 64,
             "after_sha256": None,
-            "original": None,
+            "original": f"originals/{len(r_data['mutations']):04d}.bin",
             "staged": None,
             "applied": True,
         }

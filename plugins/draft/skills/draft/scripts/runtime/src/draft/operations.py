@@ -259,8 +259,10 @@ class JournalMutation:
     kind: MutationKind
     before_sha256: str | None
     after_sha256: str | None
-    original: str | None
-    staged: str | None
+    # 恢复副本路径：read_journal 单一解析边界验证后的受约束相对路径，绝不接受
+    # 裸字符串。消费者只接触这些 Path，禁止字符串拼接决定 I/O 边界。
+    original: Path | None
+    staged: Path | None
     applied: bool
 
 
@@ -299,8 +301,10 @@ def _journal_to_json(journal: Journal) -> bytes:
                 "kind": mutation.kind.value,
                 "before_sha256": mutation.before_sha256,
                 "after_sha256": mutation.after_sha256,
-                "original": mutation.original,
-                "staged": mutation.staged,
+                "original": (
+                    mutation.original.as_posix() if mutation.original is not None else None
+                ),
+                "staged": mutation.staged.as_posix() if mutation.staged is not None else None,
                 "applied": mutation.applied,
             }
             for mutation in journal.mutations
@@ -323,11 +327,43 @@ def _expect_optional_str(value: object, journal_path: Path) -> str | None:
     return value
 
 
+def _valid_sha256(value: str) -> bool:
+    return re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
 def _validate_journal_path(value: str, journal_path: Path) -> Path:
     relative = PurePosixPath(value)
-    if relative.is_absolute() or ".." in relative.parts:
+    if not relative.parts or relative.is_absolute() or ".." in relative.parts:
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+    # 拒绝显式 `.` 或空段（非规范拼写）：PurePosixPath 会归一化它们，纯语义校验。
+    if any(part in ("", ".", "..") for part in value.split("/")):
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
     return Path(*relative.parts)
+
+
+def _validate_observation_path(value: str, journal_path: Path) -> Path:
+    """观察路径校验：根目录观察的合法协议值是 ``.``；其余路径按严格路径校验。"""
+    if value == ".":
+        return Path(".")
+    return _validate_journal_path(value, journal_path)
+
+
+def _recovery_path_for(
+    value: str | None,
+    *,
+    expected: Path,
+    journal_path: Path,
+) -> Path | None:
+    """original/staged 必须在单一解析边界精确等于协议形状（``originals/{i:04d}.bin`` 等）。
+
+    绝对路径、``..``、错误子目录、错误 index 和非规范拼写都在任何 I/O 之前被拒绝；
+    消费者只拿到受约束的相对 Path，禁止字符串拼接决定 I/O 边界。
+    """
+    if value is None:
+        return None
+    if value != expected.as_posix():
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+    return expected
 
 
 def _parse_observations(data: object, journal_path: Path) -> ObservationManifest:
@@ -350,7 +386,7 @@ def _parse_observations(data: object, journal_path: Path) -> ObservationManifest
             isinstance(member, str) for member in cast("list[object]", members_raw)
         ):
             raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
-        path = _validate_journal_path(_expect_str(item.get("path"), journal_path), journal_path)
+        path = _validate_observation_path(_expect_str(item.get("path"), journal_path), journal_path)
         if path in seen:
             raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
         seen.add(path)
@@ -373,10 +409,20 @@ def read_journal(journal_path: Path) -> Journal:
         decoded = json.loads(journal_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path) from exc
-    if not isinstance(decoded, dict):
+    return _parse_journal(decoded, journal_path)
+
+
+def _parse_journal(data: object, journal_path: Path) -> Journal:
+    """纯解析：无文件系统访问，可在单测中直接构造畸形输入。
+
+    在单一解析边界完成全部形状与协议验证：路径、hash 形状、kind/hash 组合、
+    original/staged 协议形状与唯一性。任何 I/O 消费者只接触已验证对象，
+    恢复材料路径不得由字符串拼接决定 I/O 边界（回归 H5）。
+    """
+    if not isinstance(data, dict):
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
-    data = cast("dict[str, object]", decoded)
-    version = data.get("journal_version")
+    parsed = cast("dict[str, object]", data)
+    version = parsed.get("journal_version")
     if version != JOURNAL_VERSION:
         raise DraftError(
             "operation.journal_version_unsupported",
@@ -384,38 +430,84 @@ def read_journal(journal_path: Path) -> Journal:
             details=(str(version), str(JOURNAL_VERSION)),
         )
     try:
-        kind = OperationKind(_expect_str(data.get("kind"), journal_path))
-        phase = OperationPhase(_expect_str(data.get("phase"), journal_path))
-        root_state = RootState(_expect_str(data.get("root_state"), journal_path))
-        observations = _parse_observations(data.get("observations"), journal_path)
-        mutations_raw = data.get("mutations")
+        kind = OperationKind(_expect_str(parsed.get("kind"), journal_path))
+        phase = OperationPhase(_expect_str(parsed.get("phase"), journal_path))
+        root_state = RootState(_expect_str(parsed.get("root_state"), journal_path))
+        observations = _parse_observations(parsed.get("observations"), journal_path)
+        mutations_raw = parsed.get("mutations")
         if not isinstance(mutations_raw, list):
             raise TypeError("mutations must be a list")
         mutations: list[JournalMutation] = []
-        for entry in cast("list[object]", mutations_raw):
+        seen_paths: set[Path] = set()
+        seen_originals: set[Path] = set()
+        seen_staged: set[Path] = set()
+        for index, entry in enumerate(cast("list[object]", mutations_raw)):
             if not isinstance(entry, dict):
                 raise TypeError("mutation must be an object")
             item = cast("dict[str, object]", entry)
             applied = item.get("applied")
             if not isinstance(applied, bool):
                 raise TypeError("applied must be a boolean")
+            mutation_kind = MutationKind(_expect_str(item.get("kind"), journal_path))
+            before = _expect_optional_str(item.get("before_sha256"), journal_path)
+            after = _expect_optional_str(item.get("after_sha256"), journal_path)
+            if before is not None and not _valid_sha256(before):
+                raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+            if after is not None and not _valid_sha256(after):
+                raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+            if mutation_kind is MutationKind.DELETE:
+                # 删除针对既存文件：before 必须非空，after 恒为 None。
+                if before is None or after is not None:
+                    raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+            else:
+                # WRITE 必须有 after（新建 before=None 或改写 before 非空）。
+                if after is None:
+                    raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+            path = _validate_journal_path(_expect_str(item.get("path"), journal_path), journal_path)
+            if path in seen_paths:
+                raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+            seen_paths.add(path)
+            original = _recovery_path_for(
+                _expect_optional_str(item.get("original"), journal_path),
+                expected=Path("originals") / f"{index:04d}.bin",
+                journal_path=journal_path,
+            )
+            staged = _recovery_path_for(
+                _expect_optional_str(item.get("staged"), journal_path),
+                expected=Path("staged") / f"{index:04d}.bin",
+                journal_path=journal_path,
+            )
+            # 协议形状：original 当且仅当 before!=None；staged 当且仅当 WRITE。
+            if (original is None) != (before is None):
+                raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+            if mutation_kind is MutationKind.DELETE:
+                if staged is not None:
+                    raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+            elif staged is None:
+                raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+            if original is not None:
+                if original in seen_originals:
+                    raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+                seen_originals.add(original)
+            if staged is not None:
+                if staged in seen_staged:
+                    raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+                seen_staged.add(staged)
             mutations.append(
                 JournalMutation(
-                    path=_validate_journal_path(
-                        _expect_str(item.get("path"), journal_path), journal_path
-                    ),
-                    kind=MutationKind(_expect_str(item.get("kind"), journal_path)),
-                    before_sha256=_expect_optional_str(item.get("before_sha256"), journal_path),
-                    after_sha256=_expect_optional_str(item.get("after_sha256"), journal_path),
-                    original=_expect_optional_str(item.get("original"), journal_path),
-                    staged=_expect_optional_str(item.get("staged"), journal_path),
+                    path=path,
+                    kind=mutation_kind,
+                    before_sha256=before,
+                    after_sha256=after,
+                    original=original,
+                    staged=staged,
                     applied=applied,
                 )
             )
-        directories_raw = data.get("remove_empty_directories")
+        directories_raw = parsed.get("remove_empty_directories")
         if not isinstance(directories_raw, list):
             raise TypeError("remove_empty_directories must be a list")
-        metadata_raw = data.get("metadata")
+        metadata_raw = parsed.get("metadata")
         if not isinstance(metadata_raw, dict):
             raise TypeError("metadata must be an object")
     except (TypeError, ValueError) as exc:
@@ -425,7 +517,7 @@ def read_journal(journal_path: Path) -> Journal:
         for key, value in cast("dict[object, object]", metadata_raw).items()
     }
     directory_id = validate_operation_id(journal_path.parent.name)
-    operation_id = validate_operation_id(_expect_str(data.get("operation_id"), journal_path))
+    operation_id = validate_operation_id(_expect_str(parsed.get("operation_id"), journal_path))
     if operation_id != directory_id:
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
     return Journal(
@@ -631,7 +723,7 @@ def _execute_apply_phase(root: Path, journal: Journal) -> Journal:
         if mutation.applied:
             continue
         if mutation.kind is MutationKind.WRITE:
-            staged = current.directory / cast(str, mutation.staged)
+            staged = current.directory / cast("Path", mutation.staged)
             staged_hash = sha256_file(staged)
             if staged_hash is None:
                 raise DraftError("operation.staged_missing", staged)
@@ -663,14 +755,18 @@ def _clean_recovery_copies(journal: Journal) -> None:
         registered: dict[str, str] = {}  # 文件名 -> 锚定摘要
         for mutation in journal.mutations:
             if sub == "originals":
-                if mutation.original is not None and mutation.before_sha256 is not None:
-                    relative = Path(mutation.original)
-                    if relative.parent == Path(sub):
-                        registered[relative.name] = mutation.before_sha256
-            elif mutation.staged is not None and mutation.after_sha256 is not None:
-                relative = Path(mutation.staged)
-                if relative.parent == Path(sub):
-                    registered[relative.name] = mutation.after_sha256
+                if (
+                    mutation.original is not None
+                    and mutation.before_sha256 is not None
+                    and mutation.original.parent == Path(sub)
+                ):
+                    registered[mutation.original.name] = mutation.before_sha256
+            elif (
+                mutation.staged is not None
+                and mutation.after_sha256 is not None
+                and mutation.staged.parent == Path(sub)
+            ):
+                registered[mutation.staged.name] = mutation.after_sha256
         if registered:
             # 有登记 mutation：严格只删登记文件，未知成员/类型/摘要不符拒绝。
             unknown = {entry.name for entry in directory.iterdir()} - set(registered)
@@ -757,7 +853,7 @@ def _rollback(
         if mutation.before_sha256 is None:
             _apply_delete(root, mutation.path)
         else:
-            original = journal.directory / cast(str, mutation.original)
+            original = journal.directory / cast("Path", mutation.original)
             original_hash = sha256_file(original)
             if original_hash != mutation.before_sha256:
                 raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, original)
@@ -808,7 +904,7 @@ def _finish_forward(
 
 def _apply_one(root: Path, journal: Journal, mutation: JournalMutation) -> Journal:
     if mutation.kind is MutationKind.WRITE:
-        staged = journal.directory / cast(str, mutation.staged)
+        staged = journal.directory / cast("Path", mutation.staged)
         content = staged.read_bytes()
         _apply_write(root, mutation.path, content)
     else:
@@ -959,7 +1055,7 @@ def validate_preallocated_journal(plan: OperationPlan, journal: Journal) -> None
         validate_restore_link(plan.root, journal)
 
 
-def _verify_plan_observations(root: Path, plan: OperationPlan, journal: Journal) -> None:
+def _verify_plan_observations(root: Path, journal: Journal) -> None:
     """锁内、首次业务变更前复核观察清单；差异即外部变化，不应用 mutation。"""
     changed = _verify_observations_for_recovery(root, journal, explained_mutations=())
     if changed:
@@ -1006,7 +1102,7 @@ def execute_plan(plan: OperationPlan) -> OperationResult:
             _clean_recovery_copies(journal)
         raise
     try:
-        _verify_plan_observations(root, plan, journal)
+        _verify_plan_observations(root, journal)
     except DraftError:
         # 首次业务变更前的复核失败：本次准备日志尚未授权任何根变更，安全终态化
         # 并释放锁，不遗留锁或中段日志（计划 Task 7 Step 4）。
@@ -1033,7 +1129,7 @@ def execute_preallocated_plan(
     validate_preallocated_journal(plan, journal)
     # 预分配执行同样复核读集观察（如 restore 的权威包）：计划与日志的读集在
     # 首次业务变更前必须与当前事实一致。
-    _verify_plan_observations(root, plan, journal)
+    _verify_plan_observations(root, journal)
     return _execute_allocated_plan(
         plan,
         journal,
@@ -1073,10 +1169,11 @@ def _execute_allocated_plan(
             if not retain_terminal_lock:
                 release_lock(root, operation_id)
             raise DraftError("operation.external_change", root / mutation.path)
-        original_name: str | None = None
-        staged_name: str | None = None
+        original_name: Path | None = None
+        staged_name: Path | None = None
         if mutation.before_sha256 is not None:
-            original_name = f"originals/{index:04d}.bin"
+            # journal 字段只存根内相对路径（解析边界验证形状）；文件写到绝对目录。
+            original_name = Path("originals") / f"{index:04d}.bin"
             durable_write(originals / f"{index:04d}.bin", (root / mutation.path).read_bytes())
         if mutation.kind is MutationKind.WRITE:
             if mutation.content is None or sha256_bytes(mutation.content) != (
@@ -1085,7 +1182,7 @@ def _execute_allocated_plan(
                 if not retain_terminal_lock:
                     release_lock(root, operation_id)
                 raise DraftError("operation.plan_invalid", root / mutation.path)
-            staged_name = f"staged/{index:04d}.bin"
+            staged_name = Path("staged") / f"{index:04d}.bin"
             durable_write(staged / f"{index:04d}.bin", mutation.content)
         mutations.append(
             JournalMutation(
