@@ -908,7 +908,14 @@ def execute_plan(plan: OperationPlan) -> OperationResult:
             observations=plan.observations,
             metadata=dict(plan.metadata),
         )
-    acquire_lock(root, operation_id)
+    try:
+        acquire_lock(root, operation_id)
+    except DraftError:
+        # 锁竞争失败（另一进程抢先取得锁）：本次预分配日志尚未授权任何根变更，
+        # 终态化并清理，不留 orphan（计划 Task 7 Step 4）。
+        write_journal(with_phase(journal, OperationPhase.ROLLED_BACK))
+        _clean_recovery_copies(journal)
+        raise
     try:
         _verify_plan_observations(root, plan, journal)
     except DraftError:

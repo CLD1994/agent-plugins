@@ -64,6 +64,27 @@ def test_initialize_rejects_file_target(tmp_path: Path) -> None:
         initialize(root)
 
 
+def test_initialize_check_raise_removes_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """最终检查直接抛异常（而非返回错误报告）时 marker 也必须回滚（规格 §6）。"""
+
+    def raising_check(root: Path) -> None:
+        del root
+        raise OSError("check failed")
+
+    monkeypatch.setattr(lifecycle_module, "check_draft", raising_check)
+
+    root = tmp_path / "new-topic"
+    with pytest.raises(OSError, match="check failed"):
+        initialize(root)
+
+    assert not (root / ".draft/draft.json").exists()
+    assert not (root / "index.md").exists()
+    assert not (root / "pages").exists()
+    assert not root.exists()
+
+
 def test_initialize_marker_publish_failure_rolls_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

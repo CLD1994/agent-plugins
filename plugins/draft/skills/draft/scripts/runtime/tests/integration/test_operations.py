@@ -813,6 +813,32 @@ def test_graph_observations_covers_empty_managed_directory(
     assert observed.members == ()
 
 
+def test_execute_plan_lock_competition_finalizes_preallocated_journal(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """锁竞争失败（另一进程抢先取得锁）时，本次预分配日志必须终态化，不留 orphan。"""
+    import draft.operations as ops_module
+
+    root = operation_draft
+    plan = _plan_with_observed_inputs(root)
+
+    def winning_race(root_path: Path, operation_id: str) -> None:
+        del root_path, operation_id
+        raise DraftError(
+            CheckCode.OPERATION_RECOVERY_REQUIRED.value, root / ".draft/operation.lock"
+        )
+
+    monkeypatch.setattr(ops_module, "acquire_lock", winning_race)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_RECOVERY_REQUIRED.value):
+        execute_plan(plan)
+
+    remaining = [entry for entry in (root / ".draft/operations").iterdir() if entry.is_dir()]
+    assert len(remaining) == 1
+    journal = read_journal(remaining[0] / "journal.json")
+    assert journal.phase is OperationPhase.ROLLED_BACK
+    assert read_lock(root) is None
+
+
 def test_recover_uses_live_file_state_not_stale_applied(
     operation_draft: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
