@@ -503,7 +503,10 @@ def _restore_observations(
     import os
 
     from draft.observations import (
+        EntryKind,
+        Observation,
         ObservationManifest,
+        directory_observation,
         file_digest_observation,
         graph_observations,
     )
@@ -512,11 +515,17 @@ def _restore_observations(
     if package.directory.is_dir():
         for dirpath, _dirnames, filenames in os.walk(package.directory):
             rel_dir = Path(dirpath).relative_to(root)
+            # 每个目录的直接成员集合（含空目录）：向包内新增文件/目录/符号链接都可被复核发现。
+            members = tuple(sorted(_dirnames + filenames))
+            entries.append(directory_observation(rel_dir, members))
             for name in sorted(filenames):
                 target = Path(dirpath) / name
-                if target.is_file() and not target.is_symlink():
+                relative = rel_dir / name
+                if target.is_symlink():
+                    entries.append(Observation(path=relative, kind=EntryKind.SYMLINK))
+                elif target.is_file():
                     entries.append(
-                        file_digest_observation(rel_dir / name, sha256_bytes(target.read_bytes()))
+                        file_digest_observation(relative, sha256_bytes(target.read_bytes()))
                     )
     return ObservationManifest(entries=tuple(entries))
 

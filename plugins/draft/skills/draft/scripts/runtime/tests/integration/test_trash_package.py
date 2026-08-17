@@ -81,6 +81,19 @@ def _verify_package(root: Path, operation_id: str) -> None:
     load_verified_package(root, journal)
 
 
+def test_package_rejects_extra_empty_directory(draft_factory: DraftFactory) -> None:
+    """权威包内额外的空目录是损坏：load_verified_package 必须拒绝（唯一权威包不变量）。"""
+    from draft.operations import operation_journal_path
+
+    root = build_trashable_draft(draft_factory)
+    pending = _retained_trash(root)
+    (root / ".draft/trash/outgoing" / pending.operation_id / "empty").mkdir()
+
+    journal = read_journal(operation_journal_path(root, pending.operation_id))
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        load_verified_package(root, journal)
+
+
 def _package_snapshot(package_dir: Path) -> dict[str, bytes]:
     return {
         path.relative_to(package_dir).as_posix(): path.read_bytes()

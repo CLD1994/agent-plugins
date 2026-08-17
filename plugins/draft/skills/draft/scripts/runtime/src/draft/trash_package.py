@@ -118,12 +118,22 @@ def _reject_symlink_components(base: Path, relative: Path) -> None:
 def _reject_package_extra_entries(
     package_dir: Path, payload_relative: Path, code_path: Path
 ) -> None:
-    """包目录只允许清单 package.json 与 payload 文件；额外文件或符号链接视为损坏。"""
+    """包目录只允许 package.json、payload 文件及其必要父目录；额外文件、空目录、
+    符号链接均视为损坏（唯一权威包不变量）。"""
+    allowed_dirs = {Path(".")}
+    current = payload_relative.parent
+    while current != Path("."):
+        allowed_dirs.add(current)
+        current = current.parent
     allowed_files = {Path("package.json"), payload_relative}
     for entry in package_dir.rglob("*"):
+        relative = entry.relative_to(package_dir)
         if entry.is_symlink():
             raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
-        if entry.is_file() and entry.relative_to(package_dir) not in allowed_files:
+        if entry.is_dir():
+            if relative not in allowed_dirs:
+                raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        elif relative not in allowed_files:
             raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
 
 

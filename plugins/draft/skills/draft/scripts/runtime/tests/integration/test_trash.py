@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -289,6 +290,55 @@ def test_restore_rejects_concurrent_package_edit(
     # 唯一权威包未被静默删除。
     assert package.exists()
     assert (package / "package.json").is_file()
+
+
+def _add_package_file(package: Path) -> None:
+    (package / "sneaky.txt").write_text("x", encoding="utf-8")
+
+
+def _add_package_empty_dir(package: Path) -> None:
+    (package / "empty").mkdir()
+
+
+def _add_package_symlink(package: Path) -> None:
+    (package / "link").symlink_to("package.json", target_is_directory=False)
+
+
+@pytest.mark.parametrize(
+    "mutate_package",
+    [_add_package_file, _add_package_empty_dir, _add_package_symlink],
+    ids=["file", "empty-dir", "symlink"],
+)
+def test_restore_rejects_concurrent_package_addition(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    mutate_package: Callable[[Path], None],
+) -> None:
+    """restore 观察权威包整棵目录树：计划后新增文件/空目录/符号链接使恢复按冲突中止。"""
+    import draft.operations as ops_module
+    from draft.models import OperationPlan
+    from draft.operations import Journal
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+
+    original_verify = ops_module._verify_plan_observations  # pyright: ignore[reportPrivateUsage]
+
+    def verify_then_add(root_path: Path, plan: OperationPlan, journal: Journal) -> None:
+        mutate_package(package)
+        original_verify(root_path, plan, journal)
+
+    monkeypatch.setattr(ops_module, "_verify_plan_observations", verify_then_add)
+
+    with pytest.raises(DraftError, match="trash.restore_conflict"):
+        restore_retained_trash(root, pending.operation_id, now=NOW)
+
+    # 页面未恢复，权威包与并发新增内容保留，锁释放。
+    assert not (root / "pages/obsolete.md").exists()
+    assert package.exists()
+    assert (package / "package.json").is_file()
+    assert not (root / ".draft/operation.lock").exists()
 
 
 def test_restore_completes_within_window(draft_factory: DraftFactory) -> None:
