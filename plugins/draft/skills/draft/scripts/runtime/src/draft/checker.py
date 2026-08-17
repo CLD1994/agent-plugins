@@ -555,7 +555,7 @@ def _check_trash_retained(
     root: Path, journal_path: Path, journal: Journal, relative: Path
 ) -> list[CheckIssue]:
     """trash_retained 诊断：期限与包有效即 INFO；任一无效即 ERROR。到期但未推进仍为合法 INFO。"""
-    if journal.kind != "trash":
+    if journal.kind is not OperationKind.TRASH:
         return [_error(CheckCode.OPERATION_INCONSISTENT_STATE, relative, None, journal.phase.value)]
     deadline_issue = _deadline_issue(journal, relative)
     if deadline_issue is not None:
@@ -570,7 +570,7 @@ def _check_trash_handoff_pending(
     root: Path, journal_path: Path, journal: Journal, relative: Path
 ) -> list[CheckIssue]:
     """trash_handoff_pending 诊断：期限有效且失败记录有效为 WARNING；其余为 ERROR。"""
-    if journal.kind != "trash":
+    if journal.kind is not OperationKind.TRASH:
         return [_error(CheckCode.OPERATION_INCONSISTENT_STATE, relative, None, journal.phase.value)]
     deadline_issue = _deadline_issue(journal, relative)
     if deadline_issue is not None:

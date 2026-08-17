@@ -299,7 +299,10 @@ def trash_plan(
 
 def require_retained_restore_window(journal: Journal, now: datetime) -> TrashDeadlines:
     """验证 T 仍为 trash_retained、期限完整且当前仍在恢复窗口内。"""
-    if journal.kind != "trash" or journal.phase is not OperationPhase.TRASH_RETAINED:
+    if (
+        journal.kind is not OperationKind.TRASH
+        or journal.phase is not OperationPhase.TRASH_RETAINED
+    ):
         raise DraftError("trash.restore_expired", journal.directory)
     deadlines = TrashDeadlines.parse(journal.metadata)
     if now >= deadlines.restore_expires_at:
@@ -315,7 +318,7 @@ def abandon_unlinked_restore(
     if journal_path.is_file():
         journal = read_journal(journal_path)
         if (
-            journal.kind == "restore"
+            journal.kind is OperationKind.RESTORE
             and journal.phase is OperationPhase.ALLOCATING
             and not journal.mutations
         ):
@@ -337,7 +340,9 @@ def require_no_existing_restore_claim(root: Path, journal: Journal, restore_id: 
     if not r1_path.is_file():
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     r1 = read_journal(r1_path)
-    if r1.kind != "restore" or r1.metadata.get("restores_trash_operation") != journal.operation_id:
+    if r1.kind is not OperationKind.RESTORE or (
+        r1.metadata.get("restores_trash_operation") != journal.operation_id
+    ):
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     # T <-> R1 合法可恢复关联，但 R1 不是本次 R：交给显式恢复。
     raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, journal.directory)

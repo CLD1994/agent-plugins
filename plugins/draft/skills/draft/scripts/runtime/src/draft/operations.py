@@ -888,7 +888,7 @@ def validate_preallocated_journal(plan: OperationPlan, journal: Journal) -> None
         or journal.mutations
     ):
         raise DraftError("operation.plan_invalid", journal.directory)
-    if journal.kind == "restore":
+    if journal.kind is OperationKind.RESTORE:
         validate_restore_link(plan.root, journal)
 
 
