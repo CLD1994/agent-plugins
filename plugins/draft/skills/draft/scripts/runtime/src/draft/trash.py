@@ -69,6 +69,7 @@ from draft.trash_package import (
     OUTGOING_RELATIVE,
     PACKAGE_VERSION,
     VerifiedTrashPackage,
+    clean_authoritative_package,
     load_verified_package,
 )
 
@@ -355,28 +356,6 @@ def require_no_existing_restore_claim(root: Path, journal: Journal, restore_id: 
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     # T <-> R1 合法可恢复关联，但 R1 不是本次 R：交给显式恢复。
     raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, journal.directory)
-
-
-def remove_authoritative_package(package: VerifiedTrashPackage) -> None:
-    """幂等清理权威删除包；仅在三个显式授权分支调用。
-
-    清理前用 load_verified_package 的可变快照复核当前包树：验证后新增的未知
-    条目使清理拒绝（trash.package_corrupt），绝不无条件递归删除未知内容。
-    """
-    from draft.operations import reject_symlink_components
-
-    # 清理前逐组件拒绝符号链接：包路径必须在草稿根内。
-    # package.directory = root / OUTGOING_RELATIVE / operation_id
-    root = package.directory.parents[len(OUTGOING_RELATIVE.parts)]
-    reject_symlink_components(root, OUTGOING_RELATIVE)
-    if not package.directory.exists():
-        return
-    from draft.observations import FilesystemObservationProbe, verify_observations
-
-    changed = verify_observations(FilesystemObservationProbe(root), package.observations)
-    if changed:
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package.directory)
-    remove_tree(package.directory)
 
 
 def _proven_unapplied_restore(root: Path, journal: Journal) -> bool:
@@ -856,7 +835,7 @@ def resolve_restore_execution(
             )
         verify_restore_after_state(root, current_trash, terminal_restore, package)
         write_journal(with_phase(current_trash, OperationPhase.ROLLED_BACK))
-        remove_authoritative_package(package)
+        clean_authoritative_package(root, current_trash)
         clean_recovery_copies(terminal_restore)
         release_lock(root, restore_id)
         return OperationResult(

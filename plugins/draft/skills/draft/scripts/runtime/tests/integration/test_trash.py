@@ -375,12 +375,15 @@ def test_restore_rejects_file_sneaked_between_verify_and_observe(
     assert not (root / ".draft/operation.lock").exists()
 
 
-def test_restore_preserves_file_sneaked_before_package_cleanup(
-    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("entry_type", ["file", "empty_dir", "symlink"])
+def test_restore_preserves_unknown_entry_sneaked_before_package_cleanup(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_type: str,
 ) -> None:
-    """执行复核之后、包清理之前加入的未知文件不得被无条件递归删除。
+    """执行复核之后、包清理之前加入的未知条目不得被无条件递归删除。
 
-    回归 P1：清理入口必须再次核验已验证快照，禁止对未知条目使用无条件递归删除。
+    回归 H1：清理原语必须拒绝而不是无条件递归删除未知内容。
     """
     import draft.trash as trash_module
 
@@ -396,16 +399,28 @@ def test_restore_preserves_file_sneaked_before_package_cleanup(
         verified: VerifiedTrashPackage,
     ) -> None:
         original_verify(root_path, trash_journal, restore_journal, verified)
-        (package / "late.md").write_text("# 迟来\n", encoding="utf-8")
+        if entry_type == "file":
+            (package / "late.md").write_text("# 迟来\n", encoding="utf-8")
+        elif entry_type == "empty_dir":
+            (package / "extra").mkdir()
+        elif entry_type == "symlink":
+            external = package.parent / "external.txt"
+            external.write_text("x", encoding="utf-8")
+            (package / "evil-link").symlink_to(external)
 
     monkeypatch.setattr(trash_module, "verify_restore_after_state", verify_then_sneak)
     with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
         restore_retained_trash(root, pending.operation_id, now=NOW)
     monkeypatch.undo()
 
-    # 未知条目不被删除：权威包（含迟来文件）保留。
-    assert (package / "late.md").is_file()
-    assert (package / "package.json").is_file()
+    # 未知条目绝不被删除（回归 H1）：入侵条目保留、锁保留；操作不报告 completed。
+    if entry_type == "file":
+        assert (package / "late.md").is_file()
+    elif entry_type == "empty_dir":
+        assert (package / "extra").is_dir()
+    else:
+        assert (package / "evil-link").is_symlink()
+    assert (root / ".draft/operation.lock").exists()
 
 
 def test_trash_restore_crlf_page_is_byte_identical(

@@ -48,13 +48,13 @@ from draft.operations import (
 from draft.paths import resolve_draft_root
 from draft.trash import (
     OPERATIONS_RELATIVE,
-    remove_authoritative_package,
     remove_tree,
     resolve_restore_execution,
 )
 from draft.trash_package import (
     OUTGOING_RELATIVE,
     VerifiedTrashPackage,
+    clean_authoritative_package,
     load_verified_package,
 )
 
@@ -227,7 +227,7 @@ def _attempt_handoff_locked(
                 phase=OperationPhase.TRASH_PURGE_COMMITTED,
             )
             write_journal(failed)
-            remove_authoritative_package(verified_package)
+            clean_authoritative_package(root, journal)
             remove_attempt_copy(attempt)
             write_journal(
                 with_disposition(failed, EXPIRED_PURGE_DISPOSITION, OperationPhase.COMPLETED)
@@ -264,7 +264,7 @@ def _attempt_handoff_locked(
     # 成功：先耐久 succeeded，再清权威包与副本，最后 completed+disposition。
     succeeded = with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED)
     write_journal(succeeded)
-    remove_authoritative_package(verified_package)
+    clean_authoritative_package(root, journal)
     remove_attempt_copy(attempt)
     write_journal(with_disposition(succeeded, SYSTEM_TRASH_DISPOSITION, OperationPhase.COMPLETED))
     release_lock(root, operation_id)
@@ -391,12 +391,9 @@ def _recover_locked_trash(
         OperationPhase.TRASH_HANDOFF_SUCCEEDED,
         OperationPhase.TRASH_PURGE_COMMITTED,
     ):
-        # 提交点已耐久：只完成清理，绝不再调用适配器。清理前先逐组件校验内部路径。
-        reject_symlink_components(root, OUTGOING_RELATIVE)
-        reject_symlink_components(root, OPERATIONS_RELATIVE)
-        package_dir = root / OUTGOING_RELATIVE / operation_id
-        if package_dir.is_dir():
-            remove_tree(package_dir)
+        # 提交点已耐久：只完成清理，绝不再调用适配器。清理走统一权威包原语，
+        # 从 T 日志派生授权条目逐个复核删除，未知内容使清理拒绝并保留现场。
+        clean_authoritative_package(root, journal)
         attempt = root / OPERATIONS_RELATIVE / operation_id / "attempt"
         remove_attempt_copy(attempt)
         terminal = with_disposition(
@@ -408,6 +405,7 @@ def _recover_locked_trash(
         )
         write_journal(terminal)
         release_lock(root, operation_id)
+        package_dir = root / OUTGOING_RELATIVE / operation_id
         return TrashResult(
             operation_id=operation_id, phase=OperationPhase.COMPLETED, package=package_dir
         )

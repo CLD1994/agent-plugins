@@ -309,3 +309,86 @@ def _load_verified_package(root: Path, trash_journal: Journal) -> VerifiedTrashP
             page_hash,
         ),
     )
+
+
+def _remove_verified_leaf(path: Path, expected_digest: str, code_path: Path) -> None:
+    """现存授权叶节点先复核普通文件类型与日志锚定摘要，再删除精确路径。
+
+    缺失（提交点后幂等清理）容忍；符号链接或错误类型拒绝并保留现场。摘要不符
+    说明验证后内容被改写，拒绝删除。
+    """
+    if path.is_symlink():
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+    if not path.exists():
+        return
+    if not path.is_file():
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+    try:
+        current = sha256_bytes(path.read_bytes())
+    except OSError as exc:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path) from exc
+    if current != expected_digest:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+    path.unlink()
+
+
+def _remove_verified_dir(path: Path) -> None:
+    """已知目录 rmdir：缺失容忍；非空目录（含未知内容）或符号链接拒绝并保留。"""
+    if not path.exists():
+        return
+    if path.is_symlink() or not path.is_dir():
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, path)
+    try:
+        path.rmdir()
+    except OSError as exc:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, path) from exc
+
+
+def clean_authoritative_package(root: Path, trash_journal: Journal) -> None:
+    """唯一权威包清理原语：从原 T 日志派生授权条目，逐个复核后删除精确路径。
+
+    清理计划从 T 日志的包内 mutation 派生（只允许 package.json 与 payload 新建
+    文件）；对现存叶节点先复核普通文件类型与日志锚定摘要，再删除精确路径；已知
+    目录按从深到浅顺序 rmdir。出现额外成员、符号链接或错误类型时以
+    ``trash.package_corrupt`` 停止并保留现场。已授权条目部分缺失（提交点后幂等
+    清理）不视为损坏。绝不对权威包目录递归删除未知内容。
+
+    restore、handoff、purge 与终态恢复全部经此原语清理，不再各自直接 remove_tree。
+    """
+    from draft.operations import reject_symlink_components
+
+    reject_symlink_components(root, OUTGOING_RELATIVE)
+    package_dir = root / OUTGOING_RELATIVE / trash_journal.operation_id
+    if not package_dir.exists():
+        return
+    _reject_symlink(package_dir)
+    if not package_dir.is_dir():
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package_dir)
+
+    package_relative = OUTGOING_RELATIVE / trash_journal.operation_id
+    authorized: list[tuple[Path, str]] = []
+    for mutation in trash_journal.mutations:
+        if not mutation.path.is_relative_to(package_relative):
+            continue
+        if (
+            mutation.kind is not MutationKind.WRITE
+            or mutation.before_sha256 is not None
+            or mutation.after_sha256 is None
+        ):
+            # 包内必须只有 package.json 与 payload 新建文件；其他包内 mutation 为损坏。
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package_dir)
+        authorized.append((mutation.path, mutation.after_sha256))
+    if not authorized:
+        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package_dir)
+
+    for relative, digest in sorted(authorized):
+        _remove_verified_leaf(root / relative, digest, package_dir)
+
+    known_dirs = {package_dir}
+    for relative, _ in authorized:
+        cursor = (root / relative).parent
+        while cursor != root and cursor not in known_dirs:
+            known_dirs.add(cursor)
+            cursor = cursor.parent
+    for directory in sorted(known_dirs, key=lambda path: len(path.parts), reverse=True):
+        _remove_verified_dir(directory)

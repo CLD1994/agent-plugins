@@ -328,6 +328,75 @@ def test_purge_committed_recovery_only_finishes_cleanup(
     assert not _package_exists(root, pending.operation_id)
 
 
+def _inject_unknown_package_entry(package: Path, entry_type: str) -> Path:
+    if entry_type == "file":
+        path = package / "intruder.txt"
+        path.write_text("入侵\n", encoding="utf-8")
+    elif entry_type == "empty_dir":
+        path = package / "extra"
+        path.mkdir()
+    elif entry_type == "symlink":
+        path = package / "evil-link"
+        external = package.parent / "external.txt"
+        external.write_text("x", encoding="utf-8")
+        path.symlink_to(external)
+    else:  # pragma: no cover
+        raise AssertionError(entry_type)
+    return path
+
+
+@pytest.mark.parametrize("entry_type", ["file", "empty_dir", "symlink"])
+def test_terminal_recovery_preserves_unknown_package_entry(
+    draft_factory: DraftFactory,
+    entry_type: str,
+) -> None:
+    """trash_handoff_succeeded 终态恢复的权威包清理不得删除未知条目（回归 H1）。
+
+    清理原语必须拒绝而不是无条件递归删除：未知文件/空目录/符号链接保留，操作不
+    报告 completed，锁与阶段保留。
+    """
+    from draft.operations import acquire_lock, read_journal, with_phase, write_journal
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    journal = read_journal(_journal_path(root, pending.operation_id))
+    write_journal(with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED))
+    acquire_lock(root, pending.operation_id)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    unknown = _inject_unknown_package_entry(package, entry_type)
+
+    calls: list[str] = []
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
+        recover_draft(root, now=PURGE, handoff=calls.append)
+
+    assert unknown.is_symlink() or unknown.exists()
+    assert calls == []
+    assert (root / ".draft/operation.lock").exists()
+    assert _phase(root, pending.operation_id) == "trash_handoff_succeeded"
+
+
+def test_terminal_recovery_idempotent_when_payload_missing(
+    draft_factory: DraftFactory,
+) -> None:
+    """已授权条目部分缺失（提交点后幂等清理）：终态恢复必须成功而非误报损坏。"""
+    from draft.operations import acquire_lock, read_journal, with_phase, write_journal
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    journal = read_journal(_journal_path(root, pending.operation_id))
+    write_journal(with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED))
+    acquire_lock(root, pending.operation_id)
+    payload = root / ".draft/trash/outgoing" / pending.operation_id / "payload/pages/obsolete.md"
+    payload.unlink()
+
+    calls: list[str] = []
+    recover_draft(root, now=PURGE, handoff=calls.append)
+
+    assert calls == []
+    assert _phase(root, pending.operation_id) == "completed"
+    assert not _package_exists(root, pending.operation_id)
+
+
 def test_recover_cli_never_exposes_internal_paths(
     draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
 ) -> None:
