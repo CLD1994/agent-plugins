@@ -375,7 +375,7 @@ def _render_check(report: CheckReport, args: argparse.Namespace, json_mode: bool
         print(json.dumps(payload, ensure_ascii=False))
     else:
         groups = (slice_.errors, slice_.warnings, slice_.infos, slice_.reviews)
-        if not any(groups):
+        if not any(groups) and slice_.ok:
             print("检查通过：未发现客观错误。")
         else:
             for issues in groups:
@@ -489,6 +489,7 @@ def _dispatch_query(
             {
                 "result_type": ResultType.QUERY_PAGE.value,
                 "complete": True,
+                "blocking_paths": [],
                 "path": summary.path.as_posix(),
                 "title": summary.title,
                 "status": summary.status.value,

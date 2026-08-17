@@ -184,6 +184,9 @@ def test_query_page_returns_routing_summary(
     assert payload["status"] == "pending"
     assert payload["parent"] == "index.md"
     assert payload["link_count"] == 2
+    # 规格 §11：成功的 query page 必须显式返回 complete=true 与 blocking_paths=[]。
+    assert payload["complete"] is True
+    assert payload["blocking_paths"] == []
 
 
 def test_query_links_returns_deduplicated_resources(

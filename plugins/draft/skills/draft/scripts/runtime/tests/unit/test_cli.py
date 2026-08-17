@@ -416,6 +416,26 @@ def test_render_check_groups_issues_and_emits_each_renderer_result_once(
         assert str(count) in lines[-1]
 
 
+def test_render_check_filtered_empty_with_errors_does_not_claim_pass(
+    mocker: MockerFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """过滤后无可见项但未过滤报告有错误时，不得声称检查通过（规格 §10）。"""
+    render_issue = mocker.patch.object(cli, "render_issue", autospec=True)
+    issue = CheckIssue(
+        CheckCode.PARENT_MISSING.value, IssueSeverity.ERROR, Path("pages/a.md"), None
+    )
+    args = _check_args(code=[CheckCode.LINK_MISSING.value])
+    exit_code = cli._render_check(  # pyright: ignore[reportPrivateUsage]
+        CheckReport(issues=(issue,)), args, json_mode=False
+    )
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert "检查通过" not in out
+    assert "1 个错误" in out
+    render_issue.assert_not_called()
+
+
 def test_render_check_clean_human_output_is_one_nonempty_line(
     mocker: MockerFixture,
     capsys: pytest.CaptureFixture[str],
