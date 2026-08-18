@@ -599,6 +599,36 @@ def cleanup_evidence_actions(
     )
 
 
+def cleanup_evidence_protocol_corrupt(
+    *,
+    final: EvidenceNodeState,
+    pending: EvidenceNodeState,
+    quarantine: EvidenceNodeState,
+    final_pending_same_node: bool,
+    final_quarantine_same_node: bool,
+) -> bool:
+    """KEEP/REMOVE 任一判 CORRUPT 即返回 True；不访问文件系统（第十一轮 H2）。
+
+    checker 只读结论与运行时收敛动作共用同一 ``cleanup_evidence_actions`` 权威决策：
+    KEEP 与 REMOVE 的 CORRUPT 集合必须一致（由穷举测试锁定），因此 checker 不必选择
+    更宽松的一支，也不得自行发明第三套 phase 规则。
+    """
+
+    def actions(intent: CleanupEvidenceIntent) -> tuple[CleanupEvidenceAction, ...]:
+        return cleanup_evidence_actions(
+            intent=intent,
+            final=final,
+            pending=pending,
+            quarantine=quarantine,
+            final_pending_same_node=final_pending_same_node,
+            final_quarantine_same_node=final_quarantine_same_node,
+        )
+
+    keep_corrupt = CleanupEvidenceAction.CORRUPT in actions(CleanupEvidenceIntent.KEEP)
+    remove_corrupt = CleanupEvidenceAction.CORRUPT in actions(CleanupEvidenceIntent.REMOVE)
+    return keep_corrupt or remove_corrupt
+
+
 def _keep_evidence_actions(
     final: EvidenceNodeState,
     pending: EvidenceNodeState,

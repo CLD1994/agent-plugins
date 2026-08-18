@@ -9,7 +9,7 @@ from draft.diagnostic_codes import (
     LinkEscapeKind,
     ReplacementStatusReason,
 )
-from draft.models import CheckReport, IssueSeverity, RootState
+from draft.models import CheckReport, IssueSeverity, OperationPhase, RootState
 from draft.operations import JOURNAL_VERSION
 from draft.trash import trash_page
 from draft.vocabulary import ConclusionsState
@@ -1576,8 +1576,9 @@ def test_checker_reports_invalid_evidence_names_without_mutating(
 
     report = check_draft(root)
 
+    # 联合分类一次性报告损坏：三名同一联合状态只有一个 trash.package_corrupt。
     corrupt = codes(report).count(CheckCode.TRASH_PACKAGE_CORRUPT.value)
-    assert corrupt >= 3
+    assert corrupt >= 1
     # checker 只读：三名 bytes 完全不变。
     for name in (
         "cleanup-evidence.json",
@@ -1585,6 +1586,184 @@ def test_checker_reports_invalid_evidence_names_without_mutating(
         "cleanup-evidence.json.quarantine",
     ):
         assert (op_dir / name).read_bytes() == garbage
+
+
+# ---------------------------------------------------------------------------
+# 第十一轮 H2/M2：checker 与运行时共用 cleanup evidence 联合决策；分类/读取错误稳定。
+# ---------------------------------------------------------------------------
+
+
+def build_cleanup_evidence_checker_case(
+    draft_factory: DraftFactory,
+) -> tuple[Path, Path, bytes]:
+    """真实 TRASH 日志 + 权威包 + 合法 cleanup evidence 字节（联合状态测试夹具）。
+
+    通过真实 trash_page 建立 T，把阶段改写为已提交清理点，按同一 T 授权构造证据，
+    再由 read_journal 取操作目录；checker 与运行时共用同一 parse_cleanup_evidence。
+    """
+    import base64
+    import json
+
+    from draft.operations import operation_journal_path, read_journal
+    from draft.trash_package import parse_package_authorization
+
+    root = draft_factory(_trashable_checker_files())
+    result = trash_page(
+        root,
+        Path("pages/obsolete.md"),
+        now=datetime(2026, 7, 21, 12, 0, tzinfo=UTC),
+    )
+    journal_path = operation_journal_path(root, result.operation_id)
+    raw = json.loads(journal_path.read_text(encoding="utf-8"))
+    raw["phase"] = OperationPhase.TRASH_HANDOFF_SUCCEEDED.value
+    journal_path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    journal = read_journal(journal_path)
+    package = root / ".draft/trash/outgoing" / result.operation_id
+    authorization = parse_package_authorization(journal, package)
+    leaves: list[dict[str, object]] = []
+    for relative, digest in authorization.leaves():
+        content = (root / relative).read_bytes()
+        leaves.append(
+            {
+                "relative": relative.as_posix(),
+                "sha256": digest,
+                "state": "present",
+                "content": base64.b64encode(content).decode("ascii"),
+            }
+        )
+    evidence = {
+        "version": 2,
+        "operation_id": result.operation_id,
+        "cleanup_phase": journal.phase.value,
+        "leaves": leaves,
+    }
+    return root, journal.directory, json.dumps(evidence, ensure_ascii=False).encode("utf-8")
+
+
+def write_cleanup_evidence_names(
+    operation_dir: Path,
+    evidence_bytes: bytes,
+    names: tuple[str, ...],
+    *,
+    same_inode: bool,
+) -> None:
+    """按角色名写入证据；same_inode 用 os.link 建立硬链接证明同一次发布/隔离。"""
+    protocol_names = {
+        "final": "cleanup-evidence.json",
+        "pending": "cleanup-evidence.json.pending",
+        "quarantine": "cleanup-evidence.json.quarantine",
+    }
+    first = operation_dir / protocol_names[names[0]]
+    first.write_bytes(evidence_bytes)
+    for role in names[1:]:
+        target = operation_dir / protocol_names[role]
+        if same_inode:
+            target.hardlink_to(first)
+        else:
+            target.write_bytes(evidence_bytes)
+
+
+@pytest.mark.parametrize(
+    ("names", "same_inode", "corrupt"),
+    [
+        (("final",), False, False),
+        (("pending",), False, False),
+        (("quarantine",), False, False),
+        (("final", "pending"), True, False),
+        (("final", "pending"), False, True),
+        (("final", "quarantine"), True, False),
+        (("final", "quarantine"), False, True),
+        (("pending", "quarantine"), False, True),
+        (("final", "pending", "quarantine"), False, True),
+    ],
+)
+def test_checker_matches_cleanup_evidence_joint_protocol(
+    draft_factory: DraftFactory,
+    names: tuple[str, ...],
+    same_inode: bool,
+    corrupt: bool,
+) -> None:
+    """checker 对联合 evidence 状态的损坏结论与运行时纯决策一致（第十一轮 H2）。
+
+    两名并存必须证明同一次发布/隔离（同 inode）才合法；不同 inode、pending+quarantine
+    并存与三名并存一律报告损坏。checker 始终只读：前后根树快照完全一致。
+    """
+    root, operation_dir, evidence_bytes = build_cleanup_evidence_checker_case(draft_factory)
+    write_cleanup_evidence_names(
+        operation_dir,
+        evidence_bytes,
+        names,
+        same_inode=same_inode,
+    )
+    before = snapshot_tree(root)
+    report = check_draft(root)
+    assert (CheckCode.TRASH_PACKAGE_CORRUPT.value in codes(report)) is corrupt
+    assert snapshot_tree(root) == before
+
+
+def test_checker_evidence_stat_permission_error_is_stable(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """evidence 节点 lstat PermissionError：check_draft 返回稳定诊断，不抛原始异常（M2）。"""
+    import os
+
+    import draft.operations as ops_module
+
+    root, operation_dir, evidence_bytes = build_cleanup_evidence_checker_case(draft_factory)
+    (operation_dir / "cleanup-evidence.json").write_bytes(evidence_bytes)
+    evidence_names = {
+        "cleanup-evidence.json",
+        "cleanup-evidence.json.pending",
+        "cleanup-evidence.json.quarantine",
+    }
+    real_stat = ops_module.os.stat
+
+    def deny_evidence_stat(
+        name: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> object:
+        if ops_module.os.fspath(name) in evidence_names and dir_fd is not None:
+            raise PermissionError("denied")
+        return real_stat(name, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(ops_module.os, "stat", deny_evidence_stat)
+    before = snapshot_tree(root)
+    report = check_draft(root)
+    assert any(issue.code == CheckCode.TRASH_PACKAGE_CORRUPT.value for issue in report.errors)
+    assert snapshot_tree(root) == before
+
+
+def test_checker_evidence_read_io_error_is_stable(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """evidence 内容读取 EIO：check_draft 返回稳定诊断，不抛原始异常（M2）。"""
+    import errno
+    import os
+
+    import draft.operations as ops_module
+
+    root, operation_dir, evidence_bytes = build_cleanup_evidence_checker_case(draft_factory)
+    (operation_dir / "cleanup-evidence.json").write_bytes(evidence_bytes)
+    real_open = ops_module.os.open
+
+    def fail_evidence_open(
+        name: str | bytes | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if ops_module.os.fspath(name) == "cleanup-evidence.json" and dir_fd is not None:
+            raise OSError(errno.EIO, "injected I/O error")
+        return real_open(name, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(ops_module.os, "open", fail_evidence_open)
+    before = snapshot_tree(root)
+    report = check_draft(root)
+    assert any(issue.code == CheckCode.TRASH_PACKAGE_CORRUPT.value for issue in report.errors)
+    assert snapshot_tree(root) == before
 
 
 @pytest.mark.parametrize("root_state", tuple(RootState))

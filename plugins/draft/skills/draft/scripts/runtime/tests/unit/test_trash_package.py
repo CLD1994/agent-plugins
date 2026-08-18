@@ -5,6 +5,7 @@ from draft.trash_package import (
     CleanupEvidenceIntent,
     EvidenceNodeState,
     cleanup_evidence_actions,
+    cleanup_evidence_protocol_corrupt,
 )
 
 MISS, VALID, INV, NON = (
@@ -125,3 +126,51 @@ def test_cleanup_evidence_decision_rejects_three_names_and_unlisted_rows() -> No
         assert _act(CleanupEvidenceIntent.REMOVE, VALID, VALID, VALID, same_quarantine=True) == (
             CleanupEvidenceAction.CORRUPT,
         )
+
+
+def test_cleanup_evidence_protocol_corrupt_exhaustive_both_intents() -> None:
+    """穷举 EvidenceNodeState³ × same_pending × same_quarantine 共 256 输入（第十一轮 H2）。
+
+    KEEP 与 REMOVE 的 CORRUPT 集合必须完全相等，且 ``cleanup_evidence_protocol_corrupt``
+    恰好等于该集合判定；checker 因此能由两种意图共同派生只读损坏判定，而不必自行发明
+    第三套 phase 规则。若穷举证明两个集合已分叉，必须停止并报告具体输入，不得选择
+    更宽松的一支。
+    """
+    states = tuple(EvidenceNodeState)
+    for final in states:
+        for pending in states:
+            for quarantine in states:
+                for same_pending in (False, True):
+                    for same_quarantine in (False, True):
+                        keep = _act(
+                            CleanupEvidenceIntent.KEEP,
+                            final,
+                            pending,
+                            quarantine,
+                            same_pending=same_pending,
+                            same_quarantine=same_quarantine,
+                        )
+                        remove = _act(
+                            CleanupEvidenceIntent.REMOVE,
+                            final,
+                            pending,
+                            quarantine,
+                            same_pending=same_pending,
+                            same_quarantine=same_quarantine,
+                        )
+                        keep_corrupt = CleanupEvidenceAction.CORRUPT in keep
+                        remove_corrupt = CleanupEvidenceAction.CORRUPT in remove
+                        assert keep_corrupt == remove_corrupt, (
+                            f"KEEP/REMOVE CORRUPT 集合分歧 at "
+                            f"{(final, pending, quarantine, same_pending, same_quarantine)}"
+                        )
+                        assert (
+                            cleanup_evidence_protocol_corrupt(
+                                final=final,
+                                pending=pending,
+                                quarantine=quarantine,
+                                final_pending_same_node=same_pending,
+                                final_quarantine_same_node=same_quarantine,
+                            )
+                            is keep_corrupt
+                        )

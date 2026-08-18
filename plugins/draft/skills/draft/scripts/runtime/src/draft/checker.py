@@ -443,75 +443,76 @@ _OP_DIR_ALLOCATING_ALLOWED = frozenset(
 )
 
 
-def _invalid_cleanup_evidence(operation_dir: Path, evidence_path: Path) -> bool:
-    """只读验证 evidence 内容：任何 schema/T 授权/读取错误都视为损坏（回归 H5）。
-
-    checker 只读：从锁内重读的 journal 派生授权，调用与 clean 共用同一
-    parse_cleanup_evidence 验证器，报告具体损坏而不只验证 EntryKind.FILE。
-    """
-    try:
-        journal = read_journal(operation_dir / "journal.json")
-        if journal.kind is not OperationKind.TRASH:
-            return True
-        from draft.trash_package import parse_cleanup_evidence
-
-        parse_cleanup_evidence(evidence_path.read_bytes(), journal, evidence_path)
-        return False
-    except DraftError:
-        return True
-    except OSError:
-        return True
-
-
 def _check_operation_directory_entries(
-    entry: Path, phase: OperationPhase, issues: list[CheckIssue]
+    entry: Path, journal: Journal, issues: list[CheckIssue]
 ) -> None:
     """按 phase 校验操作目录允许的精确内部条目（随机 pending/错误 evidence/终态残留可见）。
 
     终态（completed/rolled_back）只允许 journal.json，任何 originals/staged/attempt/
     evidence/pending/quarantine 都是残留并报告；allocating 只允许 journal 与恢复副本
-    目录；其余阶段允许全部登记内部条目。cleanup-evidence.json、其 .pending 与
-    .quarantine 节点必须是精确普通文件，目录/链接是错误 evidence，保留并报告；内容
-    非法同样报告（回归 H5/H1）。checker 始终只读，不发布/恢复/消费任何 evidence 名。
+    目录；其余阶段允许全部登记内部条目。evidence 合法性改为每个操作目录只执行一次
+    联合分类（第十一轮 H2/M2）：final/pending/quarantine 及 inode 关系由共享只读分类
+    ``classify_cleanup_evidence_artifacts`` 判定，再调用 ``cleanup_evidence_protocol_corrupt``；
+    任一损坏结果报告 trash.package_corrupt。checker 始终只读，不发布/恢复/消费任何
+    evidence 名；分类/读取的底层 OSError 一律转为稳定诊断，不泄漏原始异常。
     """
-    from draft.observations import EntryKind
-    from draft.operations import classify_node
+    from draft.trash_package import (
+        classify_cleanup_evidence_artifacts,
+        cleanup_evidence_protocol_corrupt,
+    )
 
+    phase = journal.phase
     if phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
         allowed = _OP_DIR_TERMINAL_ALLOWED
     elif phase is OperationPhase.ALLOCATING:
         allowed = _OP_DIR_ALLOCATING_ALLOWED
     else:
         allowed = _OP_DIR_ALLOWED_ENTRIES
-    evidence_names = {
-        "cleanup-evidence.json",
-        "cleanup-evidence.json.pending",
-        "cleanup-evidence.json.quarantine",
-    }
-    for child in sorted(entry.iterdir()):
+    try:
+        children = sorted(entry.iterdir())
+    except OSError:
+        # 目录枚举失败：不能折叠成 missing 或成功，稳定诊断保留现场。
+        issues.append(
+            _error(
+                CheckCode.OPERATION_JOURNAL_CORRUPT,
+                entry.relative_to(entry.parents[1]),
+            )
+        )
+        return
+    for child in children:
         if child.name not in allowed:
             issues.append(
                 _error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, child.relative_to(entry.parents[1]))
             )
-            continue
-        if child.name in evidence_names:
-            node = classify_node(child)
-            if node not in (EntryKind.MISSING, EntryKind.FILE):
-                issues.append(
-                    _error(
-                        CheckCode.INTERNAL_UNEXPECTED_ENTRY,
-                        child.relative_to(entry.parents[1]),
-                    )
+    # evidence 联合分类只在 evidence 名协议合法的阶段运行（非终态、非 allocating）；
+    # 非 TRASH 操作目录出现 evidence 名也会被同一分类判为损坏（授权解析失败）。
+    if allowed is _OP_DIR_ALLOWED_ENTRIES:
+        evidence_relative = entry.relative_to(entry.parents[1]) / "cleanup-evidence.json"
+        try:
+            classified = classify_cleanup_evidence_artifacts(journal)
+        except DraftError as error:
+            # 共享分类的领域错误按原 code/path 生成 CheckIssue（M2：稳定诊断，不泄漏原始异常）。
+            issues.append(
+                CheckIssue(
+                    code=error.code,
+                    severity=IssueSeverity.ERROR,
+                    path=error.paths[0] if error.paths else evidence_relative,
+                    line=None,
                 )
-                continue
-            if node is EntryKind.FILE and _invalid_cleanup_evidence(entry, child):
-                # 非法普通文件证据：内容损坏可见，不能只验证节点类型（回归 H5）。
-                issues.append(
-                    _error(
-                        CheckCode.TRASH_PACKAGE_CORRUPT,
-                        child.relative_to(entry.parents[1]),
-                    )
-                )
+            )
+        except OSError:
+            issues.append(_error(CheckCode.TRASH_PACKAGE_CORRUPT, evidence_relative))
+        else:
+            if classified is not None:
+                final, pending, quarantine, same_pending, same_quarantine = classified
+                if cleanup_evidence_protocol_corrupt(
+                    final=final,
+                    pending=pending,
+                    quarantine=quarantine,
+                    final_pending_same_node=same_pending,
+                    final_quarantine_same_node=same_quarantine,
+                ):
+                    issues.append(_error(CheckCode.TRASH_PACKAGE_CORRUPT, evidence_relative))
 
 
 def _check_operation_state(root: Path) -> list[CheckIssue]:
@@ -535,7 +536,7 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
             # 有锁操作目录仍校验内部条目形状（回归 H4）：持锁时完成清理前可能有
             # originals/staged/attempt/evidence，但未知条目与错误 evidence 必须可见。
             locked_entry = operations / locked_operation
-            _check_operation_directory_entries(locked_entry, journal.phase, issues)
+            _check_operation_directory_entries(locked_entry, journal, issues)
             issues.append(
                 _error(CheckCode.OPERATION_RECOVERY_REQUIRED, lock_path, None, locked_operation)
             )
@@ -573,7 +574,7 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
         relative = journal_path.relative_to(root)
         phase = journal.phase
         # 无锁操作目录也按 phase 校验内部条目：终态残留/随机 pending/错误 evidence 可见（回归 H4）。
-        _check_operation_directory_entries(entry, phase, issues)
+        _check_operation_directory_entries(entry, journal, issues)
         if phase is OperationPhase.ALLOCATING:
             issues.append(_review(CheckCode.OPERATION_ORPHAN_ALLOCATING, relative))
         elif phase in _MID_WRITE_PHASES:
