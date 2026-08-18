@@ -365,10 +365,12 @@ def _proven_unapplied_restore(root: Path, journal: Journal) -> bool:
 
 
 class RestoreRecoveryAction(StrEnum):
-    """R/T 双日志恢复决策结果（第十轮 H2）。"""
+    """R/T 双日志恢复决策结果（第十轮 H2，第十一轮 H1/M1 闭合）。"""
 
     VERIFY_AND_COMMIT_CLEANUP = "verify_and_commit_cleanup"
     RESUME_COMMITTED_CLEANUP = "resume_committed_cleanup"
+    RESUME_FORWARD = "resume_forward"
+    RESUME_ROLLBACK = "resume_rollback"
     ABANDON_UNAPPLIED = "abandon_unapplied"
     INCONSISTENT = "inconsistent"
 
@@ -380,23 +382,36 @@ def restore_recovery_decision(
     links_match: bool,
     proven_unapplied: bool,
 ) -> RestoreRecoveryAction:
-    """restore 双日志恢复决策（纯函数，第十轮 H2）。
+    """restore 双日志恢复决策（纯函数，唯一权威 R/T 决策来源）。
 
-    恢复所需证据由耐久状态决定：提交前需要完整包证明 restore 内容，提交后必须以耐久
-    R/T 和 cleanup evidence 恢复删除，不能重新要求已经获准删除的包仍然完整。关联不
-    匹配、R 处于中间写阶段或 T 阶段与 R 阶段矛盾时一律 INCONSISTENT（保留现场）。
+    完整分区见计划"行为契约一"：关联不匹配一律 INCONSISTENT；只有显式列出的合法
+    (R, T) 分区才返回对应动作。中段相位（applying/validating/rolling_back）不再是
+    INCONSISTENT，而是交给公开 recovery 入口复用通用 mutation 恢复；RESUME_* 动作
+    只能由显式恢复路径执行，正常业务调用不得因 phase 可恢复而吞掉原错误。未列
+    组合（如 R=rolled_back,T=rolled_back）一律 INCONSISTENT，不在后续 journal 写入
+    时才暴露（第十一轮 M1）。
     """
     if not links_match:
         return RestoreRecoveryAction.INCONSISTENT
-    if restore_phase is OperationPhase.COMPLETED:
-        if trash_phase is OperationPhase.TRASH_RETAINED:
-            return RestoreRecoveryAction.VERIFY_AND_COMMIT_CLEANUP
-        if trash_phase is OperationPhase.ROLLED_BACK:
-            return RestoreRecoveryAction.RESUME_COMMITTED_CLEANUP
-        return RestoreRecoveryAction.INCONSISTENT
-    if restore_phase is OperationPhase.ROLLED_BACK:
+    pair = (restore_phase, trash_phase)
+    if pair in (
+        (OperationPhase.APPLYING, OperationPhase.TRASH_RETAINED),
+        (OperationPhase.VALIDATING, OperationPhase.TRASH_RETAINED),
+    ):
+        return RestoreRecoveryAction.RESUME_FORWARD
+    if pair == (OperationPhase.ROLLING_BACK, OperationPhase.TRASH_RETAINED):
+        return RestoreRecoveryAction.RESUME_ROLLBACK
+    if pair == (OperationPhase.COMPLETED, OperationPhase.TRASH_RETAINED):
+        return RestoreRecoveryAction.VERIFY_AND_COMMIT_CLEANUP
+    if pair == (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
+        return RestoreRecoveryAction.RESUME_COMMITTED_CLEANUP
+    if pair == (OperationPhase.ROLLED_BACK, OperationPhase.TRASH_RETAINED):
         return RestoreRecoveryAction.ABANDON_UNAPPLIED
-    if restore_phase in (OperationPhase.ALLOCATING, OperationPhase.PREPARED) and proven_unapplied:
+    if (
+        restore_phase in (OperationPhase.ALLOCATING, OperationPhase.PREPARED)
+        and trash_phase is OperationPhase.TRASH_RETAINED
+        and proven_unapplied
+    ):
         return RestoreRecoveryAction.ABANDON_UNAPPLIED
     return RestoreRecoveryAction.INCONSISTENT
 
