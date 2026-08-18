@@ -1306,16 +1306,19 @@ def _restore_bootstrap_journal(*, change: str = "none") -> tuple[Journal, str]:
         return dataclasses.replace(journal, phase=OperationPhase.PREPARED), trash_id
     if change == "observation":
         manifest = ObservationManifest(
-            entries=(
-                Observation(
-                    path=Path("pages/obsolete.md"), kind=EntryKind.FILE, sha256="x"
-                ),
-            )
+            entries=(Observation(path=Path("pages/obsolete.md"), kind=EntryKind.FILE, sha256="x"),)
         )
         return dataclasses.replace(journal, observations=manifest), trash_id
     if change == "mutation":
         return (
-            dataclasses.replace(journal, mutations=(_auth_mutation(Path("pages/obsolete.md"),))),
+            dataclasses.replace(
+                journal,
+                mutations=(
+                    _auth_mutation(
+                        Path("pages/obsolete.md"),
+                    )
+                ),
+            ),
             trash_id,
         )
     if change == "remove_dir":
@@ -1459,6 +1462,4 @@ def test_restore_recovery_decision_preclaim_bootstrap_only_affects_one_row() -> 
                     assert base is RestoreRecoveryAction.INCONSISTENT
                     assert with_bootstrap is RestoreRecoveryAction.ABANDON_UNCLAIMED_BOOTSTRAP
                 else:
-                    assert with_bootstrap is base, (
-                        f"{(restore_phase, trash_phase, link_state)}"
-                    )
+                    assert with_bootstrap is base, f"{(restore_phase, trash_phase, link_state)}"

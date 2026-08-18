@@ -320,18 +320,29 @@ def require_retained_restore_window(journal: Journal, now: datetime) -> TrashDea
 def abandon_unlinked_restore(
     root: Path, restore_id: str, *, release_owned_lock: bool = False
 ) -> None:
-    """把调用方尚未关联的 R=allocating 耐久转为 rolled_back，清理分配材料。"""
+    """把调用方尚未关联的 R=allocating 耐久转为 rolled_back，清理分配材料。
+
+    round-13 H1：只有严格 pre-claim bootstrap（尚未写 T claim、无任何规划产物）才能
+    被异常清理放弃，与公开恢复共用同一 ``is_restore_preclaim_bootstrap``，避免两处
+    形成不同规则。形状无法证明（无 backref、backref 非法、或任一维度偏离 bootstrap）
+    时零写入保留现场（不写 R、不清理、不解锁），交由公开恢复或一致拒绝。
+    """
     journal_path = operation_journal_path(root, restore_id)
     resolve_journal_pending(journal_path)
-    if journal_path.is_file():
-        journal = read_journal(journal_path)
-        if (
-            journal.kind is OperationKind.RESTORE
-            and journal.phase is OperationPhase.ALLOCATING
-            and not journal.mutations
-        ):
-            write_journal(with_phase(journal, OperationPhase.ROLLED_BACK))
-            clean_recovery_copies(journal)
+    if not journal_path.is_file():
+        return
+    journal = read_journal(journal_path)
+    back_reference = journal.metadata.get("restores_trash_operation")
+    if not isinstance(back_reference, str):
+        return
+    try:
+        trash_id = validate_operation_id(back_reference, code="operation.plan_invalid")
+    except DraftError:
+        return
+    if not is_restore_preclaim_bootstrap(journal, trash_id):
+        return
+    write_journal(with_phase(journal, OperationPhase.ROLLED_BACK))
+    clean_recovery_copies(journal)
     if release_owned_lock and read_lock(root) == restore_id:
         release_lock(root, restore_id)
 
@@ -1137,6 +1148,39 @@ def resolve_restore_execution(
         # 幂等清理 R 登记材料、释放 R 锁；不重写 T，不加载或删除权威包。释放锁前
         # 同样必须证明 target 仍为 before（H2），不得因 T 已解关联就跳过。
         verify_locked_terminal_operation(root, restore_id, expected=OperationPhase.ROLLED_BACK)
+        clean_recovery_copies(terminal_restore)
+        release_lock(root, restore_id)
+        if execution_error is not None:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory
+            )
+        return OperationResult(
+            operation_id=restore_id,
+            kind="restore",
+            phase=OperationPhase.ROLLED_BACK,
+            changed_paths=changed,
+        )
+
+    if action is RestoreRecoveryAction.ABANDON_UNCLAIMED_BOOTSTRAP:
+        # 前认领放弃（round-13 H1）：R 仍是严格初始日志、T 未认领（生产写序中
+        # "取得锁但 claim 尚未耐久写入"的崩溃窗口）。锁内重读并复核锁仍属 R、T 仍是
+        # trash_retained+unclaimed、R/T 指向与 bootstrap 事实，防止 stale action；
+        # 然后 R=rolled_back 耐久 -> 幂等清理 R 登记材料 -> 释放 R 锁。不得写 T、
+        # 加载 payload 或删除包。R=rolled_back 耐久后中断由既有 FINISH 收敛，不新增
+        # 第三套后半段清理器。
+        current_facts_valid = (
+            read_lock(root) == restore_id
+            and current_trash.kind is OperationKind.TRASH
+            and current_trash.phase is OperationPhase.TRASH_RETAINED
+            and current_trash.metadata.get("restore_operation_id") is None
+            and is_restore_preclaim_bootstrap(terminal_restore, current_trash.operation_id)
+        )
+        if not current_facts_valid:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory
+            )
+        terminal_restore = with_phase(terminal_restore, OperationPhase.ROLLED_BACK)
+        write_journal(terminal_restore)
         clean_recovery_copies(terminal_restore)
         release_lock(root, restore_id)
         if execution_error is not None:

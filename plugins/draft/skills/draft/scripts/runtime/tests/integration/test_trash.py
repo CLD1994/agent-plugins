@@ -13,7 +13,7 @@ from draft.operations import JOURNAL_VERSION, Journal, operation_journal_path, r
 from draft.trash import restore_retained_trash, trash_page
 from draft.trash_lifecycle import recover_draft
 from draft.trash_package import VerifiedTrashPackage
-from tests.integration.support import DraftFactory
+from tests.integration.support import DraftFactory, snapshot_tree
 
 TRASH_INDEX = """# Topic
 
@@ -1388,6 +1388,225 @@ def test_abandon_unclaimed_finish_requires_terminal_target_proof(
     assert _journal_path(root, trash_id).read_bytes() == before_t
     assert (root / ".draft/operation.lock").exists()
     assert _read_journal(root, restore_id)["phase"] == "rolled_back"
+
+
+# ---------------------------------------------------------------------------
+# 第十三轮 H1：restore 在 T 认领之前的合法崩溃窗口。同值 TRASH_UNCLAIMED 在
+# "认领尚未发生"（R=allocating bootstrap）与"ABANDON 已删除 claim"（R=rolled_back）
+# 是两个不同恢复阶段：前者由新动作 ABANDON_UNCLAIMED_BOOTSTRAP 收敛，后者由既有
+# FINISH_ABANDON_CLEANUP 收敛。正例场景必须来自真实 restore_retained_trash 写点。
+# ---------------------------------------------------------------------------
+
+
+def _restore_preclaim_crash_scene(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, str, str]:
+    """真实 producer 现场：R 已取得锁并预分配，T claim 尚未耐久写入。
+
+    崩溃注入在真实 writer 写出 T 的 ``restore_operation_id`` 之前，不手改最终
+    journal。返回 (root, restore_id, trash_id)：R=allocating（严格 pre-claim
+    bootstrap）、T=trash_retained 无 claim、锁属 R、权威包完整。
+    """
+    import draft.trash as trash_module
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    real_write = trash_module.write_journal
+    fired = False
+
+    def write_then_crash(journal: Journal) -> None:
+        nonlocal fired
+        if (
+            not fired
+            and journal.kind is OperationKind.TRASH
+            and "restore_operation_id" in journal.metadata
+        ):
+            fired = True
+            raise SimulatedProcessExit
+        real_write(journal)
+
+    monkeypatch.setattr(trash_module, "write_journal", write_then_crash)
+    with pytest.raises(SimulatedProcessExit):
+        restore_retained_trash(root, pending.operation_id, now=NOW)
+    monkeypatch.undo()
+
+    from draft.operations import read_lock
+
+    restore_id = read_lock(root)
+    assert restore_id is not None
+    r = _read_journal(root, restore_id)
+    assert r["phase"] == "allocating"
+    assert r["mutations"] == []
+    assert r["observations"] == []
+    assert r["remove_empty_directories"] == []
+    assert r["metadata"] == {"restores_trash_operation": pending.operation_id}
+    t = _read_journal(root, pending.operation_id)
+    assert t["phase"] == "trash_retained"
+    assert "restore_operation_id" not in t["metadata"]
+    return root, restore_id, pending.operation_id
+
+
+def crash_after_restore_rolled_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """真实 writer 先耐久写入 R=rolled_back 再抛进程退出（新动作的耐久写点）。
+
+    只命中 ABANDON_UNCLAIMED_BOOTSTRAP 把 R 转为 rolled_back 的那次 RESTORE 写入。
+    """
+    import draft.trash as trash_module
+
+    real_write = trash_module.write_journal
+    fired = False
+
+    def write_then_crash(journal: Journal) -> None:
+        nonlocal fired
+        real_write(journal)
+        if (
+            not fired
+            and journal.kind is OperationKind.RESTORE
+            and journal.phase is OperationPhase.ROLLED_BACK
+        ):
+            fired = True
+            raise SimulatedProcessExit
+
+    monkeypatch.setattr(trash_module, "write_journal", write_then_crash)
+
+
+@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
+def test_restore_preclaim_crash_converges(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_name: str,
+) -> None:
+    """真实 producer 在写 T claim 前中断：两个公开入口幂等收敛（round-13 H1）。
+
+    收敛：R 耐久转为 rolled_back、R 登记材料清理、锁释放；T journal bytes 与权威包
+    字节完全不变、T 无 claim。重复调用无副作用。修复前公开入口报
+    operation.inconsistent_state，锁永久保留（红灯）。
+    """
+    from draft.operations import read_lock
+
+    root, restore_id, trash_id = _restore_preclaim_crash_scene(draft_factory, monkeypatch)
+    before_t = _journal_path(root, trash_id).read_bytes()
+    before_package = _package_snapshot(root, trash_id)
+
+    _recover_through_public_entry(root, entry_name)
+
+    assert read_lock(root) is None
+    assert _read_journal(root, restore_id)["phase"] == "rolled_back"
+    assert _journal_path(root, trash_id).read_bytes() == before_t
+    assert _package_snapshot(root, trash_id) == before_package
+    r_dir = root / ".draft/operations" / restore_id
+    assert not (r_dir / "originals").exists()
+    assert not (r_dir / "staged").exists()
+    t = _read_journal(root, trash_id)
+    assert t["phase"] == "trash_retained"
+    assert "restore_operation_id" not in t["metadata"]
+
+    _recover_through_public_entry(root, entry_name)
+    assert read_lock(root) is None
+    assert _journal_path(root, trash_id).read_bytes() == before_t
+    assert _package_snapshot(root, trash_id) == before_package
+
+
+@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
+def test_restore_preclaim_rolled_back_second_crash_converges_via_finish(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_name: str,
+) -> None:
+    """新动作把 R=rolled_back 耐久后再次中断：下一次 recover 走既有 FINISH（H1）。
+
+    验证要求：第二次中断后 R=rolled_back、T=trash_retained 无 claim；恢复后 T bytes
+    与包不变、R 材料清空、锁释放；重复 recover 无副作用。不得新增第三套后半段清理器。
+    """
+    from draft.operations import read_lock
+
+    root, restore_id, trash_id = _restore_preclaim_crash_scene(draft_factory, monkeypatch)
+    crash_after_restore_rolled_back(monkeypatch)
+    with pytest.raises(SimulatedProcessExit):
+        _recover_through_public_entry(root, entry_name)
+    monkeypatch.undo()
+    assert _read_journal(root, restore_id)["phase"] == "rolled_back"
+    t = _read_journal(root, trash_id)
+    assert t["phase"] == "trash_retained"
+    assert "restore_operation_id" not in t["metadata"]
+
+    before_t = _journal_path(root, trash_id).read_bytes()
+    before_package = _package_snapshot(root, trash_id)
+    _recover_through_public_entry(root, entry_name)
+    assert read_lock(root) is None
+    assert _journal_path(root, trash_id).read_bytes() == before_t
+    assert _package_snapshot(root, trash_id) == before_package
+    r_dir = root / ".draft/operations" / restore_id
+    assert not (r_dir / "originals").exists()
+    assert not (r_dir / "staged").exists()
+    assert _read_journal(root, restore_id)["phase"] == "rolled_back"
+
+    _recover_through_public_entry(root, entry_name)
+    assert read_lock(root) is None
+    assert _journal_path(root, trash_id).read_bytes() == before_t
+
+
+_NON_BOOTSTRAP_DEVIATIONS = ("observation", "mutation", "remove_dir", "extra_metadata")
+
+
+@pytest.mark.parametrize("deviation", _NON_BOOTSTRAP_DEVIATIONS)
+@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
+def test_restore_preclaim_non_bootstrap_is_inconsistent(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    deviation: str,
+    entry_name: str,
+) -> None:
+    """allocating+unclaimed 但任一维度偏离 bootstrap：零写入保留现场（round-13 H1）。
+
+    非法状态可以手工构造，但每个只改变一个维度：observation/mutation/remove_dir/
+    额外 metadata。两个公开入口都必须一致拒绝，不得把无法证明 bootstrap 的状态
+    解释为放弃、成功或无关。
+    """
+    import json
+
+    from draft.operations import read_lock
+
+    root, restore_id, trash_id = _restore_preclaim_crash_scene(draft_factory, monkeypatch)
+    journal_path = _journal_path(root, restore_id)
+    data = json.loads(journal_path.read_text(encoding="utf-8"))
+    if deviation == "observation":
+        data["observations"] = [
+            {
+                "path": "pages/obsolete.md",
+                "kind": "file",
+                "sha256": "f" * 64,
+                "members": [],
+            }
+        ]
+    elif deviation == "mutation":
+        data["mutations"] = [
+            {
+                "path": "pages/obsolete.md",
+                "kind": "write",
+                "before_sha256": None,
+                "after_sha256": "f" * 64,
+                "original": None,
+                "staged": "staged/0000.bin",
+                "applied": False,
+            }
+        ]
+    elif deviation == "remove_dir":
+        data["remove_empty_directories"] = ["pages/empty"]
+    elif deviation == "extra_metadata":
+        data["metadata"]["extra"] = "x"
+    journal_path.write_text(json.dumps(data), encoding="utf-8")
+    before = snapshot_tree(root)
+
+    with pytest.raises(DraftError) as caught:
+        _recover_through_public_entry(root, entry_name)
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    assert snapshot_tree(root) == before
+    assert read_lock(root) == restore_id
+    r_after = _read_journal(root, restore_id)
+    assert r_after["phase"] == "allocating"
+    assert r_after["metadata"]["restores_trash_operation"] == trash_id
 
 
 # ---------------------------------------------------------------------------
