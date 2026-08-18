@@ -9,8 +9,9 @@ from draft.diagnostic_codes import (
     LinkEscapeKind,
     ReplacementStatusReason,
 )
+from draft.errors import DraftError
 from draft.models import CheckReport, IssueSeverity, OperationPhase, RootState
-from draft.operations import JOURNAL_VERSION
+from draft.operations import JOURNAL_VERSION, Journal
 from draft.trash import trash_page
 from draft.vocabulary import ConclusionsState
 from tests.integration.support import (
@@ -2166,4 +2167,213 @@ def test_checker_unreadable_subtree_does_not_hide_other_corruption(
 
     assert CheckCode.OPERATION_JOURNAL_CORRUPT.value in codes(report)  # operations 子树不可读
     assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)  # trash/outgoing 损坏仍可见
+    assert snapshot_tree(root) == before
+
+
+# ---------------------------------------------------------------------------
+# 第十三轮 M1：owner 索引不完整时未知不得折叠为 ORPHAN。合法 retained 包在
+# operations/journal/lock 不可读时保持 HELD/UNKNOWN；只有可证明无 owner 的包才报
+# orphan。非法名字/节点类型/链接形状不依赖 owner 事实，必须继续报告。
+# ---------------------------------------------------------------------------
+
+
+def _has_package_orphan(report: CheckReport, package_id: str) -> bool:
+    """outgoing 下指定 package 是否被报告为 orphan 的 internal.unexpected_entry。"""
+    expected = Path(".draft/trash/outgoing") / package_id
+    return any(
+        issue.code == CheckCode.INTERNAL_UNEXPECTED_ENTRY.value and issue.path == expected
+        for issue in report.errors
+    )
+
+
+def _retained_package_root(draft_factory: DraftFactory) -> tuple[Path, str]:
+    """真实 retained T + 权威包，返回 (root, trash_id)。"""
+    root = draft_factory(_trashable_checker_files())
+    created = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=created)
+    assert (root / ".draft/trash/outgoing" / pending.operation_id).is_dir()
+    return root, pending.operation_id
+
+
+def _eacces_or_eio(error_type: str) -> BaseException:
+    if error_type == "eacces":
+        return PermissionError(13, "Permission denied")
+    return OSError(5, "Input/output error")
+
+
+@pytest.mark.parametrize("error_type", ["eacces", "eio"])
+@pytest.mark.parametrize("fail_point", ["lstat", "scandir"])
+def test_checker_operations_unavailable_keeps_retained_package(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: str,
+    fail_point: str,
+) -> None:
+    """operations 根不可 stat/枚举：合法 retained 包不得被误判 orphan（round-13 M1）。
+
+    不能只断言 report.errors 非空；必须精确断言合法包没有 orphan 诊断。
+    """
+    import os
+
+    root, trash_id = _retained_package_root(draft_factory)
+    operations = root / ".draft/operations"
+    before = snapshot_tree(root)
+    if fail_point == "lstat":
+        real_lstat = os.lstat
+
+        def fail_lstat(path: str | bytes | os.PathLike[str], *args: object) -> object:
+            if os.fspath(path) == os.fspath(operations):
+                raise _eacces_or_eio(error_type)
+            return real_lstat(path, *args)
+
+        monkeypatch.setattr(os, "lstat", fail_lstat)
+    else:
+        real_scandir = os.scandir
+
+        def fail_scandir(path: str | bytes | os.PathLike[str]) -> object:
+            if os.fspath(path) == os.fspath(operations):
+                raise _eacces_or_eio(error_type)
+            return real_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", fail_scandir)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    assert CheckCode.OPERATION_JOURNAL_CORRUPT.value in codes(report)
+    assert not _has_package_orphan(report, trash_id)
+    assert snapshot_tree(root) == before
+
+
+def test_checker_cleanup_owner_lock_unreadable_keeps_package(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """锁不可读 + 真实 cleanup owner 现场：T=rolled_back 包不得被误判 orphan（round-13 M1）。
+
+    lock 读取失败时无法证明 T 正是锁内 restore 的 cleanup owner，必须 UNKNOWN 而不是
+    ORPHAN（未知不得折叠为否定事实）。
+    """
+    import os
+
+    root, _restore_id, trash_id = _restore_cleanup_owner_scene(draft_factory, monkeypatch)
+    lock = root / ".draft/operation.lock"
+    before = snapshot_tree(root)
+    real_lstat = os.lstat
+
+    def fail_lock_lstat(path: str | bytes | os.PathLike[str], *args: object) -> object:
+        if os.fspath(path) == os.fspath(lock):
+            raise OSError(5, "Input/output error")
+        return real_lstat(path, *args)
+
+    monkeypatch.setattr(os, "lstat", fail_lock_lstat)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    assert not _has_package_orphan(report, trash_id)
+    assert snapshot_tree(root) == before
+
+
+def test_checker_cleanup_owner_r_journal_unreadable_keeps_package(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R journal 不可读 + 真实 cleanup owner 现场：包为 UNKNOWN，不误报 orphan（round-13 M1）。"""
+    import draft.operations as ops_module
+
+    root, restore_id, trash_id = _restore_cleanup_owner_scene(draft_factory, monkeypatch)
+    r_journal = root / ".draft/operations" / restore_id / "journal.json"
+    before = snapshot_tree(root)
+    real_read = ops_module.read_journal
+
+    def fail_read(journal_path: Path) -> Journal:
+        if journal_path == r_journal:
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+        return real_read(journal_path)
+
+    monkeypatch.setattr(ops_module, "read_journal", fail_read)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    assert not _has_package_orphan(report, trash_id)
+    assert snapshot_tree(root) == before
+
+
+def test_checker_unknown_owner_does_not_suppress_provable_orphan(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """两个包：一个 owner 未知、另一个可证明 orphan——只报告后者 orphan（round-13 M1）。
+
+    证明实现没有因一个 unknown 全局关闭所有 orphan 检查。
+    """
+    import draft.operations as ops_module
+
+    root, restore_id, trash_id = _restore_cleanup_owner_scene(draft_factory, monkeypatch)
+    orphan_id = "c" * 32
+    orphan_pkg = root / ".draft/trash/outgoing" / orphan_id
+    orphan_pkg.mkdir(parents=True)
+    (orphan_pkg / "leaf.bin").write_bytes(b"orphan-leaf")
+    r_journal = root / ".draft/operations" / restore_id / "journal.json"
+    before = snapshot_tree(root)
+    real_read = ops_module.read_journal
+
+    def fail_read(journal_path: Path) -> Journal:
+        if journal_path == r_journal:
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+        return real_read(journal_path)
+
+    monkeypatch.setattr(ops_module, "read_journal", fail_read)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert _has_package_orphan(report, orphan_id)
+    assert not _has_package_orphan(report, trash_id)
+    assert snapshot_tree(root) == before
+
+
+@pytest.mark.parametrize("bad_shape", ["invalid_name", "regular_file", "symlink"])
+def test_checker_outgoing_shape_checks_independent_of_operations(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_shape: str,
+) -> None:
+    """operations 不可用时，outgoing 非法形状仍分别报告（round-13 M1/M2）。
+
+    不要把"无法判 owner"扩大成"不检查 package 自身"。
+    """
+    import os
+
+    root, trash_id = _retained_package_root(draft_factory)
+    outgoing = root / ".draft/trash/outgoing"
+    if bad_shape == "invalid_name":
+        (outgoing / "not-an-op-id").mkdir()
+    elif bad_shape == "regular_file":
+        (outgoing / "regular.txt").write_text("x", encoding="utf-8")
+    else:
+        (outgoing / "symlink").symlink_to(root / "index.md")
+    operations = root / ".draft/operations"
+    before = snapshot_tree(root)
+    real_scandir = os.scandir
+
+    def fail_scandir(path: str | bytes | os.PathLike[str]) -> object:
+        if os.fspath(path) == os.fspath(operations):
+            raise PermissionError(13, "Permission denied")
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", fail_scandir)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    assert CheckCode.OPERATION_JOURNAL_CORRUPT.value in codes(report)
+    if bad_shape == "symlink":
+        assert CheckCode.PATH_SYMLINK_ESCAPE.value in codes(report)
+    else:
+        assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
+    assert not _has_package_orphan(report, trash_id)
     assert snapshot_tree(root) == before

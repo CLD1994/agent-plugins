@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from draft.diagnostic_codes import (
@@ -31,7 +33,6 @@ from draft.operations import (
     TrashDeadlines,
     has_handoff_failure,
     operation_journal_path,
-    read_journal,
 )
 from draft.paths import physical_parent, resolve_draft_root
 from draft.trash_package import OUTGOING_RELATIVE, load_verified_package
@@ -448,20 +449,121 @@ def _operation_dir_relative(operation_id: str) -> Path:
     return Path(INTERNAL_DIR) / "operations" / operation_id
 
 
+class InternalDirectoryState(StrEnum):
+    """内部目录扫描状态（round-13 M1）：MISSING 与 I/O 失败不得再同为 None。
+
+    - MISSING：目录确实不存在（合法空状态）；
+    - COMPLETE：目录存在且完整枚举成功；
+    - INVALID：存在但是普通文件/链接（非法形状，已由形状诊断报告）；
+    - UNAVAILABLE：存在但 lstat 分类或枚举失败（普通 I/O 失败，不能折叠成缺失）。
+    """
+
+    MISSING = "missing"
+    COMPLETE = "complete"
+    INVALID = "invalid"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class InternalDirectoryListing:
+    """稳定目录扫描结果：状态 + 枚举条目。"""
+
+    state: InternalDirectoryState
+    entries: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class OperationCheckIndex:
+    """一次性 operation 事实索引（round-13 M1）：owner 判定唯一事实来源。
+
+    ``journals`` 只放成功解析的 journal；``unresolved_ids`` 放无法分类/无法读取的
+    operation（EACCES/EIO/日志损坏），是"事实未知"而非"没有 owner"；``lock_known``
+    区分"锁可读但无锁"与"锁不可读"。trash tree 只消费本索引，不再二次 read_journal
+    建立第二份不一致事实。
+    """
+
+    listing_state: InternalDirectoryState
+    journals: Mapping[str, Journal]
+    unresolved_ids: frozenset[str]
+    locked_operation: str | None
+    lock_known: bool
+
+
+class PackageOwnership(StrEnum):
+    """trash 包所有权的三值结论（round-13 M1）：UNKNOWN 不得折叠为 ORPHAN/MISSING/成功。"""
+
+    HELD = "held"
+    ORPHAN = "orphan"
+    UNKNOWN = "unknown"
+
+
+def package_ownership_decision(package_id: str, index: OperationCheckIndex) -> PackageOwnership:
+    """trash 包所有权纯三值判定（round-13 M1）。
+
+    只有 ORPHAN 才能产生 orphan 的 ``internal.unexpected_entry``；UNKNOWN 只保留导致
+    未知的既有 operation/journal/lock 稳定诊断，不新增码也不误报。operations 明确缺失
+    或完整枚举且证明同 id 无合法 owner -> ORPHAN；operations/journal/lock 任一必要事实
+    不可读或未解析 -> UNKNOWN。
+    """
+    if index.listing_state is InternalDirectoryState.MISSING:
+        # operations 目录从未创建：任何包都没有持有它的 journal，完整证明无 owner。
+        return PackageOwnership.ORPHAN
+    if index.listing_state is not InternalDirectoryState.COMPLETE:
+        # INVALID/UNAVAILABLE：无法建立 owner 索引，未知不得解释为没有 owner。
+        return PackageOwnership.UNKNOWN
+    if package_id in index.unresolved_ids:
+        return PackageOwnership.UNKNOWN
+    journal = index.journals.get(package_id)
+    if journal is None:
+        return PackageOwnership.ORPHAN
+    if journal.kind is not OperationKind.TRASH:
+        return PackageOwnership.ORPHAN
+    if journal.phase in (
+        OperationPhase.TRASH_RETAINED,
+        OperationPhase.TRASH_HANDOFF_PENDING,
+    ):
+        return PackageOwnership.HELD
+    if journal.phase is not OperationPhase.ROLLED_BACK:
+        return PackageOwnership.ORPHAN
+    # rolled_back：只有由完整 R/T/lock 事实证明的 cleanup owner 才持有包。
+    if not index.lock_known:
+        return PackageOwnership.UNKNOWN
+    if index.locked_operation is None:
+        # 锁可读但明确无锁：不是锁内 cleanup owner，完整事实证明 journal 不再持有包。
+        return PackageOwnership.ORPHAN
+    referenced = journal.metadata.get("restore_operation_id")
+    if referenced != index.locked_operation:
+        # claim 指向的 R 不可读：无法证明其是否为 cleanup owner。
+        if isinstance(referenced, str) and referenced in index.unresolved_ids:
+            return PackageOwnership.UNKNOWN
+        return PackageOwnership.ORPHAN
+    if index.locked_operation in index.unresolved_ids:
+        return PackageOwnership.UNKNOWN
+    restore = index.journals.get(index.locked_operation)
+    if (
+        restore is not None
+        and restore.kind is OperationKind.RESTORE
+        and restore.phase is OperationPhase.COMPLETED
+        and restore.metadata.get("restores_trash_operation") == package_id
+    ):
+        return PackageOwnership.HELD
+    return PackageOwnership.ORPHAN
+
+
 def _list_internal_directory(
     root: Path,
     directory: Path,
     *,
     code: CheckCode,
     issues: list[CheckIssue],
-) -> tuple[Path, ...] | None:
-    """稳定分类/枚举内部目录（round-12 M2）：失败追加一次 CheckIssue 并返回 None。
+) -> InternalDirectoryListing:
+    """稳定分类/枚举内部目录（round-12 M2，round-13 M1 状态显式化）。
 
     ``classify_node_or_error``（lstat）把 EACCES/EIO 转 DraftError，不折叠成缺失/不
     存在；``os.scandir`` 直接枚举并在 OSError 时报告稳定诊断（Path.iterdir 在 3.12
-    会静默吞掉 OSError，不能用来检测枚举失败）。缺失（MISSING）不报错；普通文件/
-    链接按内部命名空间非法形状报告。返回 None 表示该子树无法枚举，调用者继续检查
-    独立子树，不得在最外层捕获后停止全部检查。
+    会静默吞掉 OSError，不能用来检测枚举失败）。缺失（MISSING）合法空状态不报错；
+    普通文件/链接按内部命名空间非法形状报告（INVALID）；分类/枚举失败报告稳定诊断
+    （UNAVAILABLE）。调用者按状态继续检查独立子树，不得在最外层捕获后停止全部检查。
     """
     from draft.observations import EntryKind
     from draft.operations import classify_node_or_error
@@ -473,20 +575,22 @@ def _list_internal_directory(
         issues.append(
             CheckIssue(code=exc.code, severity=IssueSeverity.ERROR, path=relative, line=None)
         )
-        return None
+        return InternalDirectoryListing(InternalDirectoryState.UNAVAILABLE, ())
     if node is not EntryKind.DIRECTORY:
         if node is EntryKind.SYMLINK:
             issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, relative))
-        elif node is not EntryKind.MISSING:
-            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
-        return None
+            return InternalDirectoryListing(InternalDirectoryState.INVALID, ())
+        if node is EntryKind.MISSING:
+            return InternalDirectoryListing(InternalDirectoryState.MISSING, ())
+        issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
+        return InternalDirectoryListing(InternalDirectoryState.INVALID, ())
     try:
         with os.scandir(directory) as iterator:
             entries = tuple(sorted(Path(entry.path) for entry in iterator))
     except OSError:
         issues.append(_error(code, relative))
-        return None
-    return entries
+        return InternalDirectoryListing(InternalDirectoryState.UNAVAILABLE, ())
+    return InternalDirectoryListing(InternalDirectoryState.COMPLETE, entries)
 
 
 def _check_operation_directory_entries(
@@ -609,50 +713,122 @@ def _cleanup_owner_ids(
     return frozenset({trash_id})
 
 
+def _is_valid_operation_id_name(name: str) -> bool:
+    """operation 目录名是否为合法 operation id（owner 未知事实只对合法 id 记录）。"""
+    from draft.operations import validate_operation_id
+
+    try:
+        validate_operation_id(name)
+    except DraftError:
+        return False
+    return True
+
+
+def _build_operation_index(
+    root: Path,
+    listing: InternalDirectoryListing,
+    issues: list[CheckIssue],
+    *,
+    locked_operation: str | None,
+    lock_known: bool,
+) -> OperationCheckIndex:
+    """第一遍稳定扫描：解析 journal 放 journals，不可读/不可解析放 unresolved_ids。
+
+    已知非法形状（普通文件/链接/非合法 id 目录）由形状检查报告，不当作 I/O unknown；
+    只有合法 id 且无法分类/读取的操作目录才是"owner 事实未知"。返回的索引供 trash
+    tree 复用，不再二次 read_journal 建立第二份不一致事实（round-13 M1）。
+    """
+    from draft.observations import EntryKind
+    from draft.operations import classify_node_or_error, read_journal
+
+    journals: dict[str, Journal] = {}
+    unresolved: set[str] = set()
+    if listing.state is not InternalDirectoryState.COMPLETE:
+        return OperationCheckIndex(
+            listing_state=listing.state,
+            journals=journals,
+            unresolved_ids=frozenset(),
+            locked_operation=locked_operation,
+            lock_known=lock_known,
+        )
+    for entry in listing.entries:
+        relative = entry.relative_to(root)
+        try:
+            kind = classify_node_or_error(
+                entry, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value, code_path=entry
+            )
+        except DraftError as exc:
+            # 分类失败（EACCES/EIO）：无法判断节点类型，保守记录为未知 owner 事实。
+            issues.append(
+                CheckIssue(code=exc.code, severity=IssueSeverity.ERROR, path=relative, line=None)
+            )
+            if _is_valid_operation_id_name(entry.name):
+                unresolved.add(entry.name)
+            continue
+        if kind is EntryKind.SYMLINK:
+            issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, relative))
+            continue
+        if kind is not EntryKind.DIRECTORY:
+            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
+            continue
+        journal_path = operation_journal_path(root, entry.name)
+        try:
+            journal = read_journal(journal_path)
+        except DraftError:
+            # 日志缺失/损坏/身份不匹配：稳定诊断 + 合法 id 记录为未知 owner 事实。
+            issues.append(
+                _error(CheckCode.OPERATION_JOURNAL_CORRUPT, journal_path.relative_to(root))
+            )
+            if _is_valid_operation_id_name(entry.name):
+                unresolved.add(entry.name)
+            continue
+        journals[entry.name] = journal
+    return OperationCheckIndex(
+        listing_state=listing.state,
+        journals=journals,
+        unresolved_ids=frozenset(unresolved),
+        locked_operation=locked_operation,
+        lock_known=lock_known,
+    )
+
+
 def _check_operation_state(root: Path) -> list[CheckIssue]:
     """Read-only diagnostics for lock and journal states; never mutates anything."""
-    from draft.observations import EntryKind
-    from draft.operations import classify_node_or_error, read_journal, read_lock
+    from draft.operations import read_lock
 
     issues: list[CheckIssue] = []
     operations = root / INTERNAL_DIR / "operations"
     lock_path = Path(INTERNAL_DIR) / "operation.lock"
+    lock_known = True
     try:
         locked_operation = read_lock(root)
     except DraftError:
         issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, lock_path))
         locked_operation = None
+        lock_known = False
 
-    # 第一遍：稳定枚举全部操作目录，建立 id→journal 索引与 cleanup owner 集合。
+    # 一次扫描建立 operation 事实索引（round-13 M1）：journal 解析成功放 journals，
+    # 不可读/不可解析放 unresolved_ids；trash tree 只消费同一份索引，不再二次重读。
     # 锁存在时仍扫描全部操作目录与 trash tree（round-12 H3）：锁只影响诊断/上下文，
-    # 不得成为全局 early return。解析/分类失败的目录由第二遍报告损坏。
-    operations_children = _list_internal_directory(
+    # 不得成为全局 early return。解析/分类失败的目录由索引构建报告损坏。
+    listing = _list_internal_directory(
         root, operations, code=CheckCode.OPERATION_JOURNAL_CORRUPT, issues=issues
     )
-    index: dict[str, Journal] = {}
-    if operations_children is not None:
-        for entry in operations_children:
-            try:
-                kind = classify_node_or_error(
-                    entry, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value, code_path=entry
-                )
-            except DraftError:
-                continue  # 第二遍报告
-            if kind is not EntryKind.DIRECTORY:
-                continue  # 第二遍报告
-            try:
-                index[entry.name] = read_journal(operation_journal_path(root, entry.name))
-            except DraftError:
-                continue  # 第二遍报告
-    cleanup_owner_ids = _cleanup_owner_ids(index, locked_operation)
+    index = _build_operation_index(
+        root, listing, issues, locked_operation=locked_operation, lock_known=lock_known
+    )
+    cleanup_owner_ids = _cleanup_owner_ids(index.journals, index.locked_operation)
     active_ids: frozenset[str] = cleanup_owner_ids
     if locked_operation is not None:
         active_ids = active_ids | frozenset({locked_operation})
 
     if locked_operation is not None:
-        locked_journal = index.get(locked_operation)
+        locked_journal = index.journals.get(locked_operation)
         if locked_journal is None:
-            issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, lock_path))
+            if locked_operation not in index.unresolved_ids:
+                # 锁指向的操作目录是已知非法形状（普通文件/链接/无 journal 目录）；
+                # 不可读 journal 已在索引构建时按 journal 路径报告。
+                issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, lock_path))
         else:
             # 有锁操作目录仍校验内部条目形状（回归 H4）：持锁时完成清理前可能有
             # originals/staged/attempt/evidence；活动角色使用完整允许集，但未知条目
@@ -665,45 +841,17 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
                 _error(CheckCode.OPERATION_RECOVERY_REQUIRED, lock_path, None, locked_operation)
             )
 
-    if operations_children is None:
-        # operations 缺失/普通文件/不可读：缺失正常，其余已由 helper 报告。
-        _check_trash_tree(
-            root, issues, cleanup_owner_ids=cleanup_owner_ids, operations_children=None
-        )
-        return issues
-    for entry in operations_children:
-        relative = entry.relative_to(root)
-        try:
-            kind = classify_node_or_error(
-                entry, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value, code_path=entry
-            )
-        except DraftError as exc:
-            issues.append(
-                CheckIssue(code=exc.code, severity=IssueSeverity.ERROR, path=relative, line=None)
-            )
-            continue
-        if kind is EntryKind.SYMLINK:
-            # 链接条目必须报告，不能静默跳过（否则可能漏报反向关联或误判孤儿）。
-            issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, relative))
-            continue
-        if kind is not EntryKind.DIRECTORY:
-            # 非目录条目不是合法操作目录：不能静默跳过。
-            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
-            continue
-        if entry.name == locked_operation:
+    for operation_id, journal in sorted(index.journals.items()):
+        if operation_id == locked_operation:
             continue  # 锁目录已在上方检查一次，不重复报告。
-        journal = index.get(entry.name)
-        if journal is None:
-            # 目录无 journal、名称非法或日志损坏统一报 operation.journal_corrupt，
-            # 检查保持只报告、不抛异常。
-            issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, relative / "journal.json"))
-            continue
-        journal_path = operation_journal_path(root, entry.name)
+        journal_path = operation_journal_path(root, operation_id)
         relative = journal_path.relative_to(root)
         phase = journal.phase
         # 操作目录也按 phase/角色校验内部条目：终态残留/随机 pending/错误 evidence
         # 可见（回归 H4）；cleanup owner T 允许 evidence 并运行联合分类（round-12 H3）。
-        _check_operation_directory_entries(root, entry, journal, issues, active_ids=active_ids)
+        _check_operation_directory_entries(
+            root, operations / operation_id, journal, issues, active_ids=active_ids
+        )
         if phase is OperationPhase.ALLOCATING:
             issues.append(_review(CheckCode.OPERATION_ORPHAN_ALLOCATING, relative))
         elif phase in _MID_WRITE_PHASES:
@@ -724,9 +872,7 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
             issues.extend(_check_trash_retained(root, journal_path, journal, relative))
         elif phase is OperationPhase.TRASH_HANDOFF_PENDING:
             issues.extend(_check_trash_handoff_pending(root, journal_path, journal, relative))
-    _check_trash_tree(
-        root, issues, cleanup_owner_ids=cleanup_owner_ids, operations_children=operations_children
-    )
+    _check_trash_tree(root, issues, index=index)
     return issues
 
 
@@ -734,30 +880,29 @@ def _check_trash_tree(
     root: Path,
     issues: list[CheckIssue],
     *,
-    cleanup_owner_ids: frozenset[str] = frozenset(),
-    operations_children: tuple[Path, ...] | None = None,
+    index: OperationCheckIndex,
 ) -> None:
     """闭合 .draft/trash 树形协议（candidate 与 registered 共享）：
 
     ``.draft/trash/`` 只允许 ``outgoing/``，``outgoing/`` 只允许合法 operation_id
-    包目录；被持有日志引用或锁内 cleanup owner（round-12 H3：T=rolled_back 且被锁内
-    R 关联，清理中途包仍合法存在）的包内部损坏由 trash.package_corrupt 报告，其余
-    非法形状（未登记条目、非目录、非法包名、orphan）统一报 internal.unexpected_entry，
-    任意路径组件符号链接报 path.symlink_escape。全部枚举/分类走稳定边界（M2），
-    不可读子树报告一次稳定诊断后继续扫描独立子树。
+    包目录；包所有权由纯 ``package_ownership_decision`` 三值判定（round-13 M1）：
+    只有 ORPHAN 才报 internal.unexpected_entry，UNKNOWN 不新增码、保留导致未知的既有
+    operation/journal/lock 诊断。包自身的非法名字、节点类型和符号链接形状不依赖 owner
+    事实，必须继续报告。全部枚举/分类走稳定边界（M2），不可读子树报告一次稳定诊断后
+    继续扫描独立子树。
     """
     from draft.observations import EntryKind
     from draft.operations import classify_node_or_error, validate_operation_id
     from draft.trash_package import OUTGOING_RELATIVE
 
-    trash_children = _list_internal_directory(
+    trash_listing = _list_internal_directory(
         root,
         root / INTERNAL_DIR / "trash",
         code=CheckCode.INTERNAL_UNEXPECTED_ENTRY,
         issues=issues,
     )
-    if trash_children is not None:
-        for entry in trash_children:
+    if trash_listing.state is InternalDirectoryState.COMPLETE:
+        for entry in trash_listing.entries:
             if entry.name == "outgoing":
                 continue
             relative = entry.relative_to(root)
@@ -777,35 +922,12 @@ def _check_trash_tree(
             else:
                 issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
     outgoing = root / OUTGOING_RELATIVE
-    outgoing_children = _list_internal_directory(
+    outgoing_listing = _list_internal_directory(
         root, outgoing, code=CheckCode.INTERNAL_UNEXPECTED_ENTRY, issues=issues
     )
-    if outgoing_children is None:
+    if outgoing_listing.state is not InternalDirectoryState.COMPLETE:
         return
-    # 被持有日志引用或锁内 cleanup owner 的 operation_id；operations 由调用方枚举传入，
-    # 避免重复扫描与重复报告（M2：每个不可读子树只报告一次）。
-    held: set[str] = set()
-    if operations_children is not None:
-        for entry in operations_children:
-            try:
-                kind = classify_node_or_error(
-                    entry, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value, code_path=entry
-                )
-            except DraftError:
-                continue
-            if kind is not EntryKind.DIRECTORY:
-                continue
-            try:
-                journal = read_journal(operation_journal_path(root, entry.name))
-            except DraftError:
-                continue
-            if journal.kind is OperationKind.TRASH and journal.phase in (
-                OperationPhase.TRASH_RETAINED,
-                OperationPhase.TRASH_HANDOFF_PENDING,
-            ):
-                held.add(entry.name)
-    held.update(cleanup_owner_ids)
-    for package in outgoing_children:
+    for package in outgoing_listing.entries:
         relative = package.relative_to(root)
         try:
             kind = classify_node_or_error(
@@ -827,7 +949,7 @@ def _check_trash_tree(
         except DraftError:
             issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
             continue
-        if package.name not in held:
+        if package_ownership_decision(package.name, index) is PackageOwnership.ORPHAN:
             issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
 
 
@@ -967,12 +1089,12 @@ def _check_internal_namespace(resolved: Path) -> list[CheckIssue]:
     """
     issues: list[CheckIssue] = []
     internal = resolved / INTERNAL_DIR
-    internal_children = _list_internal_directory(
+    listing = _list_internal_directory(
         resolved, internal, code=CheckCode.INTERNAL_UNEXPECTED_ENTRY, issues=issues
     )
-    if internal_children is None:
+    if listing.state is not InternalDirectoryState.COMPLETE:
         return issues  # 缺失正常；普通文件/链接/不可读已由 helper 报告。
-    for entry in internal_children:
+    for entry in listing.entries:
         relative = entry.relative_to(resolved)
         if relative not in _ALLOWED_INTERNAL_ENTRIES:
             issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
