@@ -366,6 +366,21 @@ def _proven_unapplied_restore(root: Path, journal: Journal) -> bool:
     return True
 
 
+def restore_unapplied_fact(root: Path, journal: Journal) -> bool:
+    """仅限 R=ALLOCATING/PREPARED 的未应用证明边界；无法证明返回 False，不泄漏 OSError。
+
+    目标被目录化、读取失败（EACCES/EIO）等都属于"无法证明当前仍全部处于 before 态"，
+    在该布尔事实边界安全折叠为 False，由纯决策表得到 INCONSISTENT（保留 R/T、锁与
+    材料），不得把 IsADirectoryError/PermissionError 泄漏给调用方（round-12 M1）。
+    符号链接目标保持更精确的 ``path.symlink_escape``（稳定领域错误）。不要在纯决策
+    函数内读取文件：本 helper 是 I/O 事实采集与纯表之间的唯一转换点。
+    """
+    try:
+        return _proven_unapplied_restore(root, journal)
+    except OSError:
+        return False
+
+
 class RestoreLinkState(StrEnum):
     """R/T 关联状态（第十二轮 H1：区分 T 未认领与身份冲突）。
 
@@ -981,17 +996,22 @@ def restore_retained_trash(
 
 
 def _restore_recovery_action(root: Path, restore_id: str, trash_id: str) -> RestoreRecoveryAction:
-    """从磁盘重读 R/T 并取得唯一权威决策；任何调用方都不得建立第二套 phase 表。"""
+    """从磁盘重读 R/T 并取得唯一权威决策；任何调用方都不得建立第二套 phase 表。
+
+    未应用证明只在决策需要时（ALLOCATING/PREPARED）采集；其他 phase 不读取目标，
+    避免引入本不存在的失败路径并绕过通用恢复器（round-12 M1）。
+    """
     resolve_journal_pending(operation_journal_path(root, restore_id))
     restore_journal = read_journal(operation_journal_path(root, restore_id))
     trash_journal = validate_restore_link(root, restore_journal)
+    needs_proof = restore_journal.phase in (OperationPhase.ALLOCATING, OperationPhase.PREPARED)
     return restore_recovery_decision(
         restore_phase=restore_journal.phase,
         trash_phase=trash_journal.phase,
         # 业务调用点（restore_page）在 validate_restore_link 上已要求严格双向匹配：
         # 不匹配直接抛错，不进入决策，故此处关联必为 MATCHED。
         link_state=RestoreLinkState.MATCHED,
-        proven_unapplied=_proven_unapplied_restore(root, restore_journal),
+        proven_unapplied=restore_unapplied_fact(root, restore_journal) if needs_proof else False,
     )
 
 

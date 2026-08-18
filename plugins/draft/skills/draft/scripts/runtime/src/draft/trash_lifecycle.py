@@ -683,10 +683,17 @@ def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleRe
     """
     from draft.trash import (
         RestoreRecoveryAction,
-        _proven_unapplied_restore,  # pyright: ignore[reportPrivateUsage]
+        RestoreRecoveryFacts,
         load_restore_recovery_facts,
         restore_recovery_decision,
+        restore_unapplied_fact,
     )
+
+    def unapplied_proof(facts: RestoreRecoveryFacts) -> bool:
+        """按 R phase 门控未应用证明；其他 phase 固定 false，不读取目标（round-12 M1）。"""
+        if facts.restore.phase not in (OperationPhase.ALLOCATING, OperationPhase.PREPARED):
+            return False
+        return restore_unapplied_fact(root, facts.restore)
 
     # 恢复专用关联读取：接受 R→T 正确而 T claim 缺失的 ABANDON 耐久中间状态，不把
     # 程序自己写出的 TRASH_UNCLAIMED 拒绝为 plan_invalid（第十二轮 H1）。
@@ -695,7 +702,7 @@ def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleRe
         restore_phase=facts.restore.phase,
         trash_phase=facts.trash.phase,
         link_state=facts.link_state,
-        proven_unapplied=_proven_unapplied_restore(root, facts.restore),
+        proven_unapplied=unapplied_proof(facts),
     )
     if action in (
         RestoreRecoveryAction.RESUME_FORWARD,
@@ -711,7 +718,7 @@ def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleRe
             restore_phase=facts.restore.phase,
             trash_phase=facts.trash.phase,
             link_state=facts.link_state,
-            proven_unapplied=_proven_unapplied_restore(root, facts.restore),
+            proven_unapplied=unapplied_proof(facts),
         )
     if action in (
         RestoreRecoveryAction.RESUME_FORWARD,

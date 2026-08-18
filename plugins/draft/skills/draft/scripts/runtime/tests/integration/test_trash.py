@@ -988,7 +988,7 @@ def _apply_restore_mid_phase_crash(
     """建立 R 耐久停在中段 phase 的真实现场，返回 (root, restore_id, trash_id)。"""
     root = build_trashable_draft(draft_factory)
     pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
-    if phase is OperationPhase.ROLLING_BACK:
+    if phase in (OperationPhase.ROLLING_BACK, OperationPhase.ROLLED_BACK):
         _force_restore_rollback_validation(monkeypatch)
     crash_after_restore_phase(monkeypatch, phase)
     with pytest.raises(SimulatedProcessExit):
@@ -1379,6 +1379,159 @@ def test_abandon_unclaimed_finish_requires_terminal_target_proof(
     assert _journal_path(root, trash_id).read_bytes() == before_t
     assert (root / ".draft/operation.lock").exists()
     assert _read_journal(root, restore_id)["phase"] == "rolled_back"
+
+
+# ---------------------------------------------------------------------------
+# 第十二轮 M1：unapplied proof 只允许在决策需要时（ALLOCATING/PREPARED）采集。
+# 中段/终态相位不得读取恢复目标，否则会引入本不存在的失败路径并绕过通用恢复器。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        OperationPhase.APPLYING,
+        OperationPhase.VALIDATING,
+        OperationPhase.COMPLETED,
+        OperationPhase.ROLLING_BACK,
+        OperationPhase.ROLLED_BACK,
+    ],
+)
+def test_restore_non_allocating_phases_do_not_collect_unapplied_proof(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: OperationPhase,
+) -> None:
+    """非 allocating/prepared 相位不得采集 unapplied proof（spy 一旦被调用即失败）。
+
+    _proven_unapplied_restore 只对 ALLOCATING/PREPARED 有意义；其他相位读取目标会
+    引入本来不存在的失败路径并绕过通用恢复器（round-12 M1）。两个决策入口共享同一
+    _recover_locked_restore，故以公开入口恢复真实现场并断言收敛。
+    """
+    root, restore_id, trash_id = _apply_restore_mid_phase_crash(draft_factory, monkeypatch, phase)
+    import draft.trash as trash_module
+
+    def forbidden(*args: object, **kwargs: object) -> bool:
+        raise AssertionError(
+            f"unapplied proof collected for non-allocating/prepared phase {phase.value}"
+        )
+
+    monkeypatch.setattr(trash_module, "_proven_unapplied_restore", forbidden)
+
+    _recover_through_public_entry(root, "recover_draft")
+
+    from draft.operations import read_lock
+
+    assert read_lock(root) is None
+    if phase is OperationPhase.ROLLING_BACK or phase is OperationPhase.ROLLED_BACK:
+        assert _read_journal(root, restore_id)["phase"] == "rolled_back"
+        t = _read_journal(root, trash_id)
+        assert t["phase"] == "trash_retained"
+        assert "restore_operation_id" not in t["metadata"]
+    else:
+        assert _read_journal(root, restore_id)["phase"] == "completed"
+        assert _read_journal(root, trash_id)["phase"] == "rolled_back"
+
+
+def test_restore_prepared_collects_unapplied_proof_once(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R=PREPARED：决策恰好采集一次 unapplied proof 并收敛为放弃（M1 正例）。"""
+    root, restore_id, trash_id = _apply_restore_mid_phase_crash(
+        draft_factory, monkeypatch, OperationPhase.PREPARED
+    )
+    import draft.trash as trash_module
+
+    calls: list[object] = []
+
+    def spy(*args: object, **kwargs: object) -> bool:
+        calls.append(1)
+        return True
+
+    monkeypatch.setattr(trash_module, "_proven_unapplied_restore", spy)
+
+    _recover_through_public_entry(root, "recover_draft")
+
+    assert len(calls) == 1
+    from draft.operations import read_lock
+
+    assert read_lock(root) is None
+    assert _read_journal(root, restore_id)["phase"] == "rolled_back"
+    t = _read_journal(root, trash_id)
+    assert t["phase"] == "trash_retained"
+    assert "restore_operation_id" not in t["metadata"]
+
+
+@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
+def test_restore_applying_directory_target_stable_error(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_name: str,
+) -> None:
+    """R=applying 且目标被目录化：进入通用恢复器返回 external_change，不泄漏 OSError（M1）。
+
+    修复前 _proven_unapplied_restore 在进入通用恢复器之前对目录目标泄漏
+    IsADirectoryError；修复后该 phase 不采集 proof，目录目标由通用恢复器的 artifact
+    边界稳定判为 external_change，锁与 R/T 保留。
+    """
+    root, restore_id, trash_id = _apply_restore_mid_phase_crash(
+        draft_factory, monkeypatch, OperationPhase.APPLYING
+    )
+    (root / "pages/obsolete.md").mkdir(parents=True)
+    before_package = _package_snapshot(root, trash_id)
+
+    with pytest.raises(DraftError) as caught:
+        _recover_through_public_entry(root, entry_name)
+    assert caught.value.code == "operation.external_change"
+    assert (root / ".draft/operation.lock").exists()
+    assert _read_journal(root, restore_id)["phase"] == "applying"
+    assert _read_journal(root, trash_id)["phase"] == "trash_retained"
+    assert _package_snapshot(root, trash_id) == before_package
+
+
+@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
+def test_restore_applying_symlink_target_stable_error(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_name: str,
+) -> None:
+    """R=applying 且目标被替换为链接：稳定领域错误，不泄漏 OSError（M1）。"""
+    root, restore_id, trash_id = _apply_restore_mid_phase_crash(
+        draft_factory, monkeypatch, OperationPhase.APPLYING
+    )
+    (root / "pages/obsolete.md").symlink_to(root / "pages" / "other.md")
+    before_package = _package_snapshot(root, trash_id)
+
+    with pytest.raises(DraftError) as caught:
+        _recover_through_public_entry(root, entry_name)
+    assert caught.value.code in ("operation.external_change", "path.symlink_escape")
+    assert (root / ".draft/operation.lock").exists()
+    assert _read_journal(root, restore_id)["phase"] == "applying"
+    assert _package_snapshot(root, trash_id) == before_package
+
+
+def test_restore_prepared_unreadable_target_not_abandoned(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R=PREPARED 且目标不可读（目录化）：proof 无法证明，不得进入 ABANDON（M1）。
+
+    _proven_unapplied_restore 对不可读取目标安全返回"无法证明"，纯表得 INCONSISTENT，
+    保留 R/T、锁与材料；不泄漏 IsADirectoryError，也不因无法证明而猜成放弃。
+    """
+    root, restore_id, trash_id = _apply_restore_mid_phase_crash(
+        draft_factory, monkeypatch, OperationPhase.PREPARED
+    )
+    (root / "pages/obsolete.md").mkdir(parents=True)
+    before_lock = (root / ".draft/operation.lock").read_bytes()
+    before_package = _package_snapshot(root, trash_id)
+
+    with pytest.raises(DraftError) as caught:
+        recover_draft(root, now=NOW)
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    assert (root / ".draft/operation.lock").read_bytes() == before_lock
+    assert _read_journal(root, restore_id)["phase"] == "prepared"
+    assert _read_journal(root, trash_id)["phase"] == "trash_retained"
+    assert _package_snapshot(root, trash_id) == before_package
 
 
 def _craft_restore_pair_scene(
