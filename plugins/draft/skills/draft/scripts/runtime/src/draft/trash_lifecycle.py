@@ -684,6 +684,7 @@ def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleRe
     from draft.trash import (
         RestoreRecoveryAction,
         RestoreRecoveryFacts,
+        is_restore_preclaim_bootstrap,
         load_restore_recovery_facts,
         restore_recovery_decision,
         restore_unapplied_fact,
@@ -695,6 +696,10 @@ def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleRe
             return False
         return restore_unapplied_fact(root, facts.restore)
 
+    def bootstrap_fact(facts: RestoreRecoveryFacts) -> bool:
+        """严格前认领初始日志事实，从同一份 facts 计算，不额外重读文件（round-13 H1）。"""
+        return is_restore_preclaim_bootstrap(facts.restore, facts.trash.operation_id)
+
     # 恢复专用关联读取：接受 R→T 正确而 T claim 缺失的 ABANDON 耐久中间状态，不把
     # 程序自己写出的 TRASH_UNCLAIMED 拒绝为 plan_invalid（第十二轮 H1）。
     facts = load_restore_recovery_facts(root, restore_journal.operation_id)
@@ -702,6 +707,7 @@ def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleRe
         restore_phase=facts.restore.phase,
         trash_phase=facts.trash.phase,
         link_state=facts.link_state,
+        preclaim_bootstrap=bootstrap_fact(facts),
         proven_unapplied=unapplied_proof(facts),
     )
     if action in (
@@ -718,6 +724,7 @@ def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleRe
             restore_phase=facts.restore.phase,
             trash_phase=facts.trash.phase,
             link_state=facts.link_state,
+            preclaim_bootstrap=bootstrap_fact(facts),
             proven_unapplied=unapplied_proof(facts),
         )
     if action in (

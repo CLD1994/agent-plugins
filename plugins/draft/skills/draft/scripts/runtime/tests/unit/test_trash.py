@@ -1001,12 +1001,14 @@ def _restore_decision(
     trash_phase: OperationPhase,
     *,
     link_state: RestoreLinkState = RestoreLinkState.MATCHED,
+    preclaim_bootstrap: bool = False,
     proven_unapplied: bool = False,
 ) -> RestoreRecoveryAction:
     return restore_recovery_decision(
         restore_phase=restore_phase,
         trash_phase=trash_phase,
         link_state=link_state,
+        preclaim_bootstrap=preclaim_bootstrap,
         proven_unapplied=proven_unapplied,
     )
 
@@ -1153,6 +1155,7 @@ def test_restore_recovery_decision_valid_partitions(
             restore_phase=restore_phase,
             trash_phase=trash_phase,
             link_state=link_state,
+            preclaim_bootstrap=False,
             proven_unapplied=proven,
         )
         is expected
@@ -1268,3 +1271,194 @@ def test_restore_recovery_decision_proven_gates_abandon() -> None:
             )
             is RestoreRecoveryAction.ABANDON_UNAPPLIED
         ), str(triple)
+
+
+# ---------------------------------------------------------------------------
+# 第十三轮 H1：严格 pre-claim bootstrap 形状判定与决策表新增行。
+# 认领尚未发生（R=allocating、T unclaimed）与 ABANDON 已删除 claim（R=rolled_back、
+# T unclaimed）是同值 TRASH_UNCLAIMED 的两个不同恢复阶段，必须结合 R 形状区分。
+# ---------------------------------------------------------------------------
+
+
+def _restore_bootstrap_journal(*, change: str = "none") -> tuple[Journal, str]:
+    """构造最小合法 pre-claim bootstrap R，或每次只改变一个维度；不调用被测 predicate。
+
+    返回 (journal, trash_id)。``metadata`` 必须精确等于既定字段，helper 只负责按
+    change 构造输入，expected 由测试独立写出。
+    """
+    from draft.observations import EntryKind, Observation, ObservationManifest
+
+    trash_id = "b" * 32
+    journal = Journal(
+        operation_id="a" * 32,
+        kind=OperationKind.RESTORE,
+        phase=OperationPhase.ALLOCATING,
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
+        mutations=(),
+        remove_empty_directories=(),
+        metadata={"restores_trash_operation": trash_id},
+        directory=Path("/draft/.draft/operations") / ("a" * 32),
+    )
+    if change == "none":
+        return journal, trash_id
+    if change == "prepared":
+        return dataclasses.replace(journal, phase=OperationPhase.PREPARED), trash_id
+    if change == "observation":
+        manifest = ObservationManifest(
+            entries=(
+                Observation(
+                    path=Path("pages/obsolete.md"), kind=EntryKind.FILE, sha256="x"
+                ),
+            )
+        )
+        return dataclasses.replace(journal, observations=manifest), trash_id
+    if change == "mutation":
+        return (
+            dataclasses.replace(journal, mutations=(_auth_mutation(Path("pages/obsolete.md"),))),
+            trash_id,
+        )
+    if change == "remove_dir":
+        return dataclasses.replace(
+            journal, remove_empty_directories=(Path("pages/empty"),)
+        ), trash_id
+    if change == "missing_backref":
+        return dataclasses.replace(journal, metadata={}), trash_id
+    if change == "extra_metadata":
+        return (
+            dataclasses.replace(
+                journal, metadata={"restores_trash_operation": trash_id, "extra": "x"}
+            ),
+            trash_id,
+        )
+    if change == "different_trash":
+        return dataclasses.replace(
+            journal, metadata={"restores_trash_operation": "c" * 32}
+        ), trash_id
+    raise AssertionError(f"unknown change: {change}")
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        ("none", True),
+        ("prepared", False),
+        ("observation", False),
+        ("mutation", False),
+        ("remove_dir", False),
+        ("missing_backref", False),
+        ("extra_metadata", False),
+        ("different_trash", False),
+    ],
+)
+def test_restore_preclaim_bootstrap_shape(change: str, expected: bool) -> None:
+    """严格 bootstrap 每次只改变一个维度：任何偏离都必须是 False（round-13 H1）。"""
+    from draft.trash import is_restore_preclaim_bootstrap
+
+    restore, trash_id = _restore_bootstrap_journal(change=change)
+    assert is_restore_preclaim_bootstrap(restore, trash_id) is expected
+
+
+def test_restore_recovery_decision_preclaim_bootstrap_rows() -> None:
+    """决策表新增 preclaim_bootstrap 维度的合法/拒绝行（round-13 H1）。"""
+    cases = [
+        # 新合法行：R 仍是严格前认领初始日志。
+        (
+            OperationPhase.ALLOCATING,
+            OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.TRASH_UNCLAIMED,
+            True,
+            False,
+            RestoreRecoveryAction.ABANDON_UNCLAIMED_BOOTSTRAP,
+        ),
+        # 同 phase/link 但不再是 bootstrap，必须拒绝（不猜测）。
+        (
+            OperationPhase.ALLOCATING,
+            OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.TRASH_UNCLAIMED,
+            False,
+            True,
+            RestoreRecoveryAction.INCONSISTENT,
+        ),
+        # 既有放弃后半段不变。
+        (
+            OperationPhase.ROLLED_BACK,
+            OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.TRASH_UNCLAIMED,
+            False,
+            False,
+            RestoreRecoveryAction.FINISH_ABANDON_CLEANUP,
+        ),
+        # prepared/mid/completed unclaimed 均拒绝。
+        (
+            OperationPhase.PREPARED,
+            OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.TRASH_UNCLAIMED,
+            False,
+            True,
+            RestoreRecoveryAction.INCONSISTENT,
+        ),
+        (
+            OperationPhase.APPLYING,
+            OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.TRASH_UNCLAIMED,
+            False,
+            False,
+            RestoreRecoveryAction.INCONSISTENT,
+        ),
+        (
+            OperationPhase.COMPLETED,
+            OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.TRASH_UNCLAIMED,
+            False,
+            False,
+            RestoreRecoveryAction.INCONSISTENT,
+        ),
+    ]
+    for restore_phase, trash_phase, link_state, bootstrap, proven, expected in cases:
+        assert (
+            _restore_decision(
+                restore_phase,
+                trash_phase,
+                link_state=link_state,
+                preclaim_bootstrap=bootstrap,
+                proven_unapplied=proven,
+            )
+            is expected
+        ), f"{(restore_phase, trash_phase, link_state, bootstrap, proven)} 期望 {expected}"
+
+
+def test_restore_recovery_decision_preclaim_bootstrap_only_affects_one_row() -> None:
+    """新维度只改变 allocating × trash_retained × unclaimed 一行，其余全表不变。"""
+    for restore_phase in OperationPhase:
+        for trash_phase in OperationPhase:
+            for link_state in RestoreLinkState:
+                base = _restore_decision(
+                    restore_phase,
+                    trash_phase,
+                    link_state=link_state,
+                    preclaim_bootstrap=False,
+                    proven_unapplied=True,
+                )
+                with_bootstrap = _restore_decision(
+                    restore_phase,
+                    trash_phase,
+                    link_state=link_state,
+                    preclaim_bootstrap=True,
+                    proven_unapplied=True,
+                )
+                if (
+                    restore_phase,
+                    trash_phase,
+                    link_state,
+                ) == (
+                    OperationPhase.ALLOCATING,
+                    OperationPhase.TRASH_RETAINED,
+                    RestoreLinkState.TRASH_UNCLAIMED,
+                ):
+                    assert base is RestoreRecoveryAction.INCONSISTENT
+                    assert with_bootstrap is RestoreRecoveryAction.ABANDON_UNCLAIMED_BOOTSTRAP
+                else:
+                    assert with_bootstrap is base, (
+                        f"{(restore_phase, trash_phase, link_state)}"
+                    )

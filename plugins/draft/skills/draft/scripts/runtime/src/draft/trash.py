@@ -395,7 +395,8 @@ class RestoreLinkState(StrEnum):
 
 
 class RestoreRecoveryAction(StrEnum):
-    """R/T 双日志恢复决策结果（第十轮 H2，第十一轮 H1/M1 闭合，第十二轮 H1 扩展）。"""
+    """R/T 双日志恢复决策结果（第十轮 H2，第十一轮 H1/M1 闭合，第十二轮 H1，
+    第十三轮 H1 前认领 bootstrap 扩展）。"""
 
     VERIFY_AND_COMMIT_CLEANUP = "verify_and_commit_cleanup"
     RESUME_COMMITTED_CLEANUP = "resume_committed_cleanup"
@@ -403,7 +404,26 @@ class RestoreRecoveryAction(StrEnum):
     RESUME_ROLLBACK = "resume_rollback"
     ABANDON_UNAPPLIED = "abandon_unapplied"
     FINISH_ABANDON_CLEANUP = "finish_abandon_cleanup"
+    ABANDON_UNCLAIMED_BOOTSTRAP = "abandon_unclaimed_bootstrap"
     INCONSISTENT = "inconsistent"
+
+
+def is_restore_preclaim_bootstrap(restore: Journal, trash_id: str) -> bool:
+    """严格前认领初始日志判定（round-13 H1）：R 是否仍为尚未认领 T 时的初始形状。
+
+    只读取 ``Journal``，不访问文件系统。metadata 必须精确等于既定字段，不能只检查
+    "包含 backref"；observations/mutations/remove_empty_directories 必须为空——任何
+    规划产物都说明 restore 已越过认领前窗口。异常清理（``abandon_unlinked_restore``）
+    与公开恢复共用本 predicate，避免两处再次形成不同规则。
+    """
+    return (
+        restore.kind is OperationKind.RESTORE
+        and restore.phase is OperationPhase.ALLOCATING
+        and restore.observations.entries == ()
+        and restore.mutations == ()
+        and restore.remove_empty_directories == ()
+        and restore.metadata == {"restores_trash_operation": trash_id}
+    )
 
 
 def restore_recovery_decision(
@@ -411,23 +431,33 @@ def restore_recovery_decision(
     restore_phase: OperationPhase,
     trash_phase: OperationPhase,
     link_state: RestoreLinkState,
+    preclaim_bootstrap: bool,
     proven_unapplied: bool,
 ) -> RestoreRecoveryAction:
     """restore 双日志恢复决策（纯函数，唯一权威 R/T 决策来源）。
 
     完整分区见计划"行为契约一"：关联为 CONFLICT 一律 INCONSISTENT；TRASH_UNCLAIMED
-    只对 ``rolled_back × trash_retained`` 返回 FINISH_ABANDON_CLEANUP（ABANDON 后半段
-    幂等清理），其他 unclaimed 组合仍 INCONSISTENT。只有显式列出的合法 (R, T, link_state)
-    分区才返回对应动作。中段相位（applying/validating/rolling_back）不再是 INCONSISTENT，
-    而是交给公开 recovery 入口复用通用 mutation 恢复；RESUME_* 动作只能由显式恢复路径
-    执行，正常业务调用不得因 phase 可恢复而吞掉原错误。未列组合（如
-    R=rolled_back,T=rolled_back）一律 INCONSISTENT，不在后续 journal 写入时才暴露
+    只在两个分区返回非 INCONSISTENT：``rolled_back × trash_retained`` 返回
+    FINISH_ABANDON_CLEANUP（ABANDON 后半段幂等清理）；``allocating × trash_retained``
+    仅在 ``preclaim_bootstrap`` 为 true（严格前认领初始日志）时返回
+    ABANDON_UNCLAIMED_BOOTSTRAP，否则 INCONSISTENT——同值 unclaimed 在认领前与放弃后
+    是两个不同恢复阶段，必须结合 R 形状区分（round-13 H1）。只有显式列出的合法
+    (R, T, link_state) 分区才返回对应动作。中段相位（applying/validating/rolling_back）
+    不再是 INCONSISTENT，而是交给公开 recovery 入口复用通用 mutation 恢复；RESUME_*
+    动作只能由显式恢复路径执行，正常业务调用不得因 phase 可恢复而吞掉原错误。未列组合
+    （如 R=rolled_back,T=rolled_back）一律 INCONSISTENT，不在后续 journal 写入时才暴露
     （第十一轮 M1）。
     """
     if link_state is RestoreLinkState.CONFLICT:
         return RestoreRecoveryAction.INCONSISTENT
     pair = (restore_phase, trash_phase)
     if link_state is RestoreLinkState.TRASH_UNCLAIMED:
+        if pair == (OperationPhase.ALLOCATING, OperationPhase.TRASH_RETAINED):
+            return (
+                RestoreRecoveryAction.ABANDON_UNCLAIMED_BOOTSTRAP
+                if preclaim_bootstrap
+                else RestoreRecoveryAction.INCONSISTENT
+            )
         if pair == (OperationPhase.ROLLED_BACK, OperationPhase.TRASH_RETAINED):
             return RestoreRecoveryAction.FINISH_ABANDON_CLEANUP
         return RestoreRecoveryAction.INCONSISTENT
@@ -1011,6 +1041,7 @@ def _restore_recovery_action(root: Path, restore_id: str, trash_id: str) -> Rest
         # 业务调用点（restore_page）在 validate_restore_link 上已要求严格双向匹配：
         # 不匹配直接抛错，不进入决策，故此处关联必为 MATCHED。
         link_state=RestoreLinkState.MATCHED,
+        preclaim_bootstrap=is_restore_preclaim_bootstrap(restore_journal, trash_id),
         proven_unapplied=restore_unapplied_fact(root, restore_journal) if needs_proof else False,
     )
 
