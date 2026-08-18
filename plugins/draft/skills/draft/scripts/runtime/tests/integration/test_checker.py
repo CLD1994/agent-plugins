@@ -1704,7 +1704,12 @@ def test_checker_matches_cleanup_evidence_joint_protocol(
 def test_checker_evidence_stat_permission_error_is_stable(
     draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """evidence 节点 lstat PermissionError：check_draft 返回稳定诊断，不抛原始异常（M2）。"""
+    """evidence 身份读取（_name_node 的 os.stat）PermissionError：check_draft 稳定诊断（H4/M2）。
+
+    classify 用 os.lstat、身份捕获用 os.stat：deny os.stat 只命中身份捕获，证明
+    "classify 成功、身份 stat 失败"同样产生稳定 trash.package_corrupt，且 path 为根内
+    相对（L1），不泄漏原始异常、不改树。
+    """
     import os
 
     import draft.operations as ops_module
@@ -1731,7 +1736,13 @@ def test_checker_evidence_stat_permission_error_is_stable(
     monkeypatch.setattr(ops_module.os, "stat", deny_evidence_stat)
     before = snapshot_tree(root)
     report = check_draft(root)
-    assert any(issue.code == CheckCode.TRASH_PACKAGE_CORRUPT.value for issue in report.errors)
+    expected = Path(".draft/operations") / operation_dir.name / "cleanup-evidence.json"
+    hits = [issue for issue in report.errors if issue.code == CheckCode.TRASH_PACKAGE_CORRUPT.value]
+    assert hits
+    for issue in hits:
+        assert issue.path is not None
+        assert issue.path == expected
+        assert not issue.path.is_absolute()
     assert snapshot_tree(root) == before
 
 

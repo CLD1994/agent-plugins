@@ -964,7 +964,12 @@ def classify_cleanup_evidence_artifacts(
                 evidence_path,
             )
             kind = node.classify()
-            nodes[role] = _name_node(leaf.parent_fd, relative.name)
+            nodes[role] = _name_node(
+                leaf.parent_fd,
+                relative.name,
+                code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+                code_path=evidence_path,
+            )
             if kind is EntryKind.MISSING:
                 states[role] = EvidenceNodeState.MISSING
             elif kind is not EntryKind.FILE:
@@ -1008,9 +1013,14 @@ def _consume_cleanup_evidence_name(journal: Journal, relative: Path) -> None:
     ) as leaf:
         if not isinstance(leaf, _AnchoredLeaf):
             return  # 中间组件缺失：证据必然缺失，幂等。
-        verified = _name_node(leaf.parent_fd, leaf.name)
+        verified = _name_node(
+            leaf.parent_fd,
+            leaf.name,
+            code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+            code_path=code_path,
+        )
         if verified is None:
-            return
+            return  # ENOENT：名字确实不存在，幂等（H4：只允许缺失证明幂等）。
         if leaf.classify() is not EntryKind.FILE:
             raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
         data = _read_name_bytes(
@@ -1020,7 +1030,13 @@ def _consume_cleanup_evidence_name(journal: Journal, relative: Path) -> None:
             code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
         )
         parse_cleanup_evidence(data, journal, code_path)  # 重新验证后才消费。
-        if not _same_name_node(leaf.parent_fd, leaf.name, verified):
+        if not _same_name_node(
+            leaf.parent_fd,
+            leaf.name,
+            verified,
+            code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+            code_path=code_path,
+        ):
             raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
         try:
             os.unlink(leaf.name, dir_fd=leaf.parent_fd)
@@ -1061,7 +1077,12 @@ def _publish_cleanup_evidence_name(journal: Journal, source: str, *, code_path: 
             code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
         )
         parse_cleanup_evidence(data, journal, code_path)  # 发布前完整验证 T 授权。
-        verified = _name_node(final_leaf.parent_fd, source)
+        verified = _name_node(
+            final_leaf.parent_fd,
+            source,
+            code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+            code_path=code_path,
+        )
         try:
             os_module.link(
                 source,
@@ -1074,7 +1095,13 @@ def _publish_cleanup_evidence_name(journal: Journal, source: str, *, code_path: 
         except OSError as exc:
             raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
         _fsync_dir_fd(final_leaf.parent_fd, code_path)
-        if not _same_name_node(final_leaf.parent_fd, source, verified):
+        if not _same_name_node(
+            final_leaf.parent_fd,
+            source,
+            verified,
+            code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+            code_path=code_path,
+        ):
             raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
         try:
             os_module.unlink(source, dir_fd=final_leaf.parent_fd)

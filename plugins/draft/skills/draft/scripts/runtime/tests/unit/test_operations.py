@@ -2024,3 +2024,61 @@ def test_quarantine_decision_matrix() -> None:
         )
         == "ignore"
     )
+
+
+def test_name_node_distinguishes_missing_from_stat_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_name_node 只对 ENOENT 返回 None；其他 OSError 按 code/path 抛 DraftError（H4）。
+
+    幂等缺失只允许由 FileNotFoundError 证明；EACCES/EIO 表示"无法读取节点身份"，
+    必须阻止成功、清理与解锁，不得折叠成 missing。抛出的 DraftError 保留 __cause__。
+    """
+    import os
+
+    import draft.operations as ops_module
+    from draft.operations import _name_node  # pyright: ignore[reportPrivateUsage]
+
+    code_path = Path("/draft/.draft/operations/x/cleanup-evidence.json")
+    state = {"kind": "exists"}
+    real_stat = ops_module.os.stat
+
+    def fake_stat(
+        name: str, *, dir_fd: int | None = None, follow_symlinks: bool = True
+    ) -> os.stat_result:
+        # _name_node 始终传 dir_fd；pathlib/linecache 等无 dir_fd 调用委托真实 stat，
+        # 避免 mock 全局 os.stat 破坏无关运行时。
+        if dir_fd is None:
+            return real_stat(name, follow_symlinks=follow_symlinks)
+        kind = state["kind"]
+        if kind == "missing":
+            raise FileNotFoundError(2, "No such file")
+        if kind == "denied":
+            raise PermissionError(13, "Permission denied")
+        if kind == "eio":
+            raise OSError(5, "Input/output error")
+        return os.stat_result((0o100644, 0, 7, 1, 1000, 1000, 0, 0, 0, 0))
+
+    monkeypatch.setattr(ops_module.os, "stat", fake_stat)
+
+    state["kind"] = "missing"
+    assert (
+        _name_node(3, "cleanup-evidence.json", code="trash.package_corrupt", code_path=code_path)
+        is None
+    )
+    for kind in ("denied", "eio"):
+        state["kind"] = kind
+        with pytest.raises(DraftError) as caught:
+            _name_node(
+                3,
+                "cleanup-evidence.json",
+                code="trash.package_corrupt",
+                code_path=code_path,
+            )
+        assert caught.value.code == "trash.package_corrupt"
+        assert caught.value.paths == (code_path,)
+        assert isinstance(caught.value.__cause__, OSError)
+    state["kind"] = "exists"
+    assert _name_node(
+        3, "cleanup-evidence.json", code="trash.package_corrupt", code_path=code_path
+    ) == (0, 7)

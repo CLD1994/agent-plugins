@@ -331,7 +331,11 @@ def _publish_pending(
         # 绝不删除未知节点。
         _fsync_dir_fd(parent_fd, code_path)
         if _read_name_bytes(parent_fd, name, code_path=code_path) != content or not _same_name_node(
-            parent_fd, pending, _name_node(parent_fd, name)
+            parent_fd,
+            pending,
+            _name_node(parent_fd, name, code="operation.external_change", code_path=code_path),
+            code="operation.external_change",
+            code_path=code_path,
         ):
             raise DraftError("operation.external_change", code_path)
         try:
@@ -504,7 +508,13 @@ def recover_digest_pending(
             except DraftError:
                 raise
             if sha256_bytes(published) != expected_digest or not _same_name_node(
-                parent_fd, pending_name, _name_node(parent_fd, target.name)
+                parent_fd,
+                pending_name,
+                _name_node(
+                    parent_fd, target.name, code="operation.external_change", code_path=code_path
+                ),
+                code="operation.external_change",
+                code_path=code_path,
             ):
                 raise DraftError("operation.external_change", code_path)
             try:
@@ -606,7 +616,13 @@ def recover_quarantine(
             except DraftError:
                 raise
             if sha256_bytes(restored) != expected_digest or not _same_name_node(
-                parent_fd, quarantine.name, _name_node(parent_fd, target.name)
+                parent_fd,
+                quarantine.name,
+                _name_node(
+                    parent_fd, target.name, code="operation.external_change", code_path=code_path
+                ),
+                code="operation.external_change",
+                code_path=code_path,
             ):
                 raise DraftError("operation.external_change", code_path)
             try:
@@ -676,22 +692,46 @@ def classify_node_or_error(path: Path, *, code: str, code_path: Path) -> EntryKi
         raise error from exc
 
 
-def _name_node(parent_fd: int, name: str) -> tuple[int, int] | None:
-    """no-follow stat 返回 (st_ino, st_dev)；缺失/失败返回 None。"""
+def _name_node(
+    parent_fd: int,
+    name: str,
+    *,
+    code: str,
+    code_path: Path,
+) -> tuple[int, int] | None:
+    """no-follow stat 返回 (st_ino, st_dev)；仅 ENOENT（名字确实不存在）返回 None。
+
+    其他 OSError（EACCES/EIO 等）按调用者拥有的 code/path 转 DraftError（round-12
+    H4）：ENOENT 与"无法读取节点身份"是会导致不同行为的现实状态，不能共用 None——
+    幂等缺失只允许由 FileNotFoundError 证明，其他 I/O 失败必须阻止成功、清理与解锁。
+    """
     try:
         st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise DraftError(code, code_path) from exc
     return (st.st_ino, st.st_dev)
 
 
-def _same_name_node(parent_fd: int, name: str, node: tuple[int, int] | None) -> bool:
+def _same_name_node(
+    parent_fd: int,
+    name: str,
+    node: tuple[int, int] | None,
+    *,
+    code: str,
+    code_path: Path,
+) -> bool:
     """name 当前是否仍指向 node（删除前 inode 复核，回归 H3）。
 
     命名动作之间名字被外部替换时，绝不能按名字删除未知节点：只有名字仍指向
-    我们验证过的同一 inode 才允许消费。
+    我们验证过的同一 inode 才允许消费。身份读取失败（EACCES/EIO）让 DraftError
+    传播，不得把读取失败返回 false 后在调用者处当作幂等完成（round-12 H4）；
+    node 为 None（名字本就不存在）时返回 False。
     """
-    return node is not None and _name_node(parent_fd, name) == node
+    if node is None:
+        return False
+    return _name_node(parent_fd, name, code=code, code_path=code_path) == node
 
 
 def _read_name_bytes(
@@ -823,8 +863,16 @@ class _AnchoredLeaf:
         # 2. quarantine 名字耐久后，才允许删除原名。
         _fsync_dir_fd(self.parent_fd, self.code_path)
         # 3. inode 复核：原名仍指向刚隔离的同一节点。
-        snapshot = _name_node(self.parent_fd, quarantine)
-        if not _same_name_node(self.parent_fd, self.name, snapshot):
+        snapshot = _name_node(
+            self.parent_fd, quarantine, code="operation.external_change", code_path=self.code_path
+        )
+        if not _same_name_node(
+            self.parent_fd,
+            self.name,
+            snapshot,
+            code="operation.external_change",
+            code_path=self.code_path,
+        ):
             raise DraftError("operation.external_change", self.code_path)
         # 4. 删除原名。
         try:
@@ -833,7 +881,9 @@ class _AnchoredLeaf:
             raise self._io_error(exc) from exc
         _fsync_dir_fd(self.parent_fd, self.code_path)
         # 5. 验证隔离节点：先捕获 inode，再分类与读内容验摘要。
-        verified_node = _name_node(self.parent_fd, quarantine)
+        verified_node = _name_node(
+            self.parent_fd, quarantine, code="operation.external_change", code_path=self.code_path
+        )
         quarantined = _AnchoredLeaf(
             self.parent_fd, quarantine, self.display, self.code, self.code_path
         )
@@ -845,7 +895,13 @@ class _AnchoredLeaf:
             self._restore_quarantined(quarantine)
             raise DraftError("operation.external_change", self.code_path)
         # 6. 消费前 inode 复核：quarantine 名仍指向刚验证的同一节点。
-        if not _same_name_node(self.parent_fd, quarantine, verified_node):
+        if not _same_name_node(
+            self.parent_fd,
+            quarantine,
+            verified_node,
+            code="operation.external_change",
+            code_path=self.code_path,
+        ):
             raise DraftError("operation.external_change", self.code_path)
         # 7. 消费（删除）quarantine。
         try:
@@ -1915,7 +1971,15 @@ def _quarantine_before_then_publish(
     except OSError as exc:
         raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
     _fsync_dir_fd(leaf.parent_fd, code_path)
-    if not _same_name_node(leaf.parent_fd, leaf.name, _name_node(leaf.parent_fd, quarantine)):
+    if not _same_name_node(
+        leaf.parent_fd,
+        leaf.name,
+        _name_node(
+            leaf.parent_fd, quarantine, code="operation.external_change", code_path=code_path
+        ),
+        code="operation.external_change",
+        code_path=code_path,
+    ):
         # 原名已被替换：不触碰未知节点，no-clobber 恢复隔离名并报告外部变化。
         try:
             os.link(
@@ -1939,12 +2003,20 @@ def _quarantine_before_then_publish(
     leaf.write(content)
     # 消费陈旧 before 隔离名：inode + 内容复核后删除。
     quarantined = _AnchoredLeaf(leaf.parent_fd, quarantine, leaf.display, leaf.code, leaf.code_path)
-    verified = _name_node(leaf.parent_fd, quarantine)
+    verified = _name_node(
+        leaf.parent_fd, quarantine, code="operation.external_change", code_path=code_path
+    )
     qk = quarantined.classify()
     qd = sha256_bytes(quarantined.read()) if qk is EntryKind.FILE else None
     if qk is not EntryKind.FILE or qd != expected_digest:
         raise DraftError("operation.external_change", code_path)
-    if not _same_name_node(leaf.parent_fd, quarantine, verified):
+    if not _same_name_node(
+        leaf.parent_fd,
+        quarantine,
+        verified,
+        code="operation.external_change",
+        code_path=code_path,
+    ):
         raise DraftError("operation.external_change", code_path)
     try:
         os.unlink(quarantine, dir_fd=leaf.parent_fd)
@@ -3473,13 +3545,24 @@ def _consume_named_artifact(
         artifact = _AnchoredLeaf(
             target.parent_fd, name, relative, "operation.external_change", code_path
         )
-        verified = _name_node(target.parent_fd, artifact.name)
+        verified = _name_node(
+            target.parent_fd,
+            artifact.name,
+            code="operation.external_change",
+            code_path=code_path,
+        )
         if verified is None:
-            return  # 已不存在：幂等。
+            return  # ENOENT：名字确实不存在，幂等（H4：只允许缺失证明幂等）。
         kind = artifact.classify()
         if kind is not EntryKind.FILE or sha256_bytes(artifact.read()) != expected_digest:
             raise DraftError("operation.external_change", code_path)
-        if not _same_name_node(target.parent_fd, artifact.name, verified):
+        if not _same_name_node(
+            target.parent_fd,
+            artifact.name,
+            verified,
+            code="operation.external_change",
+            code_path=code_path,
+        ):
             raise DraftError("operation.external_change", code_path)
         try:
             os.unlink(artifact.name, dir_fd=target.parent_fd)
@@ -3530,7 +3613,13 @@ def _publish_pending_to_target(
         if sha256_bytes(
             _read_name_bytes(target.parent_fd, target.name, code_path=code_path)
         ) != expected_digest or not _same_name_node(
-            target.parent_fd, pending.name, _name_node(target.parent_fd, target.name)
+            target.parent_fd,
+            pending.name,
+            _name_node(
+                target.parent_fd, target.name, code="operation.external_change", code_path=code_path
+            ),
+            code="operation.external_change",
+            code_path=code_path,
         ):
             raise DraftError("operation.external_change", code_path)
         try:

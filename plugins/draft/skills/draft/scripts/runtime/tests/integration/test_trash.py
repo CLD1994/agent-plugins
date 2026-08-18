@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1532,6 +1533,120 @@ def test_restore_prepared_unreadable_target_not_abandoned(
     assert _read_journal(root, restore_id)["phase"] == "prepared"
     assert _read_journal(root, trash_id)["phase"] == "trash_retained"
     assert _package_snapshot(root, trash_id) == before_package
+
+
+# ---------------------------------------------------------------------------
+# 第十二轮 H4：inode 身份读取失败不能折叠成幂等缺失，避免错误成功。
+# ---------------------------------------------------------------------------
+
+
+def _committed_cleanup_scene(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, str, str]:
+    """真实 restore 已提交清理现场：evidence 已发布、包叶未删、锁属 R。
+
+    返回 (root, restore_id, trash_id)：R=completed、T=rolled_back、T 目录含
+    cleanup-evidence.json、权威包完整保留。evidence 由真实 producer 耐久写出。
+    """
+    import draft.trash_package as tp_module
+    from draft.trash_package import PackageAuthorization
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    real_write_evidence = tp_module._write_cleanup_evidence  # pyright: ignore[reportPrivateUsage]
+    fired = False
+
+    def write_then_crash(
+        journal: Journal,
+        auth: PackageAuthorization,
+        leaves_bytes: dict[Path, bytes],
+    ) -> None:
+        nonlocal fired
+        real_write_evidence(journal, auth, leaves_bytes)
+        if not fired:
+            fired = True
+            raise SimulatedProcessExit
+
+    monkeypatch.setattr(tp_module, "_write_cleanup_evidence", write_then_crash)
+    with pytest.raises(SimulatedProcessExit):
+        restore_retained_trash(root, pending.operation_id, now=NOW)
+    monkeypatch.undo()
+
+    trash_id = pending.operation_id
+    restore_id = _read_journal(root, trash_id)["metadata"]["restore_operation_id"]
+    assert _read_journal(root, trash_id)["phase"] == "rolled_back"
+    assert (root / ".draft/operation.lock").exists()
+    return root, restore_id, trash_id
+
+
+def _inject_evidence_consume_stat_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """只在 evidence 消费前身份捕获（_name_node 的 os.stat）注入 PermissionError。
+
+    classify 用 os.lstat、_name_node 用 os.stat，因此 deny os.stat 只命中身份捕获，
+    不干扰证据分类（H4：只测身份读取失败，不是分类失败）。
+    """
+    import draft.operations as ops_module
+    import draft.trash_package as tp_module
+
+    real_consume = tp_module._consume_cleanup_evidence_name  # pyright: ignore[reportPrivateUsage]
+    state = {"in_consume": False}
+
+    def enter_consume(journal: Journal, relative: Path) -> None:
+        state["in_consume"] = True
+        real_consume(journal, relative)
+
+    monkeypatch.setattr(tp_module, "_consume_cleanup_evidence_name", enter_consume)
+    real_stat = ops_module.os.stat
+
+    def deny_evidence_identity_stat(
+        name: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        if state["in_consume"] and dir_fd is not None:
+            fspath = ops_module.os.fspath(name)
+            text = fspath if isinstance(fspath, str) else fspath.decode(errors="surrogateescape")
+            if "cleanup-evidence.json" in text:
+                raise PermissionError(13, "Permission denied")
+        return real_stat(name, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(ops_module.os, "stat", deny_evidence_identity_stat)
+
+
+def test_evidence_consume_identity_stat_failure_preserves_scene(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """evidence 消费前身份复核 EACCES：recover 报 trash.package_corrupt，不错误完成（H4）。
+
+    修复前 _name_node 把 EACCES 折叠为 None，消费点当作"evidence 已消失、幂等"，
+    recover_draft 返回 completed 并释放锁，但 evidence 仍残留（错误成功）。修复后身份
+    读取失败按 evidence code/path 抛稳定错误，锁与包/材料保留；移除故障后收敛。
+    """
+    from draft.operations import read_lock
+
+    root, restore_id, trash_id = _committed_cleanup_scene(draft_factory, monkeypatch)
+    t_dir = root / ".draft/operations" / trash_id
+    before_t = _journal_path(root, trash_id).read_bytes()
+    _inject_evidence_consume_stat_failure(monkeypatch)
+
+    # 注入点位于 evidence 消费前：此刻授权包叶已按清理流程合法删除，失败不得再错误
+    # 完成/解锁；evidence 与锁必须保留，T journal 字节不变。
+    with pytest.raises(DraftError) as caught:
+        recover_draft(root, now=NOW)
+    assert caught.value.code == "trash.package_corrupt"
+    assert read_lock(root) == restore_id  # 锁仍属 R，未错误完成/解锁。
+    assert _journal_path(root, trash_id).read_bytes() == before_t
+    assert (t_dir / "cleanup-evidence.json").exists()
+
+    # 移除故障后再次 recover 收敛：包叶删除、evidence 消费、锁释放。
+    monkeypatch.undo()
+    recover_draft(root, now=NOW)
+    assert read_lock(root) is None
+    assert not (t_dir / "cleanup-evidence.json").exists()
+    assert _read_journal(root, restore_id)["phase"] == "completed"
 
 
 def _craft_restore_pair_scene(

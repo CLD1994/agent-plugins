@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -2839,3 +2840,78 @@ def test_apply_write_overwrite_preserves_unknown_quarantined_node(
 
     assert target_path.read_bytes() == b"attacker replaced name"  # 未知节点保留。
     assert (root / "pages/a.md.quarantine").read_bytes() == original  # 隔离的原始节点保留。
+
+
+def test_recover_artifact_identity_stat_failure_preserves_scene(
+    operation_draft: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_consume_named_artifact 首次身份捕获 EACCES：recover 报 external_change（H4）。
+
+    修复前 EACCES 折叠为 None，消费点当作"artifact 已不存在、幂等"，恢复可能错误完成
+    并遗留未知 artifact；修复后身份读取失败按操作边界抛 external_change，锁与 artifact
+    保留；移除故障后前向收敛。
+    """
+    import draft.operations as ops_module
+    from draft.operations import acquire_lock, read_lock
+
+    root = operation_draft
+    old_a = (root / "pages/a.md").read_bytes()
+    new_a = old_a + b"\nforward-a\n"
+    op_id = "d" * 32
+    _write_prepared_rewrite_journal(root, op_id, before=old_a, after=new_a)
+    acquire_lock(root, op_id)
+    (root / "pages/a.md").unlink()
+    (root / "pages/a.md.quarantine").write_bytes(old_a)
+    (root / "pages/a.md.pending").write_bytes(new_a)
+
+    real_consume = ops_module._consume_named_artifact  # pyright: ignore[reportPrivateUsage]
+    state = {"in_consume": False}
+
+    def enter_consume(
+        root_path: Path,
+        relative: Path,
+        *,
+        name: str,
+        expected_digest: str,
+        code_path: Path,
+    ) -> None:
+        state["in_consume"] = True
+        real_consume(
+            root_path,
+            relative,
+            name=name,
+            expected_digest=expected_digest,
+            code_path=code_path,
+        )
+
+    monkeypatch.setattr(ops_module, "_consume_named_artifact", enter_consume)
+    real_stat = ops_module.os.stat
+
+    def deny_artifact_identity_stat(
+        name: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        if state["in_consume"] and dir_fd is not None:
+            fspath = ops_module.os.fspath(name)
+            text = fspath if isinstance(fspath, str) else fspath.decode(errors="surrogateescape")
+            if text.endswith((".pending", ".quarantine")):
+                raise PermissionError(13, "Permission denied")
+        return real_stat(name, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(ops_module.os, "stat", deny_artifact_identity_stat)
+
+    with pytest.raises(DraftError) as caught:
+        ops_module.recover(root)
+    assert caught.value.code == "operation.external_change"
+    assert read_lock(root) == op_id  # 锁保留，未错误完成/解锁。
+    assert (root / "pages/a.md.quarantine").exists()  # 未知节点不被删除。
+
+    # 移除故障后再次 recover 前向收敛。
+    monkeypatch.undo()
+    result = ops_module.recover(root)
+    assert result.phase == OperationPhase.COMPLETED
+    assert read_lock(root) is None
+    assert not (root / "pages/a.md.quarantine").exists()
