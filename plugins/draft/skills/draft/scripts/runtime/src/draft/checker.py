@@ -514,6 +514,20 @@ class PackageOwnership(StrEnum):
     UNKNOWN = "unknown"
 
 
+class OperationDirectoryRole(StrEnum):
+    """终态 operation 目录的三值角色（round-14 M1）。
+
+    - ACTIVE：锁持有者，或由锁与 R/T 双向关系完整证明的 cleanup owner；
+    - INACTIVE：完整事实证明与当前锁及 cleanup 关系无关的终态 operation；
+    - UNKNOWN：lock 不可读或必要 R/journal 事实缺失，无法证明其角色。UNKNOWN 不是
+      INACTIVE，不得用空集合或 None 表示；也不得成为关闭全部目录检查的全局开关。
+    """
+
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    UNKNOWN = "unknown"
+
+
 def package_ownership_decision(package_id: str, index: OperationCheckIndex) -> PackageOwnership:
     """trash 包所有权纯三值判定（round-13 M1）。
 
@@ -565,6 +579,46 @@ def package_ownership_decision(package_id: str, index: OperationCheckIndex) -> P
     ):
         return PackageOwnership.HELD
     return PackageOwnership.ORPHAN
+
+
+def operation_directory_role(
+    operation_id: str,
+    index: OperationCheckIndex,
+) -> OperationDirectoryRole:
+    """终态 operation 目录角色纯三值判定（round-14 M1）。
+
+    对已经成功解析的终态 journal 从同一 ``OperationCheckIndex`` 判定：lock 不可读 ->
+    UNKNOWN；锁可读但无锁 -> INACTIVE；锁持有者自身与完整证明的 cleanup owner T ->
+    ACTIVE；T claim 指向的 R 不可读 -> UNKNOWN；其余完整证明与锁无关 -> INACTIVE。
+    非终态 journal 由 phase 自身协议决定允许条目，不由本表放宽。缺 journal 返回
+    UNKNOWN 是防御性总函数语义，调用方只对已解析 journal 使用，不据此扫描或写文件。
+    """
+    journal = index.journals.get(operation_id)
+    if journal is None:
+        return OperationDirectoryRole.UNKNOWN
+    if not index.lock_known:
+        return OperationDirectoryRole.UNKNOWN
+    locked = index.locked_operation
+    if locked is None:
+        return OperationDirectoryRole.INACTIVE
+    if locked == operation_id:
+        return OperationDirectoryRole.ACTIVE
+    if (
+        journal.kind is OperationKind.TRASH
+        and journal.phase is OperationPhase.ROLLED_BACK
+        and journal.metadata.get("restore_operation_id") == locked
+    ):
+        if locked in index.unresolved_ids:
+            return OperationDirectoryRole.UNKNOWN
+        restore = index.journals.get(locked)
+        if (
+            restore is not None
+            and restore.kind is OperationKind.RESTORE
+            and restore.phase is OperationPhase.COMPLETED
+            and restore.metadata.get("restores_trash_operation") == operation_id
+        ):
+            return OperationDirectoryRole.ACTIVE
+    return OperationDirectoryRole.INACTIVE
 
 
 def _list_internal_directory(

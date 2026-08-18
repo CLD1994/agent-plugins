@@ -6,8 +6,10 @@ from pathlib import Path
 from draft.checker import (
     InternalDirectoryState,
     OperationCheckIndex,
+    OperationDirectoryRole,
     PackageOwnership,
     check_graph,
+    operation_directory_role,
     package_ownership_decision,
 )
 from draft.diagnostic_codes import CheckCode, ReplacementStatusReason
@@ -686,4 +688,77 @@ def test_package_ownership_decision_matrix() -> None:
     ]
     for label, index, expected in cases:
         actual = package_ownership_decision(trash_id, index)
+        assert actual is expected, f"{label}: 期望 {expected}, 实际 {actual}"
+
+
+# ---------------------------------------------------------------------------
+# 第十四轮 M1：operation 目录角色三值决策（ACTIVE / INACTIVE / UNKNOWN）。
+# 期望矩阵从状态分类独立推导，不得由生产函数反向生成；每个 index 显式给出
+# lock_known、locked_operation、journals 与 unresolved_ids。
+# ---------------------------------------------------------------------------
+
+
+def test_operation_directory_role_decision_matrix() -> None:
+    """终态 operation 目录角色：ACTIVE/INACTIVE/UNKNOWN 分区完整（round-14 M1）。"""
+    trash_id = "a" * 32
+    restore_id = "b" * 32
+    other_id = "c" * 32
+    completed_restore = _op_journal(
+        restore_id,
+        kind=OperationKind.RESTORE,
+        phase=OperationPhase.COMPLETED,
+        metadata={"restores_trash_operation": trash_id},
+    )
+    rolled_back_trash = _op_journal(
+        trash_id,
+        kind=OperationKind.TRASH,
+        phase=OperationPhase.ROLLED_BACK,
+        metadata={"restore_operation_id": restore_id},
+    )
+    other_completed = _op_journal(
+        other_id,
+        kind=OperationKind.CREATE,
+        phase=OperationPhase.COMPLETED,
+    )
+    # lock 不可读：任何终态 operation 都可能是锁持有者或 cleanup owner。
+    lock_unknown = _ownership_index(
+        journals={trash_id: rolled_back_trash, restore_id: completed_restore},
+        lock_known=False,
+    )
+    # 锁可读但明确无锁：任意终态 operation 都不是锁内角色。
+    known_no_lock = _ownership_index(
+        journals={restore_id: completed_restore},
+        locked_operation=None,
+        lock_known=True,
+    )
+    # 锁属于 R，且 T→R、R=completed restore、R→T 完整：cleanup owner 证明成立。
+    complete_matched_pair = _ownership_index(
+        journals={trash_id: rolled_back_trash, restore_id: completed_restore},
+        locked_operation=restore_id,
+        lock_known=True,
+    )
+    # 锁指向 R，但 R journal 不可读：T 是否 cleanup owner 未知。
+    locked_r_unresolved = _ownership_index(
+        journals={trash_id: rolled_back_trash},
+        unresolved_ids=(restore_id,),
+        locked_operation=restore_id,
+        lock_known=True,
+    )
+    # 锁持有者 R 自身是 ACTIVE；无关终态 operation 是 INACTIVE。
+    lock_is_restore = _ownership_index(
+        journals={restore_id: completed_restore, other_id: other_completed},
+        locked_operation=restore_id,
+        lock_known=True,
+    )
+    cases: list[tuple[str, str, OperationCheckIndex, OperationDirectoryRole]] = [
+        ("lock_unknown_completed_r", restore_id, lock_unknown, OperationDirectoryRole.UNKNOWN),
+        ("lock_unknown_rolled_back_t", trash_id, lock_unknown, OperationDirectoryRole.UNKNOWN),
+        ("known_no_lock_terminal", restore_id, known_no_lock, OperationDirectoryRole.INACTIVE),
+        ("locked_operation_itself", restore_id, lock_is_restore, OperationDirectoryRole.ACTIVE),
+        ("matched_cleanup_t", trash_id, complete_matched_pair, OperationDirectoryRole.ACTIVE),
+        ("claimed_r_unresolved", trash_id, locked_r_unresolved, OperationDirectoryRole.UNKNOWN),
+        ("known_unrelated_terminal", other_id, lock_is_restore, OperationDirectoryRole.INACTIVE),
+    ]
+    for label, operation_id, index, expected in cases:
+        actual = operation_directory_role(operation_id, index)
         assert actual is expected, f"{label}: 期望 {expected}, 实际 {actual}"
