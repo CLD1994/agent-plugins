@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from draft.graph import (
     MarkerState,
     is_external_destination,
     parse_marker_value,
+    read_marker,
     resolve_local_destination,
 )
 from draft.models import RootState
@@ -261,3 +263,38 @@ def test_resolve_local_destination_rejects_self_escape_via_dotdot() -> None:
 def test_resolve_local_destination_normalizes_internal_dotdot() -> None:
     target, _ = resolve_local_destination(Path("pages/sub/a.md"), "../b.md", Path("/unused"))
     assert target == Path("pages/b.md")
+
+
+# ---------------------------------------------------------------------------
+# 第十四轮 M2：marker 身份读取的稳定分类边界。单元测试不得访问真实文件系统：
+# 假 root Path("/draft")，按 marker 精确路径 monkeypatch Path.lstat 这个稳定
+# 协作者边界；EACCES/EIO 一律映射 format.invalid，不泄漏原始 OSError。
+# missing/directory/symlink/非 UTF-8/非法 JSON/unsupported 由既有 integration/
+# parser 测试覆盖。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("error", ["eacces", "eio"])
+def test_read_marker_identity_stat_failure_is_stable(
+    monkeypatch: pytest.MonkeyPatch,
+    error: str,
+) -> None:
+    """marker 身份读取 EACCES/EIO：read_marker 抛 format.invalid（round-14 M2）。
+
+    修复前 ``_read_marker_file`` 的 ``Path.is_symlink()`` 不吞 OSError，EACCES/EIO
+    会原样泄漏（红灯）；修复后一次受保护 ``os.lstat`` 分类映射稳定码。
+    """
+    root = Path("/draft")
+    marker = root / ".draft/draft.json"
+
+    def fail_lstat(path: str | bytes | os.PathLike[str], *args: object) -> os.stat_result:
+        assert os.fspath(path) == os.fspath(marker)
+        if error == "eacces":
+            raise PermissionError(13, "Permission denied")
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(os, "lstat", fail_lstat)
+    with pytest.raises(DraftError) as caught:
+        read_marker(root)
+    assert caught.value.code == CheckCode.FORMAT_INVALID.value
+    assert caught.value.paths == (marker,)

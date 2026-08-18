@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -139,11 +141,24 @@ def parse_marker_value(decoded: object, marker: Path) -> MarkerState:
 
 
 def _read_marker_file(path: Path) -> MarkerState:
-    if path.is_symlink():
+    """marker 身份的单一稳定分类边界（round-14 M2）。
+
+    一次受保护 ``os.lstat`` 按 mode 分类，不再串联 ``Path.is_symlink/exists/is_file``
+    （CPython 3.12 的 ``is_symlink`` 不吞 OSError，EACCES/EIO 会原样泄漏）：ENOENT ->
+    format.missing；symlink -> path.symlink_escape；目录/其他非普通文件 ->
+    format.invalid；EACCES/EIO 等其他身份读取失败 -> format.invalid。随后再读取并解析
+    同一 marker；非 UTF-8、JSON 损坏、未知字段与版本不支持语义保持不变。
+    """
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError as exc:
+        raise DraftError(CheckCode.FORMAT_MISSING.value, path) from exc
+    except OSError as exc:
+        # 已存在但不可 stat（EACCES/EIO）：普通 I/O 失败，不是"缺失"。
+        raise DraftError(CheckCode.FORMAT_INVALID.value, path) from exc
+    if stat.S_ISLNK(mode):
         raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, path)
-    if not path.exists():
-        raise DraftError(CheckCode.FORMAT_MISSING.value, path)
-    if not path.is_file():
+    if not stat.S_ISREG(mode):
         # 已存在但不是普通文件（目录等）：异常内部状态，不是"缺失"。
         raise DraftError(CheckCode.FORMAT_INVALID.value, path)
     try:

@@ -2547,9 +2547,10 @@ _INTERNAL_CHILD_NODES = (
     ".draft/trash",
 )
 
-# 内部协议 child（_check_internal_namespace 实际分类为目录的节点）；marker child 的
-# stat 泄漏属于 read_marker（graph 根布局边界），按计划 Task 4 Step 5 记录而非本任务修复。
-_INTERNAL_PROTOCOL_CHILDREN = (".draft/operations", ".draft/trash")
+# 内部协议 child（_check_internal_namespace 实际分类为目录的节点）。marker child 的
+# 第二次 stat 必须不再经过原始 Path.is_symlink/exists/is_file 查询（round-14 M2）：
+# 健康 marker 的 os.stat 失败只能稳定返回，不得原样泄漏。
+_INTERNAL_PROTOCOL_CHILDREN = (".draft/draft.json", ".draft/operations", ".draft/trash")
 
 
 @pytest.mark.parametrize("relative", _INTERNAL_PROTOCOL_CHILDREN)
@@ -2616,4 +2617,41 @@ def test_checker_internal_child_classify_failure_is_stable(
     expected = Path(relative)
     hits = [issue for issue in report.errors if issue.path == expected]
     assert hits, f"{relative} 应产生根内相对稳定诊断，实际 {codes(report)}"
+    assert snapshot_tree(root) == before
+
+
+def test_checker_marker_lstat_io_error_is_stable(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """marker 身份读取 EIO：check_draft 返回 format.invalid，不抛原始异常（round-14 M2）。
+
+    修复前 ``_read_marker_file`` 在受保护 read_text 之前串联 ``Path.is_symlink()``/
+    ``exists()``/``is_file()``，任一 stat 失败都会从 check_draft 原样泄漏 OSError；
+    修复后一次 lstat 分类按 ENOENT->missing、symlink->escape、EACCES/EIO->
+    format.invalid 稳定映射。checker 只读：树快照不变。
+    """
+    import os
+
+    root = draft_factory(healthy(), precreate_internal=True)
+    marker = root / ".draft/draft.json"
+    before = snapshot_tree(root)
+    real_lstat = os.lstat
+
+    def fail_lstat(path: str | bytes | os.PathLike[str], *args: object) -> object:
+        if os.fspath(path) == os.fspath(marker):
+            raise OSError(5, "Input/output error")
+        return real_lstat(path, *args)
+
+    monkeypatch.setattr(os, "lstat", fail_lstat)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    hits = [
+        issue
+        for issue in report.errors
+        if issue.code == CheckCode.FORMAT_INVALID.value and issue.path == Path(".draft/draft.json")
+    ]
+    assert hits, f"缺少 format.invalid @ .draft/draft.json，实际 {codes(report)}"
     assert snapshot_tree(root) == before
