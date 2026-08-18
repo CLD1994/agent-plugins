@@ -526,9 +526,11 @@ def _check_operation_directory_entries(
         allowed = _OP_DIR_ALLOWED_ENTRIES
     operation_relative = _operation_dir_relative(journal.operation_id)
     try:
-        children = sorted(entry.iterdir())
+        with os.scandir(entry) as iterator:
+            children = tuple(sorted(Path(child.path) for child in iterator))
     except OSError:
-        # 目录枚举失败：不能折叠成 missing 或成功，稳定诊断保留现场。
+        # 目录枚举失败：不能折叠成 missing 或成功，稳定诊断保留现场。Path.iterdir
+        # 在 3.12 会静默吞掉 OSError，必须用 os.scandir 才能检测枚举失败（M2）。
         issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, operation_relative))
         return
     for child in children:

@@ -2063,7 +2063,12 @@ def test_name_node_distinguishes_missing_from_stat_failure(
 
     state["kind"] = "missing"
     assert (
-        _name_node(3, "cleanup-evidence.json", code="trash.package_corrupt", code_path=code_path)
+        _name_node(
+            3,
+            "cleanup-evidence.json",
+            code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+            code_path=code_path,
+        )
         is None
     )
     for kind in ("denied", "eio"):
@@ -2072,13 +2077,13 @@ def test_name_node_distinguishes_missing_from_stat_failure(
             _name_node(
                 3,
                 "cleanup-evidence.json",
-                code="trash.package_corrupt",
+                code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
                 code_path=code_path,
             )
-        assert caught.value.code == "trash.package_corrupt"
+        assert caught.value.code == CheckCode.TRASH_PACKAGE_CORRUPT.value
         assert caught.value.paths == (code_path,)
         assert isinstance(caught.value.__cause__, OSError)
     state["kind"] = "exists"
     assert _name_node(
-        3, "cleanup-evidence.json", code="trash.package_corrupt", code_path=code_path
+        3, "cleanup-evidence.json", code=CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path=code_path
     ) == (0, 7)

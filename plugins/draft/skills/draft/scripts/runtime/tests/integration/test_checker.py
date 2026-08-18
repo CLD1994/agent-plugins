@@ -2104,6 +2104,38 @@ def test_checker_single_operation_dir_stat_failure_is_stable(
     assert snapshot_tree(root) == before
 
 
+def test_checker_single_operation_dir_enumeration_failure_is_stable(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """单个 operation 目录 iterdir EACCES：check_draft 返回稳定诊断（M2）。
+
+    Path.iterdir 在 3.12 会静默吞掉 OSError（把不可读折叠成空目录）；修复后改用
+    os.scandir 枚举，失败产生稳定 operation 诊断，不静默丢弃该目录的未知条目。
+    """
+    import os
+
+    root = draft_factory(healthy(), precreate_internal=True)
+    op_dir = root / ".draft/operations" / ("a" * 32)
+    op_dir.mkdir()
+    write_raw_journal(root, operation_id="a" * 32)
+    before = snapshot_tree(root)
+    real_scandir = os.scandir
+
+    def fail_op_scandir(path: str | bytes | os.PathLike[str]) -> object:
+        if os.fspath(path) == os.fspath(op_dir):
+            raise PermissionError(13, "Permission denied")
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", fail_op_scandir)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    assert report.errors
+    assert snapshot_tree(root) == before
+
+
 def test_checker_unreadable_subtree_does_not_hide_other_corruption(
     draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:

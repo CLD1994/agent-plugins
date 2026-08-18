@@ -1300,20 +1300,23 @@ def _rollback_converged_scene(
         ("after", "operation.external_change"),
         ("wrong_bytes", "operation.external_change"),
         ("directory", "operation.external_change"),
-        ("symlink", "path.symlink_escape"),
+        ("symlink", CheckCode.PATH_SYMLINK_ESCAPE.value),
     ],
 )
+@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 def test_abandon_requires_terminal_target_proof(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
     target_setup: str,
     expected_code: str | None,
+    entry_name: str,
 ) -> None:
     """R=rolled_back 消费 ABANDON 前必须证明 target 仍为 before（H2）。
 
     before 分区完成放弃；after/wrong bytes 报 external_change；目录化目标报
     external_change（不可读取目标不是 before）；链接目标报更精确的
     path.symlink_escape。非 before 分区必须保留 T journal bytes、锁与权威包。
+    两个公开恢复入口都覆盖（H2 验证要求）。
     """
     from draft.operations import read_lock
 
@@ -1333,7 +1336,7 @@ def test_abandon_requires_terminal_target_proof(
         target.symlink_to(root / "pages" / "other.md")
 
     if expected_code is None:
-        _recover_through_public_entry(root, "recover_draft")
+        _recover_through_public_entry(root, entry_name)
         assert read_lock(root) is None
         t = _read_journal(root, trash_id)
         assert t["phase"] == "trash_retained"
@@ -1342,7 +1345,7 @@ def test_abandon_requires_terminal_target_proof(
         return
 
     with pytest.raises(DraftError) as caught:
-        recover_draft(root, now=NOW)
+        _recover_through_public_entry(root, entry_name)
     assert caught.value.code == expected_code
     # 验证失败不得先写 T、清副本或解锁：场景必须原样保留。
     assert _journal_path(root, trash_id).read_bytes() == before_t
@@ -1358,13 +1361,18 @@ def test_abandon_requires_terminal_target_proof(
         ("directory", "operation.external_change"),
     ],
 )
+@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 def test_abandon_unclaimed_finish_requires_terminal_target_proof(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
     target_setup: str,
     expected_code: str,
+    entry_name: str,
 ) -> None:
-    """FINISH_ABANDON_CLEANUP 同样不得因 T 已解关联就跳过 R 终态证明（H2）。"""
+    """FINISH_ABANDON_CLEANUP 同样不得因 T 已解关联就跳过 R 终态证明（H2）。
+
+    两个公开恢复入口都覆盖。
+    """
     root, restore_id, trash_id = _abandon_unclaimed_crash_scene(draft_factory, monkeypatch)
     target = root / "pages/obsolete.md"
     before_t = _journal_path(root, trash_id).read_bytes()
@@ -1375,7 +1383,7 @@ def test_abandon_unclaimed_finish_requires_terminal_target_proof(
         target.mkdir(parents=True)
 
     with pytest.raises(DraftError) as caught:
-        recover_draft(root, now=NOW)
+        _recover_through_public_entry(root, entry_name)
     assert caught.value.code == expected_code
     assert _journal_path(root, trash_id).read_bytes() == before_t
     assert (root / ".draft/operation.lock").exists()
@@ -1505,7 +1513,10 @@ def test_restore_applying_symlink_target_stable_error(
 
     with pytest.raises(DraftError) as caught:
         _recover_through_public_entry(root, entry_name)
-    assert caught.value.code in ("operation.external_change", "path.symlink_escape")
+    assert caught.value.code in (
+        "operation.external_change",
+        CheckCode.PATH_SYMLINK_ESCAPE.value,
+    )
     assert (root / ".draft/operation.lock").exists()
     assert _read_journal(root, restore_id)["phase"] == "applying"
     assert _package_snapshot(root, trash_id) == before_package
@@ -1636,7 +1647,7 @@ def test_evidence_consume_identity_stat_failure_preserves_scene(
     # 完成/解锁；evidence 与锁必须保留，T journal 字节不变。
     with pytest.raises(DraftError) as caught:
         recover_draft(root, now=NOW)
-    assert caught.value.code == "trash.package_corrupt"
+    assert caught.value.code == CheckCode.TRASH_PACKAGE_CORRUPT.value
     assert read_lock(root) == restore_id  # 锁仍属 R，未错误完成/解锁。
     assert _journal_path(root, trash_id).read_bytes() == before_t
     assert (t_dir / "cleanup-evidence.json").exists()
