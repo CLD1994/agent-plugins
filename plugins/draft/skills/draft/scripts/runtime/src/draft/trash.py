@@ -41,6 +41,7 @@ from draft.models import (
 )
 from draft.observations import ObservationManifest
 from draft.operations import (
+    LOCK_RELATIVE,
     Journal,
     TrashDeadlines,
     acquire_lock,
@@ -58,6 +59,7 @@ from draft.operations import (
     sha256_file,
     validate_operation_id,
     validate_restore_link,
+    verify_locked_terminal_operation,
     with_metadata,
     with_observations,
     with_phase,
@@ -434,6 +436,54 @@ def restore_recovery_decision(
     ):
         return RestoreRecoveryAction.ABANDON_UNAPPLIED
     return RestoreRecoveryAction.INCONSISTENT
+
+
+@dataclasses.dataclass(frozen=True)
+class RestoreRecoveryFacts:
+    """恢复专用 R/T 关联事实：restore 与 trash 日志 + 三值关联分类。
+
+    分类只接受 R→T 精确指向 + T 的 ``restore_operation_id`` 三种可区分状态
+    （MATCHED / TRASH_UNCLAIMED / CONFLICT）。ABANDON 先耐久删除 T claim 再清理
+    R 材料，因此 ``TRASH_UNCLAIMED`` 是程序自己写出的合法耐久中间状态（第十二轮 H1），
+    不得与 CONFLICT 折叠为同一个布尔 false。
+    """
+
+    restore: Journal
+    trash: Journal
+    link_state: RestoreLinkState
+
+
+def load_restore_recovery_facts(root: Path, restore_id: str) -> RestoreRecoveryFacts:
+    """恢复专用关联读取：验证锁属 R、R kind/id 与 R→T，再分类 T 的 claim。
+
+    与业务计划验证（``validate_restore_link`` 要求严格双向往返）不同：恢复边界必须先
+    接受 R→T 正确而 T claim 缺失的合法耐久中间状态，否则会把自己写出的
+    ``TRASH_UNCLAIMED`` 拒绝为 plan_invalid。R→T 缺失/非法、T kind/id 错误直接抛
+    ``operation.plan_invalid``；T 指向其他 R/身份不可证明归 ``CONFLICT``，不得误归
+    unclaimed。
+    """
+    if read_lock(root) != restore_id:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, root / LOCK_RELATIVE)
+    restore_journal = read_journal(operation_journal_path(root, restore_id))
+    if restore_journal.kind is not OperationKind.RESTORE:
+        raise DraftError("operation.plan_invalid", restore_journal.directory)
+    back_reference = restore_journal.metadata.get("restores_trash_operation")
+    if back_reference is None:
+        raise DraftError("operation.plan_invalid", restore_journal.directory)
+    trash_id = validate_operation_id(back_reference, code="operation.plan_invalid")
+    trash_path = operation_journal_path(root, trash_id)
+    resolve_journal_pending(trash_path)
+    trash_journal = read_journal(trash_path)
+    if trash_journal.kind is not OperationKind.TRASH or trash_journal.operation_id != trash_id:
+        raise DraftError("operation.plan_invalid", restore_journal.directory)
+    claim = trash_journal.metadata.get("restore_operation_id")
+    if claim == restore_journal.operation_id:
+        link_state = RestoreLinkState.MATCHED
+    elif claim is None:
+        link_state = RestoreLinkState.TRASH_UNCLAIMED
+    else:
+        link_state = RestoreLinkState.CONFLICT
+    return RestoreRecoveryFacts(restore=restore_journal, trash=trash_journal, link_state=link_state)
 
 
 def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackage) -> OperationPlan:
@@ -962,10 +1012,15 @@ def resolve_restore_execution(
     提交后分支不加载。``execution_error`` 只携带本次业务调用捕获的错误：ABANDON 分支在
     安全放弃后按既有映射返回或重新抛出；INCONSISTENT/RESUME_* 分支零副作用保留现场，
     有具体错误时返回该错误。
+
+    关联事实由调用方采集后以 action 传入（M1）；解决器只按 ``trash_id`` 读取 T 日志，
+    不再无条件 ``validate_restore_link``——ABANDON 已耐久删除 T claim 的合法中间状态
+    （TRASH_UNCLAIMED）会因此被拒绝为 plan_invalid（第十二轮 H1）。释放锁前对
+    ``rolled_back`` 复用保锁终态证明（H2），证明失败不写 T、不清理、不解锁。
     """
     resolve_journal_pending(operation_journal_path(root, restore_id))
     terminal_restore = read_journal(operation_journal_path(root, restore_id))
-    current_trash = validate_restore_link(root, terminal_restore)
+    current_trash = read_journal(operation_journal_path(root, trash_id))
     changed = tuple(mutation.path for mutation in terminal_restore.mutations)
 
     if action is RestoreRecoveryAction.VERIFY_AND_COMMIT_CLEANUP:
@@ -1001,8 +1056,12 @@ def resolve_restore_execution(
         )
 
     if action is RestoreRecoveryAction.ABANDON_UNAPPLIED:
-        # 安全回滚/未应用：耐久 R=rolled_back（若尚未），解关联 T，清理，释放。
-        if terminal_restore.phase is not OperationPhase.ROLLED_BACK:
+        # 安全回滚/未应用：释放锁前必须证明 R rolled_back 的 target 仍为 before（H2）。
+        # 验证失败保留 R/T、锁、包与材料；ALLOCATING/PREPARED 用未应用证明（决策时已
+        # 采集），只需耐久终态。
+        if terminal_restore.phase is OperationPhase.ROLLED_BACK:
+            verify_locked_terminal_operation(root, restore_id, expected=OperationPhase.ROLLED_BACK)
+        else:
             terminal_restore = with_phase(terminal_restore, OperationPhase.ROLLED_BACK)
             write_journal(terminal_restore)
         write_journal(without_metadata(current_trash, "restore_operation_id"))
@@ -1015,6 +1074,24 @@ def resolve_restore_execution(
             ):
                 raise DraftError("trash.restore_conflict", current_trash.directory)
             raise execution_error
+        return OperationResult(
+            operation_id=restore_id,
+            kind="restore",
+            phase=OperationPhase.ROLLED_BACK,
+            changed_paths=changed,
+        )
+
+    if action is RestoreRecoveryAction.FINISH_ABANDON_CLEANUP:
+        # ABANDON 后半段（H1）：T 已解关联并耐久，R 材料待清理。只复核 R 终态、
+        # 幂等清理 R 登记材料、释放 R 锁；不重写 T，不加载或删除权威包。释放锁前
+        # 同样必须证明 target 仍为 before（H2），不得因 T 已解关联就跳过。
+        verify_locked_terminal_operation(root, restore_id, expected=OperationPhase.ROLLED_BACK)
+        clean_recovery_copies(terminal_restore)
+        release_lock(root, restore_id)
+        if execution_error is not None:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory
+            )
         return OperationResult(
             operation_id=restore_id,
             kind="restore",

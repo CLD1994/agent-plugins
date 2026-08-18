@@ -3869,6 +3869,30 @@ def recover_locked_operation(
     )
 
 
+def verify_locked_terminal_operation(
+    root: Path,
+    operation_id: str,
+    *,
+    expected: OperationPhase,
+) -> None:
+    """持锁只读验证 operation 仍处于 expected 终态；失败保留锁与材料，不清理不解锁。
+
+    复用通用锁内终态验证（``_recover_terminal`` ``retain_terminal_lock=True``）证明
+    mutation 目标仍处于终态对应的 before/after 摘要，不复制摘要循环。目录等不可读取
+    目标被转换为 ``operation.external_change``，不泄漏原始 ``OSError``；符号链接目标
+    保持更精确的 ``path.symlink_escape``（第十二轮 H2：R 终态不能替代"目标仍为 before"
+    的事实证明）。调用方（restore 生命周期 ABANDON/FINISH 动作）验证通过后才允许
+    解关联、清理材料与释放锁。
+    """
+    journal = read_journal(operation_journal_path(root, operation_id))
+    if journal.phase is not expected:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+    try:
+        _recover_terminal(root, journal, operation_id, retain_terminal_lock=True)
+    except OSError as exc:
+        raise DraftError("operation.external_change", root) from exc
+
+
 def recover(root_path: Path) -> OperationResult:
     root = resolve_draft_root(root_path)
     operation_id = read_lock(root)

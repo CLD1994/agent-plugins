@@ -1079,7 +1079,12 @@ def test_restore_rollback_mid_phase_crash_recovers_through_public_entry(
 def test_restore_mid_phase_broken_link_preserves_scene(
     draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """R/T 双向关联被破坏：公开恢复保留现场报 operation.plan_invalid（第十一轮 H1）。"""
+    """R=applying 且 T claim 缺失：按关联状态表归为 INCONSISTENT，保留现场（round-12 H1）。
+
+    第十二轮把关联提升为三值：unclaimed 只对 ``rolled_back × trash_retained`` 合法；
+    R=applying 的 unclaimed 现场无法由任何已批准顺序产生，报
+    ``operation.inconsistent_state``（零写入），不再被 plan_invalid 误解释为"实现没接上"。
+    """
     root, restore_id, trash_id = _apply_restore_mid_phase_crash(
         draft_factory, monkeypatch, OperationPhase.APPLYING
     )
@@ -1088,7 +1093,7 @@ def test_restore_mid_phase_broken_link_preserves_scene(
     _write_journal(root, trash_id, t_data)
     before_package = _package_snapshot(root, trash_id)
 
-    with pytest.raises(DraftError, match="operation.plan_invalid"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
         recover_draft(root)
 
     assert (root / ".draft/operation.lock").exists()
@@ -1153,6 +1158,227 @@ def test_restore_mid_phase_observed_unrelated_change_preserves_scene(
     assert (root / ".draft/operation.lock").exists()
     assert _read_journal(root, restore_id)["phase"] == "applying"
     assert _package_snapshot(root, trash_id) == before_package
+
+
+# ---------------------------------------------------------------------------
+# 第十二轮 H1/H2：ABANDON 的 T 解关联耐久中间状态与 R 终态文件证明。
+# 崩溃点由真实 producer 写出 T claim 删除后注入；正例不得手改最终 journal JSON。
+# ---------------------------------------------------------------------------
+
+
+def crash_after_restore_unclaim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """真实 writer 先耐久写入 T 的 restore_operation_id 删除再抛进程退出。
+
+    只命中 ABANDON 执行路径中"删除 T claim"的那次 TRASH 日志写入；R=rolled_back 等
+    RESTORE 写入不会被命中（H1 的 T 解关联耐久写点）。
+    """
+    # ABANDON 的 T 解关联写入发生在 trash.py::resolve_restore_execution，其命名空间
+    # 绑定了 from draft.operations import write_journal 的函数对象，因此必须 patch
+    # draft.trash.write_journal 才能拦截该写点（patch draft.operations.write_journal
+    # 只影响 operations 模块自身调用）。
+    import draft.trash as trash_module
+
+    real_write = trash_module.write_journal
+    fired = False
+
+    def write_then_crash(journal: Journal) -> None:
+        nonlocal fired
+        real_write(journal)
+        if (
+            not fired
+            and journal.kind is OperationKind.TRASH
+            and ("restore_operation_id" not in journal.metadata)
+        ):
+            fired = True
+            raise SimulatedProcessExit
+
+    monkeypatch.setattr(trash_module, "write_journal", write_then_crash)
+
+
+def _converge_restore_to_rolled_back(root: Path, restore_id: str) -> None:
+    """通过通用锁内恢复把 R 收敛为 rolled_back，保留锁与 T claim（H2 现场）。"""
+    from draft.operations import recover_locked_operation
+
+    recover_locked_operation(root, restore_id, retain_terminal_lock=True)
+
+
+def _abandon_unclaimed_crash_scene(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, str, str]:
+    """真实 producer 现场：ABANDON 已耐久删除 T claim，尚未清理 R 材料/释放锁。
+
+    返回 (root, restore_id, trash_id)：R=rolled_back、T=trash_retained 无 claim、
+    锁仍属 R、R 恢复副本仍存在。
+    """
+    root, restore_id, trash_id = _apply_restore_mid_phase_crash(
+        draft_factory, monkeypatch, OperationPhase.ROLLING_BACK
+    )
+    crash_after_restore_unclaim(monkeypatch)
+    with pytest.raises(SimulatedProcessExit):
+        _recover_through_public_entry(root, "recover_draft")
+    monkeypatch.undo()
+    assert _read_journal(root, restore_id)["phase"] == "rolled_back"
+    t = _read_journal(root, trash_id)
+    assert t["phase"] == "trash_retained"
+    assert "restore_operation_id" not in t["metadata"]
+    assert (root / ".draft/operation.lock").exists()
+    return root, restore_id, trash_id
+
+
+@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
+@pytest.mark.parametrize("cleanup_state", ["intact", "partial", "complete"])
+def test_abandon_unclaimed_intermediate_state_converges(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_name: str,
+    cleanup_state: str,
+) -> None:
+    """ABANDON 已耐久删除 T claim 后在不同清理进度中断：公开恢复入口幂等收敛（H1）。
+
+    恢复完成：锁释放、T 保持 trash_retained 无 claim、权威包保留、R 终态 rolled_back、
+    R 恢复副本清空。重复调用仍稳定，不删除 T 包。``partial``/``complete`` 通过删除
+    崩溃现场遗留的副本叶/目录模拟清理中途/完成后中断的耐久状态，不手改 journal。
+    """
+    import shutil
+
+    from draft.operations import read_lock
+
+    root, restore_id, trash_id = _abandon_unclaimed_crash_scene(draft_factory, monkeypatch)
+    r_dir = root / ".draft/operations" / restore_id
+    staged = r_dir / "staged"
+    if cleanup_state == "partial":
+        # 清理中途：staged 叶已删除、目录残留（_clean_recovery_copies 幂等容忍缺失叶）。
+        for leaf in staged.iterdir():
+            leaf.unlink()
+    elif cleanup_state == "complete" and staged.exists():
+        # 清理已完成但锁未释放：目录整体已删除。
+        shutil.rmtree(staged)
+
+    _recover_through_public_entry(root, entry_name)
+
+    assert read_lock(root) is None
+    assert _read_journal(root, restore_id)["phase"] == "rolled_back"
+    t = _read_journal(root, trash_id)
+    assert t["phase"] == "trash_retained"
+    assert "restore_operation_id" not in t["metadata"]
+    assert not (r_dir / "originals").exists()
+    assert not (r_dir / "staged").exists()
+    assert (root / ".draft/trash/outgoing" / trash_id).is_dir()
+
+    # 重复调用仍幂等：不重写 T、不删除权威包、锁保持释放。
+    _recover_through_public_entry(root, entry_name)
+    assert read_lock(root) is None
+    assert (root / ".draft/trash/outgoing" / trash_id).is_dir()
+    t_after = _read_journal(root, trash_id)
+    assert t_after["phase"] == "trash_retained"
+    assert "restore_operation_id" not in t_after["metadata"]
+
+
+def _rollback_converged_scene(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, str, str]:
+    """真实 producer 现场：R 收敛为 rolled_back、T=trash_retained matched、锁属 R（H2）。"""
+    root, restore_id, trash_id = _apply_restore_mid_phase_crash(
+        draft_factory, monkeypatch, OperationPhase.ROLLING_BACK
+    )
+    _converge_restore_to_rolled_back(root, restore_id)
+    assert _read_journal(root, restore_id)["phase"] == "rolled_back"
+    t = _read_journal(root, trash_id)
+    assert t["phase"] == "trash_retained"
+    assert "restore_operation_id" in t["metadata"]
+    assert (root / ".draft/operation.lock").exists()
+    return root, restore_id, trash_id
+
+
+@pytest.mark.parametrize(
+    ("target_setup", "expected_code"),
+    [
+        ("before", None),
+        ("after", "operation.external_change"),
+        ("wrong_bytes", "operation.external_change"),
+        ("directory", "operation.external_change"),
+        ("symlink", "path.symlink_escape"),
+    ],
+)
+def test_abandon_requires_terminal_target_proof(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    target_setup: str,
+    expected_code: str | None,
+) -> None:
+    """R=rolled_back 消费 ABANDON 前必须证明 target 仍为 before（H2）。
+
+    before 分区完成放弃；after/wrong bytes 报 external_change；目录化目标报
+    external_change（不可读取目标不是 before）；链接目标报更精确的
+    path.symlink_escape。非 before 分区必须保留 T journal bytes、锁与权威包。
+    """
+    from draft.operations import read_lock
+
+    root, restore_id, trash_id = _rollback_converged_scene(draft_factory, monkeypatch)
+    target = root / "pages/obsolete.md"
+    before_t = _journal_path(root, trash_id).read_bytes()
+    before_lock = (root / ".draft/operation.lock").read_bytes()
+    before_package = _package_snapshot(root, trash_id)
+
+    if target_setup == "after":
+        target.write_text(OBSOLETE, encoding="utf-8")
+    elif target_setup == "wrong_bytes":
+        target.write_text("无法识别的并发垃圾内容\n", encoding="utf-8")
+    elif target_setup == "directory":
+        target.mkdir(parents=True)
+    elif target_setup == "symlink":
+        target.symlink_to(root / "pages" / "other.md")
+
+    if expected_code is None:
+        _recover_through_public_entry(root, "recover_draft")
+        assert read_lock(root) is None
+        t = _read_journal(root, trash_id)
+        assert t["phase"] == "trash_retained"
+        assert "restore_operation_id" not in t["metadata"]
+        assert (root / ".draft/trash/outgoing" / trash_id).is_dir()
+        return
+
+    with pytest.raises(DraftError) as caught:
+        recover_draft(root, now=NOW)
+    assert caught.value.code == expected_code
+    # 验证失败不得先写 T、清副本或解锁：场景必须原样保留。
+    assert _journal_path(root, trash_id).read_bytes() == before_t
+    assert (root / ".draft/operation.lock").read_bytes() == before_lock
+    assert _package_snapshot(root, trash_id) == before_package
+    assert _read_journal(root, restore_id)["phase"] == "rolled_back"
+
+
+@pytest.mark.parametrize(
+    ("target_setup", "expected_code"),
+    [
+        ("after", "operation.external_change"),
+        ("directory", "operation.external_change"),
+    ],
+)
+def test_abandon_unclaimed_finish_requires_terminal_target_proof(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    target_setup: str,
+    expected_code: str,
+) -> None:
+    """FINISH_ABANDON_CLEANUP 同样不得因 T 已解关联就跳过 R 终态证明（H2）。"""
+    root, restore_id, trash_id = _abandon_unclaimed_crash_scene(draft_factory, monkeypatch)
+    target = root / "pages/obsolete.md"
+    before_t = _journal_path(root, trash_id).read_bytes()
+
+    if target_setup == "after":
+        target.write_text(OBSOLETE, encoding="utf-8")
+    elif target_setup == "directory":
+        target.mkdir(parents=True)
+
+    with pytest.raises(DraftError) as caught:
+        recover_draft(root, now=NOW)
+    assert caught.value.code == expected_code
+    assert _journal_path(root, trash_id).read_bytes() == before_t
+    assert (root / ".draft/operation.lock").exists()
+    assert _read_journal(root, restore_id)["phase"] == "rolled_back"
 
 
 def _craft_restore_pair_scene(
