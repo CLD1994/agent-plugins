@@ -10,7 +10,7 @@ from draft.diagnostic_codes import (
     ReplacementStatusReason,
 )
 from draft.errors import DraftError
-from draft.models import CheckReport, IssueSeverity, OperationPhase, RootState
+from draft.models import CheckIssue, CheckReport, IssueSeverity, OperationPhase, RootState
 from draft.operations import JOURNAL_VERSION, Journal
 from draft.trash import trash_page
 from draft.vocabulary import ConclusionsState
@@ -2376,4 +2376,186 @@ def test_checker_outgoing_shape_checks_independent_of_operations(
     else:
         assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
     assert not _has_package_orphan(report, trash_id)
+    assert snapshot_tree(root) == before
+
+
+# ---------------------------------------------------------------------------
+# 第十三轮 M2：checker 仍有绕过稳定 helper 的原始 Path 查询。package 节点分类
+# （原 package_dir.is_dir）与 .draft child 二次分类（原 entry.is_symlink/is_dir）
+# 遇 EACCES/EIO 必须返回稳定根内相对诊断，不泄漏原始异常、不折叠成缺失。
+# ---------------------------------------------------------------------------
+
+
+def _package_node_issue(report: CheckReport, trash_id: str) -> list[CheckIssue]:
+    return [
+        issue
+        for issue in report.errors
+        if issue.code == CheckCode.TRASH_PACKAGE_CORRUPT.value
+        and issue.path is not None
+        and issue.path == Path(".draft/operations") / trash_id / "journal.json"
+    ]
+
+
+def test_checker_package_node_stat_eio_is_stable(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """package 节点 stat EIO：check_draft 返回稳定 package_corrupt，不抛原始异常（M2）。
+
+    修复前 ``package_dir.is_dir()`` 从 check_draft 原样泄漏 OSError（红灯）。
+    """
+    import os
+
+    root, trash_id = _retained_package_root(draft_factory)
+    package_dir = root / ".draft/trash/outgoing" / trash_id
+    before = snapshot_tree(root)
+    real_stat = os.stat
+
+    def fail_stat(
+        path: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> object:
+        if os.fspath(path) == os.fspath(package_dir):
+            raise OSError(5, "Input/output error")
+        return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "stat", fail_stat)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    assert _package_node_issue(report, trash_id)
+    assert CheckCode.TRASH_PACKAGE_MISSING.value not in codes(report)
+    assert snapshot_tree(root) == before
+
+
+def test_checker_package_node_lstat_failure_is_stable(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """package 节点 lstat EACCES/EIO：稳定 package_corrupt，不声称 package_missing（M2）。"""
+    import os
+
+    root, trash_id = _retained_package_root(draft_factory)
+    package_dir = root / ".draft/trash/outgoing" / trash_id
+    before = snapshot_tree(root)
+    real_lstat = os.lstat
+
+    def fail_lstat(path: str | bytes | os.PathLike[str], *args: object) -> object:
+        if os.fspath(path) == os.fspath(package_dir):
+            raise PermissionError(13, "Permission denied")
+        return real_lstat(path, *args)
+
+    monkeypatch.setattr(os, "lstat", fail_lstat)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    assert _package_node_issue(report, trash_id)
+    assert CheckCode.TRASH_PACKAGE_MISSING.value not in codes(report)
+    assert snapshot_tree(root) == before
+
+
+@pytest.mark.parametrize("shape", ["file", "symlink"])
+def test_checker_package_node_wrong_shape_is_corrupt(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    """package 节点是普通文件/链接：trash.package_corrupt，不折叠成 missing（M2）。"""
+    import shutil
+
+    root, trash_id = _retained_package_root(draft_factory)
+    package_dir = root / ".draft/trash/outgoing" / trash_id
+    shutil.rmtree(package_dir)
+    if shape == "file":
+        package_dir.write_text("not a package", encoding="utf-8")
+    else:
+        package_dir.symlink_to(root / "index.md")
+    before = snapshot_tree(root)
+
+    report = check_draft(root)
+
+    assert _package_node_issue(report, trash_id)
+    assert CheckCode.TRASH_PACKAGE_MISSING.value not in codes(report)
+    assert snapshot_tree(root) == before
+
+
+_INTERNAL_CHILD_NODES = (
+    ".draft/draft.json",
+    ".draft/operations",
+    ".draft/trash",
+)
+
+# 内部协议 child（_check_internal_namespace 实际分类为目录的节点）；marker child 的
+# stat 泄漏属于 read_marker（graph 根布局边界），按计划 Task 4 Step 5 记录而非本任务修复。
+_INTERNAL_PROTOCOL_CHILDREN = (".draft/operations", ".draft/trash")
+
+
+@pytest.mark.parametrize("relative", _INTERNAL_PROTOCOL_CHILDREN)
+def test_checker_internal_child_stat_eio_does_not_leak(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    """.draft child 的 stat EIO 不再从 _check_internal_namespace 泄漏（M2）。
+
+    修复前 ``entry.is_dir()`` 对 operations/trash child 从 check_draft 原样抛出。
+    """
+    import os
+
+    root = draft_factory(healthy(), precreate_internal=True)
+    child = root / relative
+    before = snapshot_tree(root)
+    real_stat = os.stat
+
+    def fail_stat(
+        path: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> object:
+        if os.fspath(path) == os.fspath(child):
+            raise OSError(5, "Input/output error")
+        return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "stat", fail_stat)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    assert snapshot_tree(root) == before
+
+
+@pytest.mark.parametrize("relative", _INTERNAL_CHILD_NODES)
+def test_checker_internal_child_classify_failure_is_stable(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    """.draft child 的分类 lstat EACCES/EIO：稳定根内相对诊断，不泄漏原始异常（M2）。"""
+    import os
+
+    root = draft_factory(healthy(), precreate_internal=True)
+    child = root / relative
+    before = snapshot_tree(root)
+    real_lstat = os.lstat
+
+    def fail_lstat(path: str | bytes | os.PathLike[str], *args: object) -> object:
+        if os.fspath(path) == os.fspath(child):
+            raise PermissionError(13, "Permission denied")
+        return real_lstat(path, *args)
+
+    monkeypatch.setattr(os, "lstat", fail_lstat)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    expected = Path(relative)
+    hits = [issue for issue in report.errors if issue.path == expected]
+    assert hits, f"{relative} 应产生根内相对稳定诊断，实际 {codes(report)}"
     assert snapshot_tree(root) == before

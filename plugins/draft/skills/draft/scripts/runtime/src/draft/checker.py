@@ -414,11 +414,28 @@ def check_graph(graph: DraftGraph) -> CheckReport:
 
 
 def _trash_package_issue(root: Path, journal_path: Path, journal: Journal) -> CheckIssue | None:
-    """只读校验权威删除包：缺失或无法由 T 锚定验证即为 ERROR，否则返回 None。"""
+    """只读校验权威删除包：缺失或无法由 T 锚定验证即为 ERROR，否则返回 None。
+
+    package 节点分类走共享稳定边界（round-13 M2）：只有 ENOENT（MISSING）产生
+    ``trash.package_missing``；目录才进入 ``load_verified_package``；普通文件/链接/
+    其他类型与 EACCES/EIO 分类失败统一产生 ``trash.package_corrupt``，不抛原始异常，
+    也不把不可读/错误形状折叠成 missing。
+    """
+    from draft.observations import EntryKind
+    from draft.operations import classify_node_or_error
+
     relative = journal_path.relative_to(root)
     package_dir = root / OUTGOING_RELATIVE / journal.operation_id
-    if not package_dir.is_dir():
+    try:
+        kind = classify_node_or_error(
+            package_dir, code=CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path=package_dir
+        )
+    except DraftError:
+        return _error(CheckCode.TRASH_PACKAGE_CORRUPT, relative, None, journal.operation_id)
+    if kind is EntryKind.MISSING:
         return _error(CheckCode.TRASH_PACKAGE_MISSING, relative, None, journal.operation_id)
+    if kind is not EntryKind.DIRECTORY:
+        return _error(CheckCode.TRASH_PACKAGE_CORRUPT, relative, None, journal.operation_id)
     try:
         load_verified_package(root, journal)
     except DraftError:
@@ -1094,13 +1111,25 @@ def _check_internal_namespace(resolved: Path) -> list[CheckIssue]:
     )
     if listing.state is not InternalDirectoryState.COMPLETE:
         return issues  # 缺失正常；普通文件/链接/不可读已由 helper 报告。
+    from draft.observations import EntryKind
+    from draft.operations import classify_node_or_error
+
     for entry in listing.entries:
         relative = entry.relative_to(resolved)
+        try:
+            kind = classify_node_or_error(
+                entry, code=CheckCode.INTERNAL_UNEXPECTED_ENTRY.value, code_path=entry
+            )
+        except DraftError:
+            # 分类失败（EACCES/EIO）：稳定根内相对诊断，不泄漏原始异常（M2），
+            # 也不把不可读解释成缺失/错误节点类型。
+            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
+            continue
         if relative not in _ALLOWED_INTERNAL_ENTRIES:
             issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
-        elif entry.is_symlink():
+        elif kind is EntryKind.SYMLINK:
             issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, relative))
-        elif relative in _ALLOWED_INTERNAL_DIRECTORIES and not entry.is_dir():
+        elif relative in _ALLOWED_INTERNAL_DIRECTORIES and kind is not EntryKind.DIRECTORY:
             # operations/trash 必须是目录：普通文件是内部命名空间非法形状。
             issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
     return issues
