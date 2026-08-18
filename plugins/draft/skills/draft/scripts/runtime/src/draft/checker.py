@@ -443,18 +443,31 @@ _OP_DIR_ALLOCATING_ALLOWED = frozenset(
 )
 
 
-def _check_operation_directory_entries(
-    entry: Path, journal: Journal, issues: list[CheckIssue]
-) -> None:
-    """按 phase 校验操作目录允许的精确内部条目（随机 pending/错误 evidence/终态残留可见）。
+def _operation_dir_relative(operation_id: str) -> Path:
+    """操作目录的根内相对路径（L1）：``.draft/operations/<id>/...``。"""
+    return Path(INTERNAL_DIR) / "operations" / operation_id
 
-    终态（completed/rolled_back）只允许 journal.json，任何 originals/staged/attempt/
-    evidence/pending/quarantine 都是残留并报告；allocating 只允许 journal 与恢复副本
-    目录；其余阶段允许全部登记内部条目。evidence 合法性改为每个操作目录只执行一次
-    联合分类（第十一轮 H2/M2）：final/pending/quarantine 及 inode 关系由共享只读分类
-    ``classify_cleanup_evidence_artifacts`` 判定，再调用 ``cleanup_evidence_protocol_corrupt``；
-    任一损坏结果报告 trash.package_corrupt。checker 始终只读，不发布/恢复/消费任何
-    evidence 名；分类/读取的底层 OSError 一律转为稳定诊断，不泄漏原始异常。
+
+def _check_operation_directory_entries(
+    root: Path,
+    entry: Path,
+    journal: Journal,
+    issues: list[CheckIssue],
+    *,
+    active_ids: frozenset[str] = frozenset(),
+) -> None:
+    """按 phase 与活动角色校验操作目录允许的精确内部条目（随机 pending/错误 evidence/
+    终态残留可见）。
+
+    活动角色（锁持有者 R 与锁内 RESTORE R 关联的 cleanup owner T，round-12 H3）在
+    完成清理前可能保留 originals/staged/attempt/evidence，使用完整允许集并总是运行
+    evidence 联合分类；普通终态（completed/rolled_back）只允许 journal.json，任何
+    originals/staged/attempt/evidence/pending/quarantine 都是残留并报告；allocating
+    只允许 journal 与恢复副本目录；其余阶段允许全部登记内部条目。evidence 合法性由
+    共享只读分类 ``classify_cleanup_evidence_artifacts`` 判定，再调用
+    ``cleanup_evidence_protocol_corrupt``；任一损坏结果报告 trash.package_corrupt。
+    checker 始终只读，不发布/恢复/消费任何 evidence 名；分类/枚举/读取的底层 OSError
+    一律转为稳定诊断，不泄漏原始异常。所有 path 按根内相对协议输出（L1）。
     """
     from draft.trash_package import (
         classify_cleanup_evidence_artifacts,
@@ -462,43 +475,46 @@ def _check_operation_directory_entries(
     )
 
     phase = journal.phase
-    if phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
+    if journal.operation_id in active_ids:
+        allowed = _OP_DIR_ALLOWED_ENTRIES
+    elif phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
         allowed = _OP_DIR_TERMINAL_ALLOWED
     elif phase is OperationPhase.ALLOCATING:
         allowed = _OP_DIR_ALLOCATING_ALLOWED
     else:
         allowed = _OP_DIR_ALLOWED_ENTRIES
+    operation_relative = _operation_dir_relative(journal.operation_id)
     try:
         children = sorted(entry.iterdir())
     except OSError:
         # 目录枚举失败：不能折叠成 missing 或成功，稳定诊断保留现场。
-        issues.append(
-            _error(
-                CheckCode.OPERATION_JOURNAL_CORRUPT,
-                entry.relative_to(entry.parents[1]),
-            )
-        )
+        issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, operation_relative))
         return
     for child in children:
         if child.name not in allowed:
             issues.append(
-                _error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, child.relative_to(entry.parents[1]))
+                _error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, operation_relative / child.name)
             )
-    # evidence 联合分类只在 evidence 名协议合法的阶段运行（非终态、非 allocating）；
+    # evidence 联合分类在 evidence 名协议合法的角色运行（活动角色或非终态/非 allocating）；
     # 非 TRASH 操作目录出现 evidence 名也会被同一分类判为损坏（授权解析失败）。
     if allowed is _OP_DIR_ALLOWED_ENTRIES:
-        evidence_relative = entry.relative_to(entry.parents[1]) / "cleanup-evidence.json"
+        evidence_relative = operation_relative / "cleanup-evidence.json"
         try:
             classified = classify_cleanup_evidence_artifacts(journal)
         except DraftError as error:
-            # 共享分类的领域错误按原 code/path 生成 CheckIssue（M2：稳定诊断，不泄漏原始异常）。
+            # 共享分类的领域错误按原 code/path 生成 CheckIssue（M2：稳定诊断，不泄漏
+            # 原始异常）；错误路径若在根内转根内相对，否则用预先计算的 evidence 路径
+            # （L1：机器协议 path 不得依赖临时根）。
+            error_path = error.paths[0] if error.paths else None
+            if error_path is not None:
+                try:
+                    path = error_path.relative_to(root)
+                except ValueError:
+                    path = evidence_relative
+            else:
+                path = evidence_relative
             issues.append(
-                CheckIssue(
-                    code=error.code,
-                    severity=IssueSeverity.ERROR,
-                    path=error.paths[0] if error.paths else evidence_relative,
-                    line=None,
-                )
+                CheckIssue(code=error.code, severity=IssueSeverity.ERROR, path=path, line=None)
             )
         except OSError:
             issues.append(_error(CheckCode.TRASH_PACKAGE_CORRUPT, evidence_relative))
@@ -515,6 +531,41 @@ def _check_operation_directory_entries(
                     issues.append(_error(CheckCode.TRASH_PACKAGE_CORRUPT, evidence_relative))
 
 
+def _cleanup_owner_ids(
+    index: Mapping[str, Journal],
+    locked_operation: str | None,
+) -> frozenset[str]:
+    """识别锁内 RESTORE R 所关联的 cleanup owner T（round-12 H3）。
+
+    充分条件（缺一不可）：锁属于 R、R.kind=RESTORE、R.phase=COMPLETED、
+    R.metadata[restores_trash_operation]==T.id、T.kind=TRASH、T.phase=ROLLED_BACK、
+    T.metadata[restore_operation_id]==R.id。只有由锁与合法 R/T 关系证明的 T 才能在
+    rolled_back 下拥有 cleanup evidence；条件不完整时不得放宽 terminal T 目录协议。
+    """
+    if locked_operation is None:
+        return frozenset()
+    restore_journal = index.get(locked_operation)
+    if (
+        restore_journal is None
+        or restore_journal.kind is not OperationKind.RESTORE
+        or restore_journal.phase is not OperationPhase.COMPLETED
+    ):
+        return frozenset()
+    trash_id = restore_journal.metadata.get("restores_trash_operation")
+    if not isinstance(trash_id, str):
+        return frozenset()
+    trash_journal = index.get(trash_id)
+    if (
+        trash_journal is None
+        or trash_journal.kind is not OperationKind.TRASH
+        or trash_journal.phase is not OperationPhase.ROLLED_BACK
+    ):
+        return frozenset()
+    if trash_journal.metadata.get("restore_operation_id") != locked_operation:
+        return frozenset()
+    return frozenset({trash_id})
+
+
 def _check_operation_state(root: Path) -> list[CheckIssue]:
     """Read-only diagnostics for lock and journal states; never mutates anything."""
     from draft.operations import read_journal, read_lock
@@ -527,27 +578,47 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
     except DraftError:
         issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, lock_path))
         locked_operation = None
+
+    # 第一遍：安全解析全部操作日志，建立 id→journal 索引与 cleanup owner 集合。
+    # 锁存在时仍扫描全部操作目录与 trash tree（round-12 H3）：锁只影响诊断/上下文，
+    # 不得成为全局 early return。解析失败的目录由第二遍报告损坏。
+    index: dict[str, Journal] = {}
+    if operations.is_dir():
+        for entry in sorted(operations.iterdir()):
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            try:
+                index[entry.name] = read_journal(operation_journal_path(root, entry.name))
+            except DraftError:
+                continue
+    cleanup_owner_ids = _cleanup_owner_ids(index, locked_operation)
+    active_ids: frozenset[str] = cleanup_owner_ids
     if locked_operation is not None:
-        try:
-            journal = read_journal(operation_journal_path(root, locked_operation))
-        except DraftError:
+        active_ids = active_ids | frozenset({locked_operation})
+
+    if locked_operation is not None:
+        locked_journal = index.get(locked_operation)
+        if locked_journal is None:
             issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, lock_path))
         else:
             # 有锁操作目录仍校验内部条目形状（回归 H4）：持锁时完成清理前可能有
-            # originals/staged/attempt/evidence，但未知条目与错误 evidence 必须可见。
+            # originals/staged/attempt/evidence；活动角色使用完整允许集，但未知条目
+            # 与错误 evidence 必须可见。锁目录只检查一次，不重复报告。
             locked_entry = operations / locked_operation
-            _check_operation_directory_entries(locked_entry, journal, issues)
+            _check_operation_directory_entries(
+                root, locked_entry, locked_journal, issues, active_ids=active_ids
+            )
             issues.append(
                 _error(CheckCode.OPERATION_RECOVERY_REQUIRED, lock_path, None, locked_operation)
             )
-        return issues
+
     if not operations.is_dir():
         if operations.exists():
             # .draft/operations 本身是普通文件：内部命名空间形状非法，不能当作空目录。
             issues.append(
                 _error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, Path(INTERNAL_DIR) / "operations")
             )
-        _check_trash_tree(root, issues)
+        _check_trash_tree(root, issues, cleanup_owner_ids=cleanup_owner_ids)
         return issues
     reject_symlink_components(root, Path(INTERNAL_DIR) / "operations")
     for entry in sorted(operations.iterdir()):
@@ -559,10 +630,10 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
             # 非目录条目不是合法操作目录：不能静默跳过。
             issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, entry.relative_to(root)))
             continue
-        try:
-            journal_path = operation_journal_path(root, entry.name)
-            journal = read_journal(journal_path)
-        except DraftError:
+        if entry.name == locked_operation:
+            continue  # 锁目录已在上方检查一次，不重复报告。
+        journal = index.get(entry.name)
+        if journal is None:
             # 目录无 journal、名称非法或日志损坏统一报 operation.journal_corrupt，
             # 检查保持只报告、不抛异常。
             issues.append(
@@ -571,10 +642,12 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
                 )
             )
             continue
+        journal_path = operation_journal_path(root, entry.name)
         relative = journal_path.relative_to(root)
         phase = journal.phase
-        # 无锁操作目录也按 phase 校验内部条目：终态残留/随机 pending/错误 evidence 可见（回归 H4）。
-        _check_operation_directory_entries(entry, journal, issues)
+        # 操作目录也按 phase/角色校验内部条目：终态残留/随机 pending/错误 evidence
+        # 可见（回归 H4）；cleanup owner T 允许 evidence 并运行联合分类（round-12 H3）。
+        _check_operation_directory_entries(root, entry, journal, issues, active_ids=active_ids)
         if phase is OperationPhase.ALLOCATING:
             issues.append(_review(CheckCode.OPERATION_ORPHAN_ALLOCATING, relative))
         elif phase in _MID_WRITE_PHASES:
@@ -595,16 +668,22 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
             issues.extend(_check_trash_retained(root, journal_path, journal, relative))
         elif phase is OperationPhase.TRASH_HANDOFF_PENDING:
             issues.extend(_check_trash_handoff_pending(root, journal_path, journal, relative))
-    _check_trash_tree(root, issues)
+    _check_trash_tree(root, issues, cleanup_owner_ids=cleanup_owner_ids)
     return issues
 
 
-def _check_trash_tree(root: Path, issues: list[CheckIssue]) -> None:
+def _check_trash_tree(
+    root: Path,
+    issues: list[CheckIssue],
+    *,
+    cleanup_owner_ids: frozenset[str] = frozenset(),
+) -> None:
     """闭合 .draft/trash 树形协议（candidate 与 registered 共享）：
 
     ``.draft/trash/`` 只允许 ``outgoing/``，``outgoing/`` 只允许合法 operation_id
-    包目录；被持有日志引用的包内部损坏由 trash.package_corrupt 报告，其余非法
-    形状（未登记条目、非目录、非法包名、orphan）统一报 internal.unexpected_entry，
+    包目录；被持有日志引用或锁内 cleanup owner（round-12 H3：T=rolled_back 且被锁内
+    R 关联，清理中途包仍合法存在）的包内部损坏由 trash.package_corrupt 报告，其余
+    非法形状（未登记条目、非目录、非法包名、orphan）统一报 internal.unexpected_entry，
     任意路径组件符号链接报 path.symlink_escape。
     """
     from draft.operations import validate_operation_id
@@ -632,7 +711,7 @@ def _check_trash_tree(root: Path, issues: list[CheckIssue]) -> None:
         if outgoing.exists():
             issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, Path(OUTGOING_RELATIVE)))
         return
-    # 被持有日志引用的 operation_id。
+    # 被持有日志引用或锁内 cleanup owner 的 operation_id。
     held: set[str] = set()
     operations = root / INTERNAL_DIR / "operations"
     if operations.is_dir():
@@ -648,6 +727,7 @@ def _check_trash_tree(root: Path, issues: list[CheckIssue]) -> None:
                 OperationPhase.TRASH_HANDOFF_PENDING,
             ):
                 held.add(entry.name)
+    held.update(cleanup_owner_ids)
     for package in sorted(outgoing.iterdir()):
         relative = package.relative_to(root)
         if package.is_symlink():

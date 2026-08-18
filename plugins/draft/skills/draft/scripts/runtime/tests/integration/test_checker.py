@@ -1792,3 +1792,189 @@ def test_non_utf8_marker_is_reported_as_format_invalid(
     report = check_draft(root)
 
     assert CheckCode.FORMAT_INVALID.value in codes(report)
+
+
+# ---------------------------------------------------------------------------
+# 第十二轮 H3/L1：checker 识别真实 restore cleanup owner；根内相对路径机器协议。
+# 正例由真实 restore writer 在 cleanup evidence 发布后中断创建，不手改最终 journal。
+# ---------------------------------------------------------------------------
+
+
+class SimulatedProcessExit(BaseException):
+    """模拟进程在 cleanup evidence 已耐久发布后退出：不得被生产 except DraftError 捕获。"""
+
+
+def _restore_cleanup_owner_scene(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, str, str]:
+    """真实 restore 在 evidence 已发布、首个包叶删除前中断：返回 (root, restore_id, trash_id)。
+
+    现场：R=completed、锁属 R、T=rolled_back、T 目录含 cleanup-evidence.json、权威包
+    完整保留。evidence 由真实 producer（clean_authoritative_package 的
+    ``_write_cleanup_evidence``）耐久写出，不手改最终 journal。
+    """
+    import json
+
+    import draft.trash_package as tp_module
+    from draft.operations import Journal
+    from draft.trash import restore_retained_trash
+    from draft.trash_package import PackageAuthorization
+
+    root = draft_factory(_trashable_checker_files())
+    created = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=created)
+    real_write_evidence = tp_module._write_cleanup_evidence  # pyright: ignore[reportPrivateUsage]
+    fired = False
+
+    def write_evidence_then_crash(
+        journal: Journal,
+        auth: PackageAuthorization,
+        leaves_bytes: dict[Path, bytes],
+    ) -> None:
+        nonlocal fired
+        real_write_evidence(journal, auth, leaves_bytes)
+        if not fired:
+            fired = True
+            raise SimulatedProcessExit
+
+    monkeypatch.setattr(tp_module, "_write_cleanup_evidence", write_evidence_then_crash)
+    with pytest.raises(SimulatedProcessExit):
+        restore_retained_trash(root, pending.operation_id, now=created)
+    monkeypatch.undo()
+
+    trash_id = pending.operation_id
+    raw = json.loads(
+        (root / ".draft/operations" / trash_id / "journal.json").read_text(encoding="utf-8")
+    )
+    restore_id = raw["metadata"]["restore_operation_id"]
+    t_journal = json.loads(
+        (root / ".draft/operations" / trash_id / "journal.json").read_text(encoding="utf-8")
+    )
+    assert t_journal["phase"] == "rolled_back"
+    assert (root / ".draft/operations" / restore_id / "journal.json").exists()
+    assert (root / ".draft/operation.lock").exists()
+    return root, restore_id, trash_id
+
+
+@pytest.mark.parametrize(
+    ("names", "same_inode", "corrupt"),
+    [
+        (("final",), False, False),
+        (("final", "pending"), True, False),
+        (("final", "pending"), False, True),
+        (("final", "quarantine"), True, False),
+        (("final", "quarantine"), False, True),
+        (("pending", "quarantine"), False, True),
+        (("final", "pending", "quarantine"), False, True),
+    ],
+)
+def test_checker_restore_cleanup_owner_joint_protocol(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    names: tuple[str, ...],
+    same_inode: bool,
+    corrupt: bool,
+) -> None:
+    """真实 restore cleanup owner T 上运行的联合 evidence 判定（round-12 H3）。
+
+    场景由真实 producer 在 evidence 发布后中断创建（R 持锁、T=rolled_back、evidence
+    位于 T 目录）；checker 必须识别 T 为 cleanup owner 并运行共享联合分类，而不是把
+    terminal T 的 evidence 一律视为残留。合法组合只产生 recovery_required，不误报
+    损坏；非法组合同时产生 trash.package_corrupt。checker 只读：树快照不变。
+    """
+    root, _restore_id, trash_id = _restore_cleanup_owner_scene(draft_factory, monkeypatch)
+    t_dir = root / ".draft/operations" / trash_id
+    evidence_bytes = (t_dir / "cleanup-evidence.json").read_bytes()
+    write_cleanup_evidence_names(t_dir, evidence_bytes, names, same_inode=same_inode)
+    before = snapshot_tree(root)
+
+    report = check_draft(root)
+
+    assert (CheckCode.TRASH_PACKAGE_CORRUPT.value in codes(report)) is corrupt
+    assert CheckCode.OPERATION_RECOVERY_REQUIRED.value in codes(report)
+    assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value not in codes(report)
+    assert snapshot_tree(root) == before
+
+
+def test_checker_lock_still_scans_other_subtrees(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """锁存在时仍扫描全部操作目录与 trash tree（H3）：锁只影响诊断/上下文。"""
+    root, _restore_id, _trash_id = _restore_cleanup_owner_scene(draft_factory, monkeypatch)
+    evil_op = root / ".draft/operations" / ("e" * 32)
+    evil_op.mkdir()
+    (evil_op / "evil.txt").write_text("bad", encoding="utf-8")
+    illegal = root / ".draft/trash/outgoing" / "not-an-op-id"
+    illegal.mkdir()
+    before = snapshot_tree(root)
+
+    report = check_draft(root)
+
+    assert CheckCode.OPERATION_RECOVERY_REQUIRED.value in codes(report)
+    assert CheckCode.OPERATION_JOURNAL_CORRUPT.value in codes(report)
+    assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
+    assert snapshot_tree(root) == before
+
+
+def test_checker_restore_cleanup_evidence_path_is_root_relative(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """corrupt evidence 的 CheckIssue.path 是根内相对路径（L1）。"""
+    root, _restore_id, trash_id = _restore_cleanup_owner_scene(draft_factory, monkeypatch)
+    t_dir = root / ".draft/operations" / trash_id
+    evidence_bytes = (t_dir / "cleanup-evidence.json").read_bytes()
+    write_cleanup_evidence_names(t_dir, evidence_bytes, ("final", "pending"), same_inode=False)
+
+    report = check_draft(root)
+
+    expected = Path(".draft/operations") / trash_id / "cleanup-evidence.json"
+    hits = [issue for issue in report.errors if issue.code == CheckCode.TRASH_PACKAGE_CORRUPT.value]
+    assert hits
+    for issue in hits:
+        assert issue.path is not None
+        assert issue.path == expected
+        assert not issue.path.is_absolute()
+
+
+def test_checker_evidence_io_error_path_is_root_relative(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """evidence 读取 EIO 的稳定诊断 path 同样是根内相对路径（L1）。"""
+    import errno
+    import os
+
+    import draft.operations as ops_module
+
+    root, _restore_id, trash_id = _restore_cleanup_owner_scene(draft_factory, monkeypatch)
+    t_dir = root / ".draft/operations" / trash_id
+    evidence_bytes = (t_dir / "cleanup-evidence.json").read_bytes()
+    write_cleanup_evidence_names(t_dir, evidence_bytes, ("final",), same_inode=False)
+    real_open = ops_module.os.open
+
+    def fail_evidence_open(
+        path: str | bytes | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        fspath = os.fspath(path)
+        name = fspath if isinstance(fspath, str) else fspath.decode(errors="surrogateescape")
+        if "cleanup-evidence.json" in name and "pending" not in name:
+            raise OSError(errno.EIO, "io error", name)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(ops_module.os, "open", fail_evidence_open)
+    before = snapshot_tree(root)
+
+    report = check_draft(root)
+
+    expected = Path(".draft/operations") / trash_id / "cleanup-evidence.json"
+    hits = [issue for issue in report.errors if issue.code == CheckCode.TRASH_PACKAGE_CORRUPT.value]
+    assert hits
+    for issue in hits:
+        assert issue.path is not None
+        assert issue.path == expected
+        assert not issue.path.is_absolute()
+    assert snapshot_tree(root) == before

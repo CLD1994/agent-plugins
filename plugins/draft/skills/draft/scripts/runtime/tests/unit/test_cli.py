@@ -537,6 +537,39 @@ def test_check_filters_union_within_dimension_and_intersection_between_dimension
     )
 
 
+def test_check_path_prefix_filters_root_relative_operation_diagnostic() -> None:
+    """根内相对 evidence 诊断可由 --path-prefix .draft/operations/<id> 过滤（round-12 L1）。
+
+    checker 的 trash.package_corrupt 诊断 path 必须是根内相对路径（.draft/...）；
+    JSON 负载不得依赖临时根，--path-prefix 按完整段匹配该相对路径。
+    """
+    operation_id = "a" * 32
+    evidence_path = Path(".draft/operations") / operation_id / "cleanup-evidence.json"
+    report = CheckReport(
+        issues=(
+            CheckIssue(
+                code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+                severity=IssueSeverity.ERROR,
+                path=evidence_path,
+                line=None,
+            ),
+        )
+    )
+    result = project_check(
+        report,
+        path_prefixes=(Path(".draft/operations") / operation_id,),
+        offset=0,
+        limit=20,
+        count_only=False,
+    )
+    assert tuple(issue.path for issue in result.errors) == (evidence_path,)
+    payload = cli._check_slice_payload(result)  # pyright: ignore[reportPrivateUsage]
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert ".draft/operations" in serialized
+    assert "/tmp" not in serialized
+    assert "/draft/.draft" not in serialized
+
+
 def test_check_path_prefix_matches_path_segments_not_substrings() -> None:
     report = CheckReport(
         issues=(
