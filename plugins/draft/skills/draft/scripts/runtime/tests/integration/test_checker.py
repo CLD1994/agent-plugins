@@ -1989,3 +1989,149 @@ def test_checker_evidence_io_error_path_is_root_relative(
         assert issue.path == expected
         assert not issue.path.is_absolute()
     assert snapshot_tree(root) == before
+
+
+# ---------------------------------------------------------------------------
+# 第十二轮 M2：checker 内部目录的稳定 I/O 边界。父目录枚举/lstat 失败必须返回稳定
+# 诊断，不能泄漏原始异常，也不能把失败折叠成"不存在"；独立子树仍被扫描。
+# ---------------------------------------------------------------------------
+
+_INTERNAL_PARENT_NODES = (
+    ".draft/operations",
+    ".draft/trash",
+    ".draft/trash/outgoing",
+)
+
+
+@pytest.mark.parametrize("relative", _INTERNAL_PARENT_NODES)
+@pytest.mark.parametrize("error_type", ["eacces", "eio"])
+def test_checker_internal_parent_enumeration_failure_is_stable(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+    error_type: str,
+) -> None:
+    """内部父目录 iterdir EACCES/EIO：check_draft 返回稳定诊断，不抛原始异常（M2）。"""
+    import os
+
+    root = draft_factory(healthy())
+    target = root / relative
+    target.mkdir(parents=True, exist_ok=True)
+    before = snapshot_tree(root)
+    real_scandir = os.scandir
+
+    def fail_scandir(path: str | bytes | os.PathLike[str]) -> object:
+        if os.fspath(path) == os.fspath(target):
+            if error_type == "eacces":
+                raise PermissionError(13, "Permission denied")
+            raise OSError(5, "Input/output error")
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", fail_scandir)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    assert report.errors
+    assert snapshot_tree(root) == before
+
+
+@pytest.mark.parametrize("relative", _INTERNAL_PARENT_NODES)
+@pytest.mark.parametrize("error_type", ["eacces", "eio"])
+def test_checker_internal_parent_stat_failure_is_stable(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+    error_type: str,
+) -> None:
+    """内部父目录 lstat/stat EACCES/EIO：check_draft 返回稳定诊断，不折叠成不存在（M2）。"""
+    import os
+
+    root = draft_factory(healthy())
+    target = root / relative
+    target.mkdir(parents=True, exist_ok=True)
+    before = snapshot_tree(root)
+    real_lstat = os.lstat
+
+    def fail_lstat(path: str | bytes | os.PathLike[str], *args: object) -> object:
+        if os.fspath(path) == os.fspath(target):
+            if error_type == "eacces":
+                raise PermissionError(13, "Permission denied")
+            raise OSError(5, "Input/output error")
+        return real_lstat(path, *args)
+
+    monkeypatch.setattr(os, "lstat", fail_lstat)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    assert report.errors
+    assert snapshot_tree(root) == before
+
+
+def test_checker_single_operation_dir_stat_failure_is_stable(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """单个 operation 目录 lstat EACCES：check_draft 返回稳定诊断（M2）。
+
+    操作目录必须先用真实合法 journal 建立，否则 pre-fix 也会因 journal 损坏报错；
+    修复前 lstat 失败被 is_symlink 静默吞掉、is_dir 走 os.stat 不受影响，因而无诊断
+    （把不可读折叠成正常）；修复后分类失败产生稳定 operation 诊断。
+    """
+    import os
+
+    root = draft_factory(healthy(), precreate_internal=True)
+    op_dir = root / ".draft/operations" / ("a" * 32)
+    op_dir.mkdir()
+    write_raw_journal(root, operation_id="a" * 32)
+    before = snapshot_tree(root)
+    real_lstat = os.lstat
+
+    def fail_op_lstat(path: str | bytes | os.PathLike[str], *args: object) -> object:
+        if os.fspath(path) == os.fspath(op_dir):
+            raise PermissionError(13, "Permission denied")
+        return real_lstat(path, *args)
+
+    monkeypatch.setattr(os, "lstat", fail_op_lstat)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    assert report.errors
+    assert snapshot_tree(root) == before
+
+
+def test_checker_unreadable_subtree_does_not_hide_other_corruption(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一个子树不可读时，另一个独立损坏子树仍被报告（M2）。"""
+    import os
+
+    root = draft_factory(healthy(), precreate_internal=True)
+    # 独立损坏子树：illegal trash/outgoing 条目。
+    illegal = root / ".draft/trash/outgoing" / "not-an-op-id"
+    illegal.mkdir(parents=True)
+    # 独立损坏子树：无 journal 的 operation 目录。
+    evil_op = root / ".draft/operations" / ("e" * 32)
+    evil_op.mkdir()
+    (evil_op / "evil.txt").write_text("bad", encoding="utf-8")
+    before = snapshot_tree(root)
+    operations = root / ".draft/operations"
+    real_scandir = os.scandir
+
+    def fail_operations_scandir(path: str | bytes | os.PathLike[str]) -> object:
+        if os.fspath(path) == os.fspath(operations):
+            raise PermissionError(13, "Permission denied")
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", fail_operations_scandir)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert CheckCode.OPERATION_JOURNAL_CORRUPT.value in codes(report)  # operations 子树不可读
+    assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)  # trash/outgoing 损坏仍可见
+    assert snapshot_tree(root) == before

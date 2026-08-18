@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -31,7 +32,6 @@ from draft.operations import (
     has_handoff_failure,
     operation_journal_path,
     read_journal,
-    reject_symlink_components,
 )
 from draft.paths import physical_parent, resolve_draft_root
 from draft.trash_package import OUTGOING_RELATIVE, load_verified_package
@@ -448,6 +448,47 @@ def _operation_dir_relative(operation_id: str) -> Path:
     return Path(INTERNAL_DIR) / "operations" / operation_id
 
 
+def _list_internal_directory(
+    root: Path,
+    directory: Path,
+    *,
+    code: CheckCode,
+    issues: list[CheckIssue],
+) -> tuple[Path, ...] | None:
+    """稳定分类/枚举内部目录（round-12 M2）：失败追加一次 CheckIssue 并返回 None。
+
+    ``classify_node_or_error``（lstat）把 EACCES/EIO 转 DraftError，不折叠成缺失/不
+    存在；``os.scandir`` 直接枚举并在 OSError 时报告稳定诊断（Path.iterdir 在 3.12
+    会静默吞掉 OSError，不能用来检测枚举失败）。缺失（MISSING）不报错；普通文件/
+    链接按内部命名空间非法形状报告。返回 None 表示该子树无法枚举，调用者继续检查
+    独立子树，不得在最外层捕获后停止全部检查。
+    """
+    from draft.observations import EntryKind
+    from draft.operations import classify_node_or_error
+
+    relative = directory.relative_to(root)
+    try:
+        node = classify_node_or_error(directory, code=code.value, code_path=directory)
+    except DraftError as exc:
+        issues.append(
+            CheckIssue(code=exc.code, severity=IssueSeverity.ERROR, path=relative, line=None)
+        )
+        return None
+    if node is not EntryKind.DIRECTORY:
+        if node is EntryKind.SYMLINK:
+            issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, relative))
+        elif node is not EntryKind.MISSING:
+            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
+        return None
+    try:
+        with os.scandir(directory) as iterator:
+            entries = tuple(sorted(Path(entry.path) for entry in iterator))
+    except OSError:
+        issues.append(_error(code, relative))
+        return None
+    return entries
+
+
 def _check_operation_directory_entries(
     root: Path,
     entry: Path,
@@ -568,7 +609,8 @@ def _cleanup_owner_ids(
 
 def _check_operation_state(root: Path) -> list[CheckIssue]:
     """Read-only diagnostics for lock and journal states; never mutates anything."""
-    from draft.operations import read_journal, read_lock
+    from draft.observations import EntryKind
+    from draft.operations import classify_node_or_error, read_journal, read_lock
 
     issues: list[CheckIssue] = []
     operations = root / INTERNAL_DIR / "operations"
@@ -579,18 +621,27 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
         issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, lock_path))
         locked_operation = None
 
-    # 第一遍：安全解析全部操作日志，建立 id→journal 索引与 cleanup owner 集合。
+    # 第一遍：稳定枚举全部操作目录，建立 id→journal 索引与 cleanup owner 集合。
     # 锁存在时仍扫描全部操作目录与 trash tree（round-12 H3）：锁只影响诊断/上下文，
-    # 不得成为全局 early return。解析失败的目录由第二遍报告损坏。
+    # 不得成为全局 early return。解析/分类失败的目录由第二遍报告损坏。
+    operations_children = _list_internal_directory(
+        root, operations, code=CheckCode.OPERATION_JOURNAL_CORRUPT, issues=issues
+    )
     index: dict[str, Journal] = {}
-    if operations.is_dir():
-        for entry in sorted(operations.iterdir()):
-            if not entry.is_dir() or entry.is_symlink():
-                continue
+    if operations_children is not None:
+        for entry in operations_children:
+            try:
+                kind = classify_node_or_error(
+                    entry, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value, code_path=entry
+                )
+            except DraftError:
+                continue  # 第二遍报告
+            if kind is not EntryKind.DIRECTORY:
+                continue  # 第二遍报告
             try:
                 index[entry.name] = read_journal(operation_journal_path(root, entry.name))
             except DraftError:
-                continue
+                continue  # 第二遍报告
     cleanup_owner_ids = _cleanup_owner_ids(index, locked_operation)
     active_ids: frozenset[str] = cleanup_owner_ids
     if locked_operation is not None:
@@ -612,23 +663,30 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
                 _error(CheckCode.OPERATION_RECOVERY_REQUIRED, lock_path, None, locked_operation)
             )
 
-    if not operations.is_dir():
-        if operations.exists():
-            # .draft/operations 本身是普通文件：内部命名空间形状非法，不能当作空目录。
-            issues.append(
-                _error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, Path(INTERNAL_DIR) / "operations")
-            )
-        _check_trash_tree(root, issues, cleanup_owner_ids=cleanup_owner_ids)
+    if operations_children is None:
+        # operations 缺失/普通文件/不可读：缺失正常，其余已由 helper 报告。
+        _check_trash_tree(
+            root, issues, cleanup_owner_ids=cleanup_owner_ids, operations_children=None
+        )
         return issues
-    reject_symlink_components(root, Path(INTERNAL_DIR) / "operations")
-    for entry in sorted(operations.iterdir()):
-        if entry.is_symlink():
-            # 链接条目必须报告，不能静默跳过（否则可能漏报反向关联或误判孤儿）。
-            issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, entry.relative_to(root)))
+    for entry in operations_children:
+        relative = entry.relative_to(root)
+        try:
+            kind = classify_node_or_error(
+                entry, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value, code_path=entry
+            )
+        except DraftError as exc:
+            issues.append(
+                CheckIssue(code=exc.code, severity=IssueSeverity.ERROR, path=relative, line=None)
+            )
             continue
-        if not entry.is_dir():
+        if kind is EntryKind.SYMLINK:
+            # 链接条目必须报告，不能静默跳过（否则可能漏报反向关联或误判孤儿）。
+            issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, relative))
+            continue
+        if kind is not EntryKind.DIRECTORY:
             # 非目录条目不是合法操作目录：不能静默跳过。
-            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, entry.relative_to(root)))
+            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
             continue
         if entry.name == locked_operation:
             continue  # 锁目录已在上方检查一次，不重复报告。
@@ -636,11 +694,7 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
         if journal is None:
             # 目录无 journal、名称非法或日志损坏统一报 operation.journal_corrupt，
             # 检查保持只报告、不抛异常。
-            issues.append(
-                _error(
-                    CheckCode.OPERATION_JOURNAL_CORRUPT, entry.relative_to(root) / "journal.json"
-                )
-            )
+            issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, relative / "journal.json"))
             continue
         journal_path = operation_journal_path(root, entry.name)
         relative = journal_path.relative_to(root)
@@ -668,7 +722,9 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
             issues.extend(_check_trash_retained(root, journal_path, journal, relative))
         elif phase is OperationPhase.TRASH_HANDOFF_PENDING:
             issues.extend(_check_trash_handoff_pending(root, journal_path, journal, relative))
-    _check_trash_tree(root, issues, cleanup_owner_ids=cleanup_owner_ids)
+    _check_trash_tree(
+        root, issues, cleanup_owner_ids=cleanup_owner_ids, operations_children=operations_children
+    )
     return issues
 
 
@@ -677,6 +733,7 @@ def _check_trash_tree(
     issues: list[CheckIssue],
     *,
     cleanup_owner_ids: frozenset[str] = frozenset(),
+    operations_children: tuple[Path, ...] | None = None,
 ) -> None:
     """闭合 .draft/trash 树形协议（candidate 与 registered 共享）：
 
@@ -684,39 +741,57 @@ def _check_trash_tree(
     包目录；被持有日志引用或锁内 cleanup owner（round-12 H3：T=rolled_back 且被锁内
     R 关联，清理中途包仍合法存在）的包内部损坏由 trash.package_corrupt 报告，其余
     非法形状（未登记条目、非目录、非法包名、orphan）统一报 internal.unexpected_entry，
-    任意路径组件符号链接报 path.symlink_escape。
+    任意路径组件符号链接报 path.symlink_escape。全部枚举/分类走稳定边界（M2），
+    不可读子树报告一次稳定诊断后继续扫描独立子树。
     """
-    from draft.operations import validate_operation_id
+    from draft.observations import EntryKind
+    from draft.operations import classify_node_or_error, validate_operation_id
     from draft.trash_package import OUTGOING_RELATIVE
 
-    trash_dir = root / INTERNAL_DIR / "trash"
-    if trash_dir.is_symlink():
-        issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, Path(INTERNAL_DIR) / "trash"))
-        return
-    if not trash_dir.is_dir():
-        return
-    for entry in sorted(trash_dir.iterdir()):
-        if entry.name == "outgoing":
-            continue
-        relative = entry.relative_to(root)
-        if entry.is_symlink():
-            issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, relative))
-        else:
-            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
+    trash_children = _list_internal_directory(
+        root,
+        root / INTERNAL_DIR / "trash",
+        code=CheckCode.INTERNAL_UNEXPECTED_ENTRY,
+        issues=issues,
+    )
+    if trash_children is not None:
+        for entry in trash_children:
+            if entry.name == "outgoing":
+                continue
+            relative = entry.relative_to(root)
+            try:
+                kind = classify_node_or_error(
+                    entry, code=CheckCode.INTERNAL_UNEXPECTED_ENTRY.value, code_path=entry
+                )
+            except DraftError as exc:
+                issues.append(
+                    CheckIssue(
+                        code=exc.code, severity=IssueSeverity.ERROR, path=relative, line=None
+                    )
+                )
+                continue
+            if kind is EntryKind.SYMLINK:
+                issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, relative))
+            else:
+                issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
     outgoing = root / OUTGOING_RELATIVE
-    if outgoing.is_symlink():
-        issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, Path(OUTGOING_RELATIVE)))
+    outgoing_children = _list_internal_directory(
+        root, outgoing, code=CheckCode.INTERNAL_UNEXPECTED_ENTRY, issues=issues
+    )
+    if outgoing_children is None:
         return
-    if not outgoing.is_dir():
-        if outgoing.exists():
-            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, Path(OUTGOING_RELATIVE)))
-        return
-    # 被持有日志引用或锁内 cleanup owner 的 operation_id。
+    # 被持有日志引用或锁内 cleanup owner 的 operation_id；operations 由调用方枚举传入，
+    # 避免重复扫描与重复报告（M2：每个不可读子树只报告一次）。
     held: set[str] = set()
-    operations = root / INTERNAL_DIR / "operations"
-    if operations.is_dir():
-        for entry in sorted(operations.iterdir()):
-            if not entry.is_dir():
+    if operations_children is not None:
+        for entry in operations_children:
+            try:
+                kind = classify_node_or_error(
+                    entry, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value, code_path=entry
+                )
+            except DraftError:
+                continue
+            if kind is not EntryKind.DIRECTORY:
                 continue
             try:
                 journal = read_journal(operation_journal_path(root, entry.name))
@@ -728,12 +803,21 @@ def _check_trash_tree(
             ):
                 held.add(entry.name)
     held.update(cleanup_owner_ids)
-    for package in sorted(outgoing.iterdir()):
+    for package in outgoing_children:
         relative = package.relative_to(root)
-        if package.is_symlink():
+        try:
+            kind = classify_node_or_error(
+                package, code=CheckCode.INTERNAL_UNEXPECTED_ENTRY.value, code_path=package
+            )
+        except DraftError as exc:
+            issues.append(
+                CheckIssue(code=exc.code, severity=IssueSeverity.ERROR, path=relative, line=None)
+            )
+            continue
+        if kind is EntryKind.SYMLINK:
             issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, relative))
             continue
-        if not package.is_dir():
+        if kind is not EntryKind.DIRECTORY:
             issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
             continue
         try:
@@ -881,15 +965,12 @@ def _check_internal_namespace(resolved: Path) -> list[CheckIssue]:
     """
     issues: list[CheckIssue] = []
     internal = resolved / INTERNAL_DIR
-    if internal.is_symlink():
-        issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, Path(INTERNAL_DIR)))
-        return issues
-    if not internal.exists():
-        return issues
-    if not internal.is_dir():
-        issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, Path(INTERNAL_DIR)))
-        return issues
-    for entry in sorted(internal.iterdir()):
+    internal_children = _list_internal_directory(
+        resolved, internal, code=CheckCode.INTERNAL_UNEXPECTED_ENTRY, issues=issues
+    )
+    if internal_children is None:
+        return issues  # 缺失正常；普通文件/链接/不可读已由 helper 报告。
+    for entry in internal_children:
         relative = entry.relative_to(resolved)
         if relative not in _ALLOWED_INTERNAL_ENTRIES:
             issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
