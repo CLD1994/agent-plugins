@@ -39,6 +39,7 @@ from draft.operations import (
     read_lock,
     recover,
     recover_digest_pending,
+    recover_locked_operation,
     recover_quarantine,
     reject_symlink_components,
     release_lock,
@@ -672,12 +673,14 @@ def _restore_linked_back(root: Path, restore_journal: Journal) -> bool:
 
 
 def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleResult:
-    """按 R/T 提交状态恢复锁内 restore（第十轮 H2）。
+    """按 R/T 提交状态恢复锁内 restore（第十轮 H2，第十一轮 H1/M1 闭合）。
 
-    先调用纯决策 ``restore_recovery_decision``，再按分支加载所需证据：只有提交前分支
-    （T 仍为 trash_retained，需要复核 restore 后置状态）加载并验证完整包；提交后分支
-    （T 已 rolled_back）凭提交状态和 cleanup evidence 继续清理，绝不重新要求已经获准
-    删除的完整包。关联不匹配或 R 处于中间写阶段时保留锁和现场报 inconsistent。
+    先调用唯一权威纯决策 ``restore_recovery_decision``。RESUME_FORWARD/ROLLBACK 时保留
+    R 锁、复用通用 mutation 恢复（``recover_locked_operation`` retain_terminal_lock=True），
+    终态 R 耐久后重读 R/T 并重新决策；只有提交前分支（T 仍为 trash_retained，需要复核
+    restore 后置状态）加载并验证完整包，提交后分支凭 cleanup evidence 继续清理，绝不
+    重新要求已经获准删除的完整包。中段恢复后仍不可收敛或决策不一致时保留 R/T、锁、
+    包与恢复材料报 inconsistent，不猜测、不静默成功。
     """
     from draft.trash import (
         RestoreRecoveryAction,
@@ -686,15 +689,38 @@ def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleRe
     )
 
     trash_journal = validate_restore_link(root, restore_journal)
-    decision = restore_recovery_decision(
+    action = restore_recovery_decision(
         restore_phase=restore_journal.phase,
         trash_phase=trash_journal.phase,
         links_match=True,
         proven_unapplied=_proven_unapplied_restore(root, restore_journal),
     )
-    if decision is RestoreRecoveryAction.INCONSISTENT:
+    if action in (
+        RestoreRecoveryAction.RESUME_FORWARD,
+        RestoreRecoveryAction.RESUME_ROLLBACK,
+    ):
+        recover_locked_operation(
+            root,
+            restore_journal.operation_id,
+            retain_terminal_lock=True,
+        )
+        restore_journal = read_journal(operation_journal_path(root, restore_journal.operation_id))
+        trash_journal = validate_restore_link(root, restore_journal)
+        action = restore_recovery_decision(
+            restore_phase=restore_journal.phase,
+            trash_phase=trash_journal.phase,
+            links_match=True,
+            proven_unapplied=_proven_unapplied_restore(root, restore_journal),
+        )
+    if action in (
+        RestoreRecoveryAction.RESUME_FORWARD,
+        RestoreRecoveryAction.RESUME_ROLLBACK,
+        RestoreRecoveryAction.INCONSISTENT,
+    ):
+        # 中段恢复后只允许收敛到 verify/committed/abandon；仍不可收敛或决策不一致
+        # 时保留现场报 inconsistent，不把失败解释为放弃或成功。
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, restore_journal.directory)
-    if decision is RestoreRecoveryAction.VERIFY_AND_COMMIT_CLEANUP:
+    if action is RestoreRecoveryAction.VERIFY_AND_COMMIT_CLEANUP:
         package: VerifiedTrashPackage | None = load_verified_package(root, trash_journal)
     else:
         package = None
@@ -702,8 +728,8 @@ def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleRe
         root,
         trash_id=trash_journal.operation_id,
         restore_id=restore_journal.operation_id,
+        action=action,
         package=package,
-        execution_result=None,
         execution_error=None,
     )
 

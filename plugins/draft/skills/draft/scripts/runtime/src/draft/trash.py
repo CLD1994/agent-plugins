@@ -882,23 +882,44 @@ def restore_retained_trash(
         # 读集观察耐久写入预分配日志，供执行前复核与恢复使用。
         restore_journal = read_journal(operation_journal_path(resolved, restore_id))
         write_journal(with_observations(restore_journal, plan.observations))
-        result = execute_preallocated_plan(plan, retain_terminal_lock=True)
+        execute_preallocated_plan(plan, retain_terminal_lock=True)
     except DraftError as error:
+        action = _restore_recovery_action(resolved, restore_id, operation_id)
+        if action in (
+            RestoreRecoveryAction.RESUME_FORWARD,
+            RestoreRecoveryAction.RESUME_ROLLBACK,
+        ):
+            # 正常业务调用捕获到明确执行错误：不得因 phase 可恢复就自动吞掉原错误，
+            # 中段相位自动继续只属于用户调用的公开 recovery 路径（第十一轮 H1）。
+            raise error
         return resolve_restore_execution(
             resolved,
             trash_id=operation_id,
             restore_id=restore_id,
+            action=action,
             package=package,
-            execution_result=None,
             execution_error=error,
         )
     return resolve_restore_execution(
         resolved,
         trash_id=operation_id,
         restore_id=restore_id,
+        action=_restore_recovery_action(resolved, restore_id, operation_id),
         package=package,
-        execution_result=result,
         execution_error=None,
+    )
+
+
+def _restore_recovery_action(root: Path, restore_id: str, trash_id: str) -> RestoreRecoveryAction:
+    """从磁盘重读 R/T 并取得唯一权威决策；任何调用方都不得建立第二套 phase 表。"""
+    resolve_journal_pending(operation_journal_path(root, restore_id))
+    restore_journal = read_journal(operation_journal_path(root, restore_id))
+    trash_journal = validate_restore_link(root, restore_journal)
+    return restore_recovery_decision(
+        restore_phase=restore_journal.phase,
+        trash_phase=trash_journal.phase,
+        links_match=True,
+        proven_unapplied=_proven_unapplied_restore(root, restore_journal),
     )
 
 
@@ -907,45 +928,35 @@ def resolve_restore_execution(
     *,
     trash_id: str,
     restore_id: str,
+    action: RestoreRecoveryAction,
     package: VerifiedTrashPackage | None,
-    execution_result: OperationResult | None,
     execution_error: DraftError | None,
 ) -> OperationResult:
-    """同一终态解决器：重读 R 与 T，证明终态后再解关联、清理、释放。
+    """只按已决策的 ``RestoreRecoveryAction`` 执行，不自行建立第二套 phase 表（第十一轮 M1）。
 
-    恢复所需证据由耐久状态决定（第十轮 H2）：只有提交前分支（T 仍为 trash_retained，
-    需要复核 restore 后置状态）才要求完整包；T 已 rolled_back 时凭提交状态和 cleanup
-    evidence 继续清理，不重新加载/验证已获准删除的完整包。``package`` 为可选；提交前
-    分支缺失时按需加载（提交后分支不加载）。
+    action 只能由唯一权威 ``restore_recovery_decision`` 产生：调用方（restore_page /
+    _recover_locked_restore）计算一次后传入。RESUME_* 只能由显式恢复路径先执行；若传到
+    终态解决器视为控制流错误并保留现场。``package`` 可选：提交前分支缺失时按需加载，
+    提交后分支不加载。``execution_error`` 只携带本次业务调用捕获的错误：ABANDON 分支在
+    安全放弃后按既有映射返回或重新抛出；INCONSISTENT/RESUME_* 分支零副作用保留现场，
+    有具体错误时返回该错误。
     """
     resolve_journal_pending(operation_journal_path(root, restore_id))
     terminal_restore = read_journal(operation_journal_path(root, restore_id))
     current_trash = validate_restore_link(root, terminal_restore)
     changed = tuple(mutation.path for mutation in terminal_restore.mutations)
 
-    if terminal_restore.phase is OperationPhase.COMPLETED:
+    if action is RestoreRecoveryAction.VERIFY_AND_COMMIT_CLEANUP:
         if execution_error is not None:
             raise DraftError(
                 CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory
             )
-        if current_trash.phase is OperationPhase.TRASH_RETAINED:
-            # 提交前：必须证明 restore 内容完整后才把 T 提交为 rolled_back。
-            if package is None:
-                package = load_verified_package(root, current_trash)
-            verify_restore_after_state(root, current_trash, terminal_restore, package)
-            write_journal(with_phase(current_trash, OperationPhase.ROLLED_BACK))
-        elif current_trash.phase is not OperationPhase.ROLLED_BACK:
-            raise DraftError(
-                CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory
-            )
-        # M1：restore 清理授权从锁内重读的已提交 T journal 派生（rolled_back 已耐久
-        # 写入）；当前锁属于 R 操作（restore_id），双向关联已由 validate_restore_link 证明。
-        clean_authoritative_package(
-            root,
-            cleanup_authorization(root, current_trash.operation_id, lock_operation_id=restore_id),
-        )
-        clean_recovery_copies(terminal_restore)
-        release_lock(root, restore_id)
+        # 提交前：必须证明 restore 内容完整后才把 T 提交为 rolled_back。
+        if package is None:
+            package = load_verified_package(root, current_trash)
+        verify_restore_after_state(root, current_trash, terminal_restore, package)
+        write_journal(with_phase(current_trash, OperationPhase.ROLLED_BACK))
+        _commit_restore_cleanup(root, current_trash, restore_id, terminal_restore)
         return OperationResult(
             operation_id=restore_id,
             kind="restore",
@@ -953,40 +964,63 @@ def resolve_restore_execution(
             changed_paths=changed,
         )
 
-    if terminal_restore.phase is OperationPhase.ROLLED_BACK:
-        safe = True
-    elif terminal_restore.phase in (
-        OperationPhase.ALLOCATING,
-        OperationPhase.PREPARED,
-    ):
-        safe = _proven_unapplied_restore(root, terminal_restore)
-    else:
-        safe = False
-
-    if not safe:
-        # 不可证明安全：保留认领、锁、包；原操作错误交给 recover。
+    if action is RestoreRecoveryAction.RESUME_COMMITTED_CLEANUP:
         if execution_error is not None:
-            raise execution_error
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory)
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory
+            )
+        # 已提交清理：T=rolled_back 已耐久，凭 cleanup evidence 清理，不重新要求完整包。
+        _commit_restore_cleanup(root, current_trash, restore_id, terminal_restore)
+        return OperationResult(
+            operation_id=restore_id,
+            kind="restore",
+            phase=OperationPhase.COMPLETED,
+            changed_paths=changed,
+        )
 
-    # 安全回滚/未应用：耐久 R=rolled_back（若尚未），解关联 T，清理，释放。
-    if terminal_restore.phase is not OperationPhase.ROLLED_BACK:
-        terminal_restore = with_phase(terminal_restore, OperationPhase.ROLLED_BACK)
-        write_journal(terminal_restore)
-    write_journal(without_metadata(current_trash, "restore_operation_id"))
+    if action is RestoreRecoveryAction.ABANDON_UNAPPLIED:
+        # 安全回滚/未应用：耐久 R=rolled_back（若尚未），解关联 T，清理，释放。
+        if terminal_restore.phase is not OperationPhase.ROLLED_BACK:
+            terminal_restore = with_phase(terminal_restore, OperationPhase.ROLLED_BACK)
+            write_journal(terminal_restore)
+        write_journal(without_metadata(current_trash, "restore_operation_id"))
+        clean_recovery_copies(terminal_restore)
+        release_lock(root, restore_id)
+        if execution_error is not None:
+            if execution_error.code in (
+                "operation.validation_failed",
+                "operation.external_change",
+            ):
+                raise DraftError("trash.restore_conflict", current_trash.directory)
+            raise execution_error
+        return OperationResult(
+            operation_id=restore_id,
+            kind="restore",
+            phase=OperationPhase.ROLLED_BACK,
+            changed_paths=changed,
+        )
+
+    # RESUME_* 与 INCONSISTENT：零副作用保留现场（不写入、不清理、不解锁）。有本次
+    # 业务捕获的具体错误时返回该更具体的既有领域错误，否则报 inconsistent_state。
+    if execution_error is not None:
+        raise execution_error
+    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory)
+
+
+def _commit_restore_cleanup(
+    root: Path,
+    current_trash: Journal,
+    restore_id: str,
+    terminal_restore: Journal,
+) -> None:
+    """已提交 restore 的统一清理：授权包删除、R 恢复副本清理、释放 R 锁。
+
+    M1：restore 清理授权从锁内重读的已提交 T journal 派生（rolled_back 已耐久写入）；
+    当前锁属于 R 操作（restore_id），双向关联已由 validate_restore_link 证明。
+    """
+    clean_authoritative_package(
+        root,
+        cleanup_authorization(root, current_trash.operation_id, lock_operation_id=restore_id),
+    )
     clean_recovery_copies(terminal_restore)
     release_lock(root, restore_id)
-
-    if execution_error is not None:
-        if execution_error.code in (
-            "operation.validation_failed",
-            "operation.external_change",
-        ):
-            raise DraftError("trash.restore_conflict", current_trash.directory)
-        raise execution_error
-    return OperationResult(
-        operation_id=restore_id,
-        kind="restore",
-        phase=OperationPhase.ROLLED_BACK,
-        changed_paths=changed,
-    )

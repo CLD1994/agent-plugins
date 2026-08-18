@@ -940,6 +940,281 @@ def test_committed_cleanup_recovers_from_crash_point(
     assert not (root / ".draft/operation.lock").exists()
 
 
+# ---------------------------------------------------------------------------
+# 第十一轮 H1/Q1：restore 中段相位（applying/validating/rolling_back）的真实崩溃恢复。
+# 故障注入在真实 writer 写出相位的 I/O 接缝，不手工构造最终 JSON。
+# ---------------------------------------------------------------------------
+
+
+class SimulatedProcessExit(BaseException):
+    """模拟进程在相位已耐久后退出：不得被生产 except DraftError 捕获。"""
+
+
+def crash_after_restore_phase(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: OperationPhase,
+) -> None:
+    """真实 writer 先耐久写入目标 phase 再抛进程退出；只命中 RESTORE 日志首次进入。"""
+    import draft.operations as operations_module
+
+    real_write = operations_module.write_journal
+    fired = False
+
+    def write_then_crash(journal: Journal) -> None:
+        nonlocal fired
+        real_write(journal)
+        if not fired and journal.kind is OperationKind.RESTORE and journal.phase is phase:
+            fired = True
+            raise SimulatedProcessExit
+
+    monkeypatch.setattr(operations_module, "write_journal", write_then_crash)
+
+
+def _force_restore_rollback_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """registered 根的 post-apply 完整检查固定失败，使 _validate_and_complete 进入回滚。"""
+    import draft.operations as operations_module
+
+    def fail_check(root: Path) -> None:
+        raise DraftError("operation.validation_failed", root)
+
+    monkeypatch.setattr(operations_module, "_check", fail_check)
+
+
+def _apply_restore_mid_phase_crash(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: OperationPhase,
+) -> tuple[Path, str, str]:
+    """建立 R 耐久停在中段 phase 的真实现场，返回 (root, restore_id, trash_id)。"""
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    if phase is OperationPhase.ROLLING_BACK:
+        _force_restore_rollback_validation(monkeypatch)
+    crash_after_restore_phase(monkeypatch, phase)
+    with pytest.raises(SimulatedProcessExit):
+        restore_retained_trash(root, pending.operation_id, now=NOW)
+    monkeypatch.undo()
+    restore_id = _read_journal(root, pending.operation_id)["metadata"]["restore_operation_id"]
+    assert _read_journal(root, restore_id)["phase"] == phase.value
+    assert (root / ".draft/operation.lock").exists()
+    return root, restore_id, pending.operation_id
+
+
+def _recover_through_public_entry(root: Path, entry_name: str) -> None:
+    from draft.trash_lifecycle import recover_interrupted_operations
+
+    # now=NOW 保持 T 仍在恢复窗口内：本测试聚焦回滚/前向恢复的协调收敛，不让
+    # recover_draft 的批量到期推进（真实 send2trash）把 T 推过生命周期。
+    if entry_name == "recover_draft":
+        recover_draft(root, now=NOW)
+    else:
+        recover_interrupted_operations(root, now=NOW)
+
+
+@pytest.mark.parametrize("phase", [OperationPhase.APPLYING, OperationPhase.VALIDATING])
+@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
+def test_restore_forward_mid_phase_crash_recovers_through_public_entry(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: OperationPhase,
+    entry_name: str,
+) -> None:
+    """真实 restore 在 R 耐久进入 applying/validating 后中断：两个公开入口前向收敛。
+
+    正向恢复最终 R=completed、T=rolled_back、包按 cleanup evidence 安全清理、锁释放
+    （第十一轮 H1/Q1：生产者写出相位，消费者经公开入口恢复）。
+    """
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    crash_after_restore_phase(monkeypatch, phase)
+    with pytest.raises(SimulatedProcessExit):
+        restore_retained_trash(root, pending.operation_id, now=NOW)
+    monkeypatch.undo()
+
+    restore_id = _read_journal(root, pending.operation_id)["metadata"]["restore_operation_id"]
+    assert _read_journal(root, restore_id)["phase"] == phase.value
+    assert _read_journal(root, pending.operation_id)["phase"] == "trash_retained"
+
+    _recover_through_public_entry(root, entry_name)
+
+    assert _read_journal(root, restore_id)["phase"] == "completed"
+    assert _read_journal(root, pending.operation_id)["phase"] == "rolled_back"
+    assert (root / "pages/obsolete.md").read_text(encoding="utf-8") == OBSOLETE
+    assert not (root / ".draft/operation.lock").exists()
+
+
+@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
+def test_restore_rollback_mid_phase_crash_recovers_through_public_entry(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_name: str,
+) -> None:
+    """真实 restore 在 R 耐久进入 rolling_back 后中断：回滚收敛为 rolled_back + 解关联。
+
+    回滚恢复最终 R=rolled_back、T=trash_retained 无 claim、权威包保留、锁释放；
+    页面与父导航回到 restore 开始前（即 trash 后）的摘要（第十一轮 H1）。
+    """
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    _force_restore_rollback_validation(monkeypatch)
+    crash_after_restore_phase(monkeypatch, OperationPhase.ROLLING_BACK)
+    with pytest.raises(SimulatedProcessExit):
+        restore_retained_trash(root, pending.operation_id, now=NOW)
+    monkeypatch.undo()
+
+    restore_id = _read_journal(root, pending.operation_id)["metadata"]["restore_operation_id"]
+    assert _read_journal(root, restore_id)["phase"] == "rolling_back"
+
+    _recover_through_public_entry(root, entry_name)
+
+    assert _read_journal(root, restore_id)["phase"] == "rolled_back"
+    t = _read_journal(root, pending.operation_id)
+    assert t["phase"] == "trash_retained"
+    assert "restore_operation_id" not in t["metadata"]
+    assert (root / ".draft/trash/outgoing" / pending.operation_id).is_dir()
+    assert not (root / "pages/obsolete.md").exists()
+    assert not (root / ".draft/operation.lock").exists()
+
+
+def test_restore_mid_phase_broken_link_preserves_scene(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R/T 双向关联被破坏：公开恢复保留现场报 operation.plan_invalid（第十一轮 H1）。"""
+    root, restore_id, trash_id = _apply_restore_mid_phase_crash(
+        draft_factory, monkeypatch, OperationPhase.APPLYING
+    )
+    t_data = _read_journal(root, trash_id)
+    del t_data["metadata"]["restore_operation_id"]
+    _write_journal(root, trash_id, t_data)
+    before_package = _package_snapshot(root, trash_id)
+
+    with pytest.raises(DraftError, match="operation.plan_invalid"):
+        recover_draft(root)
+
+    assert (root / ".draft/operation.lock").exists()
+    assert _read_journal(root, restore_id)["phase"] == "applying"
+    assert _package_snapshot(root, trash_id) == before_package
+
+
+def test_restore_mid_phase_external_change_preserves_scene(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """目标页被改成 before/after 都无法识别的状态：恢复保留现场报 external_change。"""
+    root, restore_id, trash_id = _apply_restore_mid_phase_crash(
+        draft_factory, monkeypatch, OperationPhase.APPLYING
+    )
+    (root / "pages/obsolete.md").write_text("不可识别的并发垃圾内容\n", encoding="utf-8")
+    before_package = _package_snapshot(root, trash_id)
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        recover_draft(root)
+
+    assert (root / ".draft/operation.lock").exists()
+    assert _read_journal(root, restore_id)["phase"] == "applying"
+    assert _read_journal(root, trash_id)["phase"] == "trash_retained"
+    assert _package_snapshot(root, trash_id) == before_package
+
+
+def test_restore_rolling_back_corrupt_original_preserves_scene(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回滚现场 original 摘要被破坏：恢复保留现场报 operation.journal_corrupt。"""
+    root, restore_id, trash_id = _apply_restore_mid_phase_crash(
+        draft_factory, monkeypatch, OperationPhase.ROLLING_BACK
+    )
+    original = root / ".draft/operations" / restore_id / "originals" / "0000.bin"
+    original.write_bytes(b"corrupted original bytes")
+    before_package = _package_snapshot(root, trash_id)
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        recover_draft(root)
+
+    assert (root / ".draft/operation.lock").exists()
+    assert _read_journal(root, restore_id)["phase"] == "rolling_back"
+    assert _package_snapshot(root, trash_id) == before_package
+
+
+def test_restore_mid_phase_observed_unrelated_change_preserves_scene(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """观察清单外的无关页面变化：恢复保留现场报 external_change（不静默提交）。"""
+    root, restore_id, trash_id = _apply_restore_mid_phase_crash(
+        draft_factory, monkeypatch, OperationPhase.APPLYING
+    )
+    (root / "pages/other.md").write_text(
+        (root / "pages/other.md").read_text(encoding="utf-8") + "\n并发编辑。\n",
+        encoding="utf-8",
+    )
+    before_package = _package_snapshot(root, trash_id)
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        recover_draft(root)
+
+    assert (root / ".draft/operation.lock").exists()
+    assert _read_journal(root, restore_id)["phase"] == "applying"
+    assert _package_snapshot(root, trash_id) == before_package
+
+
+def _craft_restore_pair_scene(
+    root: Path,
+    trash_id: str,
+    restore_phase: OperationPhase,
+    trash_phase: OperationPhase,
+) -> str:
+    """手写不可能的 R/T 双日志组合（parser/非法状态测试，不是生产者证据）。"""
+    import json as json_module
+
+    restore_id = "c" * 32
+    t_data = _read_journal(root, trash_id)
+    t_data["phase"] = trash_phase.value
+    t_data["metadata"]["restore_operation_id"] = restore_id
+    r_data: dict[str, object] = {
+        "journal_version": JOURNAL_VERSION,
+        "operation_id": restore_id,
+        "kind": "restore",
+        "phase": restore_phase.value,
+        "root_state": "registered",
+        "observations": [],
+        "mutations": [],
+        "remove_empty_directories": [],
+        "metadata": {"restores_trash_operation": trash_id},
+    }
+    _write_journal(root, restore_id, r_data)
+    _write_journal(root, trash_id, t_data)
+    lock = root / ".draft/operation.lock"
+    lock.write_text(json_module.dumps({"operation_id": restore_id}), encoding="utf-8")
+    return restore_id
+
+
+@pytest.mark.parametrize(
+    ("restore_phase", "trash_phase"),
+    [
+        (OperationPhase.ROLLED_BACK, OperationPhase.ROLLED_BACK),
+        (OperationPhase.PREPARED, OperationPhase.ROLLED_BACK),
+    ],
+)
+def test_restore_impossible_pair_reports_inconsistent_without_writes(
+    draft_factory: DraftFactory,
+    restore_phase: OperationPhase,
+    trash_phase: OperationPhase,
+) -> None:
+    """不可能 R/T 组合在任何 journal 写入前报 inconsistent，保留现场（第十一轮 M1）。"""
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    restore_id = _craft_restore_pair_scene(root, pending.operation_id, restore_phase, trash_phase)
+    before_r = _read_journal(root, restore_id)
+    before_t = _read_journal(root, pending.operation_id)
+    before_package = _package_snapshot(root, pending.operation_id)
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        recover_draft(root)
+
+    assert _read_journal(root, restore_id) == before_r
+    assert _read_journal(root, pending.operation_id) == before_t
+    assert _package_snapshot(root, pending.operation_id) == before_package
+    assert (root / ".draft/operation.lock").exists()
+
+
 def test_verify_commit_branch_still_requires_complete_package(
     draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:

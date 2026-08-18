@@ -1249,6 +1249,7 @@ _COMMON_PRE_COMMIT_EDGES: frozenset[tuple[OperationPhase, OperationPhase]] = fro
         (OperationPhase.APPLYING, OperationPhase.APPLYING),
         (OperationPhase.APPLYING, OperationPhase.VALIDATING),
         (OperationPhase.APPLYING, OperationPhase.ROLLING_BACK),
+        (OperationPhase.VALIDATING, OperationPhase.VALIDATING),
         (OperationPhase.VALIDATING, OperationPhase.ROLLING_BACK),
         (OperationPhase.ROLLING_BACK, OperationPhase.ROLLING_BACK),
         (OperationPhase.ROLLING_BACK, OperationPhase.ROLLED_BACK),
@@ -2733,17 +2734,24 @@ def _verify_recovery_material(journal: Journal) -> None:
                 raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, staged)
 
 
-def _recover_terminal(root: Path, journal: Journal, operation_id: str) -> OperationResult:
+def _recover_terminal(
+    root: Path,
+    journal: Journal,
+    operation_id: str,
+    *,
+    retain_terminal_lock: bool = False,
+) -> OperationResult:
     """合法崩溃窗口：终态日志已耐久但锁未释放。验证文件状态后清理并释放锁。"""
     expected = "after" if journal.phase is OperationPhase.COMPLETED else "before"
     for mutation in journal.mutations:
         if _classify(root, mutation) != expected:
             raise DraftError("operation.external_change", root / mutation.path)
-    _clean_recovery_copies(journal)
-    for relative in journal.remove_empty_directories:
-        with suppress(OSError):
-            (root / relative).rmdir()
-    release_lock(root, operation_id)
+    if not retain_terminal_lock:
+        _clean_recovery_copies(journal)
+        for relative in journal.remove_empty_directories:
+            with suppress(OSError):
+                (root / relative).rmdir()
+        release_lock(root, operation_id)
     return OperationResult(
         operation_id=operation_id,
         kind=journal.kind.value,
@@ -3757,7 +3765,12 @@ def _clean_owned_temp_artifacts(
             leaf.quarantine_delete(mutation.after_sha256)
 
 
-def _recover_locked(root: Path, operation_id: str) -> OperationResult:
+def _recover_locked(
+    root: Path,
+    operation_id: str,
+    *,
+    retain_terminal_lock: bool = False,
+) -> OperationResult:
     # 先把崩溃遗留的 journal pending 发布为最新日志（回归 H2），再从最新日志恢复。
     resolve_journal_pending(operation_journal_path(root, operation_id))
     journal = read_journal(operation_journal_path(root, operation_id))
@@ -3766,13 +3779,17 @@ def _recover_locked(root: Path, operation_id: str) -> OperationResult:
     if journal.kind is OperationKind.ADOPT:
         return _recover_adopt(root, journal, operation_id)
     if journal.phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
-        return _recover_terminal(root, journal, operation_id)
+        return _recover_terminal(
+            root, journal, operation_id, retain_terminal_lock=retain_terminal_lock
+        )
     if journal.phase is OperationPhase.ALLOCATING:
         # 完整计划尚未耐久形成：不得前向完成，只能放弃、清理分配材料并释放锁。
+        # retain_terminal_lock=True 时只耐久终态，材料与锁交由恢复包装层统一处理。
         abandoned = _with_phase(journal, OperationPhase.ROLLED_BACK)
         write_journal(abandoned)
-        _clean_recovery_copies(journal)
-        release_lock(root, operation_id)
+        if not retain_terminal_lock:
+            _clean_recovery_copies(journal)
+            release_lock(root, operation_id)
         return OperationResult(
             operation_id=operation_id,
             kind=journal.kind.value,
@@ -3789,11 +3806,12 @@ def _recover_locked(root: Path, operation_id: str) -> OperationResult:
     if journal.phase is OperationPhase.ROLLING_BACK:
         # 回滚意图已耐久：先按方向收敛回滚 artifact（quarantine 保存 after、pending
         # 保存 before），再继续回滚。_rollback 幂等跳过已恢复目标，全部恢复后终态化
-        # 为 rolled_back 并释放锁。
+        # 为 rolled_back（retain_terminal_lock=True 时保留锁与材料）。
         _recover_mutation_artifacts(root, journal, direction=MutationDirection.ROLLBACK)
         return _rollback(
             root,
             journal,
+            retain_terminal_lock=retain_terminal_lock,
             changed_paths=_recover_changed_paths(journal),
         )
     # 先把崩溃遗留的 managed temp quarantine 收敛（回归 H3）：被中断的 consume 删除
@@ -3821,7 +3839,34 @@ def _recover_locked(root: Path, operation_id: str) -> OperationResult:
         current = _with_phase(current, OperationPhase.APPLYING)
         write_journal(current)
     _clean_owned_temp_artifacts(root, current, consume_temps)
-    return _finish_forward(root, current, changed_paths=_recover_changed_paths(current))
+    return _finish_forward(
+        root,
+        current,
+        retain_terminal_lock=retain_terminal_lock,
+        changed_paths=_recover_changed_paths(current),
+    )
+
+
+def recover_locked_operation(
+    root: Path,
+    operation_id: str,
+    *,
+    retain_terminal_lock: bool = False,
+) -> OperationResult:
+    """恢复锁内通用 operation 的窄接口（第十一轮 H1）。
+
+    供 restore 生命周期层在 R/T 协调事务内调用：验证锁仍属于 operation_id 后复用
+    通用锁内恢复。``retain_terminal_lock=True`` 时终态日志耐久但不清材料、不解锁，
+    由调用方重读 R/T、重新决策后统一解关联、清理与释放。不要在生命周期层调用会
+    释放锁的公开 ``recover`` 再重新拿锁：释放与重拿之间会丢失 R/T 协调所有权。
+    """
+    if read_lock(root) != operation_id:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, root / LOCK_RELATIVE)
+    return _recover_locked(
+        root,
+        operation_id,
+        retain_terminal_lock=retain_terminal_lock,
+    )
 
 
 def recover(root_path: Path) -> OperationResult:
