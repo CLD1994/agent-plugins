@@ -2252,11 +2252,13 @@ def test_checker_cleanup_owner_lock_unreadable_keeps_package(
     """锁不可读 + 真实 cleanup owner 现场：T=rolled_back 包不得被误判 orphan（round-13 M1）。
 
     lock 读取失败时无法证明 T 正是锁内 restore 的 cleanup owner，必须 UNKNOWN 而不是
-    ORPHAN（未知不得折叠为否定事实）。
+    ORPHAN（未知不得折叠为否定事实）。同一 UNKNOWN 事实也必须进入 operation 目录角色
+    判定：R 的 originals/staged 与 T 的 cleanup-evidence.json 不得被报为终态残留
+    （round-14 M1）。
     """
     import os
 
-    root, _restore_id, trash_id = _restore_cleanup_owner_scene(draft_factory, monkeypatch)
+    root, restore_id, trash_id = _restore_cleanup_owner_scene(draft_factory, monkeypatch)
     lock = root / ".draft/operation.lock"
     before = snapshot_tree(root)
     real_lstat = os.lstat
@@ -2273,13 +2275,25 @@ def test_checker_cleanup_owner_lock_unreadable_keeps_package(
 
     assert isinstance(report, CheckReport)
     assert not _has_package_orphan(report, trash_id)
+    unexpected = {
+        issue.path
+        for issue in report.errors
+        if issue.code == CheckCode.INTERNAL_UNEXPECTED_ENTRY.value
+    }
+    assert Path(f".draft/operations/{restore_id}/originals") not in unexpected
+    assert Path(f".draft/operations/{restore_id}/staged") not in unexpected
+    assert Path(f".draft/operations/{trash_id}/cleanup-evidence.json") not in unexpected
     assert snapshot_tree(root) == before
 
 
 def test_checker_cleanup_owner_r_journal_unreadable_keeps_package(
     draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """R journal 不可读 + 真实 cleanup owner 现场：包为 UNKNOWN，不误报 orphan（round-13 M1）。"""
+    """R journal 不可读 + 真实 cleanup owner 现场：包为 UNKNOWN，不误报 orphan（round-13 M1）。
+
+    T claim 指向的 R 不可读时 T 目录角色为 UNKNOWN（round-14 M1）：T 的
+    cleanup-evidence.json 不得被报为终态残留。
+    """
     import draft.operations as ops_module
 
     root, restore_id, trash_id = _restore_cleanup_owner_scene(draft_factory, monkeypatch)
@@ -2298,6 +2312,50 @@ def test_checker_cleanup_owner_r_journal_unreadable_keeps_package(
     monkeypatch.undo()
 
     assert isinstance(report, CheckReport)
+    assert not _has_package_orphan(report, trash_id)
+    unexpected = {
+        issue.path
+        for issue in report.errors
+        if issue.code == CheckCode.INTERNAL_UNEXPECTED_ENTRY.value
+    }
+    assert Path(f".draft/operations/{trash_id}/cleanup-evidence.json") not in unexpected
+    assert snapshot_tree(root) == before
+
+
+def test_checker_unknown_role_keeps_illegal_entry(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """UNKNOWN 角色不关闭独立形状检查（round-14 M1）：lock-EIO 现场加入未登记名字仍报残留。
+
+    UNKNOWN 允许登记材料存在，但不得把未知扩大成"不检查目录"；两种角色都不允许的
+    ``not-registered.bin`` 必须继续得到 internal.unexpected_entry。
+    """
+    import os
+
+    root, _restore_id, trash_id = _restore_cleanup_owner_scene(draft_factory, monkeypatch)
+    t_dir = root / ".draft/operations" / trash_id
+    (t_dir / "not-registered.bin").write_bytes(b"x")
+    lock = root / ".draft/operation.lock"
+    before = snapshot_tree(root)
+    real_lstat = os.lstat
+
+    def fail_lock_lstat(path: str | bytes | os.PathLike[str], *args: object) -> object:
+        if os.fspath(path) == os.fspath(lock):
+            raise OSError(5, "Input/output error")
+        return real_lstat(path, *args)
+
+    monkeypatch.setattr(os, "lstat", fail_lock_lstat)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    unexpected = {
+        issue.path
+        for issue in report.errors
+        if issue.code == CheckCode.INTERNAL_UNEXPECTED_ENTRY.value
+    }
+    assert Path(f".draft/operations/{trash_id}/not-registered.bin") in unexpected
     assert not _has_package_orphan(report, trash_id)
     assert snapshot_tree(root) == before
 

@@ -670,18 +670,21 @@ def _check_operation_directory_entries(
     journal: Journal,
     issues: list[CheckIssue],
     *,
-    active_ids: frozenset[str] = frozenset(),
+    role: OperationDirectoryRole,
 ) -> None:
-    """按 phase 与活动角色校验操作目录允许的精确内部条目（随机 pending/错误 evidence/
-    终态残留可见）。
+    """按 phase 与三值目录角色校验操作目录允许的精确内部条目（随机 pending/错误
+    evidence/终态残留可见）。
 
-    活动角色（锁持有者 R 与锁内 RESTORE R 关联的 cleanup owner T，round-12 H3）在
-    完成清理前可能保留 originals/staged/attempt/evidence，使用完整允许集并总是运行
-    evidence 联合分类；普通终态（completed/rolled_back）只允许 journal.json，任何
-    originals/staged/attempt/evidence/pending/quarantine 都是残留并报告；allocating
-    只允许 journal 与恢复副本目录；其余阶段允许全部登记内部条目。evidence 合法性由
-    共享只读分类 ``classify_cleanup_evidence_artifacts`` 判定，再调用
-    ``cleanup_evidence_protocol_corrupt``；任一损坏结果报告 trash.package_corrupt。
+    ACTIVE（锁持有者 R 与锁内 RESTORE R 关联的 cleanup owner T）在完成清理前可能
+    保留 originals/staged/attempt/evidence，使用完整允许集并总是运行 evidence 联合
+    分类；INACTIVE 终态（completed/rolled_back）只允许 journal.json，任何
+    originals/staged/attempt/evidence/pending/quarantine 都是残留并报告；UNKNOWN
+    （lock 不可读或必要 R/journal 事实缺失）使用 ACTIVE 与 INACTIVE 允许集的并集，
+    登记材料不因存在而报残留，但两种角色都不允许的名字/链接/错误节点类型仍报告，
+    且不依赖角色的 evidence schema/节点验证继续运行——UNKNOWN 不是不检查目录。
+    allocating 只允许 journal 与恢复副本目录；其余非终态阶段允许全部登记内部条目。
+    evidence 合法性由共享只读分类 ``classify_cleanup_evidence_artifacts`` 判定，再
+    调用 ``cleanup_evidence_protocol_corrupt``；任一损坏结果报告 trash.package_corrupt。
     checker 始终只读，不发布/恢复/消费任何 evidence 名；分类/枚举/读取的底层 OSError
     一律转为稳定诊断，不泄漏原始异常。所有 path 按根内相对协议输出（L1）。
     """
@@ -691,10 +694,15 @@ def _check_operation_directory_entries(
     )
 
     phase = journal.phase
-    if journal.operation_id in active_ids:
-        allowed = _OP_DIR_ALLOWED_ENTRIES
-    elif phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
-        allowed = _OP_DIR_TERMINAL_ALLOWED
+    if phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
+        # 终态目录：只有 INACTIVE 使用严格终态集合；ACTIVE 与 UNKNOWN 都允许登记材料
+        # 存在（round-14 M1）。UNKNOWN 不是 ACTIVE：枚举与 type 保持区别，便于未来
+        # 消费者不再次丢失完整性。
+        allowed = (
+            _OP_DIR_TERMINAL_ALLOWED
+            if role is OperationDirectoryRole.INACTIVE
+            else _OP_DIR_ALLOWED_ENTRIES
+        )
     elif phase is OperationPhase.ALLOCATING:
         allowed = _OP_DIR_ALLOCATING_ALLOWED
     else:
@@ -747,41 +755,6 @@ def _check_operation_directory_entries(
                     final_quarantine_same_node=same_quarantine,
                 ):
                     issues.append(_error(CheckCode.TRASH_PACKAGE_CORRUPT, evidence_relative))
-
-
-def _cleanup_owner_ids(
-    index: Mapping[str, Journal],
-    locked_operation: str | None,
-) -> frozenset[str]:
-    """识别锁内 RESTORE R 所关联的 cleanup owner T（round-12 H3）。
-
-    充分条件（缺一不可）：锁属于 R、R.kind=RESTORE、R.phase=COMPLETED、
-    R.metadata[restores_trash_operation]==T.id、T.kind=TRASH、T.phase=ROLLED_BACK、
-    T.metadata[restore_operation_id]==R.id。只有由锁与合法 R/T 关系证明的 T 才能在
-    rolled_back 下拥有 cleanup evidence；条件不完整时不得放宽 terminal T 目录协议。
-    """
-    if locked_operation is None:
-        return frozenset()
-    restore_journal = index.get(locked_operation)
-    if (
-        restore_journal is None
-        or restore_journal.kind is not OperationKind.RESTORE
-        or restore_journal.phase is not OperationPhase.COMPLETED
-    ):
-        return frozenset()
-    trash_id = restore_journal.metadata.get("restores_trash_operation")
-    if not isinstance(trash_id, str):
-        return frozenset()
-    trash_journal = index.get(trash_id)
-    if (
-        trash_journal is None
-        or trash_journal.kind is not OperationKind.TRASH
-        or trash_journal.phase is not OperationPhase.ROLLED_BACK
-    ):
-        return frozenset()
-    if trash_journal.metadata.get("restore_operation_id") != locked_operation:
-        return frozenset()
-    return frozenset({trash_id})
 
 
 def _is_valid_operation_id_name(name: str) -> bool:
@@ -888,11 +861,6 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
     index = _build_operation_index(
         root, listing, issues, locked_operation=locked_operation, lock_known=lock_known
     )
-    cleanup_owner_ids = _cleanup_owner_ids(index.journals, index.locked_operation)
-    active_ids: frozenset[str] = cleanup_owner_ids
-    if locked_operation is not None:
-        active_ids = active_ids | frozenset({locked_operation})
-
     if locked_operation is not None:
         locked_journal = index.journals.get(locked_operation)
         if locked_journal is None:
@@ -902,11 +870,15 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
                 issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, lock_path))
         else:
             # 有锁操作目录仍校验内部条目形状（回归 H4）：持锁时完成清理前可能有
-            # originals/staged/attempt/evidence；活动角色使用完整允许集，但未知条目
-            # 与错误 evidence 必须可见。锁目录只检查一次，不重复报告。
+            # originals/staged/attempt/evidence；锁持有者角色 ACTIVE 使用完整允许集，
+            # 但未知条目与错误 evidence 必须可见。锁目录只检查一次，不重复报告。
             locked_entry = operations / locked_operation
             _check_operation_directory_entries(
-                root, locked_entry, locked_journal, issues, active_ids=active_ids
+                root,
+                locked_entry,
+                locked_journal,
+                issues,
+                role=operation_directory_role(locked_operation, index),
             )
             issues.append(
                 _error(CheckCode.OPERATION_RECOVERY_REQUIRED, lock_path, None, locked_operation)
@@ -918,10 +890,15 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
         journal_path = operation_journal_path(root, operation_id)
         relative = journal_path.relative_to(root)
         phase = journal.phase
-        # 操作目录也按 phase/角色校验内部条目：终态残留/随机 pending/错误 evidence
-        # 可见（回归 H4）；cleanup owner T 允许 evidence 并运行联合分类（round-12 H3）。
+        # 操作目录也按 phase/三值角色校验内部条目（round-14 M1）：终态残留/随机
+        # pending/错误 evidence 可见（回归 H4）；cleanup owner T 允许 evidence 并运行
+        # 联合分类（round-12 H3）；lock/R 事实缺失的 UNKNOWN 不因登记材料误报残留。
         _check_operation_directory_entries(
-            root, operations / operation_id, journal, issues, active_ids=active_ids
+            root,
+            operations / operation_id,
+            journal,
+            issues,
+            role=operation_directory_role(operation_id, index),
         )
         if phase is OperationPhase.ALLOCATING:
             issues.append(_review(CheckCode.OPERATION_ORPHAN_ALLOCATING, relative))
