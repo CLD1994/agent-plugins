@@ -38,6 +38,7 @@ from draft.operations import (
 )
 from draft.resources import resolve_page_resources
 from draft.trash import (
+    RestoreLinkState,
     RestoreRecoveryAction,
     require_retained_restore_window,
     restore_recovery_decision,
@@ -999,101 +1000,141 @@ def _restore_decision(
     restore_phase: OperationPhase,
     trash_phase: OperationPhase,
     *,
-    links_match: bool = True,
+    link_state: RestoreLinkState = RestoreLinkState.MATCHED,
     proven_unapplied: bool = False,
 ) -> RestoreRecoveryAction:
     return restore_recovery_decision(
         restore_phase=restore_phase,
         trash_phase=trash_phase,
-        links_match=links_match,
+        link_state=link_state,
         proven_unapplied=proven_unapplied,
     )
 
 
-# 权威期望分区（计划"行为契约一"）：只有这些 (R, T) pair 在满足附加条件时非 INCONSISTENT。
-# 其余全部组合一律 INCONSISTENT（保留 R/T、锁、包与恢复材料，不猜测）。期望表独立于
-# 生产映射，不允许读取生产 _PHASES_BY_KIND 或调用另一生产 helper 生成 expected。
-_VALID_RESTORE_PAIRS_WITHOUT_PROVEN: dict[
-    tuple[OperationPhase, OperationPhase], RestoreRecoveryAction
+# 权威期望分区（计划"行为契约一"，第十二轮 H1/H2 扩展）：关联从布尔提升为三值状态，
+# 只有这些 (R, T, link_state) 在满足附加事实时非 INCONSISTENT。其余全部组合一律
+# INCONSISTENT（保留 R/T、锁、包与恢复材料，不猜测）。期望表独立于生产映射，不允许
+# 读取生产 _PHASES_BY_KIND 或调用另一生产 helper 生成 expected。
+_VALID_RESTORE_TRIPLES: dict[
+    tuple[OperationPhase, OperationPhase, RestoreLinkState], RestoreRecoveryAction
 ] = {
     (
         OperationPhase.COMPLETED,
         OperationPhase.TRASH_RETAINED,
+        RestoreLinkState.MATCHED,
     ): RestoreRecoveryAction.VERIFY_AND_COMMIT_CLEANUP,
     (
         OperationPhase.COMPLETED,
         OperationPhase.ROLLED_BACK,
+        RestoreLinkState.MATCHED,
     ): RestoreRecoveryAction.RESUME_COMMITTED_CLEANUP,
-    (OperationPhase.APPLYING, OperationPhase.TRASH_RETAINED): RestoreRecoveryAction.RESUME_FORWARD,
+    (
+        OperationPhase.APPLYING,
+        OperationPhase.TRASH_RETAINED,
+        RestoreLinkState.MATCHED,
+    ): RestoreRecoveryAction.RESUME_FORWARD,
     (
         OperationPhase.VALIDATING,
         OperationPhase.TRASH_RETAINED,
+        RestoreLinkState.MATCHED,
     ): RestoreRecoveryAction.RESUME_FORWARD,
     (
         OperationPhase.ROLLING_BACK,
         OperationPhase.TRASH_RETAINED,
+        RestoreLinkState.MATCHED,
     ): RestoreRecoveryAction.RESUME_ROLLBACK,
     (
         OperationPhase.ROLLED_BACK,
         OperationPhase.TRASH_RETAINED,
+        RestoreLinkState.MATCHED,
     ): RestoreRecoveryAction.ABANDON_UNAPPLIED,
+    # H1：ABANDON 已把 T 解关联并耐久写，R 材料待清理。这是程序自己写出的耐久中间
+    # 状态，不能因 validate_restore_link 要求双向往返而把它拒绝为 plan_invalid。
+    (
+        OperationPhase.ROLLED_BACK,
+        OperationPhase.TRASH_RETAINED,
+        RestoreLinkState.TRASH_UNCLAIMED,
+    ): RestoreRecoveryAction.FINISH_ABANDON_CLEANUP,
 }
-_PROVEN_GATED_PAIRS = frozenset(
+_PROVEN_GATED_TRIPLES = frozenset(
     {
-        (OperationPhase.ALLOCATING, OperationPhase.TRASH_RETAINED),
-        (OperationPhase.PREPARED, OperationPhase.TRASH_RETAINED),
+        (
+            OperationPhase.ALLOCATING,
+            OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.MATCHED,
+        ),
+        (
+            OperationPhase.PREPARED,
+            OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.MATCHED,
+        ),
     }
 )
 
 
 @pytest.mark.parametrize(
-    ("restore_phase", "trash_phase", "proven", "expected"),
+    ("restore_phase", "trash_phase", "link_state", "proven", "expected"),
     [
         (
             OperationPhase.COMPLETED,
             OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.MATCHED,
             False,
             RestoreRecoveryAction.VERIFY_AND_COMMIT_CLEANUP,
         ),
         (
             OperationPhase.COMPLETED,
             OperationPhase.ROLLED_BACK,
+            RestoreLinkState.MATCHED,
             False,
             RestoreRecoveryAction.RESUME_COMMITTED_CLEANUP,
         ),
         (
             OperationPhase.APPLYING,
             OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.MATCHED,
             False,
             RestoreRecoveryAction.RESUME_FORWARD,
         ),
         (
             OperationPhase.VALIDATING,
             OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.MATCHED,
             False,
             RestoreRecoveryAction.RESUME_FORWARD,
         ),
         (
             OperationPhase.ROLLING_BACK,
             OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.MATCHED,
             False,
             RestoreRecoveryAction.RESUME_ROLLBACK,
         ),
         (
             OperationPhase.ROLLED_BACK,
             OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.MATCHED,
             False,
             RestoreRecoveryAction.ABANDON_UNAPPLIED,
         ),
         (
+            OperationPhase.ROLLED_BACK,
+            OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.TRASH_UNCLAIMED,
+            False,
+            RestoreRecoveryAction.FINISH_ABANDON_CLEANUP,
+        ),
+        (
             OperationPhase.ALLOCATING,
             OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.MATCHED,
             True,
             RestoreRecoveryAction.ABANDON_UNAPPLIED,
         ),
         (
             OperationPhase.PREPARED,
             OperationPhase.TRASH_RETAINED,
+            RestoreLinkState.MATCHED,
             True,
             RestoreRecoveryAction.ABANDON_UNAPPLIED,
         ),
@@ -1102,37 +1143,45 @@ _PROVEN_GATED_PAIRS = frozenset(
 def test_restore_recovery_decision_valid_partitions(
     restore_phase: OperationPhase,
     trash_phase: OperationPhase,
+    link_state: RestoreLinkState,
     proven: bool,
     expected: RestoreRecoveryAction,
 ) -> None:
-    """行为契约一的合法分区逐项成立（第十一轮 H1/H2 扩展）。"""
+    """行为契约一的合法分区逐项成立（第十二轮 H1/H2 扩展）。"""
     assert (
         restore_recovery_decision(
             restore_phase=restore_phase,
             trash_phase=trash_phase,
-            links_match=True,
+            link_state=link_state,
             proven_unapplied=proven,
         )
         is expected
-    ), f"{(restore_phase, trash_phase, proven)} 期望 {expected}"
+    ), f"{(restore_phase, trash_phase, link_state, proven)} 期望 {expected}"
 
 
-def test_restore_recovery_decision_exhaustive_other_pairs_inconsistent() -> None:
-    """穷举全部 R phase × T phase：未列组合一律 INCONSISTENT（proven=False 基线）。
+def test_restore_recovery_decision_exhaustive_link_state_matrix() -> None:
+    """穷举 R phase × T phase × link_state：未列组合一律 INCONSISTENT（proven=False 基线）。
 
     覆盖第十一轮 M1：R=rolled_back,T=rolled_back 与 R=prepared,T=rolled_back 等先前
     误判为可放弃/可提交的组合必须先报 INCONSISTENT，不得在后续 journal 写入时才失败。
+    覆盖第十二轮 H1：unclaimed 只在 rolled_back/trash_retained 下进入
+    FINISH_ABANDON_CLEANUP，其他任何 unclaimed 组合都不得猜测。
     """
     for restore_phase in OperationPhase:
         for trash_phase in OperationPhase:
-            pair = (restore_phase, trash_phase)
-            expected = _VALID_RESTORE_PAIRS_WITHOUT_PROVEN.get(
-                pair, RestoreRecoveryAction.INCONSISTENT
-            )
-            assert _restore_decision(restore_phase, trash_phase) is expected, (
-                f"{pair} 期望 {expected}"
-            )
-    # 明确点出评审给出的反例组合。
+            for link_state in RestoreLinkState:
+                expected = _VALID_RESTORE_TRIPLES.get(
+                    (restore_phase, trash_phase, link_state),
+                    RestoreRecoveryAction.INCONSISTENT,
+                )
+                assert (
+                    _restore_decision(restore_phase, trash_phase, link_state=link_state) is expected
+                ), f"{(restore_phase, trash_phase, link_state)} 期望 {expected}"
+
+
+def test_restore_recovery_decision_counterexamples_inconsistent() -> None:
+    """评审给出的反例组合必须仍为零写入 INCONSISTENT（第十二轮 H1/H2）。"""
+    # 终态 + 终态：T 已 rolled_back 时 R 不能单方面放弃。
     assert (
         _restore_decision(OperationPhase.ROLLED_BACK, OperationPhase.ROLLED_BACK)
         is RestoreRecoveryAction.INCONSISTENT
@@ -1145,40 +1194,77 @@ def test_restore_recovery_decision_exhaustive_other_pairs_inconsistent() -> None
         _restore_decision(OperationPhase.COMPLETED, OperationPhase.ALLOCATING)
         is RestoreRecoveryAction.INCONSISTENT
     )
-
-
-def test_restore_recovery_decision_links_mismatch_all_inconsistent() -> None:
-    """links_match=False 时不论其他输入为何一律 INCONSISTENT。"""
+    # CONFLICT（T 指向其他 R / 身份不可证明）一律零写入失败，不得误归 unclaimed/matched。
     for restore_phase in OperationPhase:
         for trash_phase in OperationPhase:
-            for proven in (False, True):
+            assert (
+                _restore_decision(
+                    restore_phase,
+                    trash_phase,
+                    link_state=RestoreLinkState.CONFLICT,
+                )
+                is RestoreRecoveryAction.INCONSISTENT
+            ), f"conflict {(restore_phase, trash_phase)}"
+
+
+def test_restore_recovery_decision_unclaimed_only_rolled_back_retained() -> None:
+    """TRASH_UNCLAIMED 只对 rolled_back/trash_retained 合法，其他组合不得用 FINISH 掩盖。"""
+    for restore_phase in OperationPhase:
+        for trash_phase in OperationPhase:
+            if (restore_phase, trash_phase) == (
+                OperationPhase.ROLLED_BACK,
+                OperationPhase.TRASH_RETAINED,
+            ):
+                continue
+            assert (
+                _restore_decision(
+                    restore_phase,
+                    trash_phase,
+                    link_state=RestoreLinkState.TRASH_UNCLAIMED,
+                )
+                is RestoreRecoveryAction.INCONSISTENT
+            ), f"unclaimed {(restore_phase, trash_phase)}"
+
+
+def test_restore_recovery_decision_proven_only_gates_allocating_prepared() -> None:
+    """proven_unapplied 只改变 allocating/prepared × trash_retained × matched。"""
+    for restore_phase in OperationPhase:
+        for trash_phase in OperationPhase:
+            for link_state in RestoreLinkState:
+                if (restore_phase, trash_phase, link_state) in _PROVEN_GATED_TRIPLES:
+                    continue
+                base = _restore_decision(restore_phase, trash_phase, link_state=link_state)
                 assert (
                     _restore_decision(
                         restore_phase,
                         trash_phase,
-                        links_match=False,
-                        proven_unapplied=proven,
+                        link_state=link_state,
+                        proven_unapplied=True,
                     )
-                    is RestoreRecoveryAction.INCONSISTENT
-                ), f"{(restore_phase, trash_phase, proven)}"
-
-
-def test_restore_recovery_decision_proven_only_gates_allocating_prepared() -> None:
-    """proven_unapplied 只影响 allocating/prepared；其他 R phase 读取它不得改变动作。"""
-    for restore_phase in OperationPhase:
-        for trash_phase in OperationPhase:
-            if restore_phase in (OperationPhase.ALLOCATING, OperationPhase.PREPARED):
-                continue
-            base = _restore_decision(restore_phase, trash_phase)
-            assert _restore_decision(restore_phase, trash_phase, proven_unapplied=True) is base, (
-                f"{(restore_phase, trash_phase)}"
-            )
+                    is base
+                ), f"{(restore_phase, trash_phase, link_state)}"
 
 
 def test_restore_recovery_decision_not_proven_unapplied_is_inconsistent() -> None:
     """R=allocating/prepared 但不能证明未应用：不猜测，保留现场。"""
-    for pair in _PROVEN_GATED_PAIRS:
-        restore_phase, trash_phase = pair
+    for triple in _PROVEN_GATED_TRIPLES:
+        restore_phase, trash_phase, link_state = triple
         assert (
-            _restore_decision(restore_phase, trash_phase) is RestoreRecoveryAction.INCONSISTENT
-        ), str(pair)
+            _restore_decision(restore_phase, trash_phase, link_state=link_state)
+            is RestoreRecoveryAction.INCONSISTENT
+        ), str(triple)
+
+
+def test_restore_recovery_decision_proven_gates_abandon() -> None:
+    """allocating/prepared × trash_retained × matched 且 proven 时进入 ABANDON。"""
+    for triple in _PROVEN_GATED_TRIPLES:
+        restore_phase, trash_phase, link_state = triple
+        assert (
+            _restore_decision(
+                restore_phase,
+                trash_phase,
+                link_state=link_state,
+                proven_unapplied=True,
+            )
+            is RestoreRecoveryAction.ABANDON_UNAPPLIED
+        ), str(triple)

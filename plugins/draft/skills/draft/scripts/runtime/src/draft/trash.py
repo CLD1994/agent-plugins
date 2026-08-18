@@ -364,14 +364,28 @@ def _proven_unapplied_restore(root: Path, journal: Journal) -> bool:
     return True
 
 
+class RestoreLinkState(StrEnum):
+    """R/T 关联状态（第十二轮 H1：区分 T 未认领与身份冲突）。
+
+    ABANDON 先耐久删除 T 的 ``restore_operation_id`` 再清理 R 材料，因此程序自己写出的
+    ``TRASH_UNCLAIMED`` 是合法耐久中间状态，不得与 CONFLICT（T 指向其他 R/身份不可证明）
+    折叠为同一个布尔 false。
+    """
+
+    MATCHED = "matched"
+    TRASH_UNCLAIMED = "trash_unclaimed"
+    CONFLICT = "conflict"
+
+
 class RestoreRecoveryAction(StrEnum):
-    """R/T 双日志恢复决策结果（第十轮 H2，第十一轮 H1/M1 闭合）。"""
+    """R/T 双日志恢复决策结果（第十轮 H2，第十一轮 H1/M1 闭合，第十二轮 H1 扩展）。"""
 
     VERIFY_AND_COMMIT_CLEANUP = "verify_and_commit_cleanup"
     RESUME_COMMITTED_CLEANUP = "resume_committed_cleanup"
     RESUME_FORWARD = "resume_forward"
     RESUME_ROLLBACK = "resume_rollback"
     ABANDON_UNAPPLIED = "abandon_unapplied"
+    FINISH_ABANDON_CLEANUP = "finish_abandon_cleanup"
     INCONSISTENT = "inconsistent"
 
 
@@ -379,21 +393,27 @@ def restore_recovery_decision(
     *,
     restore_phase: OperationPhase,
     trash_phase: OperationPhase,
-    links_match: bool,
+    link_state: RestoreLinkState,
     proven_unapplied: bool,
 ) -> RestoreRecoveryAction:
     """restore 双日志恢复决策（纯函数，唯一权威 R/T 决策来源）。
 
-    完整分区见计划"行为契约一"：关联不匹配一律 INCONSISTENT；只有显式列出的合法
-    (R, T) 分区才返回对应动作。中段相位（applying/validating/rolling_back）不再是
-    INCONSISTENT，而是交给公开 recovery 入口复用通用 mutation 恢复；RESUME_* 动作
-    只能由显式恢复路径执行，正常业务调用不得因 phase 可恢复而吞掉原错误。未列
-    组合（如 R=rolled_back,T=rolled_back）一律 INCONSISTENT，不在后续 journal 写入
-    时才暴露（第十一轮 M1）。
+    完整分区见计划"行为契约一"：关联为 CONFLICT 一律 INCONSISTENT；TRASH_UNCLAIMED
+    只对 ``rolled_back × trash_retained`` 返回 FINISH_ABANDON_CLEANUP（ABANDON 后半段
+    幂等清理），其他 unclaimed 组合仍 INCONSISTENT。只有显式列出的合法 (R, T, link_state)
+    分区才返回对应动作。中段相位（applying/validating/rolling_back）不再是 INCONSISTENT，
+    而是交给公开 recovery 入口复用通用 mutation 恢复；RESUME_* 动作只能由显式恢复路径
+    执行，正常业务调用不得因 phase 可恢复而吞掉原错误。未列组合（如
+    R=rolled_back,T=rolled_back）一律 INCONSISTENT，不在后续 journal 写入时才暴露
+    （第十一轮 M1）。
     """
-    if not links_match:
+    if link_state is RestoreLinkState.CONFLICT:
         return RestoreRecoveryAction.INCONSISTENT
     pair = (restore_phase, trash_phase)
+    if link_state is RestoreLinkState.TRASH_UNCLAIMED:
+        if pair == (OperationPhase.ROLLED_BACK, OperationPhase.TRASH_RETAINED):
+            return RestoreRecoveryAction.FINISH_ABANDON_CLEANUP
+        return RestoreRecoveryAction.INCONSISTENT
     if pair in (
         (OperationPhase.APPLYING, OperationPhase.TRASH_RETAINED),
         (OperationPhase.VALIDATING, OperationPhase.TRASH_RETAINED),
@@ -918,7 +938,9 @@ def _restore_recovery_action(root: Path, restore_id: str, trash_id: str) -> Rest
     return restore_recovery_decision(
         restore_phase=restore_journal.phase,
         trash_phase=trash_journal.phase,
-        links_match=True,
+        # 业务调用点（restore_page）在 validate_restore_link 上已要求严格双向匹配：
+        # 不匹配直接抛错，不进入决策，故此处关联必为 MATCHED。
+        link_state=RestoreLinkState.MATCHED,
         proven_unapplied=_proven_unapplied_restore(root, restore_journal),
     )
 

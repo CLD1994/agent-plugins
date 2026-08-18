@@ -683,16 +683,19 @@ def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleRe
     包与恢复材料报 inconsistent，不猜测、不静默成功。
     """
     from draft.trash import (
+        RestoreLinkState,
         RestoreRecoveryAction,
         _proven_unapplied_restore,  # pyright: ignore[reportPrivateUsage]
         restore_recovery_decision,
     )
 
+    # 恢复专用关联分类在 Task 2 升级为三值；此处 validate_restore_link 已保证严格双向
+    # 匹配才不抛错，因此进入决策时必为 MATCHED（机械适配，不改变语义）。
     trash_journal = validate_restore_link(root, restore_journal)
     action = restore_recovery_decision(
         restore_phase=restore_journal.phase,
         trash_phase=trash_journal.phase,
-        links_match=True,
+        link_state=RestoreLinkState.MATCHED,
         proven_unapplied=_proven_unapplied_restore(root, restore_journal),
     )
     if action in (
@@ -709,7 +712,7 @@ def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleRe
         action = restore_recovery_decision(
             restore_phase=restore_journal.phase,
             trash_phase=trash_journal.phase,
-            links_match=True,
+            link_state=RestoreLinkState.MATCHED,
             proven_unapplied=_proven_unapplied_restore(root, restore_journal),
         )
     if action in (
