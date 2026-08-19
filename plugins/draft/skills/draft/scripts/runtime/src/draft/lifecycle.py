@@ -5,13 +5,12 @@ from contextlib import suppress
 from pathlib import Path
 
 from draft.checker import check_draft
-from draft.diagnostic_codes import RootCode
+from draft.diagnostic_codes import CheckCode, RootCode
 from draft.errors import DraftError
 from draft.graph import (
     FORMAT_VERSION,
     INTERNAL_DIR,
     MARKER_PATH,
-    read_marker,
 )
 from draft.models import (
     FileMutation,
@@ -24,7 +23,6 @@ from draft.models import (
 from draft.operations import (
     durable_write,
     fsync_directory,
-    reject_symlink_components,
 )
 from draft.paths import resolve_draft_root
 from draft.vocabulary import ConclusionsState
@@ -104,15 +102,15 @@ def adopt(root: Path) -> OperationResult:
     通过后以 kind="adopt" 的普通计划执行，marker 的 candidate→registered 替换作为
     唯一受管根 mutation 原子提交；恢复按 OperationKind.ADOPT 单向收敛。
     """
-    from draft.graph import load_graph_tolerant
+    from draft.graph import load_graph_tolerant, read_marker_snapshot
     from draft.operations import execute_plan, sha256_bytes
 
     target = resolve_draft_root(root)
-    final_marker = target / MARKER_PATH
-    reject_symlink_components(target, MARKER_PATH)
-    if not final_marker.is_file():
-        raise DraftError("adopt.invalid_candidate", target)
-    state = read_marker(target)
+    # marker 身份、before bytes、state 与观察摘要全部来自同一次 snapshot（round-15 H1）；
+    # .draft/marker symlink 与非普通节点由 snapshot 读取器分类，不再有 is_file/read_bytes
+    # 旁路。ENOENT -> format.missing，不得改写为 adopt.invalid_candidate。
+    snapshot = read_marker_snapshot(target)
+    state = snapshot.state
     if state.root_state is not RootState.CANDIDATE:
         raise DraftError("adopt.already_registered", target)
     if (target / INTERNAL_DIR / "operation.lock").exists():
@@ -125,8 +123,11 @@ def adopt(root: Path) -> OperationResult:
             target,
             details=tuple(issue.code for issue in report.errors),
         )
-    before_bytes = final_marker.read_bytes()
+    before_bytes = snapshot.raw_bytes
     after_bytes = marker_bytes(RootState.REGISTERED, state.conclusions_state)
+    if sha256_bytes(before_bytes) == sha256_bytes(after_bytes):
+        # 结构性排除 before==after：不得写入前后摘要相同的 adopt journal。
+        raise DraftError(CheckCode.FORMAT_INVALID.value, target / MARKER_PATH)
     graph = load_graph_tolerant(target).graph
     from draft.observations import (
         Observation,
@@ -135,10 +136,11 @@ def adopt(root: Path) -> OperationResult:
         internal_protocol_observations,
     )
 
-    # marker 同时属于页面协议与内部协议，两处捕获会重复：按路径去重。
+    # marker 由 snapshot 生成，internal_protocol_observations 已跳过 MARKER_PATH；
+    # 合并后 marker 恰好一项，不能靠重复读取后 setdefault 隐藏。
     merged: dict[Path, Observation] = {}
     for observation in (
-        *graph_observations(graph).entries,
+        *graph_observations(graph, marker=snapshot).entries,
         *internal_protocol_observations(graph).entries,
     ):
         merged.setdefault(observation.path, observation)

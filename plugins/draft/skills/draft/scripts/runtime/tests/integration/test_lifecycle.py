@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -7,7 +8,7 @@ from draft.checker import check_draft
 from draft.errors import DraftError
 from draft.lifecycle import adopt, initialize
 from draft.models import OperationPhase, RootState
-from tests.integration.support import build_valid_candidate, managed_marker_text
+from tests.integration.support import build_valid_candidate, managed_marker_text, snapshot_tree
 
 FINAL_MARKER_BYTES = managed_marker_text().encode("utf-8")
 
@@ -216,18 +217,196 @@ def test_adopt_rejects_registered_root(tmp_path: Path) -> None:
 
 
 def test_adopt_rejects_unmanaged_root(tmp_path: Path) -> None:
-    """未受管目录（无 marker）不是候选：adopt 拒绝且不写任何内部状态。"""
+    """未受管目录（无 marker）不是候选：marker ENOENT 报 format.missing（round-15 H1）。
+
+    adopt 不得把缺失改写为 adopt.invalid_candidate；不写任何内部状态。
+    """
     root = tmp_path / "broken"
     root.mkdir()
     (root / "pages").mkdir()
     (root / "index.md").write_text("# 主题\n\n> 状态：`进行中`\n", encoding="utf-8")
     before = (root / "index.md").read_bytes()
 
-    with pytest.raises(DraftError, match="adopt.invalid_candidate"):
+    from draft.diagnostic_codes import CheckCode
+
+    with pytest.raises(DraftError, match=CheckCode.FORMAT_MISSING.value):
         adopt(root)
 
     assert (root / "index.md").read_bytes() == before
     assert not (root / ".draft").exists()
+
+
+def test_adopt_marker_identity_read_eio_is_stable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """adopt marker 身份读取 EIO：format.invalid @ marker，无锁、无 operation（round-15 H1）。
+
+    修复前 final_marker.is_file()/read_bytes() 会原样泄漏 OSError；snapshot 读取器把
+    EACCES/EIO 稳定映射 format.invalid，且不写任何内部状态。
+    """
+    import os
+
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    marker = root / ".draft/draft.json"
+    before = snapshot_tree(root)
+    real_lstat = os.lstat
+
+    def fail_marker_lstat(path: str | bytes | os.PathLike[str], *args: object) -> object:
+        if os.fspath(path) == os.fspath(marker):
+            raise OSError(5, "Input/output error")
+        return real_lstat(path, *args)
+
+    monkeypatch.setattr(os, "lstat", fail_marker_lstat)
+
+    from draft.diagnostic_codes import CheckCode
+
+    with pytest.raises(DraftError, match=CheckCode.FORMAT_INVALID.value):
+        adopt(root)
+    monkeypatch.undo()
+
+    assert snapshot_tree(root) == before
+    assert not (root / ".draft/operation.lock").exists()
+    assert not (root / ".draft/operations").exists()
+
+
+def test_adopt_marker_bytes_read_eio_is_stable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """adopt marker bytes 读取 EIO：format.invalid @ marker，无锁、无 operation（round-15 H1）。
+
+    修复前 final_marker.read_bytes() 原样泄漏 OSError(5)；修复后普通 I/O 失败稳定失败。
+    """
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    marker = root / ".draft/draft.json"
+    before = snapshot_tree(root)
+    real_read_bytes = Path.read_bytes
+
+    def fail_marker_read(self: Path) -> bytes:
+        if self == marker:
+            raise OSError(5, "Input/output error")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_marker_read)
+
+    from draft.diagnostic_codes import CheckCode
+
+    with pytest.raises(DraftError, match=CheckCode.FORMAT_INVALID.value):
+        adopt(root)
+    monkeypatch.undo()
+
+    assert snapshot_tree(root) == before
+    assert not (root / ".draft/operation.lock").exists()
+    assert not (root / ".draft/operations").exists()
+
+
+def test_adopt_rejects_non_regular_marker_without_writes(
+    tmp_path: Path,
+) -> None:
+    """marker 是目录：adopt 报 format.invalid，无锁、无 operation（round-15 H1）。"""
+    from draft.diagnostic_codes import CheckCode
+
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    marker = root / ".draft/draft.json"
+    marker.unlink()
+    marker.mkdir()
+    before = snapshot_tree(root)
+
+    with pytest.raises(DraftError, match=CheckCode.FORMAT_INVALID.value):
+        adopt(root)
+
+    assert snapshot_tree(root) == before
+    assert not (root / ".draft/operation.lock").exists()
+    assert not (root / ".draft/operations").exists()
+
+
+def test_adopt_rejects_marker_symlink_without_writes(
+    tmp_path: Path,
+) -> None:
+    """marker 是 symlink：adopt 报 path.symlink_escape，无锁、无 operation（round-15 H1）。"""
+    from draft.diagnostic_codes import CheckCode
+
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    marker = root / ".draft/draft.json"
+    marker.rename(marker.with_suffix(".json.real"))
+    marker.symlink_to(marker.with_suffix(".json.real"))
+    before = snapshot_tree(root)
+
+    with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
+        adopt(root)
+
+    assert snapshot_tree(root) == before
+    assert not (root / ".draft/operation.lock").exists()
+    assert not (root / ".draft/operations").exists()
+
+
+def test_adopt_rejects_unknown_marker_version_without_writes(
+    tmp_path: Path,
+) -> None:
+    """marker 版本未知整数：adopt 报 format.unsupported，无锁、无 operation（round-15 H1）。"""
+    import json
+
+    from draft.diagnostic_codes import CheckCode
+
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    marker = root / ".draft/draft.json"
+    data = json.loads(marker.read_text(encoding="utf-8"))
+    data["format_version"] = 2
+    marker.write_text(json.dumps(data), encoding="utf-8")
+    before = snapshot_tree(root)
+
+    with pytest.raises(DraftError, match=CheckCode.FORMAT_UNSUPPORTED.value):
+        adopt(root)
+
+    assert snapshot_tree(root) == before
+    assert not (root / ".draft/operation.lock").exists()
+    assert not (root / ".draft/operations").exists()
+
+
+def test_adopt_snapshot_switch_candidate_to_registered_rejects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """adopt snapshot 后 live marker 切成 registered：锁内观察拒绝（round-15 H1）。
+
+    通过真实 candidate 根 + 受接口约束的 draft.graph.read_marker_snapshot 替身注入
+    snapshot 后切换；adopt 不得形成 before==after journal，marker 保持外部切换后的
+    registered，本次准备日志按既有冲突协议终态化且锁释放。
+    """
+    import draft.graph as graph_module
+    from draft.graph import MARKER_PATH, MarkerSnapshot
+
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    registered_bytes = managed_marker_text(root_state=RootState.REGISTERED).encode("utf-8")
+
+    real_snapshot = graph_module.read_marker_snapshot
+    fired = False
+
+    def snapshot_then_switch(path: Path) -> MarkerSnapshot:
+        nonlocal fired
+        snapshot = real_snapshot(path)
+        if not fired:
+            fired = True
+            (path / MARKER_PATH).write_bytes(registered_bytes)
+        return snapshot
+
+    monkeypatch.setattr(graph_module, "read_marker_snapshot", snapshot_then_switch)
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        adopt(root)
+
+    assert (root / ".draft/draft.json").read_bytes() == registered_bytes
+    assert not (root / ".draft/operation.lock").exists()
+    # 本次 adopt 准备日志按既有冲突协议安全终态化（rolled_back），无未终态活动操作。
+    ops = root / ".draft/operations"
+    if ops.exists():
+        for journal_dir in ops.iterdir():
+            raw = json.loads((journal_dir / "journal.json").read_text(encoding="utf-8"))
+            assert raw["phase"] in ("rolled_back", "completed")
 
 
 def test_adopt_rejects_malformed_candidate_without_writes(tmp_path: Path) -> None:
@@ -314,6 +493,10 @@ def test_adopt_observations_cover_pre_existing_internal_protocol_files(
     assert Path(".draft/trash/outgoing") / ("c" * 32) / "package.json" in {
         entry.path for entry in merged
     }
+    # marker 由 graph_observations 的 snapshot 恰好提供一项，internal_protocol_observations
+    # 已跳过 MARKER_PATH（round-15 H1）：合并后不得出现重复 marker 观察。
+    marker_entries = [entry for entry in merged if entry.path == Path(".draft/draft.json")]
+    assert len(marker_entries) == 1
 
 
 def test_adopt_rejects_concurrent_internal_protocol_change(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from draft.conclusions import (
     plan_generation,
 )
 from draft.errors import DraftError
+from draft.graph import MarkerSnapshot, MarkerState
 from draft.markdown import parse_page
 from draft.models import PageDocument, RelationCode, RootState, StatusCode
 from draft.vocabulary import status_label
@@ -21,6 +23,27 @@ INDEX = Path("index.md")
 CONCLUSIONS = Path("conclusions.md")
 A = Path("pages/a.md")
 B = Path("pages/b.md")
+
+
+def _marker_snapshot(
+    *, root_state: RootState, conclusions_state: ConclusionsState
+) -> MarkerSnapshot:
+    """从状态构造合成 snapshot：unit 不访问真实文件系统（round-15 H1）。"""
+    raw = json.dumps(
+        {
+            "format_version": 1,
+            "root_state": root_state.value,
+            "conclusions_state": conclusions_state.value,
+        }
+    ).encode("utf-8")
+    return MarkerSnapshot(
+        state=MarkerState(
+            version=1,
+            root_state=root_state,
+            conclusions_state=conclusions_state,
+        ),
+        raw_bytes=raw,
+    )
 
 
 def _page(
@@ -101,7 +124,10 @@ def test_not_generated_without_confirmed_is_no_op() -> None:
     graph = _draft_with_confirmed(state=ConclusionsState.NOT_GENERATED)
     graph.pages = {p: page for p, page in graph.pages.items() if p != B}
     plan = plan_generation(
-        graph, state=ConclusionsState.NOT_GENERATED, root_state=RootState.REGISTERED
+        graph,
+        marker=_marker_snapshot(
+            root_state=RootState.REGISTERED, conclusions_state=ConclusionsState.NOT_GENERATED
+        ),
     )
     assert isinstance(plan, GenerationPlan)
     assert plan.generated is False
@@ -112,7 +138,10 @@ def test_not_generated_without_confirmed_is_no_op() -> None:
 def test_not_generated_with_confirmed_creates_page_and_marks_owner() -> None:
     graph = _draft_with_confirmed(state=ConclusionsState.NOT_GENERATED)
     plan = plan_generation(
-        graph, state=ConclusionsState.NOT_GENERATED, root_state=RootState.REGISTERED
+        graph,
+        marker=_marker_snapshot(
+            root_state=RootState.REGISTERED, conclusions_state=ConclusionsState.NOT_GENERATED
+        ),
     )
     assert plan.generated is True
     assert plan.reason is None
@@ -131,7 +160,10 @@ def test_plan_generation_preserves_root_state() -> None:
     """生成计划必须携带当前根状态，不能硬编码 registered（计划 Task 11 Step 4）。"""
     graph = _draft_with_confirmed(state=ConclusionsState.NOT_GENERATED)
     plan = plan_generation(
-        graph, state=ConclusionsState.NOT_GENERATED, root_state=RootState.CANDIDATE
+        graph,
+        marker=_marker_snapshot(
+            root_state=RootState.CANDIDATE, conclusions_state=ConclusionsState.NOT_GENERATED
+        ),
     )
     assert plan.operation is not None
     assert plan.operation.root_state is RootState.CANDIDATE
@@ -139,7 +171,12 @@ def test_plan_generation_preserves_root_state() -> None:
 
 def test_generated_unchanged_produces_no_effect() -> None:
     graph = _draft_generated_with_nav()
-    plan = plan_generation(graph, state=ConclusionsState.GENERATED, root_state=RootState.REGISTERED)
+    plan = plan_generation(
+        graph,
+        marker=_marker_snapshot(
+            root_state=RootState.REGISTERED, conclusions_state=ConclusionsState.GENERATED
+        ),
+    )
     assert plan.generated is True
     assert plan.operation is None or plan.operation.effects == ()
 
@@ -147,7 +184,12 @@ def test_generated_unchanged_produces_no_effect() -> None:
 def test_generated_confirmed_page_is_rebuilt_as_proposed() -> None:
     graph = _draft_with_confirmed(state=ConclusionsState.GENERATED)
     graph.pages[CONCLUSIONS] = _page(CONCLUSIONS, status=StatusCode.CONFIRMED, title="结论汇总")
-    plan = plan_generation(graph, state=ConclusionsState.GENERATED, root_state=RootState.REGISTERED)
+    plan = plan_generation(
+        graph,
+        marker=_marker_snapshot(
+            root_state=RootState.REGISTERED, conclusions_state=ConclusionsState.GENERATED
+        ),
+    )
     assert plan.generated is True
     operation = plan.operation
     assert operation is not None
@@ -161,7 +203,12 @@ def test_generated_without_confirmed_keeps_empty_list() -> None:
     graph = _draft_with_confirmed(state=ConclusionsState.GENERATED)
     graph.pages = {p: page for p, page in graph.pages.items() if p != B}
     graph.pages[CONCLUSIONS] = _page(CONCLUSIONS, status=StatusCode.PROPOSED, title="结论汇总")
-    plan = plan_generation(graph, state=ConclusionsState.GENERATED, root_state=RootState.REGISTERED)
+    plan = plan_generation(
+        graph,
+        marker=_marker_snapshot(
+            root_state=RootState.REGISTERED, conclusions_state=ConclusionsState.GENERATED
+        ),
+    )
     assert plan.generated is True
     operation = plan.operation
     assert operation is not None
@@ -178,7 +225,10 @@ def test_not_generated_with_unexpected_file_fails() -> None:
     graph.pages[CONCLUSIONS] = _page(CONCLUSIONS, status=StatusCode.PROPOSED, title="结论汇总")
     with pytest.raises(DraftError, match=CheckCode.CONCLUSIONS_UNEXPECTED_FILE.value):
         plan_generation(
-            graph, state=ConclusionsState.NOT_GENERATED, root_state=RootState.REGISTERED
+            graph,
+            marker=_marker_snapshot(
+                root_state=RootState.REGISTERED, conclusions_state=ConclusionsState.NOT_GENERATED
+            ),
         )
 
 

@@ -20,6 +20,7 @@ from draft.graph import (
     MARKER_PATH,
     ROOT_PAGE,
     DraftGraph,
+    MarkerSnapshot,
 )
 from draft.models import (
     FileMutation,
@@ -368,10 +369,15 @@ class GenerationPlan:
 def plan_generation(
     graph: ConclusionsView,
     *,
-    state: ConclusionsState,
-    root_state: RootState,
+    marker: MarkerSnapshot,
 ) -> GenerationPlan:
-    """构造结论生成计划；不执行写入。root_state 必须由调用方从当前 marker 权威读出。"""
+    """构造结论生成计划；不执行写入。marker 为调用方一次读取的 snapshot（round-15 H1）。
+
+    conclusions_state/root_state、marker mutation before、after bytes 与观察清单全部
+    来自同一 snapshot，不重新读取 live marker。
+    """
+    state = marker.state.conclusions_state
+    root_state = marker.state.root_state
     confirmed = _confirmed_pages(graph)
     if state is ConclusionsState.NOT_GENERATED:
         conclusions_path = graph.root / CONCLUSIONS_PAGE
@@ -449,13 +455,11 @@ def plan_generation(
             )
         )
     marker_bytes = _marker_bytes(root_state, ConclusionsState.GENERATED)
-    marker_path = graph.root / MARKER_PATH
-    marker_before = marker_path.read_bytes() if marker_path.is_file() else None
     mutations.append(
         FileMutation(
             MARKER_PATH,
             MutationKind.WRITE,
-            sha256_bytes(marker_before) if marker_before is not None else None,
+            marker.sha256,
             sha256_bytes(marker_bytes),
             marker_bytes,
         )
@@ -476,7 +480,7 @@ def plan_generation(
         root=graph.root,
         mutations=tuple(mutations),
         root_state=root_state,
-        observations=graph_observations(graph),
+        observations=graph_observations(graph, marker=marker),
         effects=tuple(effects),
     )
     return GenerationPlan(generated=True, reason=None, operation=plan)
@@ -489,14 +493,14 @@ def generate_conclusions(root: Path) -> GenerationPlan:
     允许（不可解析页面阻止，不完整导航由生成器报 conclusions.invalid_navigation）。
     结论页在 generated 所有权下是可替换的机器产物，损坏不阻止生成。
     """
-    from draft.graph import read_marker
+    from draft.graph import read_marker_snapshot
     from draft.operations import execute_plan
     from draft.paths import resolve_draft_root
     from draft.query import load_tolerant_view
 
     resolved = resolve_draft_root(root)
-    marker = read_marker(resolved)
-    state = marker.conclusions_state
+    marker = read_marker_snapshot(resolved)
+    state = marker.state.conclusions_state
     view = load_tolerant_view(resolved)
     blocking = [
         path
@@ -507,7 +511,7 @@ def generate_conclusions(root: Path) -> GenerationPlan:
         details = tuple(path.as_posix() for path in blocking)
         raise DraftError("conclusions.incomplete", resolved, details=details)
     graph = _load_graph_with_conclusions(resolved, state)
-    plan = plan_generation(graph, state=state, root_state=marker.root_state)
+    plan = plan_generation(graph, marker=marker)
     if plan.operation is not None:
         execute_plan(plan.operation)
     return plan
