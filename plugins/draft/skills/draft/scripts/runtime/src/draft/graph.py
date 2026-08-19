@@ -102,6 +102,23 @@ class MarkerState:
     conclusions_state: ConclusionsState = ConclusionsState.NOT_GENERATED
 
 
+@dataclass(frozen=True)
+class MarkerSnapshot:
+    """一次读取的不可变 marker 快照（round-15 H1）：state、raw_bytes、sha256 同源。
+
+    同一操作计划的 root_state/conclusions_state、marker 原始 bytes（若该操作要修改
+    marker）、before digest 与观察清单中的 marker 摘要必须来自同一次成功读取；不得
+    由构造者分别传入互相矛盾的对象，也不得在 snapshot 后再次读取 live 文件重建事实。
+    """
+
+    state: MarkerState
+    raw_bytes: bytes
+
+    @property
+    def sha256(self) -> str:
+        return _sha256_hex(self.raw_bytes)
+
+
 def _parse_conclusions_state(value: object, marker: Path) -> ConclusionsState:
     if not isinstance(value, str):
         raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
@@ -140,42 +157,75 @@ def parse_marker_value(decoded: object, marker: Path) -> MarkerState:
     )
 
 
-def _read_marker_file(path: Path) -> MarkerState:
-    """marker 身份的单一稳定分类边界（round-14 M2）。
+def _classify_marker_parent(internal: Path, marker: Path) -> None:
+    """稳定分类 .draft 中间组件（round-15 H1）：symlink 是路径错误，缺失合法。
+
+    中间组件缺失时最终 marker 必然缺失，由 leaf 分类给出 format.missing；.draft 存在
+    但不是目录、或无法 lstat（EACCES/EIO）映射 format.invalid；只有 symlink 在中间
+    组件自身位置报告 path.symlink_escape（与 reject_symlink_components 同语义）。
+    """
+    try:
+        mode = os.lstat(internal).st_mode
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise DraftError(CheckCode.FORMAT_INVALID.value, marker) from exc
+    if stat.S_ISLNK(mode):
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, internal) from None
+    if not stat.S_ISDIR(mode):
+        raise DraftError(CheckCode.FORMAT_INVALID.value, marker) from None
+
+
+def _classify_marker_leaf(marker: Path) -> None:
+    """稳定分类 marker 最终节点（round-14 M2 分类语义，round-15 H1 独立成叶分类）。
 
     一次受保护 ``os.lstat`` 按 mode 分类，不再串联 ``Path.is_symlink/exists/is_file``
     （CPython 3.12 的 ``is_symlink`` 不吞 OSError，EACCES/EIO 会原样泄漏）：ENOENT ->
     format.missing；symlink -> path.symlink_escape；目录/其他非普通文件 ->
-    format.invalid；EACCES/EIO 等其他身份读取失败 -> format.invalid。随后再读取并解析
-    同一 marker；非 UTF-8、JSON 损坏、未知字段与版本不支持语义保持不变。
+    format.invalid；EACCES/EIO 等其他身份读取失败 -> format.invalid。随后由
+    snapshot 读取器从同一普通文件读取 bytes。
     """
     try:
-        mode = os.lstat(path).st_mode
+        mode = os.lstat(marker).st_mode
     except FileNotFoundError as exc:
-        raise DraftError(CheckCode.FORMAT_MISSING.value, path) from exc
+        raise DraftError(CheckCode.FORMAT_MISSING.value, marker) from exc
     except OSError as exc:
         # 已存在但不可 stat（EACCES/EIO）：普通 I/O 失败，不是"缺失"。
-        raise DraftError(CheckCode.FORMAT_INVALID.value, path) from exc
+        raise DraftError(CheckCode.FORMAT_INVALID.value, marker) from exc
     if stat.S_ISLNK(mode):
-        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, path)
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, marker)
     if not stat.S_ISREG(mode):
         # 已存在但不是普通文件（目录等）：异常内部状态，不是"缺失"。
-        raise DraftError(CheckCode.FORMAT_INVALID.value, path)
+        raise DraftError(CheckCode.FORMAT_INVALID.value, marker)
+
+
+def read_marker_snapshot(root: Path) -> MarkerSnapshot:
+    """一次读取返回不可变 marker 快照（round-15 H1）：state、bytes、digest 同源。
+
+    实现顺序必须是稳定分类 .draft 中间组件 -> 稳定分类 marker 最终节点 -> 读取普通
+    文件 bytes 一次 -> 从同一 bytes 完成 UTF-8、JSON、schema 解析。不做第二次
+    read_text/read_bytes；non-UTF-8、JSON 损坏、未知字段与版本不支持语义保持既有。
+    """
+    marker = root / MARKER_PATH
+    _classify_marker_parent(root / INTERNAL_DIR, marker)
+    _classify_marker_leaf(marker)
     try:
-        decoded = json.loads(path.read_text(encoding="utf-8"))
+        raw = marker.read_bytes()
+        decoded = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         # 非法 UTF-8 的登记文件与 JSON 损坏一致映射 format.invalid（回归 M3）。
-        raise DraftError(CheckCode.FORMAT_INVALID.value, path) from exc
-    return parse_marker_value(decoded, path)
+        raise DraftError(CheckCode.FORMAT_INVALID.value, marker) from exc
+    return MarkerSnapshot(state=parse_marker_value(decoded, marker), raw_bytes=raw)
 
 
 def read_marker(root: Path) -> MarkerState:
-    """Read and validate .draft/draft.json, raising stable codes.
+    """Read and validate .draft/draft.json, returning the parsed state.
 
-    The formal marker carries exactly ``format_version`` / ``root_state`` /
-    ``conclusions_state``.
+    ``read_marker`` 是只返回解析状态的兼容包装；需要 marker bytes/digest，或把 marker
+    与计划、日志、mutation、observation 组合的入口必须使用 ``read_marker_snapshot``
+    （round-15 H1），不能为满足这些消费再次读取 live 文件。
     """
-    return _read_marker_file(root / MARKER_PATH)
+    return read_marker_snapshot(root).state
 
 
 def _normalize_relative(decoded: str) -> PurePosixPath | None:

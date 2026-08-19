@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,7 @@ from draft.graph import (
     is_external_destination,
     parse_marker_value,
     read_marker,
+    read_marker_snapshot,
     resolve_local_destination,
 )
 from draft.models import RootState
@@ -282,13 +285,17 @@ def test_read_marker_identity_stat_failure_is_stable(
     """marker 身份读取 EACCES/EIO：read_marker 抛 format.invalid（round-14 M2）。
 
     修复前 ``_read_marker_file`` 的 ``Path.is_symlink()`` 不吞 OSError，EACCES/EIO
-    会原样泄漏（红灯）；修复后一次受保护 ``os.lstat`` 分类映射稳定码。
+    会原样泄漏（红灯）；修复后一次受保护 ``os.lstat`` 分类映射稳定码。round-15 H1
+    起 parent（.draft）分类先于 leaf，fake 让 parent 分类成功、只对 marker 注入失败。
     """
     root = Path("/draft")
     marker = root / ".draft/draft.json"
 
     def fail_lstat(path: str | bytes | os.PathLike[str], *args: object) -> os.stat_result:
-        assert os.fspath(path) == os.fspath(marker)
+        value = os.fspath(path)
+        if value == os.fspath(root / ".draft"):
+            return _stat_result(stat.S_IFDIR | 0o755)
+        assert value == os.fspath(marker)
         if error == "eacces":
             raise PermissionError(13, "Permission denied")
         raise OSError(5, "Input/output error")
@@ -297,4 +304,250 @@ def test_read_marker_identity_stat_failure_is_stable(
     with pytest.raises(DraftError) as caught:
         read_marker(root)
     assert caught.value.code == CheckCode.FORMAT_INVALID.value
+    assert caught.value.paths == (marker,)
+
+
+# ---------------------------------------------------------------------------
+# 第十五轮 H1：marker 一次读取的不可变 snapshot。unit 不访问真实文件系统：假 root
+# Path("/draft")，按精确路径 monkeypatch os.lstat 与 Path.read_bytes 这个稳定协作者
+# 边界；parent（.draft）与 leaf（marker）各自分类，bytes 只读取一次。
+# ---------------------------------------------------------------------------
+
+CANDIDATE_BYTES = (
+    b'{"format_version":1,"root_state":"candidate","conclusions_state":"not_generated"}'
+)
+CANDIDATE_REGISTERED_BYTES = (
+    b'{"format_version":1,"root_state":"registered","conclusions_state":"not_generated"}'
+)
+
+
+def _stat_result(mode: int) -> os.stat_result:
+    return os.stat_result((mode, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+
+
+def _marker_lstat(internal: Path, marker: Path) -> object:
+    """parent 为目录、marker 为普通文件的受接口约束 lstat 替身。"""
+
+    def fake(path: str | bytes | os.PathLike[str], *args: object) -> os.stat_result:
+        value = os.fspath(path)
+        if value == os.fspath(internal):
+            return _stat_result(stat.S_IFDIR | 0o755)
+        if value == os.fspath(marker):
+            return _stat_result(stat.S_IFREG | 0o644)
+        raise AssertionError(value)
+
+    return fake
+
+
+def test_read_marker_snapshot_single_read_and_immutable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """valid candidate：一次读取产生 state/bytes/digest 同源快照（round-15 H1）。
+
+    摘要由同一 raw_bytes 计算，不是再次读取 live 所得；live 返回变化不改变已构造
+    snapshot，证明对象不可变。
+    """
+    root = Path("/draft")
+    internal = root / ".draft"
+    marker = root / ".draft/draft.json"
+    calls: list[Path] = []
+
+    def counting_read_bytes(self: Path) -> bytes:
+        calls.append(self)
+        return CANDIDATE_BYTES
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
+    monkeypatch.setattr(os, "lstat", _marker_lstat(internal, marker))
+
+    snapshot = read_marker_snapshot(root)
+    assert snapshot.state.root_state is RootState.CANDIDATE
+    assert snapshot.state.conclusions_state is ConclusionsState.NOT_GENERATED
+    assert snapshot.raw_bytes == CANDIDATE_BYTES
+    assert snapshot.sha256 == hashlib.sha256(CANDIDATE_BYTES).hexdigest()
+    assert calls == [marker]
+
+    # live 返回变化：已构造 snapshot 不变，摘要不是再次读取所得。
+    def registered_bytes(self: Path) -> bytes:
+        return CANDIDATE_REGISTERED_BYTES
+
+    monkeypatch.setattr(Path, "read_bytes", registered_bytes)
+    assert snapshot.raw_bytes == CANDIDATE_BYTES
+    assert snapshot.sha256 == hashlib.sha256(CANDIDATE_BYTES).hexdigest()
+
+
+def test_read_marker_returns_snapshot_state_without_second_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """read_marker 是返回 snapshot.state 的兼容包装：一次读取，不维护第二套读取（round-15 H1）。"""
+    root = Path("/draft")
+    internal = root / ".draft"
+    marker = root / ".draft/draft.json"
+    calls: list[Path] = []
+
+    def counting_read_bytes(self: Path) -> bytes:
+        calls.append(self)
+        return CANDIDATE_BYTES
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
+    monkeypatch.setattr(os, "lstat", _marker_lstat(internal, marker))
+
+    state = read_marker(root)
+    assert state.root_state is RootState.CANDIDATE
+    assert state.conclusions_state is ConclusionsState.NOT_GENERATED
+    assert calls == [marker]
+
+
+@pytest.mark.parametrize(
+    ("parent_kind", "leaf_kind", "read_error", "expected_code", "expected_path"),
+    [
+        (
+            "missing",
+            "missing",
+            None,
+            CheckCode.FORMAT_MISSING.value,
+            Path("/draft/.draft/draft.json"),
+        ),
+        ("symlink", "unused", None, CheckCode.PATH_SYMLINK_ESCAPE.value, Path("/draft/.draft")),
+        ("file", "unused", None, CheckCode.FORMAT_INVALID.value, Path("/draft/.draft/draft.json")),
+        ("other", "unused", None, CheckCode.FORMAT_INVALID.value, Path("/draft/.draft/draft.json")),
+        (
+            "directory",
+            "missing",
+            None,
+            CheckCode.FORMAT_MISSING.value,
+            Path("/draft/.draft/draft.json"),
+        ),
+        (
+            "directory",
+            "symlink",
+            None,
+            CheckCode.PATH_SYMLINK_ESCAPE.value,
+            Path("/draft/.draft/draft.json"),
+        ),
+        (
+            "directory",
+            "directory",
+            None,
+            CheckCode.FORMAT_INVALID.value,
+            Path("/draft/.draft/draft.json"),
+        ),
+        (
+            "directory",
+            "other",
+            None,
+            CheckCode.FORMAT_INVALID.value,
+            Path("/draft/.draft/draft.json"),
+        ),
+        (
+            "eacces",
+            "unused",
+            None,
+            CheckCode.FORMAT_INVALID.value,
+            Path("/draft/.draft/draft.json"),
+        ),
+        ("eio", "unused", None, CheckCode.FORMAT_INVALID.value, Path("/draft/.draft/draft.json")),
+        (
+            "directory",
+            "file",
+            "eio",
+            CheckCode.FORMAT_INVALID.value,
+            Path("/draft/.draft/draft.json"),
+        ),
+    ],
+)
+def test_read_marker_snapshot_classification_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    parent_kind: str,
+    leaf_kind: str,
+    read_error: str | None,
+    expected_code: str,
+    expected_path: Path,
+) -> None:
+    """.draft 中间组件 × marker 最终节点分类矩阵：每个 case 只验证一个分区（round-15 H1）。
+
+    parent 在分类失败/非目录时短路，leaf 不得被读取（"unused" 分支断言）；leaf 的
+    missing/symlink/non-regular/EACCES/EIO 语义与 round-14 M2 一致，错误路径按各自
+    节点报告。
+    """
+    root = Path("/draft")
+    internal = root / ".draft"
+    marker = root / ".draft/draft.json"
+    kinds = {
+        "symlink": stat.S_IFLNK | 0o777,
+        "directory": stat.S_IFDIR | 0o755,
+        "file": stat.S_IFREG | 0o644,
+        "other": stat.S_IFIFO | 0o644,
+    }
+
+    def fake_lstat(path: str | bytes | os.PathLike[str], *args: object) -> os.stat_result:
+        value = os.fspath(path)
+        if value == os.fspath(internal):
+            if parent_kind == "missing":
+                raise FileNotFoundError(2, "No such file", value)
+            if parent_kind == "eacces":
+                raise PermissionError(13, "Permission denied")
+            if parent_kind == "eio":
+                raise OSError(5, "Input/output error")
+            return _stat_result(kinds[parent_kind])
+        assert value == os.fspath(marker)
+        if leaf_kind == "missing":
+            raise FileNotFoundError(2, "No such file", value)
+        assert leaf_kind != "unused", "父组件分类失败后不得再读取 marker"
+        return _stat_result(kinds[leaf_kind])
+
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+    if read_error is not None:
+
+        def fail_read_bytes(self: Path) -> bytes:
+            raise OSError(5, "Input/output error")
+
+        monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+
+    with pytest.raises(DraftError) as caught:
+        read_marker_snapshot(root)
+    assert caught.value.code == expected_code
+    assert caught.value.paths == (expected_path,)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_code"),
+    [
+        (b"\xff\xfe\x00 garbage", CheckCode.FORMAT_INVALID.value),
+        (b"{not json", CheckCode.FORMAT_INVALID.value),
+        (b"[]", CheckCode.FORMAT_INVALID.value),
+        (
+            b'{"format_version": 2, "root_state": "candidate", '
+            b'"conclusions_state": "not_generated"}',
+            CheckCode.FORMAT_UNSUPPORTED.value,
+        ),
+        (
+            b'{"format_version": 1, "root_state": "adopting", '
+            b'"conclusions_state": "not_generated"}',
+            CheckCode.FORMAT_INVALID.value,
+        ),
+    ],
+)
+def test_read_marker_snapshot_content_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: bytes,
+    expected_code: str,
+) -> None:
+    """内容错误经 snapshot 读取路径：非法 UTF-8/JSON/非 dict/schema 与版本语义保持既有。
+
+    parse_marker_value 的纯 parser tests 保留；这里覆盖 snapshot 读取器自身从同一
+    bytes 解析的内容错误（round-15 H1）。
+    """
+    root = Path("/draft")
+    internal = root / ".draft"
+    marker = root / ".draft/draft.json"
+
+    def fixed_bytes(self: Path) -> bytes:
+        return raw
+
+    monkeypatch.setattr(Path, "read_bytes", fixed_bytes)
+    monkeypatch.setattr(os, "lstat", _marker_lstat(internal, marker))
+
+    with pytest.raises(DraftError) as caught:
+        read_marker_snapshot(root)
+    assert caught.value.code == expected_code
     assert caught.value.paths == (marker,)
