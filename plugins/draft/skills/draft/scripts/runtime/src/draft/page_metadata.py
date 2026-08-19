@@ -6,7 +6,7 @@ import unicodedata
 from pathlib import Path
 
 from draft.errors import DraftError
-from draft.graph import MARKER_PATH, DraftGraph
+from draft.graph import DraftGraph, MarkerSnapshot
 from draft.markdown import locate_status_value_span, parse_page, rewrite_link_destinations
 from draft.models import (
     FileMutation,
@@ -17,14 +17,13 @@ from draft.models import (
     OperationResult,
     PageDocument,
     Relation,
-    RootState,
     StatusCode,
 )
 from draft.observations import (
     EMPTY_OBSERVATIONS,
     ObservationManifest,
     file_digest_observation,
-    graph_observations,
+    marker_observation,
 )
 from draft.operations import sha256_bytes
 from draft.plan_effects import PlanAction, PlanEffect
@@ -37,14 +36,15 @@ from draft.vocabulary import (
 
 
 def _target_marker_observations(
-    resolved: Path, page: Path, page_digest: str
+    page: Path, page_digest: str, marker: MarkerSnapshot
 ) -> ObservationManifest:
-    """status set 的自有事实闭包：目标页（实际字节摘要）与 marker 所有权。"""
-    entries = [file_digest_observation(page, page_digest)]
-    marker = resolved / MARKER_PATH
-    if marker.is_file() and not marker.is_symlink():
-        entries.append(file_digest_observation(MARKER_PATH, sha256_bytes(marker.read_bytes())))
-    return ObservationManifest(entries=tuple(entries))
+    """status set 的自有事实闭包：目标页（实际字节摘要）与 marker 所有权（round-15 H1）。
+
+    marker 观察由调用方持有的 snapshot 直接生成，不访问 marker 文件系统路径。
+    """
+    return ObservationManifest(
+        entries=(file_digest_observation(page, page_digest), marker_observation(marker))
+    )
 
 
 def replace_status(text: str, code: StatusCode, explanation: str | None) -> str:
@@ -197,7 +197,7 @@ def plan_set_status(
             ),
         ),
         root_state=facts.root_state,
-        observations=_target_marker_observations(resolved, page, graph.page_digest(page)),
+        observations=_target_marker_observations(page, graph.page_digest(page), facts.marker),
         effects=(PlanEffect(action=PlanAction.MODIFY, path=page),),
     )
     return plan
@@ -251,7 +251,8 @@ def plan_add_relation(
             source,
             EditableRelationCode.DEPENDS_ON,
             target,
-            root_state=facts.root_state,
+            marker=facts.marker,
+            observations=facts.observations,
         )
     if code is EditableRelationCode.CHALLENGES:
         return _pair_relation_plan(
@@ -261,10 +262,18 @@ def plan_add_relation(
             EditableRelationCode.CHALLENGES,
             RelationCode.CHALLENGED_BY,
             target,
-            root_state=facts.root_state,
+            marker=facts.marker,
+            observations=facts.observations,
         )
     if code is EditableRelationCode.SUPERSEDES:
-        return _supersedes_plan(resolved, graph, source, target, root_state=facts.root_state)
+        return _supersedes_plan(
+            resolved,
+            graph,
+            source,
+            target,
+            marker=facts.marker,
+            observations=facts.observations,
+        )
     raise DraftError("relation.unsupported", source)
 
 
@@ -317,7 +326,8 @@ def _single_relation_plan(
     code: EditableRelationCode,
     target: Path,
     *,
-    root_state: RootState,
+    marker: MarkerSnapshot,
+    observations: ObservationManifest,
 ) -> OperationPlan:
     """单向关系添加：若已存在则幂等无变化。"""
     document = graph.pages[source]
@@ -330,7 +340,7 @@ def _single_relation_plan(
             kind=OperationKind.RELATION_ADD,
             root=root,
             mutations=(),
-            root_state=RootState.REGISTERED,
+            root_state=marker.state.root_state,
             observations=EMPTY_OBSERVATIONS,
             effects=(),
         )
@@ -346,7 +356,8 @@ def _single_relation_plan(
         document.text,
         new_text,
         graph,
-        root_state=root_state,
+        marker=marker,
+        observations=observations,
     )
 
 
@@ -358,7 +369,8 @@ def _pair_relation_plan(
     reverse: RelationCode,
     target: Path,
     *,
-    root_state: RootState,
+    marker: MarkerSnapshot,
+    observations: ObservationManifest,
 ) -> OperationPlan:
     """双向关系添加：补齐缺失的一边；双方都存在则幂等。"""
     src_doc = graph.pages[source]
@@ -387,11 +399,18 @@ def _pair_relation_plan(
             kind=OperationKind.RELATION_ADD,
             root=root,
             mutations=(),
-            root_state=RootState.REGISTERED,
+            root_state=marker.state.root_state,
             observations=EMPTY_OBSERVATIONS,
             effects=(),
         )
-    return _multi_write_plan(root, OperationKind.RELATION_ADD, edits, graph, root_state=root_state)
+    return _multi_write_plan(
+        root,
+        OperationKind.RELATION_ADD,
+        edits,
+        graph,
+        marker=marker,
+        observations=observations,
+    )
 
 
 def _supersedes_plan(
@@ -400,7 +419,8 @@ def _supersedes_plan(
     source: Path,
     target: Path,
     *,
-    root_state: RootState,
+    marker: MarkerSnapshot,
+    observations: ObservationManifest,
 ) -> OperationPlan:
     """取代：双向 supersedes/superseded_by + 目标状态 superseded。"""
     src_doc = graph.pages[source]
@@ -440,11 +460,18 @@ def _supersedes_plan(
             kind=OperationKind.RELATION_ADD,
             root=root,
             mutations=(),
-            root_state=RootState.REGISTERED,
+            root_state=marker.state.root_state,
             observations=EMPTY_OBSERVATIONS,
             effects=(),
         )
-    return _multi_write_plan(root, OperationKind.RELATION_ADD, edits, graph, root_state=root_state)
+    return _multi_write_plan(
+        root,
+        OperationKind.RELATION_ADD,
+        edits,
+        graph,
+        marker=marker,
+        observations=observations,
+    )
 
 
 def _resolves_to_page(graph: DraftGraph, source: Path, relation: Relation, target: Path) -> bool:
@@ -469,9 +496,17 @@ def _write_plan(
     after: str,
     graph: DraftGraph,
     *,
-    root_state: RootState,
+    marker: MarkerSnapshot,
+    observations: ObservationManifest,
 ) -> OperationPlan:
-    return _multi_write_plan(root, kind, {path: (before, after)}, graph, root_state=root_state)
+    return _multi_write_plan(
+        root,
+        kind,
+        {path: (before, after)},
+        graph,
+        marker=marker,
+        observations=observations,
+    )
 
 
 def _multi_write_plan(
@@ -480,8 +515,13 @@ def _multi_write_plan(
     edits: dict[Path, tuple[str, str]],
     graph: DraftGraph,
     *,
-    root_state: RootState,
+    marker: MarkerSnapshot,
+    observations: ObservationManifest,
 ) -> OperationPlan:
+    """多页写计划：root_state 来自 snapshot，读集观察由调用方已构造的 facts 提供。
+
+    不再在 planner 内重新读取 marker 或调用 graph_observations（round-15 H1）。
+    """
     mutations = [
         FileMutation(
             path,
@@ -499,8 +539,8 @@ def _multi_write_plan(
         kind=kind,
         root=root,
         mutations=tuple(mutations),
-        root_state=root_state,
-        observations=graph_observations(graph),
+        root_state=marker.state.root_state,
+        observations=observations,
         effects=effects,
     )
 
@@ -534,7 +574,8 @@ def plan_remove_relation(
             source,
             RelationCode.DEPENDS_ON,
             target,
-            root_state=facts.root_state,
+            marker=facts.marker,
+            observations=facts.observations,
         )
     if code is EditableRelationCode.CHALLENGES:
         return _pair_relation_remove(
@@ -544,7 +585,8 @@ def plan_remove_relation(
             RelationCode.CHALLENGES,
             RelationCode.CHALLENGED_BY,
             target,
-            root_state=facts.root_state,
+            marker=facts.marker,
+            observations=facts.observations,
         )
     if code is EditableRelationCode.SUPERSEDES:
         return _supersedes_remove(
@@ -553,7 +595,8 @@ def plan_remove_relation(
             source,
             target,
             restored_status=restored_status,
-            root_state=facts.root_state,
+            marker=facts.marker,
+            observations=facts.observations,
         )
     raise DraftError("relation.unsupported", source)
 
@@ -565,7 +608,8 @@ def _single_relation_remove(
     code: RelationCode,
     target: Path,
     *,
-    root_state: RootState,
+    marker: MarkerSnapshot,
+    observations: ObservationManifest,
 ) -> OperationPlan:
     document = graph.pages[source]
     existing = any(
@@ -577,7 +621,7 @@ def _single_relation_remove(
             kind=OperationKind.RELATION_REMOVE,
             root=root,
             mutations=(),
-            root_state=root_state,
+            root_state=marker.state.root_state,
             observations=EMPTY_OBSERVATIONS,
             effects=(),
         )
@@ -589,7 +633,8 @@ def _single_relation_remove(
         document.text,
         new_text,
         graph,
-        root_state=root_state,
+        marker=marker,
+        observations=observations,
     )
 
 
@@ -601,7 +646,8 @@ def _pair_relation_remove(
     reverse: RelationCode,
     target: Path,
     *,
-    root_state: RootState,
+    marker: MarkerSnapshot,
+    observations: ObservationManifest,
 ) -> OperationPlan:
     src_doc = graph.pages[source]
     tgt_doc = graph.pages[target]
@@ -629,12 +675,17 @@ def _pair_relation_remove(
             kind=OperationKind.RELATION_REMOVE,
             root=root,
             mutations=(),
-            root_state=RootState.REGISTERED,
+            root_state=marker.state.root_state,
             observations=EMPTY_OBSERVATIONS,
             effects=(),
         )
     return _multi_write_plan(
-        root, OperationKind.RELATION_REMOVE, edits, graph, root_state=root_state
+        root,
+        OperationKind.RELATION_REMOVE,
+        edits,
+        graph,
+        marker=marker,
+        observations=observations,
     )
 
 
@@ -645,7 +696,8 @@ def _supersedes_remove(
     target: Path,
     *,
     restored_status: StatusCode | None,
-    root_state: RootState,
+    marker: MarkerSnapshot,
+    observations: ObservationManifest,
 ) -> OperationPlan:
     src_doc = graph.pages[source]
     tgt_doc = graph.pages[target]
@@ -692,12 +744,17 @@ def _supersedes_remove(
             kind=OperationKind.RELATION_REMOVE,
             root=root,
             mutations=(),
-            root_state=RootState.REGISTERED,
+            root_state=marker.state.root_state,
             observations=EMPTY_OBSERVATIONS,
             effects=(),
         )
     return _multi_write_plan(
-        root, OperationKind.RELATION_REMOVE, edits, graph, root_state=root_state
+        root,
+        OperationKind.RELATION_REMOVE,
+        edits,
+        graph,
+        marker=marker,
+        observations=observations,
     )
 
 

@@ -766,7 +766,11 @@ def _dispatch(
                 root=root,
                 operation=DryRunOperation.MOVE,
                 build=lambda facts: plan_move(
-                    facts.graph, source, target, root_state=facts.root_state
+                    facts.graph,
+                    source,
+                    target,
+                    marker=facts.marker,
+                    observations=facts.observations,
                 ),
             )
         _reject_pagination_without_dry_run(args)
@@ -785,7 +789,11 @@ def _dispatch(
                 root=root,
                 operation=DryRunOperation.PROMOTE,
                 build=lambda facts: plan_promote(
-                    facts.graph, page, tuple(children), root_state=facts.root_state
+                    facts.graph,
+                    page,
+                    tuple(children),
+                    marker=facts.marker,
+                    observations=facts.observations,
                 ),
             )
         _reject_pagination_without_dry_run(args)
@@ -802,7 +810,12 @@ def _dispatch(
                 args,
                 root=root,
                 operation=DryRunOperation.COLLAPSE,
-                build=lambda facts: plan_collapse(facts.graph, hub, root_state=facts.root_state),
+                build=lambda facts: plan_collapse(
+                    facts.graph,
+                    hub,
+                    marker=facts.marker,
+                    observations=facts.observations,
+                ),
             )
         _reject_pagination_without_dry_run(args)
         result = collapse_hub(root, hub)
@@ -951,7 +964,7 @@ def _dispatch(
                 load_generation_graph,
                 plan_generation,
             )
-            from draft.graph import read_marker
+            from draft.graph import read_marker_snapshot
             from draft.operations import read_lock
             from draft.paths import resolve_draft_root
 
@@ -963,8 +976,8 @@ def _dispatch(
             # 预演与正式执行调用同一个门禁与计划构造器。
             from draft.query import load_tolerant_view
 
-            marker = read_marker(resolved)
-            state = marker.conclusions_state
+            marker = read_marker_snapshot(resolved)
+            state = marker.state.conclusions_state
             view = load_tolerant_view(resolved)
             blocking = [
                 path
@@ -975,7 +988,7 @@ def _dispatch(
                 details = tuple(path.as_posix() for path in blocking)
                 raise DraftError("conclusions.incomplete", resolved, details=details)
             graph = load_generation_graph(resolved)
-            plan = plan_generation(graph, state=state, root_state=marker.root_state)
+            plan = plan_generation(graph, marker=marker)
             if plan.operation is None:
                 # 无已确认页面或幂等无变化：成功返回空 effects 与业务事实。
                 limit = int(getattr(args, "limit", 20) or 20)

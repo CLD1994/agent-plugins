@@ -370,6 +370,39 @@ def test_create_inserts_before_conclusions_link(
     assert index.index("- [乙](pages/c.md)") < index.index("- [结论汇总](conclusions.md)")
 
 
+def test_candidate_generated_conclusions_move_keeps_links(
+    draft_factory: DraftFactory,
+) -> None:
+    """candidate 根 generated 结论：结构命令不重写结论页旧链接（round-15 M2）。
+
+    candidate 与 registered 的 generated 都表示机器拥有 conclusions.md；move 不得
+    把允许过时的机器结论列表中的旧链接改写为新路径，conclusions.md bytes 必须不变。
+    """
+    from draft.conclusions import generate_conclusions
+    from draft.structure import move_page
+
+    root = draft_factory(
+        {
+            "index.md": PAGE_INDEX,
+            "pages/a.md": PAGE_A.replace("待讨论", "已确认"),
+            "pages/b.md": PAGE_B,
+        },
+        root_state=RootState.CANDIDATE,
+    )
+    result = generate_conclusions(root)
+    assert result.generated is True
+    conclusions = root / "conclusions.md"
+    assert conclusions.exists()
+    assert "pages/a.md" in conclusions.read_text(encoding="utf-8")
+    before = conclusions.read_bytes()
+
+    move_page(root, Path("pages/a.md"), Path("pages/c.md"))
+
+    assert conclusions.read_bytes() == before
+    assert (root / "pages/c.md").is_file()
+    assert not (root / "pages/a.md").exists()
+
+
 def test_status_set_changes_and_validates_final_state(
     draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
 ) -> None:

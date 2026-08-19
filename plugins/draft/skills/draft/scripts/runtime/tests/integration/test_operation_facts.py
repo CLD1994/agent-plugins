@@ -11,10 +11,12 @@ from pathlib import Path
 import pytest
 
 import draft.operation_facts as facts_module
+from draft.errors import DraftError
 from draft.graph import MARKER_PATH, MarkerSnapshot
-from draft.models import RootState
+from draft.models import RootState, StatusCode
 from draft.operation_facts import load_operation_facts
 from draft.operations import sha256_bytes
+from draft.page_create import create_page
 from tests.integration.support import build_valid_candidate, managed_marker_text
 
 
@@ -56,3 +58,39 @@ def test_load_operation_facts_snapshot_survives_marker_switch(
     assert facts.marker.sha256 == sha256_bytes(candidate_bytes)
     assert facts.marker.state.root_state is RootState.CANDIDATE
     assert (root / ".draft/draft.json").read_bytes() == registered_bytes
+
+
+def test_create_executes_external_change_when_marker_switches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """snapshot 后 candidate→registered：create 在 mutation 前得到 external_change（round-15 H1）。
+
+    普通命令与 adopt 共享同一个 load_operation_facts/snapshot 边界；锁内观察以
+    snapshot 摘要拒绝，不把切换后的 registered 新基线重新采信为观察。页面/marker
+    保持外部切换后的状态，本次准备日志按既有冲突协议终态化且锁释放。
+    """
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    (root / "pages/a.md").write_text("# 甲\n\n正文。\n", encoding="utf-8")
+    registered_bytes = managed_marker_text(root_state=RootState.REGISTERED).encode("utf-8")
+
+    real_snapshot = facts_module.read_marker_snapshot
+    fired = False
+
+    def snapshot_then_switch(path: Path) -> MarkerSnapshot:
+        nonlocal fired
+        snapshot = real_snapshot(path)
+        if not fired:
+            fired = True
+            (path / MARKER_PATH).write_bytes(registered_bytes)
+        return snapshot
+
+    monkeypatch.setattr(facts_module, "read_marker_snapshot", snapshot_then_switch)
+
+    with pytest.raises(DraftError, match="operation.external_change"):
+        create_page(root, Path("pages/new.md"), title="新页面", status=StatusCode.PROPOSED)
+
+    assert (root / ".draft/draft.json").read_bytes() == registered_bytes
+    assert not (root / "pages/new.md").exists()
+    assert not (root / ".draft/operation.lock").exists()

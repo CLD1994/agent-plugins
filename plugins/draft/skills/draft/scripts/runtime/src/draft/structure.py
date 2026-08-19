@@ -12,6 +12,7 @@ from draft.graph import (
     CONCLUSIONS_PAGE,
     ROOT_PAGE,
     DraftGraph,
+    MarkerSnapshot,
     resolve_local_destination,
 )
 from draft.markdown import (
@@ -28,9 +29,10 @@ from draft.models import (
     OperationKind,
     OperationPlan,
     OperationResult,
-    RootState,
     SourceSpan,
 )
+from draft.observations import ObservationManifest
+from draft.operation_facts import OperationFacts
 from draft.operations import execute_plan, read_lock, sha256_bytes
 from draft.paths import physical_parent, resolve_draft_root
 from draft.plan_effects import PlanAction, PlanEffect
@@ -39,7 +41,7 @@ from draft.resources import (
     ResourceKind,
     rebase_body_destination,
 )
-from draft.vocabulary import RelationCode
+from draft.vocabulary import ConclusionsState, RelationCode
 
 
 def _is_hub(path: Path) -> bool:
@@ -111,21 +113,6 @@ def _collapse_empty_hubs(
         if leaf in graph.pages or leaf in expanded.values():
             raise DraftError("structure.target_exists", leaf)
         expanded[page] = leaf
-
-
-def _conclusions_owned_generated(root: Path) -> bool:
-    """结论所有权是否为 generated；仅正式根有效，标记缺失/无效/候选时视为未生成。"""
-    from draft.graph import read_marker
-    from draft.models import RootState
-    from draft.vocabulary import ConclusionsState
-
-    try:
-        state = read_marker(root)
-    except DraftError:
-        return False
-    if state.root_state is not RootState.REGISTERED:
-        return False
-    return state.conclusions_state is ConclusionsState.GENERATED
 
 
 def _render_pages(
@@ -248,7 +235,8 @@ def plan_path_remap(
     parent_changes: Mapping[Path, Path],
     *,
     kind: OperationKind = OperationKind.MOVE,
-    root_state: RootState,
+    marker: MarkerSnapshot,
+    observations: ObservationManifest,
 ) -> OperationPlan:
     # 结构变换不把全图 check_graph 结果当门禁：已可解析的无关全局错误不阻止本次
     # 操作（计划 Task 10 Step 1）。registered 的完整健康门禁由 load_operation_facts
@@ -262,7 +250,9 @@ def plan_path_remap(
     _collapse_empty_hubs(graph, expanded, final_parents)
     # 降级改变枢纽最终路径后重新推导父映射；不级联再次降级。
     final_parents = _final_parents(graph, expanded, parent_changes)
-    conclusions_generated = _conclusions_owned_generated(graph.root)
+    # 机器结论所有权只由 conclusions_state 判定：candidate 与 registered 的 generated
+    # 都表示机器拥有 conclusions.md（round-15 M2），不得绑定 root_state。
+    conclusions_generated = marker.state.conclusions_state is ConclusionsState.GENERATED
     rendered = _render_pages(
         graph,
         expanded,
@@ -331,14 +321,12 @@ def plan_path_remap(
         key=lambda directory: len(directory.parts),
         reverse=True,
     )
-    from draft.observations import graph_observations
-
     return OperationPlan(
         kind=kind,
         root=graph.root,
         mutations=tuple([*writes, *deletes]),
-        root_state=root_state,
-        observations=graph_observations(graph),
+        root_state=marker.state.root_state,
+        observations=observations,
         remove_empty_directories=tuple(removable),
         effects=tuple(effects),
     )
@@ -381,7 +369,12 @@ def _validate_target(graph: DraftGraph, target: Path) -> Path:
 
 
 def plan_move(
-    graph: DraftGraph, source: Path, target: Path, *, root_state: RootState
+    graph: DraftGraph,
+    source: Path,
+    target: Path,
+    *,
+    marker: MarkerSnapshot,
+    observations: ObservationManifest,
 ) -> OperationPlan:
     _validate_operand(graph, source)
     _validate_target(graph, target)
@@ -396,12 +389,22 @@ def plan_move(
     if new_parent is not None and new_parent != graph.parents.get(source):
         parent_changes[source] = new_parent
     return plan_path_remap(
-        graph, {source: target}, parent_changes, kind=OperationKind.MOVE, root_state=root_state
+        graph,
+        {source: target},
+        parent_changes,
+        kind=OperationKind.MOVE,
+        marker=marker,
+        observations=observations,
     )
 
 
 def plan_promote(
-    graph: DraftGraph, page: Path, children: tuple[Path, ...], *, root_state: RootState
+    graph: DraftGraph,
+    page: Path,
+    children: tuple[Path, ...],
+    *,
+    marker: MarkerSnapshot,
+    observations: ObservationManifest,
 ) -> OperationPlan:
     _validate_operand(graph, page)
     if page in (ROOT_PAGE, CONCLUSIONS_PAGE) or _is_hub(page):
@@ -430,11 +433,22 @@ def plan_promote(
         page_map[child] = target
         parent_changes[child] = hub
     return plan_path_remap(
-        graph, page_map, parent_changes, kind=OperationKind.PROMOTE, root_state=root_state
+        graph,
+        page_map,
+        parent_changes,
+        kind=OperationKind.PROMOTE,
+        marker=marker,
+        observations=observations,
     )
 
 
-def plan_collapse(graph: DraftGraph, hub: Path, *, root_state: RootState) -> OperationPlan:
+def plan_collapse(
+    graph: DraftGraph,
+    hub: Path,
+    *,
+    marker: MarkerSnapshot,
+    observations: ObservationManifest,
+) -> OperationPlan:
     _validate_operand(graph, hub)
     if hub == ROOT_PAGE:
         raise DraftError("structure.protected", hub)
@@ -446,18 +460,22 @@ def plan_collapse(graph: DraftGraph, hub: Path, *, root_state: RootState) -> Ope
     if leaf in graph.pages:
         raise DraftError("structure.target_exists", leaf)
     return plan_path_remap(
-        graph, {hub: leaf}, {}, kind=OperationKind.COLLAPSE, root_state=root_state
+        graph,
+        {hub: leaf},
+        {},
+        kind=OperationKind.COLLAPSE,
+        marker=marker,
+        observations=observations,
     )
 
 
-def _load_clean_graph(
-    root: Path, *, allow_empty_hub: Path | None = None
-) -> tuple[DraftGraph, RootState]:
+def _load_clean_graph(root: Path, *, allow_empty_hub: Path | None = None) -> OperationFacts:
     """结构变换的事实加载：registered 全绿；candidate 全受管页可解析即可。
 
     任一不可解析页面可能隐藏正文链接、正式关系或父导航，因此必须阻止结构变换；
     已可解析的无关全局错误（依赖环、状态/取代不匹配、容量提醒）不阻止本次操作。
-    ``allow_empty_hub`` 供 collapse 容忍目标枢纽的 HUB_EMPTY。返回图与当前根状态。
+    ``allow_empty_hub`` 供 collapse 容忍目标枢纽的 HUB_EMPTY。返回 OperationFacts：
+    图、marker snapshot、阻碍与读集观察全部来自同一次根事实读取（round-15 H1）。
     """
     from draft.operation_facts import load_operation_facts
 
@@ -468,7 +486,7 @@ def _load_clean_graph(
     if facts.blocking_paths:
         details = tuple(path.as_posix() for path in facts.blocking_paths)
         raise DraftError("structure.dirty", resolved, details=details)
-    return facts.graph, facts.root_state
+    return facts
 
 
 def move_page(
@@ -476,8 +494,14 @@ def move_page(
 ) -> OperationResult:
     del now  # 前置推进由 CLI 编排统一完成；领域函数不再重复调用。
     resolved = resolve_draft_root(root)
-    graph, root_state = _load_clean_graph(resolved)
-    plan = plan_move(graph, source, target, root_state=root_state)
+    facts = _load_clean_graph(resolved)
+    plan = plan_move(
+        facts.graph,
+        source,
+        target,
+        marker=facts.marker,
+        observations=facts.observations,
+    )
     return execute_plan(plan)
 
 
@@ -486,14 +510,25 @@ def promote_page(
 ) -> OperationResult:
     del now  # 前置推进由 CLI 编排统一完成；领域函数不再重复调用。
     resolved = resolve_draft_root(root)
-    graph, root_state = _load_clean_graph(resolved)
-    plan = plan_promote(graph, page, tuple(children), root_state=root_state)
+    facts = _load_clean_graph(resolved)
+    plan = plan_promote(
+        facts.graph,
+        page,
+        tuple(children),
+        marker=facts.marker,
+        observations=facts.observations,
+    )
     return execute_plan(plan)
 
 
 def collapse_hub(root: Path, hub: Path, *, now: datetime | None = None) -> OperationResult:
     del now  # 前置推进由 CLI 编排统一完成；领域函数不再重复调用。
     resolved = resolve_draft_root(root)
-    graph, root_state = _load_clean_graph(resolved, allow_empty_hub=hub)
-    plan = plan_collapse(graph, hub, root_state=root_state)
+    facts = _load_clean_graph(resolved, allow_empty_hub=hub)
+    plan = plan_collapse(
+        facts.graph,
+        hub,
+        marker=facts.marker,
+        observations=facts.observations,
+    )
     return execute_plan(plan)

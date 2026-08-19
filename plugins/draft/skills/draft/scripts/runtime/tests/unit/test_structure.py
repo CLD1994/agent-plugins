@@ -24,7 +24,7 @@ from draft.models import (
     RootState,
     SourceSpan,
 )
-from draft.observations import EMPTY_OBSERVATIONS
+from draft.observations import EMPTY_OBSERVATIONS, ObservationManifest
 from draft.operations import sha256_bytes
 from draft.plan_effects import PlanAction, PlanEffect
 from draft.resources import resolve_page_resources
@@ -38,7 +38,7 @@ from draft.vocabulary import ConclusionsState, RelationCode
 
 ROOT = Path("/draft")
 
-# 合成图无真实文件系统：marker 观察使用显式构造的 registered snapshot（round-15 H1）。
+# 合成图无真实文件系统：marker 观察使用显式构造的 snapshot（round-15 H1）。
 _REGISTERED_BYTES = (
     b'{"format_version":1,"root_state":"registered","conclusions_state":"not_generated"}'
 )
@@ -50,6 +50,26 @@ _REGISTERED_SNAPSHOT = MarkerSnapshot(
     ),
     raw_bytes=_REGISTERED_BYTES,
 )
+_CANDIDATE_BYTES = (
+    b'{"format_version":1,"root_state":"candidate","conclusions_state":"not_generated"}'
+)
+_CANDIDATE_SNAPSHOT = MarkerSnapshot(
+    state=MarkerState(
+        version=1,
+        root_state=RootState.CANDIDATE,
+        conclusions_state=ConclusionsState.NOT_GENERATED,
+    ),
+    raw_bytes=_CANDIDATE_BYTES,
+)
+
+
+def _structure_observations(
+    graph: DraftGraph, *, marker: MarkerSnapshot = _REGISTERED_SNAPSHOT
+) -> ObservationManifest:
+    """合成图结构计划的读集观察：与 _plan(graph=...) 预期同源（默认 registered snapshot）。"""
+    from draft.observations import graph_observations
+
+    return graph_observations(graph, marker=marker)
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +396,13 @@ def test_plan_move_leaf_rewrites_inbound_links() -> None:
         }
     )
 
-    plan = plan_move(graph, Path("pages/a.md"), Path("pages/c.md"), root_state=RootState.REGISTERED)
+    plan = plan_move(
+        graph,
+        Path("pages/a.md"),
+        Path("pages/c.md"),
+        marker=_REGISTERED_SNAPSHOT,
+        observations=_structure_observations(graph),
+    )
 
     expected_index = _INDEX_WITH_B.replace("pages/a.md", "pages/c.md")
     expected_b = _B_LINKS_A.replace("](a.md)", "](c.md)")
@@ -410,7 +436,13 @@ def test_plan_move_leaf_to_same_directory_omits_unchanged_pages() -> None:
         }
     )
 
-    plan = plan_move(graph, Path("pages/a.md"), Path("pages/b.md"), root_state=RootState.REGISTERED)
+    plan = plan_move(
+        graph,
+        Path("pages/a.md"),
+        Path("pages/b.md"),
+        marker=_REGISTERED_SNAPSHOT,
+        observations=_structure_observations(graph),
+    )
 
     expected_index = _INDEX.replace("pages/a.md", "pages/b.md")
     expected = _plan(
@@ -454,7 +486,8 @@ def test_plan_move_subtree_relocates_complete_subtree() -> None:
         graph,
         Path("pages/old/index.md"),
         Path("pages/archive/index.md"),
-        root_state=RootState.REGISTERED,
+        marker=_REGISTERED_SNAPSHOT,
+        observations=_structure_observations(graph),
     )
 
     mutation_paths = {m.path for m in plan.mutations}
@@ -487,7 +520,11 @@ def test_plan_move_missing_source_raises_unknown_page() -> None:
     )
     with pytest.raises(DraftError) as caught:
         plan_move(
-            graph, Path("pages/missing.md"), Path("pages/b.md"), root_state=RootState.REGISTERED
+            graph,
+            Path("pages/missing.md"),
+            Path("pages/b.md"),
+            marker=_REGISTERED_SNAPSHOT,
+            observations=_structure_observations(graph),
         )
     assert caught.value.code == "structure.unknown_page"
 
@@ -501,7 +538,13 @@ def test_plan_move_target_outside_pages_raises_invalid_target() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        plan_move(graph, Path("pages/a.md"), Path("other.md"), root_state=RootState.REGISTERED)
+        plan_move(
+            graph,
+            Path("pages/a.md"),
+            Path("other.md"),
+            marker=_REGISTERED_SNAPSHOT,
+            observations=_structure_observations(graph),
+        )
     assert caught.value.code == "structure.invalid_target"
 
 
@@ -515,7 +558,13 @@ def test_plan_move_target_already_exists_raises_target_exists() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        plan_move(graph, Path("pages/a.md"), Path("pages/b.md"), root_state=RootState.REGISTERED)
+        plan_move(
+            graph,
+            Path("pages/a.md"),
+            Path("pages/b.md"),
+            marker=_REGISTERED_SNAPSHOT,
+            observations=_structure_observations(graph),
+        )
     assert caught.value.code == "structure.target_exists"
 
 
@@ -533,7 +582,8 @@ def test_plan_move_into_descendant_raises_descendant() -> None:
             graph,
             Path("pages/old/index.md"),
             Path("pages/old/sub/index.md"),
-            root_state=RootState.REGISTERED,
+            marker=_REGISTERED_SNAPSHOT,
+            observations=_structure_observations(graph),
         )
     assert caught.value.code == "structure.descendant"
 
@@ -547,7 +597,13 @@ def test_plan_move_protected_root_raises_protected() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        plan_move(graph, ROOT_PAGE, Path("pages/b.md"), root_state=RootState.REGISTERED)
+        plan_move(
+            graph,
+            ROOT_PAGE,
+            Path("pages/b.md"),
+            marker=_REGISTERED_SNAPSHOT,
+            observations=_structure_observations(graph),
+        )
     assert caught.value.code == "structure.protected"
 
 
@@ -572,7 +628,8 @@ def test_plan_promote_creates_hub_and_reparents_selected_children() -> None:
         graph,
         Path("pages/topic.md"),
         (Path("pages/child-a.md"), Path("pages/child-b.md")),
-        root_state=RootState.REGISTERED,
+        marker=_REGISTERED_SNAPSHOT,
+        observations=_structure_observations(graph),
     )
 
     mutation_paths = {m.path for m in plan.mutations}
@@ -602,7 +659,11 @@ def test_plan_promote_preserves_unselected_children() -> None:
     )
 
     plan = plan_promote(
-        graph, Path("pages/topic.md"), (Path("pages/child-a.md"),), root_state=RootState.REGISTERED
+        graph,
+        Path("pages/topic.md"),
+        (Path("pages/child-a.md"),),
+        marker=_REGISTERED_SNAPSHOT,
+        observations=_structure_observations(graph),
     )
 
     mutation_paths = {m.path for m in plan.mutations}
@@ -625,7 +686,13 @@ def test_plan_promote_requires_at_least_one_child() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        plan_promote(graph, Path("pages/topic.md"), (), root_state=RootState.REGISTERED)
+        plan_promote(
+            graph,
+            Path("pages/topic.md"),
+            (),
+            marker=_REGISTERED_SNAPSHOT,
+            observations=_structure_observations(graph),
+        )
     assert caught.value.code == "structure.missing_child"
 
 
@@ -643,7 +710,8 @@ def test_plan_promote_rejects_page_with_children() -> None:
             graph,
             Path("pages/old/index.md"),
             (Path("pages/old/a.md"),),
-            root_state=RootState.REGISTERED,
+            marker=_REGISTERED_SNAPSHOT,
+            observations=_structure_observations(graph),
         )
     assert caught.value.code == "structure.invalid_target"
 
@@ -663,7 +731,12 @@ def test_plan_collapse_empty_hub_produces_leaf() -> None:
         }
     )
 
-    plan = plan_collapse(graph, Path("pages/sub/index.md"), root_state=RootState.REGISTERED)
+    plan = plan_collapse(
+        graph,
+        Path("pages/sub/index.md"),
+        marker=_REGISTERED_SNAPSHOT,
+        observations=_structure_observations(graph),
+    )
 
     expected_index = _EMPTY_HUB_INDEX.replace("pages/sub/index.md", "pages/sub.md")
     expected_leaf = _EMPTY_HUB.replace("(../../index.md)", "(../index.md)")
@@ -698,7 +771,12 @@ def test_plan_collapse_rejects_non_empty_hub() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        plan_collapse(graph, Path("pages/old/index.md"), root_state=RootState.REGISTERED)
+        plan_collapse(
+            graph,
+            Path("pages/old/index.md"),
+            marker=_REGISTERED_SNAPSHOT,
+            observations=_structure_observations(graph),
+        )
     assert caught.value.code == "structure.hub_not_empty"
 
 
@@ -711,7 +789,12 @@ def test_plan_collapse_rejects_non_hub_page() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        plan_collapse(graph, Path("pages/a.md"), root_state=RootState.REGISTERED)
+        plan_collapse(
+            graph,
+            Path("pages/a.md"),
+            marker=_REGISTERED_SNAPSHOT,
+            observations=_structure_observations(graph),
+        )
     assert caught.value.code == "structure.not_hub"
 
 
@@ -724,7 +807,12 @@ def test_plan_collapse_rejects_root() -> None:
         }
     )
     with pytest.raises(DraftError) as caught:
-        plan_collapse(graph, ROOT_PAGE, root_state=RootState.REGISTERED)
+        plan_collapse(
+            graph,
+            ROOT_PAGE,
+            marker=_REGISTERED_SNAPSHOT,
+            observations=_structure_observations(graph),
+        )
     assert caught.value.code == "structure.protected"
 
 
@@ -748,7 +836,8 @@ def test_plan_path_remap_orders_writes_before_deletes_by_path() -> None:
         {Path("pages/a.md"): Path("pages/z.md")},
         {},
         kind=OperationKind.MOVE,
-        root_state=RootState.REGISTERED,
+        marker=_REGISTERED_SNAPSHOT,
+        observations=_structure_observations(graph),
     )
 
     kinds = [m.kind for m in plan.mutations]
@@ -778,7 +867,8 @@ def test_plan_path_remap_omits_unchanged_pages() -> None:
         {Path("pages/a.md"): Path("pages/b.md")},
         {},
         kind=OperationKind.MOVE,
-        root_state=RootState.REGISTERED,
+        marker=_REGISTERED_SNAPSHOT,
+        observations=_structure_observations(graph),
     )
 
     mutation_paths = {m.path for m in plan.mutations}
@@ -802,7 +892,8 @@ def test_plan_path_remap_ignores_unrelated_graph_errors() -> None:
         {Path("pages/a.md"): Path("pages/topic.md")},
         {},
         kind=OperationKind.MOVE,
-        root_state=RootState.REGISTERED,
+        marker=_REGISTERED_SNAPSHOT,
+        observations=_structure_observations(graph),
     )
     assert any(m.path == Path("pages/topic.md") for m in plan.mutations)
 
@@ -821,9 +912,30 @@ def test_plan_path_remap_carries_root_state() -> None:
         {Path("pages/a.md"): Path("pages/topic.md")},
         {},
         kind=OperationKind.MOVE,
-        root_state=RootState.CANDIDATE,
+        marker=_CANDIDATE_SNAPSHOT,
+        observations=_structure_observations(graph, marker=_CANDIDATE_SNAPSHOT),
     )
     assert plan.root_state is RootState.CANDIDATE
+
+
+def test_plan_move_passes_through_marker_and_observations() -> None:
+    """结构 planner 直接使用调用方传入的 marker/observations，不重读根状态（round-15 H1）。"""
+    graph = _graph_from_texts(
+        {
+            Path("index.md"): _INDEX,
+            Path("conclusions.md"): _CONCLUSIONS,
+            Path("pages/a.md"): _A,
+        }
+    )
+    plan = plan_move(
+        graph,
+        Path("pages/a.md"),
+        Path("pages/b.md"),
+        marker=_CANDIDATE_SNAPSHOT,
+        observations=EMPTY_OBSERVATIONS,
+    )
+    assert plan.root_state is RootState.CANDIDATE
+    assert plan.observations is EMPTY_OBSERVATIONS
 
 
 # ===========================================================================
@@ -840,6 +952,11 @@ def test_plan_collapse_empty_hub_succeeds_without_graph_gate() -> None:
             Path("pages/sub/index.md"): _EMPTY_HUB,
         }
     )
-    plan = plan_collapse(graph, Path("pages/sub/index.md"), root_state=RootState.REGISTERED)
+    plan = plan_collapse(
+        graph,
+        Path("pages/sub/index.md"),
+        marker=_REGISTERED_SNAPSHOT,
+        observations=_structure_observations(graph),
+    )
     assert plan.kind is OperationKind.COLLAPSE
     assert any(m.path == Path("pages/sub.md") for m in plan.mutations)

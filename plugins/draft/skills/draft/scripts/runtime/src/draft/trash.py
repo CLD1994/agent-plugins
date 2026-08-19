@@ -15,6 +15,7 @@ from draft.graph import (
     INTERNAL_DIR,
     ROOT_PAGE,
     DraftGraph,
+    MarkerSnapshot,
     load_graph,
     load_graph_tolerant,
     resolve_local_destination,
@@ -542,16 +543,20 @@ def load_restore_recovery_facts(root: Path, restore_id: str) -> RestoreRecoveryF
     return RestoreRecoveryFacts(restore=restore_journal, trash=trash_journal, link_state=link_state)
 
 
-def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackage) -> OperationPlan:
+def build_restore_plan(
+    root: Path, restore_id: str, package: VerifiedTrashPackage, *, marker: MarkerSnapshot
+) -> OperationPlan:
     """构造恢复计划：页面回写、父/枢纽导航恢复；冲突在此以 operation.* 抛出。
 
     规划阶段边界把受管页面读取失败（删除、目录化、非 UTF-8）统一转换为
     ``operation.external_change``：规划前的外部变化可安全回滚，进入统一 resolver
     证明 R 未应用后映射为 ``trash.restore_conflict``、解关联并释放锁。不把原始
     FileNotFoundError/IsADirectoryError/UnicodeDecodeError 泄漏给调用方。
+    marker 为调用方在 preallocate 前一次读取的 snapshot（round-15 H1），本函数
+    不再重新读取 marker。
     """
     try:
-        return _build_restore_plan_impl(root, restore_id, package)
+        return _build_restore_plan_impl(root, restore_id, package, marker)
     except DraftError:
         raise
     except (OSError, UnicodeDecodeError) as exc:
@@ -559,19 +564,18 @@ def build_restore_plan(root: Path, restore_id: str, package: VerifiedTrashPackag
 
 
 def _build_restore_plan_impl(
-    root: Path, restore_id: str, package: VerifiedTrashPackage
+    root: Path, restore_id: str, package: VerifiedTrashPackage, marker: MarkerSnapshot
 ) -> OperationPlan:
     """构造恢复计划：页面回写、父/枢纽导航恢复；冲突在此以 operation.* 抛出。
 
     registered 根在规划前通过完整健康门禁；candidate 根按操作级契约恢复，不要求
     全根健康，但折叠恢复需要重写全部指向叶页的入站链接，不可解析页面仍须阻止。
     """
-    from draft.graph import read_marker
     from draft.models import RootState
     from draft.query import load_tolerant_view
 
     resolved = resolve_draft_root(root)
-    root_state = read_marker(resolved).root_state
+    root_state = marker.state.root_state
     page_path = package.page_path
     parent_path = package.parent_path
     hub_path = package.hub_path
@@ -671,7 +675,7 @@ def _build_restore_plan_impl(
         (mutation for mutation in mutations if mutation.kind is MutationKind.DELETE),
         key=lambda mutation: str(mutation.path),
     )
-    observations = _restore_observations(package, graph)
+    observations = _restore_observations(package, graph, marker)
     return OperationPlan(
         kind=OperationKind.RESTORE,
         root=resolved,
@@ -682,20 +686,23 @@ def _build_restore_plan_impl(
     )
 
 
-def _restore_observations(package: VerifiedTrashPackage, graph: DraftGraph) -> ObservationManifest:
+def _restore_observations(
+    package: VerifiedTrashPackage, graph: DraftGraph, marker: MarkerSnapshot
+) -> ObservationManifest:
     """恢复读集观察：页面/目录/状态与权威删除包文件。
 
     恢复计划读取父/枢纽导航、受影响页面与权威包；并发修改其中任一都会改变读集，
     执行前复核必须拒绝（唯一权威包不变量）。权威包观察直接复用 load_verified_package
     的已验证快照，不重新扫描磁盘：验证后新增的未知条目不能进入基线、不能随整包
-    递归删除（回归：验证—观察窗口的并发新增被复核发现并保留现场）。
+    递归删除（回归：验证—观察窗口的并发新增被复核发现并保留现场）。marker 观察
+    由调用方持有的 snapshot 生成，不访问 marker 文件系统路径（round-15 H1）。
     """
     from draft.observations import (
         ObservationManifest,
         graph_observations,
     )
 
-    entries = list(graph_observations(graph).entries)
+    entries = list(graph_observations(graph, marker=marker).entries)
     entries.extend(package.observations.entries)
     return ObservationManifest(entries=tuple(entries))
 
@@ -975,16 +982,17 @@ def restore_retained_trash(
     normalized_now = normalize_utc(now)
     validate_operation_id(operation_id, code="operation.invalid_id")
     restore_id = uuid.uuid4().hex
-    from draft.graph import read_marker
+    from draft.graph import read_marker_snapshot
     from draft.observations import EMPTY_OBSERVATIONS
 
+    # preallocate 前一次读取 marker snapshot：恢复日志身份与规划/观察同源（round-15
+    # H1）；snapshot 后 live 变化由锁内观察拒绝，不被重新采信。
+    marker = read_marker_snapshot(resolved)
     preallocate_journal(
         resolved,
         kind=OperationKind.RESTORE,
         operation_id=restore_id,
-        # 恢复日志保留创建时的当前根状态作为审计事实；规划门禁由 build_restore_plan
-        # 重新读取 marker（计划 Task 11 Step 4）。
-        root_state=read_marker(resolved).root_state,
+        root_state=marker.state.root_state,
         observations=EMPTY_OBSERVATIONS,
         metadata={"restores_trash_operation": operation_id},
     )
@@ -1004,7 +1012,7 @@ def restore_retained_trash(
     linked_trash = with_metadata(trash_journal, {"restore_operation_id": restore_id})
     write_journal(linked_trash)
     try:
-        plan = build_restore_plan(resolved, restore_id, package)
+        plan = build_restore_plan(resolved, restore_id, package, marker=marker)
         # 读集观察耐久写入预分配日志，供执行前复核与恢复使用。
         restore_journal = read_journal(operation_journal_path(resolved, restore_id))
         write_journal(with_observations(restore_journal, plan.observations))
