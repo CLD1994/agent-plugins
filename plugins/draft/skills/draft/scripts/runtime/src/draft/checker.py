@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 
 from draft.diagnostic_codes import (
     CheckCode,
@@ -28,6 +29,7 @@ from draft.models import (
     OperationKind,
     OperationPhase,
 )
+from draft.observations import EntryKind
 from draft.operations import (
     Journal,
     TrashDeadlines,
@@ -443,18 +445,36 @@ def _trash_package_issue(root: Path, journal_path: Path, journal: Journal) -> Ch
     return None
 
 
-_OP_DIR_ALLOWED_ENTRIES = frozenset(
+_EVIDENCE_NAMES = frozenset(
+    {"cleanup-evidence.json", "cleanup-evidence.json.pending", "cleanup-evidence.json.quarantine"}
+)
+
+# operation 目录"名字→顶层节点类型"的单一协议表（round-15 M1）。phase/role 只选择
+# 允许的 key 集合（_OP_DIR_*_ALLOWED），名字是否允许与节点类型是正交维度：允许名字
+# 下的错误类型同样报告，不存在专用分类器的 symlink 是路径错误，不得因名字合法而通过。
+# 类型/内容诊断所有权：journal.json 由索引 reader（_build_operation_index 的
+# read_journal）验证，evidence 三名由共享联合分类器验证；通用 pass 只负责名字与其余
+# 顶层类型，避免同一节点产生重复等价诊断。
+_OPERATION_ENTRY_KINDS: Mapping[str, EntryKind] = MappingProxyType(
     {
-        "journal.json",
-        "journal.json.pending",
-        "originals",
-        "staged",
-        "attempt",
-        "cleanup-evidence.json",
-        "cleanup-evidence.json.pending",
-        "cleanup-evidence.json.quarantine",
+        "journal.json": EntryKind.FILE,
+        "journal.json.pending": EntryKind.FILE,
+        "originals": EntryKind.DIRECTORY,
+        "staged": EntryKind.DIRECTORY,
+        "attempt": EntryKind.DIRECTORY,
+        "cleanup-evidence.json": EntryKind.FILE,
+        "cleanup-evidence.json.pending": EntryKind.FILE,
+        "cleanup-evidence.json.quarantine": EntryKind.FILE,
     }
 )
+
+
+def operation_entry_kind(name: str) -> EntryKind | None:
+    """operation 目录登记名字的预期顶层节点类型；未知名字返回 None（round-15 M1）。"""
+    return _OPERATION_ENTRY_KINDS.get(name)
+
+
+_OP_DIR_ALLOWED_ENTRIES = frozenset(_OPERATION_ENTRY_KINDS)
 _OP_DIR_TERMINAL_ALLOWED = frozenset({"journal.json"})
 _OP_DIR_ALLOCATING_ALLOWED = frozenset(
     {"journal.json", "journal.json.pending", "originals", "staged"}
@@ -664,6 +684,37 @@ def _list_internal_directory(
     return InternalDirectoryListing(InternalDirectoryState.COMPLETE, entries)
 
 
+def _stable_child_kind(
+    child: Path,
+    issues: list[CheckIssue],
+    relative: Path,
+) -> EntryKind | None:
+    """稳定分类 operation 目录的单个枚举 child；分类 I/O 已转稳定诊断并返回 None。
+
+    调用既有 ``classify_node_or_error``（一次受保护 lstat），不吞 EACCES/EIO 也不泄漏
+    原始异常；失败时按根内相对协议记录稳定 issue（L1），调用方不再补充第二条等价诊断。
+    禁止改用 ``Path.is_*``/``DirEntry.is_*`` 重新折叠分类错误（round-15 M1）。
+    """
+    from draft.operations import classify_node_or_error
+
+    try:
+        return classify_node_or_error(
+            child,
+            code=CheckCode.INTERNAL_UNEXPECTED_ENTRY.value,
+            code_path=child,
+        )
+    except DraftError as exc:
+        issues.append(
+            CheckIssue(
+                code=exc.code,
+                severity=IssueSeverity.ERROR,
+                path=relative,
+                line=None,
+            )
+        )
+        return None
+
+
 def _check_operation_directory_entries(
     root: Path,
     entry: Path,
@@ -717,10 +768,33 @@ def _check_operation_directory_entries(
         issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, operation_relative))
         return
     for child in children:
+        relative = operation_relative / child.name
         if child.name not in allowed:
+            # 未知名字：终态残留/未知条目；symlink 保留最具体路径诊断（round-15 M1）。
+            kind = _stable_child_kind(child, issues, relative)
+            if kind is None:
+                continue  # 分类 I/O 已产生稳定诊断。
             issues.append(
-                _error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, operation_relative / child.name)
+                _error(
+                    CheckCode.PATH_SYMLINK_ESCAPE
+                    if kind is EntryKind.SYMLINK
+                    else CheckCode.INTERNAL_UNEXPECTED_ENTRY,
+                    relative,
+                )
             )
+            continue
+        if child.name in _EVIDENCE_NAMES or child.name == "journal.json":
+            # 类型/内容诊断所有权：evidence 由共享联合分类器、journal.json 由索引
+            # reader 验证；通用 pass 不为同一节点重复报告（round-15 M1）。
+            continue
+        expected = operation_entry_kind(child.name)
+        actual = _stable_child_kind(child, issues, relative)
+        if actual is None:
+            continue  # 分类 I/O 已产生稳定诊断。
+        if actual is EntryKind.SYMLINK:
+            issues.append(_error(CheckCode.PATH_SYMLINK_ESCAPE, relative))
+        elif actual is not expected:
+            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
     # evidence 联合分类在 evidence 名协议合法的角色运行（活动角色或非终态/非 allocating）；
     # 非 TRASH 操作目录出现 evidence 名也会被同一分类判为损坏（授权解析失败）。
     if allowed is _OP_DIR_ALLOWED_ENTRIES:

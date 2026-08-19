@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 
+import pytest
+
 from draft.checker import (
     InternalDirectoryState,
     OperationCheckIndex,
@@ -10,6 +12,7 @@ from draft.checker import (
     PackageOwnership,
     check_graph,
     operation_directory_role,
+    operation_entry_kind,
     package_ownership_decision,
 )
 from draft.diagnostic_codes import CheckCode, ReplacementStatusReason
@@ -26,6 +29,7 @@ from draft.models import (
     SourceSpan,
     StatusValue,
 )
+from draft.observations import EntryKind
 from draft.operations import Journal
 from draft.vocabulary import RelationCode, StatusCode
 
@@ -762,3 +766,29 @@ def test_operation_directory_role_decision_matrix() -> None:
     for label, operation_id, index, expected in cases:
         actual = operation_directory_role(operation_id, index)
         assert actual is expected, f"{label}: 期望 {expected}, 实际 {actual}"
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("journal.json", EntryKind.FILE),
+        ("journal.json.pending", EntryKind.FILE),
+        ("originals", EntryKind.DIRECTORY),
+        ("staged", EntryKind.DIRECTORY),
+        ("attempt", EntryKind.DIRECTORY),
+        ("cleanup-evidence.json", EntryKind.FILE),
+        ("cleanup-evidence.json.pending", EntryKind.FILE),
+        ("cleanup-evidence.json.quarantine", EntryKind.FILE),
+    ],
+)
+def test_operation_entry_kind_protocol(name: str, expected: EntryKind) -> None:
+    """operation 目录"名字→顶层节点类型"协议表：每个登记名字有且仅有一个预期类型（round-15 M1）。
+
+    测试预期独立列出，不从生产 mapping 反向生成；名字允许与节点类型是正交维度。
+    """
+    assert operation_entry_kind(name) is expected
+
+
+def test_operation_entry_kind_unknown_name() -> None:
+    """协议表只登记内部协议名字；未知名字返回 None，不是任意类型。"""
+    assert operation_entry_kind("not-registered.bin") is None

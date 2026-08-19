@@ -2360,6 +2360,115 @@ def test_checker_unknown_role_keeps_illegal_entry(
     assert snapshot_tree(root) == before
 
 
+def _force_node_kind(path: Path, kind: str) -> None:
+    """把节点安排成给定顶层类型（file/directory/symlink），不复制生产分类逻辑。
+
+    只负责布置测试现场：删除原内容后按 kind 写一个普通文件/目录/指向 journal 的链接。
+    """
+    import shutil
+
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        shutil.rmtree(path)
+    if kind == "file":
+        path.write_bytes(b"not-a-protocol-node")
+    elif kind == "directory":
+        path.mkdir()
+    elif kind == "symlink":
+        path.symlink_to("journal.json")
+    else:
+        raise AssertionError(f"未知类型 {kind}")
+
+
+@pytest.mark.parametrize(
+    ("relative", "wrong_kind"),
+    [
+        (Path("originals"), "file"),
+        (Path("staged"), "file"),
+        (Path("attempt"), "file"),
+        (Path("journal.json.pending"), "directory"),
+    ],
+)
+def test_checker_unknown_role_rejects_allowed_name_with_wrong_kind(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: Path,
+    wrong_kind: str,
+) -> None:
+    """UNKNOWN 角色：名字允许但节点类型错误仍报告（round-15 M1）。
+
+    lock lstat EIO 使 R/T 角色 UNKNOWN，originals/staged/attempt/journal.json.pending
+    按名允许；但把允许名字换成错误顶层类型后，通用 shape pass 必须报告
+    internal.unexpected_entry（名字×类型正交，UNKNOWN 不关闭形状检查）。
+    每个 case 只验证一个协议分区。
+    """
+    import os
+
+    root, restore_id, _trash_id = _restore_cleanup_owner_scene(draft_factory, monkeypatch)
+    operation = root / ".draft/operations" / restore_id
+    _force_node_kind(operation / relative, wrong_kind)
+    lock = root / ".draft/operation.lock"
+    before = snapshot_tree(root)
+    real_lstat = os.lstat
+
+    def fail_lock_lstat(path: str | bytes | os.PathLike[str], *args: object) -> object:
+        if os.fspath(path) == os.fspath(lock):
+            raise OSError(5, "Input/output error")
+        return real_lstat(path, *args)
+
+    monkeypatch.setattr(os, "lstat", fail_lock_lstat)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    unexpected = {
+        issue.path
+        for issue in report.errors
+        if issue.code == CheckCode.INTERNAL_UNEXPECTED_ENTRY.value
+    }
+    assert Path(f".draft/operations/{restore_id}") / relative in unexpected
+    assert not _has_package_orphan(report, _trash_id)
+    assert snapshot_tree(root) == before
+
+
+def test_checker_unknown_role_reports_symlink_for_allowed_name(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """UNKNOWN 角色：允许名字下是 symlink 时保留最具体路径诊断（round-15 M1）。
+
+    没有专用分类器的 originals 出现 symlink 是路径错误，不能因名字合法而通过；断言
+    path.symlink_escape，不读取链接目标内容。
+    """
+    import os
+
+    root, restore_id, _trash_id = _restore_cleanup_owner_scene(draft_factory, monkeypatch)
+    operation = root / ".draft/operations" / restore_id
+    _force_node_kind(operation / "originals", "symlink")
+    lock = root / ".draft/operation.lock"
+    before = snapshot_tree(root)
+    real_lstat = os.lstat
+
+    def fail_lock_lstat(path: str | bytes | os.PathLike[str], *args: object) -> object:
+        if os.fspath(path) == os.fspath(lock):
+            raise OSError(5, "Input/output error")
+        return real_lstat(path, *args)
+
+    monkeypatch.setattr(os, "lstat", fail_lock_lstat)
+
+    report = check_draft(root)
+    monkeypatch.undo()
+
+    assert isinstance(report, CheckReport)
+    escape = {
+        issue.path for issue in report.errors if issue.code == CheckCode.PATH_SYMLINK_ESCAPE.value
+    }
+    assert Path(f".draft/operations/{restore_id}/originals") in escape
+    assert not _has_package_orphan(report, _trash_id)
+    assert snapshot_tree(root) == before
+
+
 def test_checker_unknown_owner_does_not_suppress_provable_orphan(
     draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
