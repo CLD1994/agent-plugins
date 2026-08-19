@@ -8,7 +8,7 @@ import pytest
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
-from draft.graph import load_graph
+from draft.graph import load_graph, read_marker_snapshot
 from draft.models import (
     FileMutation,
     MutationKind,
@@ -117,7 +117,9 @@ def two_write_plan(root: Path) -> tuple[OperationPlan, bytes, bytes, bytes, byte
 def _observed_two_write_plan(root: Path) -> tuple[OperationPlan, bytes, bytes, bytes, bytes]:
     """双写计划带真实读集观察：artifact 所有权证明需要计划时缺失证据（回归 H4）。"""
     plan, old_a, old_b, new_a, new_b = two_write_plan(root)
-    observed = dataclasses.replace(plan, observations=graph_observations(load_graph(root)))
+    observed = dataclasses.replace(
+        plan, observations=graph_observations(load_graph(root), marker=read_marker_snapshot(root))
+    )
     return observed, old_a, old_b, new_a, new_b
 
 
@@ -568,7 +570,7 @@ def test_recover_never_consumes_preexisting_pending_artifact(
         kind=OperationKind.CREATE,
         root=root,
         root_state=RootState.REGISTERED,
-        observations=graph_observations(load_graph(root)),
+        observations=graph_observations(load_graph(root), marker=read_marker_snapshot(root)),
         mutations=(
             FileMutation(
                 Path("pages/new.md"),
@@ -601,7 +603,7 @@ def test_recover_preserves_preexisting_quarantine_artifact(
         kind=OperationKind.CREATE,
         root=root,
         root_state=RootState.REGISTERED,
-        observations=graph_observations(load_graph(root)),
+        observations=graph_observations(load_graph(root), marker=read_marker_snapshot(root)),
         mutations=(
             FileMutation(
                 Path("pages/a.md"),
@@ -1170,7 +1172,7 @@ def _plan_with_observed_inputs(root: Path) -> OperationPlan:
         kind=OperationKind.CREATE,
         root=root,
         root_state=RootState.REGISTERED,
-        observations=graph_observations(graph),
+        observations=graph_observations(graph, marker=read_marker_snapshot(root)),
         mutations=(
             FileMutation(
                 Path("pages/a.md"),
@@ -1212,7 +1214,8 @@ def test_graph_observations_covers_empty_managed_directory(
         text = "# A\n"
 
     manifest = graph_observations(
-        FakeGraph(root=root, pages={Path("pages/a.md"): cast(PageDocument, _Page())})
+        FakeGraph(root=root, pages={Path("pages/a.md"): cast(PageDocument, _Page())}),
+        marker=read_marker_snapshot(root),
     )
     observed = manifest.for_path(Path("pages/empty"))
     assert observed is not None
@@ -1319,7 +1322,7 @@ def test_recover_uses_live_file_state_not_stale_applied(
         kind=OperationKind.CREATE,
         root=root,
         root_state=RootState.REGISTERED,
-        observations=graph_observations(load_graph(root)),
+        observations=graph_observations(load_graph(root), marker=read_marker_snapshot(root)),
         mutations=(
             # 非受管页面文件：只改变目录成员，不触发页面解析检查。
             FileMutation(
@@ -1885,7 +1888,7 @@ def _write_journal_with_originals_and_staged(
 
 def _graph_observations_payload(root: Path) -> list[dict[str, object]]:
     """真实图观察清单的 JSON 载荷：管理目录成员枚举（artifact 所有权证据）。"""
-    manifest = graph_observations(load_graph(root))
+    manifest = graph_observations(load_graph(root), marker=read_marker_snapshot(root))
     return [
         {
             "path": entry.path.as_posix(),

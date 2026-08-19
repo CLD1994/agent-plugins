@@ -1237,6 +1237,7 @@ def _build_trash_state(
     from draft.trash_package import OUTGOING_RELATIVE
 
     graph = load_graph(root)
+    from draft.graph import read_marker_snapshot
     from draft.models import RootState
     from draft.observations import graph_observations
 
@@ -1244,7 +1245,7 @@ def _build_trash_state(
         graph,
         Path("pages/obsolete.md"),
         root_state=RootState.REGISTERED,
-        observations=graph_observations(graph),
+        observations=graph_observations(graph, marker=read_marker_snapshot(root)),
     )
     execute_plan(plan)
     operation_id = plan.metadata["operation_id"]

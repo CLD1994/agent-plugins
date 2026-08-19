@@ -291,7 +291,7 @@ def test_adopt_observations_cover_pre_existing_internal_protocol_files(
     tmp_path: Path,
 ) -> None:
     """adopt 观察清单必须纳入既有操作日志与权威删除包（规格 §12.1）。"""
-    from draft.graph import load_graph_tolerant
+    from draft.graph import load_graph_tolerant, read_marker_snapshot
     from draft.observations import graph_observations, internal_protocol_observations
 
     root = tmp_path / "candidate"
@@ -306,7 +306,7 @@ def test_adopt_observations_cover_pre_existing_internal_protocol_files(
 
     graph = load_graph_tolerant(root).graph
     manifest = internal_protocol_observations(graph)
-    merged = graph_observations(graph).entries + manifest.entries
+    merged = graph_observations(graph, marker=read_marker_snapshot(root)).entries + manifest.entries
 
     assert Path(".draft/operations") / ("b" * 32) / "journal.json" in {
         entry.path for entry in merged

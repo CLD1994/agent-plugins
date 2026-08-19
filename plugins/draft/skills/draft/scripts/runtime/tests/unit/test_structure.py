@@ -9,6 +9,8 @@ from draft.errors import DraftError
 from draft.graph import (
     ROOT_PAGE,
     DraftGraph,
+    MarkerSnapshot,
+    MarkerState,
     resolve_local_destination,
 )
 from draft.markdown import parse_page
@@ -32,9 +34,22 @@ from draft.structure import (
     plan_path_remap,
     plan_promote,
 )
-from draft.vocabulary import RelationCode
+from draft.vocabulary import ConclusionsState, RelationCode
 
 ROOT = Path("/draft")
+
+# 合成图无真实文件系统：marker 观察使用显式构造的 registered snapshot（round-15 H1）。
+_REGISTERED_BYTES = (
+    b'{"format_version":1,"root_state":"registered","conclusions_state":"not_generated"}'
+)
+_REGISTERED_SNAPSHOT = MarkerSnapshot(
+    state=MarkerState(
+        version=1,
+        root_state=RootState.REGISTERED,
+        conclusions_state=ConclusionsState.NOT_GENERATED,
+    ),
+    raw_bytes=_REGISTERED_BYTES,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +172,11 @@ def _plan(
         (m for m in mutations if m.kind is MutationKind.DELETE),
         key=lambda m: str(m.path),
     )
-    observations = graph_observations(graph) if graph is not None else EMPTY_OBSERVATIONS
+    observations = (
+        graph_observations(graph, marker=_REGISTERED_SNAPSHOT)
+        if graph is not None
+        else EMPTY_OBSERVATIONS
+    )
     return OperationPlan(
         kind=kind,
         root=ROOT,

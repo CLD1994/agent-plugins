@@ -16,6 +16,8 @@ from draft.graph import (
     CONCLUSIONS_PAGE,
     ROOT_PAGE,
     DraftGraph,
+    MarkerSnapshot,
+    MarkerState,
     resolve_local_destination,
 )
 from draft.markdown import parse_page
@@ -45,9 +47,22 @@ from draft.trash import (
     trash_plan,
 )
 from draft.trash_package import OUTGOING_RELATIVE, PACKAGE_VERSION
-from draft.vocabulary import RelationCode
+from draft.vocabulary import ConclusionsState, RelationCode
 
 ROOT = Path("/draft")
+
+# 合成图无真实文件系统：marker 观察使用显式构造的 registered snapshot（round-15 H1）。
+_REGISTERED_BYTES = (
+    b'{"format_version":1,"root_state":"registered","conclusions_state":"not_generated"}'
+)
+_REGISTERED_SNAPSHOT = MarkerSnapshot(
+    state=MarkerState(
+        version=1,
+        root_state=RootState.REGISTERED,
+        conclusions_state=ConclusionsState.NOT_GENERATED,
+    ),
+    raw_bytes=_REGISTERED_BYTES,
+)
 FIXED_OPERATION_ID = "12345678123456781234567812345678"
 FIXED_UUID = uuid_module.UUID("12345678-1234-5678-1234-567812345678")
 
@@ -327,7 +342,7 @@ def _trash_plan(graph: DraftGraph, page: Path) -> tuple[OperationPlan, Path]:
         graph,
         page,
         root_state=RootState.REGISTERED,
-        observations=graph_observations(graph),
+        observations=graph_observations(graph, marker=_REGISTERED_SNAPSHOT),
     )
 
 

@@ -6,19 +6,32 @@ from pathlib import Path
 import pytest
 
 from draft.errors import DraftError
-from draft.graph import DraftGraph
+from draft.graph import DraftGraph, MarkerSnapshot, MarkerState
 from draft.markdown import parse_page
-from draft.models import OperationPlan, PageDocument, StatusCode
+from draft.models import OperationPlan, PageDocument, RootState, StatusCode
 from draft.page_create import (
     PlanAction,
     plan_create_page,
     resolve_new_leaf_operand,
 )
-from draft.vocabulary import status_label
+from draft.vocabulary import ConclusionsState, status_label
 
 ROOT = Path("/draft")
 INDEX = Path("index.md")
 A = Path("pages/a.md")
+
+# 合成图无真实文件系统：marker 观察使用显式构造的 registered snapshot（round-15 H1）。
+_REGISTERED_BYTES = (
+    b'{"format_version":1,"root_state":"registered","conclusions_state":"not_generated"}'
+)
+_REGISTERED_SNAPSHOT = MarkerSnapshot(
+    state=MarkerState(
+        version=1,
+        root_state=RootState.REGISTERED,
+        conclusions_state=ConclusionsState.NOT_GENERATED,
+    ),
+    raw_bytes=_REGISTERED_BYTES,
+)
 
 
 def _page(path: Path, *, title: str = "t", status: StatusCode = StatusCode.PENDING) -> PageDocument:
@@ -61,7 +74,7 @@ def _create_plan(
         title=title,
         status=status,
         root_state=RootState.REGISTERED,
-        observations=graph_observations(graph),
+        observations=graph_observations(graph, marker=_REGISTERED_SNAPSHOT),
     )
 
 

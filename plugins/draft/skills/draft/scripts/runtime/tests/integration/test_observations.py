@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+from draft.graph import read_marker_snapshot
 from draft.models import PageDocument
 from draft.observations import (
     EntryKind,
@@ -31,14 +32,23 @@ def test_graph_observations_covers_pages_dirs_and_marker(tmp_path: Path) -> None
     (tmp_path / "pages").mkdir()
     (tmp_path / "pages/a.md").write_text("# 甲\n", encoding="utf-8")
     (tmp_path / ".draft").mkdir()
-    (tmp_path / ".draft/draft.json").write_text("{}", encoding="utf-8")
+    marker = tmp_path / ".draft/draft.json"
+    marker.write_text(
+        '{"format_version":1,"root_state":"candidate","conclusions_state":"not_generated"}\n',
+        encoding="utf-8",
+    )
+    marker_snapshot = read_marker_snapshot(tmp_path)
 
     manifest = graph_observations(
-        FakeGraph(root=tmp_path, pages={Path("pages/a.md"): cast(PageDocument, _Page())})
+        FakeGraph(root=tmp_path, pages={Path("pages/a.md"): cast(PageDocument, _Page())}),
+        marker=marker_snapshot,
     )
     assert manifest.for_path(Path("pages/a.md")) is not None
     assert manifest.for_path(Path("pages")) is not None
-    assert manifest.for_path(Path(".draft/draft.json")) is not None
+    marker_obs = manifest.for_path(Path(".draft/draft.json"))
+    assert marker_obs is not None
+    # marker 观察摘要与 snapshot 同源，不访问 marker 文件系统路径（round-15 H1）。
+    assert marker_obs.sha256 == marker_snapshot.sha256
 
 
 def test_filesystem_probe_observes_actual_state(tmp_path: Path) -> None:

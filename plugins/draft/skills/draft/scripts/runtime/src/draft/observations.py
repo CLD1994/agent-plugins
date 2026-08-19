@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from draft.graph import DraftGraph
+    from draft.graph import DraftGraph, MarkerSnapshot
     from draft.models import PageDocument
 
 
@@ -76,6 +76,18 @@ def file_observation(path: Path, data: bytes) -> Observation:
 
 def file_digest_observation(path: Path, sha256: str) -> Observation:
     return Observation(path=path, kind=EntryKind.FILE, sha256=sha256)
+
+
+def marker_observation(snapshot: MarkerSnapshot) -> Observation:
+    """由 snapshot 直接生成 marker 观察：摘要来自同一次读取的 raw_bytes（round-15 H1）。
+
+    ``graph_observations`` 与 adopt 的合并 manifest 从调用方持有的 snapshot 生成
+    marker 观察，不访问 marker 文件系统路径；同一计划的 state/bytes/digest 与观察
+    摘要同源。调用方必须持有 snapshot，不得回退为读取 live 文件。
+    """
+    from draft.graph import MARKER_PATH
+
+    return file_digest_observation(MARKER_PATH, snapshot.sha256)
 
 
 def directory_observation(path: Path, members: tuple[str, ...]) -> Observation:
@@ -160,13 +172,15 @@ def verify_observations(
     return tuple(sorted(changed))
 
 
-def graph_observations(graph: _GraphLike) -> ObservationManifest:
-    """从已加载图构建读集观察：页面摘要复用已解析文本，目录成员与 marker 各枚举一次。
+def graph_observations(graph: _GraphLike, *, marker: MarkerSnapshot) -> ObservationManifest:
+    """从已加载图构建读集观察：页面摘要复用已解析文本，目录成员各枚举一次。
 
-    ``graph`` 需提供 ``root`` 与 ``pages``（path → 带 ``text`` 的页面对象）。
-    复杂度 O(页面字节总数 + 受管理目录条目数 + marker 一次读取)。
+    ``graph`` 需提供 ``root`` 与 ``pages``（path → 带 ``text`` 的页面对象）。marker
+    观察由调用方持有的 snapshot 直接生成（round-15 H1）：不访问 marker 文件系统路径，
+    同一计划的 state/bytes/digest 与观察摘要同源。
+    复杂度 O(页面字节总数 + 受管理目录条目数)。
     """
-    from draft.graph import INTERNAL_DIR, MARKER_PATH, PAGES_DIR
+    from draft.graph import INTERNAL_DIR, PAGES_DIR
     from draft.operations import sha256_bytes
 
     entries: list[Observation] = []
@@ -202,9 +216,9 @@ def graph_observations(graph: _GraphLike) -> ObservationManifest:
             else ()
         )
         entries.append(directory_observation(directory, members))
-    marker = root / MARKER_PATH
-    if marker.is_file() and not marker.is_symlink():
-        entries.append(file_digest_observation(MARKER_PATH, sha256_bytes(marker.read_bytes())))
+    # marker 观察由调用方持有的 snapshot 直接生成，不访问 marker 文件系统路径
+    # （round-15 H1）；同一计划的 state/bytes/digest 与观察摘要同源。
+    entries.append(marker_observation(marker))
     # 内部命名空间目录基线：操作会在其中按需创建 operations/operation.lock，
     # 恢复时据此可证明首次创建的 .draft/operations 等在计划期缺失（与 pages
     # 子树对称，只观察成员，不逐个观察内部文件）。
@@ -222,7 +236,7 @@ def internal_protocol_observations(graph: DraftGraph) -> ObservationManifest:
     锁等）与根内本地资源目标；adopt 随后自己创建的操作目录与锁由恢复复核按可解释
     变化处理。复杂度 O(内部文件字节数 + 目录条目数)。
     """
-    from draft.graph import INTERNAL_DIR
+    from draft.graph import INTERNAL_DIR, MARKER_PATH
     from draft.operations import sha256_bytes
     from draft.resources import ResourceKind, ResourceScope, TargetState
 
@@ -235,6 +249,9 @@ def internal_protocol_observations(graph: DraftGraph) -> ObservationManifest:
             directories.add(relative_dir)
             for name in sorted(filenames):
                 relative = relative_dir / name
+                if relative == MARKER_PATH:
+                    # marker 由调用方持有的 snapshot 显式合并，不在此重读（round-15 H1）。
+                    continue
                 target = graph.root / relative
                 if target.is_file() and not target.is_symlink():
                     entries.append(

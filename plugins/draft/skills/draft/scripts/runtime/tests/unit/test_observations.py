@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
+from draft.graph import MARKER_PATH, MarkerSnapshot, MarkerState
+from draft.models import RootState
 from draft.observations import (
     EMPTY_OBSERVATIONS,
     EntryKind,
@@ -9,11 +12,13 @@ from draft.observations import (
     ObservationManifest,
     directory_observation,
     file_observation,
+    marker_observation,
     missing_observation,
     observation_shape_error,
     verify_observations,
 )
 from draft.operations import sha256_bytes
+from draft.vocabulary import ConclusionsState
 
 PAGES = Path("pages")
 
@@ -109,6 +114,25 @@ def test_manifest_for_path_returns_matching_entry() -> None:
     )
     assert manifest.for_path(Path("pages/a.md")) is not None
     assert manifest.for_path(Path("pages/missing.md")) is None
+
+
+def test_marker_observation_uses_snapshot() -> None:
+    """marker 观察摘要直接来自 snapshot 的 raw_bytes（round-15 H1），不访问文件系统。"""
+    raw = b'{"format_version":1,"root_state":"candidate","conclusions_state":"not_generated"}'
+    snapshot = MarkerSnapshot(
+        state=MarkerState(
+            version=1,
+            root_state=RootState.CANDIDATE,
+            conclusions_state=ConclusionsState.NOT_GENERATED,
+        ),
+        raw_bytes=raw,
+    )
+
+    observation = marker_observation(snapshot)
+
+    assert observation.path == MARKER_PATH
+    assert observation.kind is EntryKind.FILE
+    assert observation.sha256 == hashlib.sha256(raw).hexdigest()
 
 
 def test_empty_manifest_is_defined() -> None:
