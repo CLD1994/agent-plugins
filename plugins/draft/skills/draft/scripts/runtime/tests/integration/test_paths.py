@@ -167,6 +167,85 @@ def test_managed_at_without_draft_reports_format_missing(tmp_path: Path) -> None
     assert caught.value.paths == (root.resolve() / ".draft/draft.json",)
 
 
+# ---------------------------------------------------------------------------
+# round-16 表二：pwd 祖先发现的异常祖先 fail-fast 语义。外层合法根存在时，symlink
+# 与 stat 失败祖先都以正确错误码立即失败，不跳过、不上溯、不折叠。
+# ---------------------------------------------------------------------------
+
+
+def test_pwd_discovery_symlink_ancestor_fails_fast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """场景 A：`outer/mid/.draft` 是 symlink，cwd 在更深处 -> path.symlink_escape 立即失败。
+
+    基线旧分类器报 format.invalid @ marker（红）；修复后由单一权威报
+    path.symlink_escape @ `outer/mid/.draft`，且不落回外层合法根 outer。
+    """
+    outer = tmp_path / "outer"
+    initialize(outer)
+    mid = outer / "mid"
+    mid.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (mid / ".draft").symlink_to(outside, target_is_directory=True)
+    deep = mid / "deep"
+    deep.mkdir(parents=True)
+    monkeypatch.chdir(deep)
+
+    with pytest.raises(DraftError) as caught:
+        _select(physical_cwd=Path.cwd())
+    assert caught.value.code == CheckCode.PATH_SYMLINK_ESCAPE.value
+    assert caught.value.paths == (mid.resolve() / ".draft",)
+
+
+def test_pwd_discovery_stat_failure_ancestor_fails_fast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """场景 B：`outer/mid/.draft` 无法 stat（EIO），cwd 在更深处 -> format.invalid 立即失败。
+
+    注入精确作用于 `outer/mid/.draft`（不误伤 outer/deep 的探测）。基线泄漏原始
+    OSError（红）或跳过祖先落回 outer；修复后立即失败 format.invalid，outer 不被采信。
+    """
+    outer = tmp_path / "outer"
+    initialize(outer)
+    mid = outer / "mid"
+    mid.mkdir()
+    (mid / ".draft").mkdir()
+    (mid / ".draft/draft.json").write_text(
+        '{"format_version":1,"root_state":"registered","conclusions_state":"not_generated"}',
+        encoding="utf-8",
+    )
+    deep = mid / "deep"
+    deep.mkdir(parents=True)
+    monkeypatch.chdir(deep)
+
+    mid_draft = mid.resolve() / ".draft"
+    real_lstat = os.lstat
+    real_stat = os.stat
+
+    def fail_mid_lstat(
+        path: str | bytes | os.PathLike[str], *args: object, **kwargs: object
+    ) -> os.stat_result:
+        if os.fsdecode(path) == os.fspath(mid_draft):
+            raise OSError(errno.EIO, "Input/output error")
+        return real_lstat(path, *args, **kwargs)  # type: ignore[return-value]
+
+    def fail_mid_stat(
+        path: str | bytes | os.PathLike[str], *args: object, **kwargs: object
+    ) -> os.stat_result:
+        if os.fsdecode(path) == os.fspath(mid_draft):
+            raise OSError(errno.EIO, "Input/output error")
+        return real_stat(path, *args, **kwargs)  # type: ignore[return-value]
+
+    monkeypatch.setattr(os, "lstat", fail_mid_lstat)
+    monkeypatch.setattr(os, "stat", fail_mid_stat)
+
+    with pytest.raises(DraftError) as caught:
+        _select(physical_cwd=Path.cwd())
+    assert caught.value.code == CheckCode.FORMAT_INVALID.value
+    assert caught.value.paths == (mid.resolve() / ".draft/draft.json",)
+
+
 def test_absolute_draft_root_operates_from_any_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

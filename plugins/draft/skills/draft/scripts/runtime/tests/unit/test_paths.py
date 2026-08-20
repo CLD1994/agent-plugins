@@ -23,6 +23,7 @@ class FakeProbe:
         self.directories: set[Path] = set()
         self.managed: dict[Path, MarkerState] = {}
         self.broken: set[Path] = set()
+        self.broken_symlink: set[Path] = set()
         self.inspected: list[Path] = []
 
     def is_directory(self, path: Path) -> bool:
@@ -33,6 +34,8 @@ class FakeProbe:
 
     def managed_at(self, directory: Path) -> MarkerState | None:
         self.inspected.append(directory)
+        if directory in self.broken_symlink:
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, directory / ".draft")
         if directory in self.broken:
             raise DraftError(CheckCode.FORMAT_INVALID.value, directory / ".draft/draft.json")
         return self.managed.get(directory)
@@ -142,6 +145,46 @@ def test_nearest_damaged_draft_blocks_outer_root(root_probe: FakeProbe) -> None:
             probe=root_probe,
         )
     assert caught.value.code == CheckCode.FORMAT_INVALID.value
+
+
+def test_symlink_broken_ancestor_propagates_symlink_escape(root_probe: FakeProbe) -> None:
+    """表二（round-16）：中间祖先 .draft 是 symlink -> path.symlink_escape 原样传播。
+
+    不跳过该祖先、不继续上溯到外层合法根；发现 walk 在损坏祖先即终止。
+    """
+    root_probe.managed[Path("/work")] = _registered()
+    root_probe.broken_symlink.add(Path("/work/inner"))
+
+    with pytest.raises(DraftError) as caught:
+        select_managed_root(
+            explicit=None,
+            environment_value=None,
+            physical_cwd=Path("/work/inner/deep"),
+            probe=root_probe,
+        )
+    assert caught.value.code == CheckCode.PATH_SYMLINK_ESCAPE.value
+    assert caught.value.paths == (Path("/work/inner/.draft"),)
+    assert root_probe.inspected == [Path("/work/inner/deep"), Path("/work/inner")]
+
+
+def test_stat_failure_ancestor_propagates_format_invalid(root_probe: FakeProbe) -> None:
+    """表二（round-16）：中间祖先 stat 失败 -> format.invalid 原样传播，外层合法根不被采信。
+
+    ``test_nearest_damaged_draft_blocks_outer_root`` 只断言码；本用例同时钉住
+    fail-fast（walk 不越过损坏祖先）这一已确认语义。
+    """
+    root_probe.managed[Path("/work")] = _registered()
+    root_probe.broken.add(Path("/work/inner"))
+
+    with pytest.raises(DraftError) as caught:
+        select_managed_root(
+            explicit=None,
+            environment_value=None,
+            physical_cwd=Path("/work/inner/deep"),
+            probe=root_probe,
+        )
+    assert caught.value.code == CheckCode.FORMAT_INVALID.value
+    assert root_probe.inspected == [Path("/work/inner/deep"), Path("/work/inner")]
 
 
 def test_two_legal_ancestor_roots_is_ambiguous(root_probe: FakeProbe) -> None:
