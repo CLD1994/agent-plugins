@@ -185,6 +185,23 @@ def _render_pages(
                 destination = _relative_destination(final_path, final_parent, None)
                 if destination != parent_relation.link.destination:
                     edits[parent_relation.link.destination_span] = destination
+        # 非父正式关系（依赖/取代/质疑及反向）的链接目标：声明页或目标任一移动都必须
+        # 重算相对目标，与正文链接同一规则（规格 §9.1 "全部可受影响链接一致"）。
+        for relation in page.relations:
+            if relation.code is RelationCode.PARENT:
+                continue
+            try:
+                target, _anchor = resolve_local_destination(
+                    path, relation.link.destination, graph.root
+                )
+            except DraftError:
+                continue
+            final_target = expanded.get(target, target)
+            if final_path == path and final_target == target:
+                continue
+            destination = _relative_destination(final_path, final_target, None)
+            if destination != relation.link.destination:
+                edits.setdefault(relation.link.destination_span, destination)
         # 机器结论列表允许过时：所有权为 generated 时结构命令不重写结论页正文链接。
         if not (skip_conclusions_links and path == CONCLUSIONS_PAGE):
             body_by_span = {

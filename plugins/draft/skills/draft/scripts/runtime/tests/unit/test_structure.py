@@ -608,6 +608,194 @@ def test_plan_move_protected_root_raises_protected() -> None:
 
 
 # ===========================================================================
+# 非父正式关系目标重写决策表（规格 §9.1 "全部可受影响链接一致"）
+# ===========================================================================
+#
+# 被测合同：move/promote/collapse 的重写器必须把所有非父关系目标指向被移动集合
+# （含声明页自身移动）的链接重新定位；四种移动组合分别断言。预期目标字符串从
+# 根相对路径的几何关系独立推导，不复制生产重写算法。
+
+_RELATION_TEXTS: dict[RelationCode, str] = {
+    RelationCode.DEPENDS_ON: "依赖",
+    RelationCode.SUPERSEDES: "取代",
+    RelationCode.SUPERSEDED_BY: "被取代",
+    RelationCode.CHALLENGES: "质疑",
+    RelationCode.CHALLENGED_BY: "被质疑",
+}
+
+
+def _relation_declarer(code: RelationCode, *, destination: str = "b.md") -> str:
+    label = _RELATION_TEXTS[code]
+    return f"""# 甲
+
+> 状态：`待讨论`
+>
+> 父主题：[枢纽](index.md)
+>
+> {label}：[{label}]({destination})
+
+甲的正文。
+"""
+
+
+_RELATION_INDEX = """# 根
+
+> 状态：`已关闭：纯导航页`
+
+## 子主题
+
+- [结论汇总](conclusions.md)
+- [枢纽](pages/sub/index.md)
+"""
+
+_RELATION_HUB = """# 枢纽
+
+> 状态：`已关闭：纯导航页`
+>
+> 父主题：[根](../../index.md)
+
+## 子主题
+
+- [甲](a.md)
+- [乙](b.md)
+- [丙](c.md)
+"""
+
+_RELATION_TARGET = """# 乙
+
+> 状态：`待讨论`
+>
+> 父主题：[枢纽](index.md)
+
+乙的正文。
+"""
+
+_RELATION_OTHER = """# 丙
+
+> 状态：`待讨论`
+>
+> 父主题：[枢纽](index.md)
+
+丙的正文。
+"""
+
+
+def _relation_graph(code: RelationCode) -> DraftGraph:
+    """声明页 a（子枢纽内）声明到 b 的关系；c 供无关移动场景使用。"""
+    return _graph_from_texts(
+        {
+            Path("index.md"): _RELATION_INDEX,
+            Path("conclusions.md"): _CONCLUSIONS,
+            Path("pages/sub/index.md"): _RELATION_HUB,
+            Path("pages/sub/a.md"): _relation_declarer(code),
+            Path("pages/sub/b.md"): _RELATION_TARGET,
+            Path("pages/sub/c.md"): _RELATION_OTHER,
+        }
+    )
+
+
+# 场景表：(移动映射, 父变化映射, 重写后的关系目标字符串)。
+#   source_same:   声明页同深度移动（目标未动）   -> 几何不变，不产生编辑
+#   source_cross:  声明页跨深度上移（目标未动）   -> b.md -> sub/b.md
+#   target_same:   目标页同深度移动（声明页未动） -> b.md -> b2.md
+#   target_cross:  目标页跨深度上移（声明页未动） -> b.md -> ../b.md
+#   both_same:     两端同深度同向移动             -> 几何不变
+#   both_split:    声明页跨深度、目标同深度       -> 仍重新定位
+#   both_cross:    两端同向跨深度上移             -> 几何不变（平行迁移）
+#   neither:       无关页移动                     -> 声明页不产生任何编辑
+_RELATION_SCENARIOS: dict[str, tuple[dict[Path, Path], dict[Path, Path], str]] = {
+    "source_same": (
+        {Path("pages/sub/a.md"): Path("pages/sub/a2.md")},
+        {},
+        "b.md",
+    ),
+    "source_cross": (
+        {Path("pages/sub/a.md"): Path("pages/a.md")},
+        {Path("pages/sub/a.md"): Path("index.md")},
+        "sub/b.md",
+    ),
+    "target_same": (
+        {Path("pages/sub/b.md"): Path("pages/sub/b2.md")},
+        {},
+        "b2.md",
+    ),
+    "target_cross": (
+        {Path("pages/sub/b.md"): Path("pages/b.md")},
+        {Path("pages/sub/b.md"): Path("index.md")},
+        "../b.md",
+    ),
+    "both_same": (
+        {
+            Path("pages/sub/a.md"): Path("pages/sub/a2.md"),
+            Path("pages/sub/b.md"): Path("pages/sub/b2.md"),
+        },
+        {},
+        "b2.md",
+    ),
+    "both_split": (
+        {
+            Path("pages/sub/a.md"): Path("pages/a.md"),
+            Path("pages/sub/b.md"): Path("pages/sub/b2.md"),
+        },
+        {Path("pages/sub/a.md"): Path("index.md")},
+        "sub/b2.md",
+    ),
+    "both_cross": (
+        {
+            Path("pages/sub/a.md"): Path("pages/a.md"),
+            Path("pages/sub/b.md"): Path("pages/b.md"),
+        },
+        {
+            Path("pages/sub/a.md"): Path("index.md"),
+            Path("pages/sub/b.md"): Path("index.md"),
+        },
+        "b.md",
+    ),
+    "neither": (
+        {Path("pages/sub/c.md"): Path("pages/sub/c2.md")},
+        {},
+        "b.md",
+    ),
+}
+
+
+@pytest.mark.parametrize("code", [c for c in RelationCode if c is not RelationCode.PARENT])
+@pytest.mark.parametrize("scenario", sorted(_RELATION_SCENARIOS))
+def test_plan_rewrites_relation_destination_by_decision_table(
+    code: RelationCode, scenario: str
+) -> None:
+    """非父关系目标按 声明页/目标页 四种移动组合与同/跨深度重写（决策表）。"""
+    mapping, parent_changes, expected_dest = _RELATION_SCENARIOS[scenario]
+    graph = _relation_graph(code)
+    declarer = Path("pages/sub/a.md")
+    final_declarer = mapping.get(declarer, declarer)
+    plan = plan_path_remap(
+        graph,
+        mapping,
+        parent_changes,
+        kind=OperationKind.MOVE,
+        marker=_REGISTERED_SNAPSHOT,
+        observations=_structure_observations(graph),
+    )
+    writes = {
+        mutation.path: mutation.content.decode("utf-8")
+        for mutation in plan.mutations
+        if mutation.kind is MutationKind.WRITE and mutation.content is not None
+    }
+    label = _RELATION_TEXTS[code]
+    expected_line = f"{label}：[{label}]({expected_dest})"
+    if scenario == "neither":
+        # 与被移动集合无关的声明页：内容零变化，不应产生任何写操作。
+        assert final_declarer not in writes
+        return
+    assert final_declarer in writes
+    content = writes[final_declarer]
+    assert expected_line in content
+    if expected_dest != "b.md":
+        assert f"{label}：[{label}](b.md)" not in content
+
+
+# ===========================================================================
 # plan_promote: 选定子页升格与未选子页保留
 # ===========================================================================
 

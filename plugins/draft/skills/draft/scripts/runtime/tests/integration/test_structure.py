@@ -983,6 +983,274 @@ def test_same_span_in_other_page_is_not_silenced(
 
 
 # ---------------------------------------------------------------------------
+# 非父正式关系链接的目标重写（round-18 H1）
+# ---------------------------------------------------------------------------
+
+REL_INDEX = """# 主题
+
+> 状态：`已关闭：纯导航页，不表达独立结论`
+
+## 子主题
+
+- [A](pages/a.md)
+- [B](pages/b.md)
+- [结论汇总](conclusions.md)
+"""
+
+REL_CONCLUSIONS = """# 结论汇总
+
+> 状态：`已确认`
+>
+> 父主题：[根索引](index.md)
+
+## 已确认结论
+"""
+
+REL_A = """# A
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+>
+> 依赖：[依赖](b.md)
+
+看 [B](b.md)。
+"""
+
+REL_B = """# B
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+
+看 [A](a.md)。
+"""
+
+
+def _relation_move_root(draft_factory: DraftFactory, *, root_state: RootState) -> Path:
+    return draft_factory(
+        {
+            "index.md": REL_INDEX,
+            "conclusions.md": REL_CONCLUSIONS,
+            "pages/a.md": REL_A,
+            "pages/b.md": REL_B,
+        },
+        root_state=root_state,
+    )
+
+
+def test_candidate_move_rewrites_inbound_relation_target(
+    draft_factory: DraftFactory,
+) -> None:
+    """candidate 根：move 后入站 depends_on 目标必须重写，check 零错误（round-18 实验一）。"""
+    root = _relation_move_root(draft_factory, root_state=RootState.CANDIDATE)
+
+    move_page(root, Path("pages/b.md"), Path("pages/b2.md"))
+
+    a_text = (root / "pages/a.md").read_text(encoding="utf-8")
+    assert "> 依赖：[依赖](b2.md)" in a_text
+    assert "> 依赖：[依赖](b.md)" not in a_text
+    assert check_draft(root).errors == ()
+
+
+def test_registered_move_rewrites_inbound_relation_target(
+    draft_factory: DraftFactory,
+) -> None:
+    """registered 根：入站关系目标的页面必须可移动，重写后应用后完整检查通过（round-18 实验二）。"""
+    root = _relation_move_root(draft_factory, root_state=RootState.REGISTERED)
+
+    result = move_page(root, Path("pages/b.md"), Path("pages/b2.md"))
+
+    assert result.phase == "completed"
+    assert (root / "pages/b2.md").is_file()
+    assert not (root / "pages/b.md").exists()
+    a_text = (root / "pages/a.md").read_text(encoding="utf-8")
+    assert "> 依赖：[依赖](b2.md)" in a_text
+    assert check_draft(root).errors == ()
+
+
+PROMOTE_REL_INDEX = """# 主题
+
+> 状态：`已关闭：纯导航页，不表达独立结论`
+
+## 子主题
+
+- [主题](pages/topic.md)
+- [甲](pages/child-a.md)
+- [乙](pages/child-b.md)
+- [笔记](pages/notes.md)
+- [结论汇总](conclusions.md)
+"""
+
+PROMOTE_REL_TOPIC = """# 主题
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+>
+> 依赖：[依赖](child-b.md)
+
+主题正文。
+"""
+
+PROMOTE_REL_CHILD = """# 甲
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+
+甲的正文。
+"""
+
+PROMOTE_REL_CHILD_B = """# 乙
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+
+乙的正文。
+"""
+
+PROMOTE_REL_NOTES = """# 笔记
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+>
+> 依赖：[依赖](topic.md)
+>
+> 依赖：[依赖](child-a.md)
+
+笔记正文。
+"""
+
+
+def test_promote_rewrites_relations_across_depth(draft_factory: DraftFactory) -> None:
+    """promote 跨深度移动：被移动页声明的出站关系与指向被移动页的入站关系都重写。"""
+    root = draft_factory(
+        {
+            "index.md": PROMOTE_REL_INDEX,
+            "conclusions.md": REL_CONCLUSIONS,
+            "pages/topic.md": PROMOTE_REL_TOPIC,
+            "pages/child-a.md": PROMOTE_REL_CHILD,
+            "pages/child-b.md": PROMOTE_REL_CHILD_B,
+            "pages/notes.md": PROMOTE_REL_NOTES,
+        }
+    )
+
+    promote_page(root, Path("pages/topic.md"), [Path("pages/child-a.md")])
+
+    topic = (root / "pages/topic/index.md").read_text(encoding="utf-8")
+    # 被移动页自己声明的出站关系：目标未动，跨深度后相对目标必须重算。
+    assert "> 依赖：[依赖](../child-b.md)" in topic
+    assert "> 依赖：[依赖](child-b.md)" not in topic
+    notes = (root / "pages/notes.md").read_text(encoding="utf-8")
+    # 指向被移动页（主题与新枢纽）的入站关系：目标跨深度移动。
+    assert "> 依赖：[依赖](topic/index.md)" in notes
+    assert "> 依赖：[依赖](topic/child-a.md)" in notes
+    assert "> 依赖：[依赖](topic.md)" not in notes
+    assert check_draft(root).errors == ()
+
+
+PAIR_TOPIC = """# 主题
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+>
+> 取代：[取代](child-a.md)
+
+主题正文。
+"""
+
+PAIR_CHILD_A = """# 甲
+
+> 状态：`已取代`
+>
+> 父主题：[根索引](../index.md)
+>
+> 被取代：[被取代](topic.md)
+
+甲的正文。
+"""
+
+
+def test_promote_rewrites_bidirectional_pair_with_both_ends_moved(
+    draft_factory: DraftFactory,
+) -> None:
+    """promote 同时移动取代配对两端：两条关系目标都按新几何重写，配对语义保持。"""
+    root = draft_factory(
+        {
+            "index.md": PROMOTE_REL_INDEX.replace("- [笔记](pages/notes.md)\n", ""),
+            "conclusions.md": REL_CONCLUSIONS,
+            "pages/topic.md": PAIR_TOPIC,
+            "pages/child-a.md": PAIR_CHILD_A,
+            "pages/child-b.md": PROMOTE_REL_CHILD_B,
+        }
+    )
+
+    promote_page(root, Path("pages/topic.md"), [Path("pages/child-a.md")])
+
+    topic = (root / "pages/topic/index.md").read_text(encoding="utf-8")
+    child_a = (root / "pages/topic/child-a.md").read_text(encoding="utf-8")
+    # 取代方向（主题 -> 甲）：两端落在同一子目录，目标字符串不变但必须正确。
+    assert "> 取代：[取代](child-a.md)" in topic
+    # 被取代方向（甲 -> 主题）：目标页也移动，重写为新几何下的枢纽目标。
+    assert "> 被取代：[被取代](index.md)" in child_a
+    assert "> 被取代：[被取代](topic.md)" not in child_a
+    assert check_draft(root).errors == ()
+
+
+COLLAPSE_INDEX = """# 主题
+
+> 状态：`已关闭：纯导航页，不表达独立结论`
+
+## 子主题
+
+- [枢纽](pages/x/index.md)
+- [笔记](pages/notes.md)
+- [结论汇总](conclusions.md)
+"""
+
+COLLAPSE_HUB = """# 枢纽
+
+> 状态：`已关闭：纯导航页，不表达独立结论`
+>
+> 父主题：[根索引](../../index.md)
+"""
+
+COLLAPSE_NOTES = """# 笔记
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+>
+> 依赖：[依赖](x/index.md)
+
+笔记正文。
+"""
+
+
+def test_collapse_rewrites_inbound_relation_to_hub(draft_factory: DraftFactory) -> None:
+    """collapse：空枢纽折叠为叶页后，指向枢纽的入站关系目标必须同步重写。"""
+    root = draft_factory(
+        {
+            "index.md": COLLAPSE_INDEX,
+            "conclusions.md": REL_CONCLUSIONS,
+            "pages/x/index.md": COLLAPSE_HUB,
+            "pages/notes.md": COLLAPSE_NOTES,
+        }
+    )
+
+    collapse_hub(root, Path("pages/x/index.md"))
+
+    notes = (root / "pages/notes.md").read_text(encoding="utf-8")
+    assert "> 依赖：[依赖](x.md)" in notes
+    assert "> 依赖：[依赖](x/index.md)" not in notes
+    assert check_draft(root).errors == ()
+
+
+# ---------------------------------------------------------------------------
 # 惰性推进与只读诊断（设计 §13.5）：结构写前置推进、恢复/检查不推进。
 # ---------------------------------------------------------------------------
 
