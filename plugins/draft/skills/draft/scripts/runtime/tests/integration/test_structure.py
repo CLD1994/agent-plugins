@@ -12,7 +12,7 @@ from draft.operations import recover
 from draft.query import load_tolerant_view
 from draft.structure import collapse_hub, move_page, promote_page
 from draft.trash import trash_page
-from tests.integration.support import DraftFactory
+from tests.integration.support import DraftFactory, snapshot_tree
 
 INDEX = """# Topic
 
@@ -1537,11 +1537,14 @@ def test_registered_move_still_reports_conclusions_unexpected_file(
     # 夹具的 marker 因不含 conclusions.md 而为 not_generated；随后写入遗留文件。
     (root / "conclusions.md").write_text(LEGACY_CONCLUSIONS_UNPARSEABLE, encoding="utf-8")
     before = (root / "pages/a.md").read_bytes()
+    legacy_before = (root / "conclusions.md").read_bytes()
 
     with pytest.raises(DraftError) as caught:
         move_page(root, Path("pages/a.md"), Path("pages/a2.md"))
     assert caught.value.code == CheckCode.CONCLUSIONS_UNEXPECTED_FILE.value
+    # 门禁拒绝发生在写计划之前：被移动页与遗留文件字节都不得被触碰。
     assert (root / "pages/a.md").read_bytes() == before
+    assert (root / "conclusions.md").read_bytes() == legacy_before
     assert not (root / "pages/a2.md").exists()
 
 
@@ -1592,3 +1595,39 @@ def test_generated_conclusions_remain_managed_and_untouched(
     # 结论列表旧链接保持原样，机器结论允许过时（规格 §12.5）。
     assert (root / "conclusions.md").read_bytes() == conclusions_bytes
     assert check_draft(root).errors == ()
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [LEGACY_CONCLUSIONS_UNPARSEABLE, LEGACY_CONCLUSIONS_PARSEABLE],
+    ids=["unparseable", "parseable"],
+)
+@pytest.mark.parametrize(
+    "operand_op",
+    ["move", "promote", "collapse"],
+    ids=["move", "promote", "collapse"],
+)
+def test_candidate_structure_command_legacy_conclusions_source_is_unknown_page(
+    draft_factory: DraftFactory, legacy: str, operand_op: str
+) -> None:
+    """not_generated 下遗留 conclusions.md 作结构命令源操作数一律 structure.unknown_page
+    （M1 合同 6 操作数语义）。
+
+    两种遗留内容断言相同：行为不依赖偶然可解析性。拒绝发生在规划阶段的既有操作数
+    校验路径，未新增错误码；遗留文件字节不变，且无任何 mutation 残留（全树快照一致）。
+    """
+    root = _legacy_conclusions_root(draft_factory, legacy=legacy)
+    before_bytes = (root / "conclusions.md").read_bytes()
+    before_tree = snapshot_tree(root)
+
+    with pytest.raises(DraftError) as caught:
+        if operand_op == "move":
+            move_page(root, Path("conclusions.md"), Path("pages/renamed.md"))
+        elif operand_op == "promote":
+            promote_page(root, Path("conclusions.md"), [Path("pages/a.md"), Path("pages/b.md")])
+        else:
+            collapse_hub(root, Path("conclusions.md"))
+
+    assert caught.value.code == "structure.unknown_page"
+    assert (root / "conclusions.md").read_bytes() == before_bytes
+    assert snapshot_tree(root) == before_tree

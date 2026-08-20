@@ -7,7 +7,7 @@ import pytest
 from draft.checker import check_draft
 from draft.cli import main
 from draft.models import RootState
-from tests.integration.support import DraftFactory
+from tests.integration.support import DraftFactory, snapshot_tree
 
 PAGE_INDEX = """# Topic
 
@@ -817,3 +817,110 @@ def test_relation_add_cycle_is_rejected_before_write(
     assert error["code"] == "relation.dependency_cycle"
     assert (root / "pages/b.md").read_text(encoding="utf-8") == PAGE_B
     assert (root / "pages/a.md").read_text(encoding="utf-8") == a_before
+
+
+# ---------------------------------------------------------------------------
+# 最终评审波次：not_generated 下遗留 conclusions.md 作 status/relation 操作数
+# ---------------------------------------------------------------------------
+
+LEGACY_CONCLUSIONS_UNPARSEABLE = """# 旧笔记
+
+> 状态：`已迁移为正式设计，等待评审`
+>
+> 父主题：[根索引](index.md)
+
+旧笔记正文。
+"""
+
+LEGACY_CONCLUSIONS_PARSEABLE = """# 旧笔记
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](index.md)
+
+旧笔记正文。
+"""
+
+
+def _legacy_conclusions_page_root(draft_factory: DraftFactory, *, legacy: str) -> Path:
+    """candidate 根 + not_generated 下的遗留 conclusions.md（夹具 marker 不含该文件时
+    为 not_generated，随后按旧笔记集合写入遗留文件）。"""
+    root = draft_factory(
+        {
+            "index.md": PAGE_INDEX,
+            "pages/a.md": PAGE_A,
+            "pages/b.md": PAGE_B,
+        },
+        root_state=RootState.CANDIDATE,
+    )
+    (root / "conclusions.md").write_text(legacy, encoding="utf-8")
+    return root
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [LEGACY_CONCLUSIONS_UNPARSEABLE, LEGACY_CONCLUSIONS_PARSEABLE],
+    ids=["unparseable", "parseable"],
+)
+def test_candidate_status_set_legacy_conclusions_target_is_page_not_found(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str], legacy: str
+) -> None:
+    """not_generated 下遗留 conclusions.md 作 status set 目标操作数报 page.not_found
+    （M1 合同 6 操作数语义）：既有操作数校验路径已按未受管处理，未新增错误码，
+    遗留文件字节不变且无 mutation 残留。"""
+    root = _legacy_conclusions_page_root(draft_factory, legacy=legacy)
+    capsys.readouterr()
+    before_bytes = (root / "conclusions.md").read_bytes()
+    before_tree = snapshot_tree(root)
+
+    code, payload = run_json(
+        ["status", "set", "--root", str(root), "conclusions.md", "proposed", "--json"],
+        capsys,
+    )
+
+    assert code == 2
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "page.not_found"
+    assert (root / "conclusions.md").read_bytes() == before_bytes
+    assert snapshot_tree(root) == before_tree
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [LEGACY_CONCLUSIONS_UNPARSEABLE, LEGACY_CONCLUSIONS_PARSEABLE],
+    ids=["unparseable", "parseable"],
+)
+@pytest.mark.parametrize(
+    "operand_side",
+    ["source", "target"],
+    ids=["source", "target"],
+)
+def test_candidate_relation_add_legacy_conclusions_operand_is_page_not_found(
+    draft_factory: DraftFactory,
+    capsys: pytest.CaptureFixture[str],
+    legacy: str,
+    operand_side: str,
+) -> None:
+    """not_generated 下遗留 conclusions.md 作 relation add 源或目标操作数一律
+    page.not_found（M1 合同 6 操作数语义）。
+
+    两端任一为遗留文件都被既有操作数校验路径按未受管拒绝，未新增错误码；
+    遗留文件字节不变且无 mutation 残留。"""
+    root = _legacy_conclusions_page_root(draft_factory, legacy=legacy)
+    capsys.readouterr()
+    before_bytes = (root / "conclusions.md").read_bytes()
+    before_tree = snapshot_tree(root)
+
+    if operand_side == "source":
+        operands = ["conclusions.md", "depends_on", "pages/a.md"]
+    else:
+        operands = ["pages/a.md", "depends_on", "conclusions.md"]
+    code, payload = run_json(["relation", "add", "--root", str(root), *operands, "--json"], capsys)
+
+    assert code == 2
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "page.not_found"
+    assert (root / "conclusions.md").read_bytes() == before_bytes
+    assert snapshot_tree(root) == before_tree
