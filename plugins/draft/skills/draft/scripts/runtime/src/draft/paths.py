@@ -62,15 +62,15 @@ class FilesystemProbe:
         return path.exists()
 
     def managed_at(self, directory: Path) -> MarkerState | None:
-        from draft.graph import INTERNAL_DIR, MARKER_PATH, read_marker
+        from draft.graph import (
+            INTERNAL_DIR,
+            MARKER_PATH,
+            classify_marker_parent,
+            read_marker,
+        )
 
-        internal = directory / INTERNAL_DIR
-        if internal.is_symlink():
-            raise DraftError(CheckCode.FORMAT_INVALID.value, directory / MARKER_PATH)
-        if not internal.exists():
+        if not classify_marker_parent(directory / INTERNAL_DIR, directory / MARKER_PATH):
             return None
-        if not internal.is_dir():
-            raise DraftError(CheckCode.FORMAT_INVALID.value, directory / MARKER_PATH)
         return read_marker(directory)
 
 

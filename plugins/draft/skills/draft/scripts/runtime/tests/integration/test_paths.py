@@ -1,3 +1,6 @@
+import errno
+import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -75,6 +78,93 @@ def test_damaged_near_root_blocks_outer_root(
     with pytest.raises(DraftError) as caught:
         _select(physical_cwd=Path.cwd())
     assert caught.value.code == CheckCode.FORMAT_INVALID.value
+
+
+# ---------------------------------------------------------------------------
+# round-16 M1：CLI 入口前置分类与 snapshot 读取器共享同一 .draft 身份权威。
+# 经真实 FilesystemProbe/select_managed_root 走通，unit 替身不覆盖。
+# ---------------------------------------------------------------------------
+
+
+def test_managed_at_draft_symlink_reports_symlink_escape(tmp_path: Path) -> None:
+    """`.draft` 是 symlink：CLI 入口与 snapshot 读取器给出同一码，@ .draft 自身。
+
+    基线 managed_at 的三连分类报 format.invalid @ marker（与 H1 契约表不符，红）；
+    修复后经 classify_marker_parent 报 path.symlink_escape @ .draft。
+    """
+    root = tmp_path / "topic"
+    initialize(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    shutil.rmtree(root / ".draft")
+    (root / ".draft").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(DraftError) as caught:
+        _select(explicit=str(root), physical_cwd=tmp_path)
+    assert caught.value.code == CheckCode.PATH_SYMLINK_ESCAPE.value
+    assert caught.value.paths == (root.resolve() / ".draft",)
+
+
+def test_managed_at_draft_lstat_eio_reports_format_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`.draft` 无法 stat（EIO）不得折叠为缺失：报 format.invalid @ marker。
+
+    注入同时命中 os.lstat 与 os.stat（真实的 .draft stat 失败会同时影响两个 syscall）：
+    基线 managed_at 的 Path.is_symlink（经 os.stat）重新抛出原始 OSError（红），修复后
+    由 classify_marker_parent（os.lstat）稳定映射 format.invalid。
+    """
+    root = tmp_path / "topic"
+    initialize(root)
+
+    real_lstat = os.lstat
+    real_stat = os.stat
+
+    def fail_draft_lstat(
+        path: str | bytes | os.PathLike[str], *args: object, **kwargs: object
+    ) -> os.stat_result:
+        if os.fsdecode(path).endswith("/.draft"):
+            raise OSError(errno.EIO, "Input/output error")
+        return real_lstat(path, *args, **kwargs)  # type: ignore[return-value]
+
+    def fail_draft_stat(
+        path: str | bytes | os.PathLike[str], *args: object, **kwargs: object
+    ) -> os.stat_result:
+        if os.fsdecode(path).endswith("/.draft"):
+            raise OSError(errno.EIO, "Input/output error")
+        return real_stat(path, *args, **kwargs)  # type: ignore[return-value]
+
+    monkeypatch.setattr(os, "lstat", fail_draft_lstat)
+    monkeypatch.setattr(os, "stat", fail_draft_stat)
+
+    with pytest.raises(DraftError) as caught:
+        _select(explicit=str(root), physical_cwd=tmp_path)
+    assert caught.value.code == CheckCode.FORMAT_INVALID.value
+    assert caught.value.paths == (root.resolve() / ".draft/draft.json",)
+
+
+def test_managed_at_draft_regular_file_reports_format_invalid(tmp_path: Path) -> None:
+    """`.draft` 是普通文件（非目录）：format.invalid @ marker（保持用例，防回归）。"""
+    root = tmp_path / "topic"
+    initialize(root)
+    shutil.rmtree(root / ".draft")
+    (root / ".draft").write_text("not a directory\n", encoding="utf-8")
+
+    with pytest.raises(DraftError) as caught:
+        _select(explicit=str(root), physical_cwd=tmp_path)
+    assert caught.value.code == CheckCode.FORMAT_INVALID.value
+    assert caught.value.paths == (root.resolve() / ".draft/draft.json",)
+
+
+def test_managed_at_without_draft_reports_format_missing(tmp_path: Path) -> None:
+    """无 `.draft`：None -> select_managed_root 报 format.missing @ marker（保持用例）。"""
+    root = tmp_path / "topic"
+    root.mkdir()
+
+    with pytest.raises(DraftError) as caught:
+        _select(explicit=str(root), physical_cwd=tmp_path)
+    assert caught.value.code == CheckCode.FORMAT_MISSING.value
+    assert caught.value.paths == (root.resolve() / ".draft/draft.json",)
 
 
 def test_absolute_draft_root_operates_from_any_cwd(

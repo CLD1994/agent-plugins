@@ -157,23 +157,27 @@ def parse_marker_value(decoded: object, marker: Path) -> MarkerState:
     )
 
 
-def _classify_marker_parent(internal: Path, marker: Path) -> None:
-    """稳定分类 .draft 中间组件（round-15 H1）：symlink 是路径错误，缺失合法。
+def classify_marker_parent(internal: Path, marker: Path) -> bool:
+    """稳定分类 .draft 中间组件，是 CLI 入口与 snapshot 读取器共用的单一权威（round-16 M1）。
 
-    中间组件缺失时最终 marker 必然缺失，由 leaf 分类给出 format.missing；.draft 存在
-    但不是目录、或无法 lstat（EACCES/EIO）映射 format.invalid；只有 symlink 在中间
-    组件自身位置报告 path.symlink_escape（与 reject_symlink_components 同语义）。
+    返回 ``False`` 当且仅当 ``.draft`` 缺失（ENOENT，缺失合法：调用方按无 marker
+    处理，最终由 leaf 分类给出 ``format.missing``）；返回 ``True`` 当 ``.draft`` 是
+    普通目录。symlink 是路径错误（在 ``.draft`` 自身位置报告 ``path.symlink_escape``，
+    与 reject_symlink_components 同语义）；``.draft`` 已存在但无法 lstat（EACCES/EIO）
+    或存在但非目录映射 ``format.invalid @ marker``。后三种均立即抛 DraftError，
+    不得折叠为缺失或 None。
     """
     try:
         mode = os.lstat(internal).st_mode
     except FileNotFoundError:
-        return
+        return False
     except OSError as exc:
         raise DraftError(CheckCode.FORMAT_INVALID.value, marker) from exc
     if stat.S_ISLNK(mode):
         raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, internal) from None
     if not stat.S_ISDIR(mode):
         raise DraftError(CheckCode.FORMAT_INVALID.value, marker) from None
+    return True
 
 
 def _classify_marker_leaf(marker: Path) -> None:
@@ -207,7 +211,8 @@ def read_marker_snapshot(root: Path) -> MarkerSnapshot:
     read_text/read_bytes；non-UTF-8、JSON 损坏、未知字段与版本不支持语义保持既有。
     """
     marker = root / MARKER_PATH
-    _classify_marker_parent(root / INTERNAL_DIR, marker)
+    # .draft 缺失合法：返回 False 后仍继续由 leaf 分类给出 format.missing。
+    classify_marker_parent(root / INTERNAL_DIR, marker)
     _classify_marker_leaf(marker)
     try:
         raw = marker.read_bytes()
