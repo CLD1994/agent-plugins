@@ -6,6 +6,7 @@ import pytest
 
 from draft.checker import check_draft
 from draft.cli import main
+from draft.diagnostic_codes import CheckCode
 from draft.graph import read_marker
 from draft.vocabulary import ConclusionsState
 from tests.integration.support import DraftFactory
@@ -332,6 +333,29 @@ def test_generate_conclusions_fails_on_invalid_navigation(
     error = payload["error"]
     assert isinstance(error, dict)
     assert error["code"] == "conclusions.invalid_navigation"
+
+
+def test_generate_conclusions_still_rejects_legacy_file_when_not_generated(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """not_generated + 遗留 conclusions.md：生成守卫的拒绝语义保持不变（round-18 M1/A1）。
+
+    A1 后图成员条件（``CONCLUSIONS_PAGE in graph.pages``）不再命中，但物理文件
+    存在条件仍命中：generate-conclusions 必须继续报 conclusions.unexpected_file。
+    """
+    root = build_conc_draft(draft_factory)  # candidate 默认；夹具无 conclusions.md → not_generated
+    (root / "conclusions.md").write_text("# 遗留笔记\n\n旧笔记正文。\n", encoding="utf-8")
+    capsys.readouterr()
+
+    code, payload = run_json(["generate-conclusions", "--root", str(root), "--json"], capsys)
+
+    assert code == 2
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == CheckCode.CONCLUSIONS_UNEXPECTED_FILE.value
+    # 拒绝时不写任何业务 mutation：conclusions.md 保持原样，marker 仍 not_generated。
+    assert (root / "conclusions.md").read_text(encoding="utf-8") == "# 遗留笔记\n\n旧笔记正文。\n"
+    assert read_marker(root).conclusions_state is ConclusionsState.NOT_GENERATED
 
 
 def test_conclusions_page_queryable_as_managed_page(

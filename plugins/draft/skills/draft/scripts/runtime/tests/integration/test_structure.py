@@ -9,6 +9,7 @@ from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import RootState
 from draft.operations import recover
+from draft.query import load_tolerant_view
 from draft.structure import collapse_hub, move_page, promote_page
 from draft.trash import trash_page
 from tests.integration.support import DraftFactory
@@ -1385,3 +1386,209 @@ def test_restore_does_not_advance_any_package(
     due_journal = json.loads(due_path.read_text(encoding="utf-8"))
     assert due_journal["phase"] == "trash_retained"
     assert (root / ".draft/trash/outgoing" / due.operation_id).is_dir()
+
+
+# ---------------------------------------------------------------------------
+# 第十八轮 M1/A1：not_generated 下根级遗留 conclusions.md 按未受管内容处理
+# ---------------------------------------------------------------------------
+
+# round-18 实验四现场内容形状：状态标签未知 → 不可解析（page.invalid_status）。
+LEGACY_CONCLUSIONS_UNPARSEABLE = """# 旧笔记
+
+> 状态：`已迁移为正式设计，等待评审`
+>
+> 父主题：[根索引](index.md)
+
+旧笔记正文。
+"""
+
+# 完整可解析的合法内容：可被当作普通页面，但不再是受管页的一部分。
+LEGACY_CONCLUSIONS_PARSEABLE = """# 旧笔记
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](index.md)
+
+旧笔记正文。
+"""
+
+M1_INDEX = """# 主题
+
+> 状态：`已关闭：纯导航页，不表达独立结论`
+
+## 子主题
+
+- [主题](pages/topic.md)
+- [甲](pages/a.md)
+- [子枢纽](pages/hub/index.md)
+- [乙](pages/b.md)
+"""
+
+M1_TOPIC = """# 主题
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+
+主题的正文。
+"""
+
+M1_LEAF = """# {title}
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+
+{title}的正文。
+"""
+
+M1_HUB = """# 子枢纽
+
+> 状态：`已关闭：纯导航页，不表达独立结论`
+>
+> 父主题：[根索引](../../index.md)
+"""
+
+
+def _legacy_conclusions_root(
+    draft_factory: DraftFactory,
+    *,
+    legacy: str,
+    root_state: RootState = RootState.CANDIDATE,
+) -> Path:
+    root = draft_factory(
+        {
+            "index.md": M1_INDEX,
+            "pages/topic.md": M1_TOPIC,
+            "pages/a.md": M1_LEAF.format(title="甲"),
+            "pages/b.md": M1_LEAF.format(title="乙"),
+            "pages/hub/index.md": M1_HUB,
+        },
+        root_state=root_state,
+    )
+    # 夹具的 marker 因不含 conclusions.md 而为 not_generated；随后按旧笔记集合
+    # 写入遗留文件（模拟迁移场景）。
+    (root / "conclusions.md").write_text(legacy, encoding="utf-8")
+    return root
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [LEGACY_CONCLUSIONS_UNPARSEABLE, LEGACY_CONCLUSIONS_PARSEABLE],
+    ids=["unparseable", "parseable"],
+)
+def test_candidate_structure_commands_ignore_legacy_conclusions(
+    draft_factory: DraftFactory, legacy: str
+) -> None:
+    """candidate × not_generated 下根级遗留 conclusions.md 不阻断结构命令（round-18 M1/A1）。
+
+    不可解析与可完整解析两种内容断言相同：结构命令行为不依赖遗留文件的偶然可解析性。
+    该文件始终按未受管内容处理；check_draft 仍恰好一条 conclusions.unexpected_file，
+    容错视图 blocking_paths 不含该文件，遗留文件字节不变。
+    """
+    root = _legacy_conclusions_root(draft_factory, legacy=legacy)
+    legacy_bytes = (root / "conclusions.md").read_bytes()
+
+    move_page(root, Path("pages/a.md"), Path("pages/a2.md"))
+    promote_page(root, Path("pages/topic.md"), [Path("pages/a2.md"), Path("pages/b.md")])
+    collapse_hub(root, Path("pages/hub/index.md"))
+
+    # move：甲迁至 pages/a2.md；promote：主题成枢纽并把甲、乙收入 pages/topic/；
+    # collapse：空枢纽 pages/hub/index.md 折叠为 pages/hub.md。全部成功。
+    assert (root / "pages/topic/index.md").is_file()
+    assert (root / "pages/topic/a2.md").is_file()
+    assert (root / "pages/topic/b.md").is_file()
+    assert (root / "pages/hub.md").is_file()
+    assert not (root / "pages/a2.md").exists()
+    assert not (root / "pages/hub/index.md").exists()
+    # 结构命令对该文件字节零触碰（任何选项下工具都不得改写未受管遗留文件）。
+    assert (root / "conclusions.md").read_bytes() == legacy_bytes
+
+    view = load_tolerant_view(root)
+    assert Path("conclusions.md") not in view.blocking_paths
+    assert Path("conclusions.md") not in view.graph.pages
+
+    report = check_draft(root)
+    assert [issue.code for issue in report.errors] == [CheckCode.CONCLUSIONS_UNEXPECTED_FILE.value]
+
+
+M1_MOVE_INDEX = """# 主题
+
+> 状态：`已关闭：纯导航页，不表达独立结论`
+
+## 子主题
+
+- [甲](pages/a.md)
+"""
+
+
+def test_registered_move_still_reports_conclusions_unexpected_file(
+    draft_factory: DraftFactory,
+) -> None:
+    """registered × not_generated + 遗留 conclusions.md：写命令仍报
+    conclusions.unexpected_file，不回归为 structure.dirty（round-18 确认行）。"""
+    root = draft_factory(
+        {
+            "index.md": M1_MOVE_INDEX,
+            "pages/a.md": M1_LEAF.format(title="甲"),
+        },
+        root_state=RootState.REGISTERED,
+    )
+    # 夹具的 marker 因不含 conclusions.md 而为 not_generated；随后写入遗留文件。
+    (root / "conclusions.md").write_text(LEGACY_CONCLUSIONS_UNPARSEABLE, encoding="utf-8")
+    before = (root / "pages/a.md").read_bytes()
+
+    with pytest.raises(DraftError) as caught:
+        move_page(root, Path("pages/a.md"), Path("pages/a2.md"))
+    assert caught.value.code == CheckCode.CONCLUSIONS_UNEXPECTED_FILE.value
+    assert (root / "pages/a.md").read_bytes() == before
+    assert not (root / "pages/a2.md").exists()
+
+
+M1_GEN_INDEX = """# 主题
+
+> 状态：`已关闭：纯导航页，不表达独立结论`
+
+## 子主题
+
+- [甲](pages/a.md)
+- [结论汇总](conclusions.md)
+"""
+
+M1_GEN_CONCLUSIONS = """# 结论汇总
+
+> 状态：`当前提案`
+>
+> 父主题：[根索引](index.md)
+
+## 已确认结论
+
+- [甲](pages/a.md)
+"""
+
+
+@pytest.mark.parametrize("root_state", [RootState.CANDIDATE, RootState.REGISTERED])
+def test_generated_conclusions_remain_managed_and_untouched(
+    draft_factory: DraftFactory, root_state: RootState
+) -> None:
+    """generated 所有权下 conclusions.md 仍是受管机器产物（决策表 generated 行）。
+
+    candidate 与 registered 各一：结构命令不重写结论列表中的旧链接（允许过时），
+    文件字节不变，check 行为不变。
+    """
+    root = draft_factory(
+        {
+            "index.md": M1_GEN_INDEX,
+            "conclusions.md": M1_GEN_CONCLUSIONS,
+            "pages/a.md": M1_LEAF.format(title="甲"),
+        },
+        root_state=root_state,
+    )
+    conclusions_bytes = (root / "conclusions.md").read_bytes()
+
+    move_page(root, Path("pages/a.md"), Path("pages/a2.md"))
+
+    assert (root / "pages/a2.md").is_file()
+    # 结论列表旧链接保持原样，机器结论允许过时（规格 §12.5）。
+    assert (root / "conclusions.md").read_bytes() == conclusions_bytes
+    assert check_draft(root).errors == ()

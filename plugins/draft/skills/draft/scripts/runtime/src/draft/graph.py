@@ -277,7 +277,21 @@ def resolve_local_destination(
     return target, (anchor if separator else None)
 
 
-def _discover(root: Path) -> tuple[list[Path], list[CheckIssue]]:
+def _root_conclusions_managed(state: ConclusionsState | None) -> bool:
+    """根级 conclusions.md 的受管分类以 marker 所有权状态为条件（round-18 M1/A1）。
+
+    合法 marker 的 generated 保持受管（机器产物）；not_generated 时根级
+    ``conclusions.md`` 不再按受管页解析，与其他未受管内容同等对待（不阻断结构命令、
+    链接不承诺重写），同一文件在加载器与检查器中的分类由此闭合。marker 缺失/非法/
+    未知版本（None，维持现状）继续按受管对待；此类根的结构命令本就在更早的 marker
+    错误处失败，不引入行为变化。
+    """
+    return state is not ConclusionsState.NOT_GENERATED
+
+
+def _discover(
+    root: Path, conclusions_state: ConclusionsState | None
+) -> tuple[list[Path], list[CheckIssue]]:
     managed: list[Path] = []
     issues: list[CheckIssue] = []
     for entry in sorted(root.iterdir(), key=lambda item: item.name):
@@ -317,16 +331,21 @@ def _discover(root: Path) -> tuple[list[Path], list[CheckIssue]]:
             continue
         if entry.suffix != ".md":
             continue
-        if entry.name in (ROOT_PAGE.name, CONCLUSIONS_PAGE.name):
+        if entry.name == ROOT_PAGE.name:
             managed.append(Path(entry.name))
+        elif entry.name == CONCLUSIONS_PAGE.name:
+            if _root_conclusions_managed(conclusions_state):
+                managed.append(Path(entry.name))
+            else:
+                issues.append(error_issue(CheckCode.PAGE_UNMANAGED_PATH, Path(entry.name)))
         else:
             issues.append(error_issue(CheckCode.PAGE_UNMANAGED_PATH, Path(entry.name)))
     return managed, issues
 
 
-def _load(root: Path) -> LoadResult:
+def _load(root: Path, conclusions_state: ConclusionsState | None) -> LoadResult:
     issues: list[CheckIssue] = []
-    managed_paths, discover_issues = _discover(root)
+    managed_paths, discover_issues = _discover(root, conclusions_state)
     issues.extend(discover_issues)
     managed_set = set(managed_paths)
 
@@ -536,12 +555,14 @@ def load_graph_tolerant(root: Path) -> LoadResult:
     """容错加载：candidate 与 registered 共享同一页面/关系/链接/路径协议。
 
     marker 是根身份的唯一权威：``load_graph_tolerant`` 读取并校验 marker，不按外部
-    mode 区分分支。
+    mode 区分分支。发现的受管分类消费同一次读取的所有权状态（round-18 M1/A1），
+    不新增第二次 marker 文件读取。
     """
     resolved = root if root.is_absolute() else resolve_draft_root(root)
     marker_issues: list[CheckIssue] = []
+    conclusions_state: ConclusionsState | None = None
     try:
-        read_marker(resolved)
+        marker_state = read_marker(resolved)
     except DraftError as error:
         marker_issues.append(
             CheckIssue(
@@ -551,7 +572,9 @@ def load_graph_tolerant(root: Path) -> LoadResult:
                 line=None,
             )
         )
-    result = _load(resolved)
+    else:
+        conclusions_state = marker_state.conclusions_state
+    result = _load(resolved, conclusions_state)
     return LoadResult(
         graph=result.graph,
         issues=[*marker_issues, *result.issues],

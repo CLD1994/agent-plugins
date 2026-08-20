@@ -551,3 +551,38 @@ def test_read_marker_snapshot_content_errors(
         read_marker_snapshot(root)
     assert caught.value.code == expected_code
     assert caught.value.paths == (marker,)
+
+
+# ---------------------------------------------------------------------------
+# 第十八轮 M1/A1：根级 conclusions.md 的受管分类决策表（发现阶段）。
+# 分类以 marker 所有权状态为纯函数输入，磁盘事实只有一列：根级 conclusions.md
+# 物理存在（进入分类分支）；不存在时发现函数根本看不到该条目，天然无任何
+# issue/页面。unit 不访问真实文件系统：只断言纯决策函数（round-18 决策表）。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("marker_fact", "state", "expected_managed"),
+    [
+        # 合法 marker + generated：conclusions.md 是机器产物，保持受管。
+        ("generated", ConclusionsState.GENERATED, True),
+        # 合法 marker + not_generated：根级 conclusions.md 不进入受管列表
+        # （改按未受管内容处理，page.unmanaged_path 由既有过滤抑制）。
+        ("not_generated", ConclusionsState.NOT_GENERATED, False),
+        # marker 缺失/非法/未知版本（发现阶段收到 None）：维持现状受管——
+        # 此类根的结构命令本就在更早的 marker 错误处失败，不引入行为变化。
+        ("marker_missing", None, True),
+        ("marker_invalid", None, True),
+        ("marker_unsupported", None, True),
+    ],
+)
+def test_root_conclusions_managed_decision_table(
+    marker_fact: str, state: ConclusionsState | None, expected_managed: bool
+) -> None:
+    """marker 状态（五行）× 磁盘事实（根级文件存在）→ 受管分类（round-18 M1/A1）。
+
+    预期逐行直接来自已批准决策表，独立于生产算法书写；每个 case 只验证一个分区。
+    """
+    from draft.graph import _root_conclusions_managed  # pyright: ignore[reportPrivateUsage]
+
+    assert _root_conclusions_managed(state) is expected_managed, marker_fact

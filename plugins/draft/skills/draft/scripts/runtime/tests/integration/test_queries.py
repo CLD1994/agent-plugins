@@ -437,3 +437,112 @@ def test_query_missing_subcommand_is_usage_error() -> None:
     with pytest.raises(SystemExit) as caught:
         main(["query"])
     assert caught.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# 第十八轮 M1/A1：not_generated 下根级遗留 conclusions.md 的查询语义
+# ---------------------------------------------------------------------------
+
+LEGACY_UNPARSEABLE = """# 旧笔记
+
+> 状态：`已迁移为正式设计，等待评审`
+>
+> 父主题：[根索引](index.md)
+
+旧笔记正文。
+"""
+
+LEGACY_PARSEABLE = """# 旧笔记
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](index.md)
+
+旧笔记正文。
+"""
+
+LEGACY_QUERY_INDEX = """# Theme
+
+> 状态：`已关闭：纯导航页，不表达独立结论`
+
+## 子主题
+
+- [甲](pages/a.md)
+"""
+
+LEGACY_QUERY_A = """# 甲
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+
+甲的正文。
+"""
+
+
+def _legacy_query_root(
+    draft_factory: DraftFactory, *, root_state: RootState, legacy: str = LEGACY_UNPARSEABLE
+) -> Path:
+    root = draft_factory(
+        {
+            "index.md": LEGACY_QUERY_INDEX,
+            "pages/a.md": LEGACY_QUERY_A,
+        },
+        root_state=root_state,
+    )
+    (root / "conclusions.md").write_text(legacy, encoding="utf-8")
+    return root
+
+
+def test_query_status_candidate_legacy_conclusions_does_not_block(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """candidate × not_generated + 遗留 conclusions.md：集合查询 complete=true 且
+    blocking_paths 不含该文件（round-18 M1/A1）。"""
+    root = _legacy_query_root(draft_factory, root_state=RootState.CANDIDATE)
+    capsys.readouterr()
+
+    code, payload = run_json(["query", "status", "--root", str(root), "pending", "--json"], capsys)
+
+    assert code == 0
+    assert payload["complete"] is True
+    assert payload["blocking_paths"] == []
+
+
+def test_query_status_registered_legacy_conclusions_no_longer_blocks(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """registered × not_generated + 遗留 conclusions.md：查询门禁不再因该文件拒绝。
+
+    该文件被 A1 重分类为未受管后，registered 查询从"拒绝并传播最具体损坏"
+    （page.invalid_status）变为成功——已登记的行为变化（round-18 M1/A1）。
+    """
+    root = _legacy_query_root(draft_factory, root_state=RootState.REGISTERED)
+    capsys.readouterr()
+
+    code, payload = run_json(["query", "status", "--root", str(root), "pending", "--json"], capsys)
+
+    assert code == 0
+    assert payload["complete"] is True
+    assert payload["blocking_paths"] == []
+
+
+def test_query_page_legacy_conclusions_is_page_not_found(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """即使遗留内容可完整解析，not_generated 下 conclusions.md 也不再是受管页：
+    query page 报 page.not_found（A1 重分类的一致后果）。"""
+    root = _legacy_query_root(
+        draft_factory, root_state=RootState.CANDIDATE, legacy=LEGACY_PARSEABLE
+    )
+    capsys.readouterr()
+
+    code, payload = run_json(
+        ["query", "page", "--root", str(root), "conclusions.md", "--json"], capsys
+    )
+
+    assert code == 2
+    assert payload["ok"] is False
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "page.not_found"
