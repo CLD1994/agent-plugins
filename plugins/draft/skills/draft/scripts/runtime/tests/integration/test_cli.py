@@ -1,4 +1,7 @@
+import errno
 import json
+import os
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -117,6 +120,156 @@ def test_check_candidate_root_scans_unified_protocol(
 
     assert code == 0
     assert payload["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# round-16 M1：CLI 真实入口（main/check）对表一逐行成立，失败路径树不变。
+# 每个非 init 命令的第一个 marker 读取器 select_managed_root 与 snapshot 读取器
+# 对同一 .draft 事实给出同一 code/path。
+# ---------------------------------------------------------------------------
+
+
+def _tree_state(root: Path) -> dict[str, object]:
+    """递归捕获根树文件 bytes 与符号链接目标，用于失败路径的树不变断言。"""
+    state: dict[str, object] = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            state[relative] = ("symlink", os.readlink(path))
+        elif path.is_file():
+            state[relative] = ("file", path.read_bytes().hex())
+    return state
+
+
+def _assert_check_error(
+    payload: dict[str, object],
+    code: str,
+    paths: list[str],
+) -> None:
+    assert payload["ok"] is False
+    assert payload["result_type"] == "error"
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == code
+    assert error["paths"] == paths
+
+
+def test_check_draft_symlink_fails_without_mutation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """.draft 是 symlink：main 经 select_managed_root 报 path.symlink_escape @ .draft，树不变。
+
+    基线旧分类器报 format.invalid @ marker（红）；修复后与 snapshot 读取器一致。
+    """
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    shutil.rmtree(root / ".draft")
+    (root / ".draft").symlink_to(outside, target_is_directory=True)
+
+    before = _tree_state(root)
+    code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
+    after = _tree_state(root)
+
+    assert code != 0
+    _assert_check_error(
+        payload,
+        CheckCode.PATH_SYMLINK_ESCAPE.value,
+        [
+            (root.resolve() / ".draft").as_posix(),
+        ],
+    )
+    assert before == after
+
+
+def test_check_draft_lstat_eio_fails_without_mutation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """.draft 无法 stat（EIO）：main 报 format.invalid @ marker 而非泄漏 OSError，树不变。
+
+    注入同时命中 os.lstat 与 os.stat（真实 .draft stat 失败同时影响两个 syscall）。
+    基线 managed_at 的 Path.is_symlink 泄漏原始 OSError，main 未捕获（红）。
+    """
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    marker = root.resolve() / ".draft/draft.json"
+    real_lstat = os.lstat
+    real_stat = os.stat
+
+    def fail_draft_lstat(
+        path: str | bytes | os.PathLike[str], *args: object, **kwargs: object
+    ) -> os.stat_result:
+        if os.fsdecode(path).endswith("/.draft"):
+            raise OSError(errno.EIO, "Input/output error")
+        return real_lstat(path, *args, **kwargs)  # type: ignore[return-value]
+
+    def fail_draft_stat(
+        path: str | bytes | os.PathLike[str], *args: object, **kwargs: object
+    ) -> os.stat_result:
+        if os.fsdecode(path).endswith("/.draft"):
+            raise OSError(errno.EIO, "Input/output error")
+        return real_stat(path, *args, **kwargs)  # type: ignore[return-value]
+
+    before = _tree_state(root)
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "lstat", fail_draft_lstat)
+        patched.setattr(os, "stat", fail_draft_stat)
+        code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
+    after = _tree_state(root)
+
+    assert code != 0
+    _assert_check_error(payload, CheckCode.FORMAT_INVALID.value, [marker.as_posix()])
+    assert before == after
+
+
+def test_check_draft_regular_file_fails_without_mutation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """.draft 是普通文件（非目录）：format.invalid @ marker（保持用例，防回归）。"""
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    shutil.rmtree(root / ".draft")
+    (root / ".draft").write_text("not a directory\n", encoding="utf-8")
+
+    before = _tree_state(root)
+    code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
+    after = _tree_state(root)
+
+    assert code != 0
+    _assert_check_error(
+        payload,
+        CheckCode.FORMAT_INVALID.value,
+        [
+            (root.resolve() / ".draft/draft.json").as_posix(),
+        ],
+    )
+    assert before == after
+
+
+def test_check_without_draft_fails_without_mutation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """无 `.draft`：format.missing @ marker（保持用例，防回归）。"""
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+    shutil.rmtree(root / ".draft")
+
+    before = _tree_state(root)
+    code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
+    after = _tree_state(root)
+
+    assert code != 0
+    _assert_check_error(
+        payload,
+        CheckCode.FORMAT_MISSING.value,
+        [
+            (root.resolve() / ".draft/draft.json").as_posix(),
+        ],
+    )
+    assert before == after
 
 
 @pytest.mark.parametrize("precreate_internal", [False, True])
