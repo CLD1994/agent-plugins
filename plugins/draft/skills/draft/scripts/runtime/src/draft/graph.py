@@ -71,6 +71,9 @@ class LoadResult:
     issues: list[CheckIssue]
     # 正文链接目标事实（missing/invalid/unavailable）：是查询结果数据，不阻止命令。
     resource_facts: list[CheckIssue]
+    # marker 一次读取的结果（None = 未传入且自读失败，详情见 issues）：供持有
+    # 状态的调用方在同一次事实内完成 root_state 门禁，不再二次读取。
+    marker_state: MarkerState | None = None
 
 
 def error_issue(
@@ -515,19 +518,16 @@ def structural_issues(result: LoadResult) -> list[CheckIssue]:
     return [issue for issue in result.issues if issue not in facts]
 
 
-def load_graph(root: Path) -> DraftGraph:
+def load_graph(root: Path, *, marker_state: MarkerState | None = None) -> DraftGraph:
     resolved = resolve_draft_root(root)
-    result = load_graph_tolerant(resolved)
-    try:
-        state = read_marker(resolved)
-    except DraftError:
-        # 无效 marker 已由 tolerant 记录为阻断 issue；由下方 blocking 分支报出。
-        pass
-    else:
-        if state.root_state is not RootState.REGISTERED:
-            # 候选根普通写命令在 Task 9–11 按操作级门禁开放前，注册模式入口
-            # 显式拒绝，不能因为 marker 可读就意外放行。此代码随门禁落地删除。
-            raise DraftError("root.candidate", resolved)
+    result = load_graph_tolerant(resolved, marker_state=marker_state)
+    state = result.marker_state
+    # marker 无效（state 为 None）时不在此处拒绝：tolerant 已记录为阻断 issue，
+    # 由下方 blocking 分支报出（既有语义）。
+    if state is not None and state.root_state is not RootState.REGISTERED:
+        # 候选根普通写命令在 Task 9–11 按操作级门禁开放前，注册模式入口
+        # 显式拒绝，不能因为 marker 可读就意外放行。此代码随门禁落地删除。
+        raise DraftError("root.candidate", resolved)
     blocking = structural_issues(result)
     if blocking:
         first = blocking[0]
@@ -540,32 +540,37 @@ def load_graph(root: Path) -> DraftGraph:
     return result.graph
 
 
-def load_graph_tolerant(root: Path) -> LoadResult:
+def load_graph_tolerant(
+    root: Path, *, marker_state: MarkerState | None = None
+) -> LoadResult:
     """容错加载：candidate 与 registered 共享同一页面/关系/链接/路径协议。
 
     marker 是根身份的唯一权威：``load_graph_tolerant`` 读取并校验 marker，不按外部
     mode 区分分支。发现的受管分类消费同一次读取的所有权状态（round-18 M1/A1），
-    不新增第二次 marker 文件读取。
+    不新增第二次 marker 文件读取。调用方已持有同根 marker 事实时必须通过
+    ``marker_state`` 传入：本函数不再读取 marker 文件，受管分类以传入状态为权威；
+    缺省 ``None`` 表示由本函数自行读取一次。
     """
     resolved = root if root.is_absolute() else resolve_draft_root(root)
     marker_issues: list[CheckIssue] = []
-    conclusions_state: ConclusionsState | None = None
-    try:
-        marker_state = read_marker(resolved)
-    except DraftError as error:
-        marker_issues.append(
-            CheckIssue(
-                code=error.code,
-                severity=IssueSeverity.ERROR,
-                path=MARKER_PATH,
-                line=None,
+    state = marker_state
+    if state is None:
+        try:
+            state = read_marker(resolved)
+        except DraftError as error:
+            marker_issues.append(
+                CheckIssue(
+                    code=error.code,
+                    severity=IssueSeverity.ERROR,
+                    path=MARKER_PATH,
+                    line=None,
+                )
             )
-        )
-    else:
-        conclusions_state = marker_state.conclusions_state
+    conclusions_state = state.conclusions_state if state is not None else None
     result = _load(resolved, conclusions_state)
     return LoadResult(
         graph=result.graph,
         issues=[*marker_issues, *result.issues],
         resource_facts=result.resource_facts,
+        marker_state=state,
     )
