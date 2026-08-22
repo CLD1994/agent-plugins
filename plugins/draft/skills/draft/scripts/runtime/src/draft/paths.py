@@ -205,6 +205,31 @@ def resolve_page_operand(root: Path, value: str) -> ResolvedPath:
     return ResolvedPath(root=canonical_root, relative=relative, absolute=canonical_root / relative)
 
 
+def resolve_move_operand(root: Path, value: str) -> ResolvedPath:
+    """规范化 move 操作数；与页面操作数同规则，但不要求 .md 后缀。
+
+    目录与非 .md 普通文件也是合法操作数形状（规格 §2.2），类型分类
+    由调用方完成。
+    """
+    canonical_root = _expand_root(root).resolve(strict=False)
+    posix = PurePosixPath(value)
+    if posix.is_absolute():
+        raise DraftError("path.escape", Path(value))
+    normalized = Path(*posix.parts)
+    candidate = canonical_root / normalized
+    cursor = canonical_root
+    for part in normalized.parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, cursor)
+    canonical = candidate.resolve(strict=False)
+    try:
+        relative = canonical.relative_to(canonical_root)
+    except ValueError as exc:
+        raise DraftError("path.escape", candidate) from exc
+    return ResolvedPath(root=canonical_root, relative=relative, absolute=canonical_root / relative)
+
+
 def physical_parent(path: Path) -> Path | None:
     if path == Path("index.md"):
         return None
