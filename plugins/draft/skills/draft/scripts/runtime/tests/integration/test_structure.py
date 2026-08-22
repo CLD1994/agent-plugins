@@ -1319,9 +1319,7 @@ def test_domain_move_does_not_preflight_due_package(
 
     calls: list[str] = []
     monkeypatch.setattr("draft.trash_lifecycle._default_handoff", calls.append)
-    result = move_page(
-        root, Path("pages/a.md"), Path("pages/a2.md"), now=datetime(2026, 6, 10, tzinfo=UTC)
-    )
+    result = move_page(root, Path("pages/a.md"), Path("pages/a2.md"))
 
     assert calls == []
     assert (root / "pages/a2.md").is_file()

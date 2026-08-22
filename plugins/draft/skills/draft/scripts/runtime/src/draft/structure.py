@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import posixpath
 from collections.abc import Mapping
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -506,10 +505,7 @@ def _load_clean_graph(root: Path, *, allow_empty_hub: Path | None = None) -> Ope
     return facts
 
 
-def move_page(
-    root: Path, source: Path, target: Path, *, now: datetime | None = None
-) -> OperationResult:
-    del now  # 前置推进由 CLI 编排统一完成；领域函数不再重复调用。
+def move_page(root: Path, source: Path, target: Path) -> OperationResult:
     resolved = resolve_draft_root(root)
     facts = _load_clean_graph(resolved)
     plan = plan_move(
@@ -522,10 +518,7 @@ def move_page(
     return execute_plan(plan)
 
 
-def promote_page(
-    root: Path, page: Path, children: list[Path], *, now: datetime | None = None
-) -> OperationResult:
-    del now  # 前置推进由 CLI 编排统一完成；领域函数不再重复调用。
+def promote_page(root: Path, page: Path, children: list[Path]) -> OperationResult:
     resolved = resolve_draft_root(root)
     facts = _load_clean_graph(resolved)
     plan = plan_promote(
@@ -538,8 +531,7 @@ def promote_page(
     return execute_plan(plan)
 
 
-def collapse_hub(root: Path, hub: Path, *, now: datetime | None = None) -> OperationResult:
-    del now  # 前置推进由 CLI 编排统一完成；领域函数不再重复调用。
+def collapse_hub(root: Path, hub: Path) -> OperationResult:
     resolved = resolve_draft_root(root)
     facts = _load_clean_graph(resolved, allow_empty_hub=hub)
     plan = plan_collapse(
