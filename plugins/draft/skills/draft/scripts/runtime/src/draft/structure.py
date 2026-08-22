@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import posixpath
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from urllib.parse import quote
 
@@ -31,10 +31,16 @@ from draft.models import (
     OperationResult,
     SourceSpan,
 )
-from draft.move_closure import MoveClosure
-from draft.move_operands import MoveRequest, SourceKind, TargetKind, validate_results
+from draft.move_closure import MoveClosure, merged_blocking, scan_move_closure
+from draft.move_operands import (
+    MoveRequest,
+    SourceKind,
+    TargetKind,
+    classify_move_request,
+    validate_results,
+)
 from draft.observations import ObservationManifest
-from draft.operation_facts import OperationFacts
+from draft.operation_facts import OperationFacts, load_operation_facts
 from draft.operations import execute_plan, read_lock, sha256_bytes
 from draft.paths import physical_parent, resolve_draft_root
 from draft.plan_effects import PlanAction, PlanEffect
@@ -496,8 +502,39 @@ def plan_move_request(
         base_mutations = list(managed_plan.mutations)
         base_effects = list(managed_plan.effects)
         removable = managed_plan.remove_empty_directories
+    elif unmanaged_moves:
+        # 无受管理移动但存在未受管理来源移动：受管理链接者仍须重写指向移动目标的正文
+        # 链接。此路径只重渲染正文，不经过 plan_path_remap 的父映射门禁——未声明父
+        # 关系的受管理页仍可参与链接重写（纯未受管理移动不改变父结构）。
+        conclusions_generated = marker.state.conclusions_state is ConclusionsState.GENERATED
+        rendered = _render_pages(
+            graph,
+            {},
+            {},
+            skip_conclusions_links=conclusions_generated,
+            extra_moved_targets=_unmanaged_moved_identities(graph.root, unmanaged_moves),
+        )
+        base_mutations: list[FileMutation] = []
+        base_effects: list[PlanEffect] = []
+        for path in sorted(graph.pages, key=str):
+            rendered_bytes = rendered[path].encode("utf-8")
+            if rendered_bytes == graph.pages[path].text.encode("utf-8"):
+                continue
+            base_mutations.append(
+                FileMutation(
+                    path,
+                    MutationKind.WRITE,
+                    graph.page_digest(path),
+                    sha256_bytes(rendered_bytes),
+                    rendered_bytes,
+                )
+            )
+            base_effects.append(PlanEffect(action=PlanAction.MODIFY, path=path))
+        removable: tuple[Path, ...] = ()
     else:
-        base_mutations, base_effects, removable = [], [], ()
+        base_mutations = list[FileMutation]()
+        base_effects = list[PlanEffect]()
+        removable = ()
 
     unmanaged_mutations, unmanaged_effects = _plan_unmanaged(
         graph.root, closure, unmanaged_moves, moved_targets
@@ -604,24 +641,46 @@ def plan_collapse(
     )
 
 
+def _load_structure_facts(root: Path, *, allow_empty_hub: Path | None = None) -> OperationFacts:
+    if read_lock(root) is not None:
+        raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, root)
+    return load_operation_facts(root, allow_hub_empty=allow_empty_hub)
+
+
 def _load_clean_graph(root: Path, *, allow_empty_hub: Path | None = None) -> OperationFacts:
-    """结构变换的事实加载：registered 全绿；candidate 全受管页可解析即可。
-
-    任一不可解析页面可能隐藏正文链接、正式关系或父导航，因此必须阻止结构变换；
-    已可解析的无关全局错误（依赖环、状态/取代不匹配、容量提醒）不阻止本次操作。
-    ``allow_empty_hub`` 供 collapse 容忍目标枢纽的 HUB_EMPTY。返回 OperationFacts：
-    图、marker snapshot、阻碍与读集观察全部来自同一次根事实读取（round-15 H1）。
-    """
-    from draft.operation_facts import load_operation_facts
-
-    resolved = resolve_draft_root(root)
-    if read_lock(resolved) is not None:
-        raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, resolved)
-    facts = load_operation_facts(resolved, allow_hub_empty=allow_empty_hub)
+    """（现行语义保持：事实加载 + blocking 即拒绝。）"""
+    facts = _load_structure_facts(root, allow_empty_hub=allow_empty_hub)
     if facts.blocking_paths:
         details = tuple(path.as_posix() for path in facts.blocking_paths)
-        raise DraftError("structure.dirty", resolved, details=details)
+        raise DraftError("structure.dirty", root, details=details)
     return facts
+
+
+def plan_move_from_arguments(
+    root: Path,
+    facts: OperationFacts,
+    source_values: Sequence[str],
+    target_value: str,
+) -> OperationPlan:
+    request = classify_move_request(root, facts.graph, source_values, target_value)
+    closure = scan_move_closure(root, facts.graph)
+    blocking = merged_blocking(facts.blocking_paths, closure)
+    if blocking:
+        raise DraftError(
+            "structure.dirty", root, details=tuple(p.as_posix() for p in blocking)
+        )
+    return plan_move_request(
+        facts.graph, closure, request, marker=facts.marker, observations=facts.observations
+    )
+
+
+def move_entries(
+    root: Path, source_values: Sequence[str], target_value: str
+) -> OperationResult:
+    resolved = resolve_draft_root(root)
+    facts = _load_structure_facts(resolved)
+    plan = plan_move_from_arguments(resolved, facts, source_values, target_value)
+    return execute_plan(plan)
 
 
 def move_page(root: Path, source: Path, target: Path) -> OperationResult:
