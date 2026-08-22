@@ -8,9 +8,29 @@ from pathlib import Path
 import pytest
 
 from draft.errors import DraftError
-from draft.models import MarkdownLink, SourceSpan
+from draft.graph import DraftGraph, MarkerSnapshot, MarkerState, resolve_local_destination
+from draft.markdown import parse_page
+from draft.models import (
+    MarkdownLink,
+    MutationKind,
+    OperationKind,
+    PageDocument,
+    RootState,
+    SourceSpan,
+)
 from draft.move_closure import MoveClosure, UnmanagedFile
-from draft.resources import ProbeState, ResourceReference, resolve_body_resource
+from draft.move_operands import MoveRequest, MoveSource, MoveTarget, SourceKind, TargetKind
+from draft.observations import EMPTY_OBSERVATIONS, ObservationManifest, graph_observations
+from draft.resources import (
+    ProbeState,
+    ResourceIdentity,
+    ResourceKind,
+    ResourceReference,
+    resolve_body_resource,
+    resolve_page_resources,
+)
+from draft.structure import _render_pages, plan_move, plan_move_request
+from draft.vocabulary import ConclusionsState, RelationCode
 
 ROOT = Path("/draft")
 
@@ -33,6 +53,108 @@ def _reference(source: Path, text: str, destination: str) -> tuple[str, Resource
     )
     resource = resolve_body_resource(ROOT, source, destination, target_probe=_present)
     return full, ResourceReference(link=link, resource=resource)
+
+
+# 局部内存图构造器：从 Markdown 文本构造一致的 DraftGraph，不访问文件系统
+# （从 test_structure.py 复制，供 move 双类型批量编排用例复用）。
+_REGISTERED_BYTES = (
+    b'{"format_version":1,"root_state":"registered","conclusions_state":"not_generated"}'
+)
+_REGISTERED_SNAPSHOT = MarkerSnapshot(
+    state=MarkerState(
+        version=1,
+        root_state=RootState.REGISTERED,
+        conclusions_state=ConclusionsState.NOT_GENERATED,
+    ),
+    raw_bytes=_REGISTERED_BYTES,
+)
+_CANDIDATE_BYTES = (
+    b'{"format_version":1,"root_state":"candidate","conclusions_state":"not_generated"}'
+)
+_CANDIDATE_SNAPSHOT = MarkerSnapshot(
+    state=MarkerState(
+        version=1,
+        root_state=RootState.CANDIDATE,
+        conclusions_state=ConclusionsState.NOT_GENERATED,
+    ),
+    raw_bytes=_CANDIDATE_BYTES,
+)
+
+
+def _structure_observations(
+    graph: DraftGraph, *, marker: MarkerSnapshot = _REGISTERED_SNAPSHOT
+) -> ObservationManifest:
+    return graph_observations(graph, marker=marker)
+
+
+_INDEX = """# 根
+
+> 状态：`已关闭：纯导航页`
+
+## 子主题
+
+- [结论汇总](conclusions.md)
+- [甲](pages/a.md)
+"""
+
+
+def _graph_from_texts(texts: Mapping[Path, str], *, root: Path = ROOT) -> DraftGraph:
+    pages: dict[Path, PageDocument] = {}
+    for path in sorted(texts):
+        pages[path] = parse_page(path, texts[path])
+
+    managed_set = set(pages)
+    inbound: dict[Path, list[tuple[Path, MarkdownLink]]] = {}
+    relation_edges: dict[RelationCode, list[tuple[Path, Path, int]]] = {
+        label: [] for label in RelationCode
+    }
+
+    for source in sorted(pages):
+        page = pages[source]
+        resolved_links: dict[SourceSpan, Path | None] = {}
+        for link in page.links:
+            try:
+                target, _anchor = resolve_local_destination(source, link.destination, root)
+            except DraftError:
+                resolved_links[link.whole_span] = None
+                continue
+            resolved_links[link.whole_span] = target
+            if target in managed_set:
+                inbound.setdefault(target, []).append((source, link))
+        for relation in page.relations:
+            target = resolved_links.get(relation.link.whole_span)
+            if target is None or target not in managed_set:
+                continue
+            relation_edges[relation.code].append((source, target, relation.link.line))
+
+    parents: dict[Path, Path] = {}
+    for source in sorted(pages):
+        declared = [r for r in pages[source].relations if r.code is RelationCode.PARENT]
+        if len(declared) != 1:
+            continue
+        matches = [
+            target for src, target, _line in relation_edges[RelationCode.PARENT] if src == source
+        ]
+        if len(matches) == 1:
+            parents[source] = matches[0]
+
+    children: dict[Path, list[Path]] = {}
+    for child, parent in parents.items():
+        children.setdefault(parent, []).append(child)
+
+    body_resources = {path: resolve_page_resources(root, pages[path]) for path in sorted(pages)}
+    return DraftGraph(
+        root=root,
+        pages={path: pages[path] for path in sorted(pages)},
+        parents={path: parents[path] for path in sorted(parents)},
+        children={parent: tuple(sorted(entries)) for parent, entries in sorted(children.items())},
+        inbound_links={
+            target: tuple(sorted(entries, key=lambda entry: (entry[0], entry[1].whole_span.start)))
+            for target, entries in sorted(inbound.items())
+        },
+        relations={label: tuple(sorted(edges)) for label, edges in relation_edges.items()},
+        body_resources=body_resources,
+    )
 
 
 def test_plan_unmanaged_rebases_outbound_relative_links() -> None:
@@ -112,3 +234,260 @@ def test_plan_unmanaged_rejects_rendered_text_that_lost_extractability(
         _plan_unmanaged(ROOT, closure, {source: Path("pages/00-background.md")}, {})
 
     assert caught.value.code == "operation.plan_invalid"
+
+
+# ---------------------------------------------------------------------------
+# _render_pages: 未受管理移动目标的入站链接统一闭合（规格 §4.1）
+# ---------------------------------------------------------------------------
+
+
+def test_render_pages_extra_moved_targets_rewrite_managed_links() -> None:
+    page_a = (
+        "# 页面 A\n\n> 状态：`已确认：说明`\n>\n"
+        "> 父主题：[根索引](../index.md)\n\n"
+        "参考 [旧稿](../00-bg.md)。\n"
+    )
+    graph = _graph_from_texts({Path("index.md"): _INDEX, Path("pages/a.md"): page_a})
+
+    rendered = _render_pages(
+        graph,
+        {},
+        {},
+        extra_moved_targets={
+            ResourceIdentity(ResourceKind.LOCAL, "00-bg.md"): ResourceIdentity(
+                ResourceKind.PAGE, "pages/00-bg.md"
+            )
+        },
+    )
+
+    text = rendered[Path("pages/a.md")]
+    assert "[旧稿](00-bg.md)" in text      # 按 pages/a.md 新基址重算
+    assert "../00-bg.md" not in text
+
+
+# ---------------------------------------------------------------------------
+# plan_move_request: 双类型批量的统一编排
+# ---------------------------------------------------------------------------
+
+_LEAF_A = """# 甲
+
+> 状态：`待讨论`
+>
+> 父主题：[根](../index.md)
+
+甲的正文。
+"""
+
+_MOVE_DIR_INDEX = """# 根
+
+> 状态：`已关闭：纯导航页`
+
+## 子主题
+
+- [归档](pages/archive/index.md)
+- [主题](pages/topic/index.md)
+"""
+
+_MOVE_DIR_ARCHIVE = """# 归档
+
+> 状态：`已关闭：纯导航页`
+>
+> 父主题：[根](../../index.md)
+"""
+
+_MOVE_DIR_TOPIC = """# 主题
+
+> 状态：`已关闭：纯导航页`
+>
+> 父主题：[根](../../index.md)
+
+## 子主题
+
+- [甲](a.md)
+"""
+
+_MOVE_DIR_TOPIC_A = """# 甲
+
+> 状态：`待讨论`
+>
+> 父主题：[主题](index.md)
+
+甲的正文。
+"""
+
+
+def test_plan_move_request_delegates_single_managed_file_to_plan_move() -> None:
+    """文件目标 + 单受管理文件来源：与直接调用 plan_move 逐字段一致。"""
+    graph = _graph_from_texts({Path("index.md"): _INDEX, Path("pages/a.md"): _LEAF_A})
+    marker = _REGISTERED_SNAPSHOT
+    observations = _structure_observations(graph)
+    request = MoveRequest(
+        sources=(
+            MoveSource(Path("pages/a.md"), SourceKind.MANAGED_PAGE, (Path("pages/a.md"),)),
+        ),
+        target=MoveTarget(Path("pages/c.md"), TargetKind.FILE),
+        results={Path("pages/a.md"): Path("pages/c.md")},
+    )
+
+    plan = plan_move_request(
+        graph,
+        MoveClosure(unmanaged={}, blocking=()),
+        request,
+        marker=marker,
+        observations=observations,
+    )
+    expected = plan_move(
+        graph, Path("pages/a.md"), Path("pages/c.md"), marker=marker, observations=observations
+    )
+
+    assert plan.mutations == expected.mutations
+    assert plan.effects == expected.effects
+    assert plan.remove_empty_directories == expected.remove_empty_directories
+
+
+def test_plan_move_request_prefix_unmanaged_file_produces_write_delete() -> None:
+    """未受管理文件 + 前缀目标：WRITE+DELETE 形态，状态与观察原样传递。"""
+    graph = _graph_from_texts({Path("index.md"): _INDEX, Path("pages/a.md"): _LEAF_A})
+    source = Path("stray.md")
+    text, ref = _reference(source, "", "other.md")
+    closure = MoveClosure(unmanaged={source: UnmanagedFile(text, (ref,))}, blocking=())
+    request = MoveRequest(
+        sources=(MoveSource(source, SourceKind.UNMANAGED_FILE, (source,)),),
+        target=MoveTarget(Path("pages"), TargetKind.PREFIX),
+        results={source: Path("pages/stray.md")},
+    )
+
+    plan = plan_move_request(
+        graph, closure, request, marker=_CANDIDATE_SNAPSHOT, observations=EMPTY_OBSERVATIONS
+    )
+
+    writes = [m for m in plan.mutations if m.kind is MutationKind.WRITE]
+    deletes = [m for m in plan.mutations if m.kind is MutationKind.DELETE]
+    assert len(writes) == 1 and len(deletes) == 1
+    assert writes[0].path == Path("pages/stray.md")
+    assert deletes[0].path == source
+    assert plan.kind is OperationKind.MOVE
+    assert plan.root_state is RootState.CANDIDATE
+    assert plan.observations is EMPTY_OBSERVATIONS
+
+
+def test_plan_move_request_directory_source_reparents_members_under_prefix() -> None:
+    """受管理目录来源：成员逐成员显式映射并改父，渲染指向新物理父页。"""
+    graph = _graph_from_texts(
+        {
+            Path("index.md"): _MOVE_DIR_INDEX,
+            Path("pages/archive/index.md"): _MOVE_DIR_ARCHIVE,
+            Path("pages/topic/index.md"): _MOVE_DIR_TOPIC,
+            Path("pages/topic/a.md"): _MOVE_DIR_TOPIC_A,
+        }
+    )
+    request = MoveRequest(
+        sources=(
+            MoveSource(
+                Path("pages/topic"),
+                SourceKind.DIRECTORY,
+                (Path("pages/topic/index.md"), Path("pages/topic/a.md")),
+            ),
+        ),
+        target=MoveTarget(Path("pages/archive"), TargetKind.PREFIX),
+        results={
+            Path("pages/topic/index.md"): Path("pages/archive/topic/index.md"),
+            Path("pages/topic/a.md"): Path("pages/archive/topic/a.md"),
+        },
+    )
+
+    plan = plan_move_request(
+        graph,
+        MoveClosure(unmanaged={}, blocking=()),
+        request,
+        marker=_REGISTERED_SNAPSHOT,
+        observations=_structure_observations(graph),
+    )
+
+    by_path = {m.path: m for m in plan.mutations}
+    assert Path("pages/archive/topic/index.md") in by_path
+    assert Path("pages/archive/topic/a.md") in by_path
+    hub_mutation = by_path[Path("pages/archive/topic/index.md")]
+    assert hub_mutation.content is not None
+    hub = hub_mutation.content.decode("utf-8")
+    assert "父主题：[根](../index.md)" in hub      # 新物理父页 pages/archive/index.md
+    leaf_mutation = by_path[Path("pages/archive/topic/a.md")]
+    assert leaf_mutation.content is not None
+    leaf = leaf_mutation.content.decode("utf-8")
+    assert "父主题：[主题](index.md)" in leaf      # 新物理父页 pages/archive/topic/index.md
+
+
+_MOVE_BATCH_INDEX = """# 根
+
+> 状态：`已关闭：纯导航页`
+
+## 子主题
+
+- [归档](pages/out/index.md)
+- [主题](pages/topic/index.md)
+"""
+
+_MOVE_BATCH_OUT = """# 归档
+
+> 状态：`已关闭：纯导航页`
+>
+> 父主题：[根](../../index.md)
+"""
+
+
+def test_plan_move_request_mixed_batch_bfs_expansion_collides_with_unmanaged() -> None:
+    """混合批：受管理文件来源 BFS 展开目标与未受管理结果相同 → duplicate_basename。"""
+    graph = _graph_from_texts(
+        {
+            Path("index.md"): _MOVE_BATCH_INDEX,
+            Path("pages/out/index.md"): _MOVE_BATCH_OUT,
+            Path("pages/topic/index.md"): _MOVE_DIR_TOPIC,
+            Path("pages/topic/a.md"): _MOVE_DIR_TOPIC_A,
+        }
+    )
+    source = Path("a.md")  # 根级未受管理文件，与 BFS 展开的子页目标同名
+    request = MoveRequest(
+        sources=(
+            MoveSource(
+                Path("pages/topic/index.md"),
+                SourceKind.MANAGED_PAGE,
+                (Path("pages/topic/index.md"),),
+            ),
+            MoveSource(source, SourceKind.UNMANAGED_FILE, (source,)),
+        ),
+        target=MoveTarget(Path("pages/out/sub"), TargetKind.PREFIX),
+        results={
+            Path("pages/topic/index.md"): Path("pages/out/sub/index.md"),
+            source: Path("pages/out/sub/a.md"),
+        },
+    )
+
+    with pytest.raises(DraftError) as caught:
+        plan_move_request(
+            graph,
+            MoveClosure(unmanaged={}, blocking=()),
+            request,
+            marker=_REGISTERED_SNAPSHOT,
+            observations=_structure_observations(graph),
+        )
+    assert caught.value.code == "structure.duplicate_basename"
+
+
+def test_plan_move_request_rejects_prefix_outside_pages() -> None:
+    """结果校验穿透：非法前缀目标由 validate_results 拒绝。"""
+    graph = _graph_from_texts({Path("index.md"): _INDEX, Path("pages/a.md"): _LEAF_A})
+    request = MoveRequest(
+        sources=(MoveSource(Path("pages/a.md"), SourceKind.MANAGED_PAGE, (Path("pages/a.md"),)),),
+        target=MoveTarget(Path("notes"), TargetKind.PREFIX),
+        results={Path("pages/a.md"): Path("notes/a.md")},
+    )
+
+    with pytest.raises(DraftError) as caught:
+        plan_move_request(
+            graph,
+            MoveClosure(unmanaged={}, blocking=()),
+            request,
+            marker=_REGISTERED_SNAPSHOT,
+            observations=_structure_observations(graph),
+        )
+    assert caught.value.code == "structure.invalid_target"

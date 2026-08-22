@@ -32,6 +32,7 @@ from draft.models import (
     SourceSpan,
 )
 from draft.move_closure import MoveClosure
+from draft.move_operands import MoveRequest, SourceKind, TargetKind, validate_results
 from draft.observations import ObservationManifest
 from draft.operation_facts import OperationFacts
 from draft.operations import execute_plan, read_lock, sha256_bytes
@@ -124,6 +125,7 @@ def _render_pages(
     parent_changes: Mapping[Path, Path],
     *,
     skip_conclusions_links: bool = False,
+    extra_moved_targets: Mapping[ResourceIdentity, ResourceIdentity] | None = None,
 ) -> dict[Path, str]:
     rendered: dict[Path, str] = {}
     nav_removals: dict[Path, list[MarkdownLink]] = {}
@@ -171,6 +173,8 @@ def _render_pages(
         )
         for old, new in expanded.items()
     }
+    if extra_moved_targets is not None:
+        moved_targets.update(extra_moved_targets)
 
     for path, page in graph.pages.items():
         final_path = expanded.get(path, path)
@@ -257,11 +261,13 @@ def plan_path_remap(
     kind: OperationKind = OperationKind.MOVE,
     marker: MarkerSnapshot,
     observations: ObservationManifest,
+    extra_moved_targets: Mapping[ResourceIdentity, ResourceIdentity] | None = None,
+    pre_expanded: Mapping[Path, Path] | None = None,
 ) -> OperationPlan:
     # 结构变换不把全图 check_graph 结果当门禁：已可解析的无关全局错误不阻止本次
     # 操作（计划 Task 10 Step 1）。registered 的完整健康门禁由 load_operation_facts
     # 在规划前强制执行；candidate 只拒绝不可解析页（blocking_paths）。
-    expanded = _expand_mapping(graph, page_map)
+    expanded = dict(pre_expanded) if pre_expanded is not None else _expand_mapping(graph, page_map)
     final_parents = _final_parents(graph, expanded, parent_changes)
     for page, final_parent in final_parents.items():
         final_path = expanded.get(page, page)
@@ -278,6 +284,7 @@ def plan_path_remap(
         expanded,
         parent_changes,
         skip_conclusions_links=conclusions_generated,
+        extra_moved_targets=extra_moved_targets,
     )
 
     mutations: list[FileMutation] = []
@@ -416,6 +423,114 @@ def plan_move(
         marker=marker,
         observations=observations,
     )
+
+
+def plan_move_request(
+    graph: DraftGraph,
+    closure: MoveClosure,
+    request: MoveRequest,
+    *,
+    marker: MarkerSnapshot,
+    observations: ObservationManifest,
+) -> OperationPlan:
+    if (
+        request.target.kind is TargetKind.FILE
+        and len(request.sources) == 1
+        and request.sources[0].kind is SourceKind.MANAGED_PAGE
+    ):
+        source = request.sources[0].path
+        return plan_move(
+            graph, source, request.target.path, marker=marker, observations=observations
+        )
+
+    directory_sources = [s.path for s in request.sources if s.kind is SourceKind.DIRECTORY]
+    validate_results(graph, request.results, directory_sources)
+
+    managed_pairs: dict[Path, Path] = {}
+    physical_pairs: dict[Path, Path] = {}
+    unmanaged_moves: dict[Path, Path] = {}
+    for source in request.sources:
+        for member in source.members:
+            result = request.results[member]
+            if member in graph.pages:
+                if source.kind is SourceKind.DIRECTORY:
+                    physical_pairs[member] = result
+                else:
+                    managed_pairs[member] = result
+            else:
+                unmanaged_moves[member] = result
+
+    expanded = _expand_mapping(graph, managed_pairs) if managed_pairs else {}
+    expanded = {**expanded, **physical_pairs}
+    _validate_cross_collisions(graph, expanded, unmanaged_moves)
+
+    parent_changes: dict[Path, Path] = {}
+    for member, result in physical_pairs.items():
+        parent = physical_parent(result)
+        if parent is not None and graph.parents.get(member) != parent:
+            parent_changes[member] = parent
+    for member, result in managed_pairs.items():
+        parent = physical_parent(result)
+        if parent is not None and parent != graph.parents.get(member):
+            parent_changes[member] = parent
+
+    moved_targets = {
+        ResourceIdentity(ResourceKind.PAGE, old.as_posix()): ResourceIdentity(
+            ResourceKind.PAGE, new.as_posix()
+        )
+        for old, new in expanded.items()
+    }
+    moved_targets.update(_unmanaged_moved_identities(graph.root, unmanaged_moves))
+
+    if expanded or parent_changes:
+        managed_plan = plan_path_remap(
+            graph,
+            {**managed_pairs, **physical_pairs},
+            parent_changes,
+            kind=OperationKind.MOVE,
+            marker=marker,
+            observations=observations,
+            pre_expanded=expanded,
+            extra_moved_targets=_unmanaged_moved_identities(graph.root, unmanaged_moves),
+        )
+        base_mutations = list(managed_plan.mutations)
+        base_effects = list(managed_plan.effects)
+        removable = managed_plan.remove_empty_directories
+    else:
+        base_mutations, base_effects, removable = [], [], ()
+
+    unmanaged_mutations, unmanaged_effects = _plan_unmanaged(
+        graph.root, closure, unmanaged_moves, moved_targets
+    )
+    writes = [m for m in [*base_mutations, *unmanaged_mutations] if m.kind is MutationKind.WRITE]
+    deletes = [m for m in [*base_mutations, *unmanaged_mutations] if m.kind is MutationKind.DELETE]
+    writes.sort(key=lambda m: m.path.as_posix())
+    deletes.sort(key=lambda m: m.path.as_posix())
+    return OperationPlan(
+        kind=OperationKind.MOVE,
+        root=graph.root,
+        mutations=tuple([*writes, *deletes]),
+        root_state=marker.state.root_state,
+        observations=observations,
+        remove_empty_directories=removable,
+        effects=tuple([*base_effects, *unmanaged_effects]),
+    )
+
+
+def _validate_cross_collisions(
+    graph: DraftGraph,
+    expanded: Mapping[Path, Path],
+    unmanaged_moves: Mapping[Path, Path],
+) -> None:
+    all_targets = [*expanded.values(), *unmanaged_moves.values()]
+    if len(set(all_targets)) != len(all_targets):
+        raise DraftError("structure.duplicate_basename")
+    for target in unmanaged_moves.values():
+        if target in graph.pages and target not in expanded:
+            raise DraftError("structure.target_exists", target)
+    for target in expanded.values():
+        if target in unmanaged_moves.values():
+            raise DraftError("structure.target_exists", target)
 
 
 def plan_promote(
