@@ -196,7 +196,7 @@ def trash_plan(
         remove_empty.append(parent.parent)
 
     # 权威包保存页面实际字节：CRLF 页面恢复后必须逐字节一致。
-    page_bytes = graph.page_bytes.get(page, graph.pages[page].text.encode("utf-8"))
+    page_bytes = graph.pages[page].text.encode("utf-8")
     package = {
         "version": PACKAGE_VERSION,
         "operation_id": operation_id,

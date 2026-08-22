@@ -186,8 +186,7 @@ def graph_observations(graph: _GraphLike, *, marker: MarkerSnapshot) -> Observat
     entries: list[Observation] = []
     directories: set[Path] = set()
     for relative, page in graph.pages.items():
-        # 摘要基于实际读取字节（page_digest 优先），避免 CRLF 页面被规范化文本摘要
-        # 误判为外部变化；内存合成图回退到规范化文本。
+        # 摘要基于加载文本（保留 \r\n，编码即磁盘字节）；内存合成图与磁盘图同式。
         digest_provider = getattr(graph, "page_digest", None)
         digest = (
             digest_provider(relative)
