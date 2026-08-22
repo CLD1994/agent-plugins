@@ -191,6 +191,24 @@ def test_check_draft_consumes_passed_state_without_reading(
     assert _issue_tuples(report) == _issue_tuples(expected)
 
 
+def test_check_draft_default_with_corrupt_marker_reads_twice_and_reports_invalid(
+    draft_factory: DraftFactory, marker_reads: list[Path]
+) -> None:
+    """缺省路径损坏 marker 恰好读取两次：自身失败 1 次 + tolerant 自读报 issue 1 次。
+
+    计划未决事项 4 保留的现状语义：marker 损坏时 check_draft 开头的默认自读失败
+    不计 issue，由 load_graph_tolerant 接收 None 后再自读一次并把 format.invalid
+    记入报告。该语义与传入状态路径无关，本用例钉住读取次数与报告内容。
+    """
+    root = draft_factory({"index.md": PAGE_INDEX, "pages/a.md": PAGE_A})
+    (root / ".draft" / "draft.json").write_text("{broken json", encoding="utf-8")
+
+    report = check_draft(root)
+
+    assert marker_reads == [root, root]
+    assert any(issue.code == CheckCode.FORMAT_INVALID.value for issue in report.issues)
+
+
 def test_load_tolerant_view_consumes_passed_state_without_reading(
     draft_factory: DraftFactory, marker_reads: list[Path]
 ) -> None:
