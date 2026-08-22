@@ -14,7 +14,7 @@ from typing import Protocol
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
-from draft.graph import DraftGraph, load_graph
+from draft.graph import DraftGraph, MarkerState, load_graph
 from draft.models import CheckIssue, PageDocument, RelationCode, StatusCode
 from draft.paths import resolve_draft_root, resolve_page_operand
 from draft.resources import (
@@ -161,16 +161,19 @@ class TolerantView:
     first_blocking: CheckIssue | None
 
 
-def load_tolerant_view(root: Path) -> TolerantView:
+def load_tolerant_view(
+    root: Path, *, marker_state: MarkerState | None = None
+) -> TolerantView:
     """容错全根加载：只有能归属到具体页面的解析失败才可成为候选部分结果。
 
     marker/格式等无法归属到具体页面的根级损坏继续整体失败；未管理路径不属于
-    阻碍页面。``first_blocking`` 供 registered 根传播最具体的损坏代码。
+    阻碍页面。``first_blocking`` 供 registered 根传播最具体的损坏代码。调用方
+    已持有同根 marker 事实时必须传入，本函数不再二次读取。
     """
     from draft.graph import load_graph_tolerant
 
     resolved = resolve_draft_root(root)
-    result = load_graph_tolerant(resolved)
+    result = load_graph_tolerant(resolved, marker_state=marker_state)
     fatal = [issue for issue in result.issues if issue.code in _FATAL_QUERY_CODES]
     if fatal:
         first = fatal[0]

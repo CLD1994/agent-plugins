@@ -14,12 +14,14 @@ import pytest
 
 import draft.graph as graph_module
 import draft.operation_facts as facts_module
+from draft.checker import check_draft
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import FORMAT_VERSION, MarkerSnapshot, MarkerState, load_graph, load_graph_tolerant
-from draft.models import RootState
+from draft.models import CheckReport, RootState
+from draft.query import load_tolerant_view
 from draft.vocabulary import ConclusionsState
-from tests.integration.support import DraftFactory
+from tests.integration.support import DraftFactory, managed_marker_text
 
 PAGE_INDEX = """# Topic
 
@@ -159,3 +161,49 @@ def test_load_graph_rejects_candidate_from_passed_state(
 
     assert caught.value.code == "root.candidate"
     assert marker_reads == []
+
+
+def _issue_tuples(report: CheckReport) -> list[tuple[str, Path | None, tuple[str, ...]]]:
+    return [(issue.code, issue.path, issue.details) for issue in report.issues]
+
+
+def test_check_draft_consumes_passed_state_without_reading(
+    draft_factory: DraftFactory, marker_reads: list[Path]
+) -> None:
+    """传入状态：不读取 marker；报告与磁盘 marker 同状态的报告逐项一致。"""
+    root = draft_factory({"index.md": PAGE_INDEX, "pages/a.md": PAGE_A})
+    generated = _registered(ConclusionsState.GENERATED)
+
+    report = check_draft(root, marker_state=generated)
+    assert marker_reads == []
+
+    # 磁盘 marker 改写为同一状态后自读：两条路径的报告必须一致（含结论必需项）。
+    (root / ".draft" / "draft.json").write_text(
+        managed_marker_text(conclusions_state=ConclusionsState.GENERATED), encoding="utf-8"
+    )
+    expected = check_draft(root)
+    assert marker_reads == [root]
+    assert _issue_tuples(report) == _issue_tuples(expected)
+
+
+def test_load_tolerant_view_consumes_passed_state_without_reading(
+    draft_factory: DraftFactory, marker_reads: list[Path]
+) -> None:
+    """传入状态：不读取 marker；视图与自读路径的阻碍集合一致。"""
+    root = draft_factory(
+        {"index.md": PAGE_INDEX, "pages/a.md": PAGE_A},
+        root_state=RootState.CANDIDATE,
+    )
+    candidate = MarkerState(
+        version=FORMAT_VERSION,
+        root_state=RootState.CANDIDATE,
+        conclusions_state=ConclusionsState.NOT_GENERATED,
+    )
+
+    threaded = load_tolerant_view(root, marker_state=candidate)
+    assert marker_reads == []
+
+    direct = load_tolerant_view(root)
+    assert marker_reads == [root]
+    assert threaded.blocking_paths == direct.blocking_paths
+    assert set(threaded.graph.pages) == set(direct.graph.pages)

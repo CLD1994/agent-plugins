@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -19,6 +20,7 @@ from draft.graph import (
     MARKER_PATH,
     ROOT_PAGE,
     DraftGraph,
+    MarkerState,
     load_graph_tolerant,
     resolve_local_destination,
 )
@@ -1159,29 +1161,19 @@ def _check_conclusions_product(
     return issues
 
 
-def _conclusions_state(resolved: Path) -> ConclusionsState | None:
-    """读取所有权状态；标记缺失/无效时返回 None（不在此处报错）。"""
-    from draft.graph import read_marker
-
-    try:
-        state = read_marker(resolved)
-    except DraftError:
+def _conclusions_state(state: MarkerState | None) -> ConclusionsState | None:
+    """所有权状态；marker 缺失/无效时为 None（不在此处报错，由加载期 marker issue 报告）。"""
+    if state is None:
         return None
     return state.conclusions_state
 
 
-def _conclusions_required(resolved: Path) -> bool:
+def _conclusions_required(state: MarkerState | None) -> bool:
     """conclusions.md 是否必须存在：标记有效时由所有权状态决定。
 
     标记缺失/无效时不在此处要求；对应诊断由加载期 marker issue 报告。
     """
-    from draft.graph import read_marker
-
-    try:
-        state = read_marker(resolved)
-    except DraftError:
-        return False
-    return state.conclusions_state is ConclusionsState.GENERATED
+    return state is not None and state.conclusions_state is ConclusionsState.GENERATED
 
 
 _ALLOWED_INTERNAL_ENTRIES = frozenset(
@@ -1244,8 +1236,18 @@ def check_draft(
     root: Path,
     *,
     include_operation_state: bool = True,
+    marker_state: MarkerState | None = None,
 ) -> CheckReport:
+    from draft.graph import read_marker
+
     resolved = resolve_draft_root(root)
+    # marker 事实单次读取：缺省时本函数读取一次并贯穿全部消费者；调用方已持有
+    # 同根状态时必须传入，本函数不再读取（与 load_graph_tolerant 同一不变量）。
+    state = marker_state
+    if state is None:
+        # marker 损坏记为 issue 由 tolerant 加载报出，此处不重复报错。
+        with suppress(DraftError):
+            state = read_marker(resolved)
     layout: list[CheckIssue] = []
     for required in (ROOT_PAGE,):
         candidate = resolved / required
@@ -1260,7 +1262,7 @@ def check_draft(
                 )
             )
     # conclusions.md 只在所有权为 generated 时要求存在；not_generated 允许缺失。
-    conclusions_required = _conclusions_required(resolved)
+    conclusions_required = _conclusions_required(state)
     if conclusions_required:
         candidate = resolved / CONCLUSIONS_PAGE
         if not candidate.is_file() or candidate.is_symlink():
@@ -1281,7 +1283,7 @@ def check_draft(
             )
         )
 
-    result = load_graph_tolerant(resolved)
+    result = load_graph_tolerant(resolved, marker_state=state)
 
     ordered: list[CheckIssue] = []
     ordered.extend(sorted(layout, key=_sort_key))
@@ -1303,7 +1305,7 @@ def check_draft(
     ordered.extend(sorted(_load_issues_in(result.issues, None), key=_sort_key))
     ordered.extend(check_graph(result.graph).issues)
     ordered.extend(sorted(_check_internal_namespace(resolved), key=_sort_key))
-    conclusions_state = _conclusions_state(resolved)
+    conclusions_state = _conclusions_state(state)
     if conclusions_state is ConclusionsState.NOT_GENERATED and _conclusions_unexpected(resolved):
         # not_generated 时意外出现的 conclusions.md 不是普通受管理页面：只报告
         # conclusions.unexpected_file，不把它的普通页面诊断（缺父主题/不可达等）当作噪声。
