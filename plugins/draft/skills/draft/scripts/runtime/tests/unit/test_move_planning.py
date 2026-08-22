@@ -411,6 +411,7 @@ def test_plan_move_request_directory_source_reparents_members_under_prefix() -> 
     assert hub_mutation.content is not None
     hub = hub_mutation.content.decode("utf-8")
     assert "父主题：[根](../index.md)" in hub      # 新物理父页 pages/archive/index.md
+    assert "- [甲](a.md)" in hub                  # 子导航随批保留：旧父随批移动，不判为改父
     leaf_mutation = by_path[Path("pages/archive/topic/a.md")]
     assert leaf_mutation.content is not None
     leaf = leaf_mutation.content.decode("utf-8")

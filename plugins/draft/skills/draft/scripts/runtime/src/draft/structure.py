@@ -473,11 +473,19 @@ def plan_move_request(
     parent_changes: dict[Path, Path] = {}
     for member, result in physical_pairs.items():
         parent = physical_parent(result)
-        if parent is not None and graph.parents.get(member) != parent:
+        if parent is None:
+            continue
+        old_parent = graph.parents.get(member)
+        moved_old_parent = expanded.get(old_parent, old_parent) if old_parent is not None else None
+        if moved_old_parent != parent:
             parent_changes[member] = parent
     for member, result in managed_pairs.items():
         parent = physical_parent(result)
-        if parent is not None and parent != graph.parents.get(member):
+        if parent is None:
+            continue
+        old_parent = graph.parents.get(member)
+        moved_old_parent = expanded.get(old_parent, old_parent) if old_parent is not None else None
+        if moved_old_parent != parent:
             parent_changes[member] = parent
 
     moved_targets = {
