@@ -12,7 +12,6 @@ from draft.paths import (
     RootSource,
     physical_parent,
     relative_markdown_destination,
-    resolve_move_operand,
     select_managed_root,
 )
 
@@ -330,24 +329,3 @@ def test_relative_markdown_destination_anchor_not_encoded() -> None:
         relative_markdown_destination(Path("pages/a.md"), Path("pages/b.md"), "锚 点")
         == "b.md#锚 点"
     )
-
-
-def test_resolve_move_operand_accepts_directory_and_non_markdown(tmp_path: Path) -> None:
-    (tmp_path / "legacy-notes").mkdir()
-    (tmp_path / "img.png").write_bytes(b"x")
-
-    directory = resolve_move_operand(tmp_path, "legacy-notes")
-    image = resolve_move_operand(tmp_path, "img.png")
-
-    assert directory.relative == Path("legacy-notes")
-    assert image.relative == Path("img.png")
-
-
-def test_resolve_move_operand_rejects_escape_and_symlink(tmp_path: Path) -> None:
-    (tmp_path / "real.md").write_text("x", encoding="utf-8")
-    (tmp_path / "link.md").symlink_to(tmp_path / "real.md")
-
-    with pytest.raises(DraftError, match="path.escape"):
-        resolve_move_operand(tmp_path, "../outside.md")
-    with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
-        resolve_move_operand(tmp_path, "link.md")

@@ -13,6 +13,7 @@ from draft.paths import (
     ManagedRoot,
     RootSource,
     resolve_draft_root,
+    resolve_move_operand,
     resolve_page_operand,
     select_managed_root,
 )
@@ -392,3 +393,29 @@ def test_page_operand_maps_unresolvable_home_to_root_missing(
 
     assert excinfo.value.code == "root.missing"
     assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# resolve_move_operand：真实文件系统边界的规范化（原单元层违规，迁移至此）
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_move_operand_accepts_directory_and_non_markdown(tmp_path: Path) -> None:
+    (tmp_path / "legacy-notes").mkdir()
+    (tmp_path / "img.png").write_bytes(b"x")
+
+    directory = resolve_move_operand(tmp_path, "legacy-notes")
+    image = resolve_move_operand(tmp_path, "img.png")
+
+    assert directory.relative == Path("legacy-notes")
+    assert image.relative == Path("img.png")
+
+
+def test_resolve_move_operand_rejects_escape_and_symlink(tmp_path: Path) -> None:
+    (tmp_path / "real.md").write_text("x", encoding="utf-8")
+    (tmp_path / "link.md").symlink_to(tmp_path / "real.md")
+
+    with pytest.raises(DraftError, match="path.escape"):
+        resolve_move_operand(tmp_path, "../outside.md")
+    with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
+        resolve_move_operand(tmp_path, "link.md")
