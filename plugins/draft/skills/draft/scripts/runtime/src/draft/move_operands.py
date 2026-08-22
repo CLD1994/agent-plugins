@@ -108,7 +108,7 @@ def enumerate_directory(root: Path, directory: Path) -> tuple[Path, ...]:
     base = root / directory
     for descendant in sorted(base.rglob("*"), key=lambda item: item.as_posix()):
         relative = descendant.relative_to(root)
-        if _INTERNAL_DIR in relative.parts:
+        if is_internal_territory(relative):
             continue
         if classify_node(descendant) is EntryKind.SYMLINK:
             raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, relative)
@@ -148,9 +148,12 @@ def classify_move_request(
             sources.append(MoveSource(relative, SourceKind.DIRECTORY, members))
             continue
         if entry_kind is EntryKind.FILE:
+            # 规格 §2.5：根 index.md 与 conclusions.md 无论受管资格一律保护。
+            # 候选根 + not_generated 时 conclusions.md 不在 graph.pages 内，该检查
+            # 必须先于受管分支执行，否则会被当作未受管理文件提升走。
+            if relative in (ROOT_PAGE, CONCLUSIONS_PAGE):
+                raise DraftError("structure.protected", relative)
             if relative in graph.pages:
-                if relative in (ROOT_PAGE, CONCLUSIONS_PAGE):
-                    raise DraftError("structure.protected", relative)
                 sources.append(MoveSource(relative, SourceKind.MANAGED_PAGE, (relative,)))
                 continue
             if resolved.relative.suffix == ".md":

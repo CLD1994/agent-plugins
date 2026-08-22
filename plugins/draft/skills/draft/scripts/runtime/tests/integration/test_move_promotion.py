@@ -224,3 +224,64 @@ def test_move_managed_directory_reparents_physically(
     assert (root / "pages/archive/topic/a.md").is_file()
     assert not list((root / "pages/topic").rglob("*.md"))
     assert check_draft(root).errors == ()
+
+
+# ---------------------------------------------------------------------------
+# H1：根 conclusions.md 来源保护（规格 §2.5）
+# ---------------------------------------------------------------------------
+
+
+def test_move_rejects_conclusions_source_on_candidate(
+    draft_factory: DraftFactory,
+) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "conclusions.md").write_text("旧稿结论。\n", encoding="utf-8")
+
+    with pytest.raises(DraftError) as caught:
+        move_entries(root, ["conclusions.md"], "pages/conclusions.md")
+
+    assert caught.value.code == "structure.protected"
+    assert (root / "conclusions.md").exists()          # 拒绝后零写入
+    assert not (root / "pages/conclusions.md").exists()
+
+
+def test_move_rejects_conclusions_source_in_batch(
+    draft_factory: DraftFactory,
+) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "a.md").write_text("甲。\n", encoding="utf-8")
+    (root / "conclusions.md").write_text("旧稿结论。\n", encoding="utf-8")
+
+    with pytest.raises(DraftError) as caught:
+        move_entries(root, ["a.md", "conclusions.md"], "pages")
+
+    assert caught.value.code == "structure.protected"
+    assert not (root / "pages/conclusions.md").exists()
+    assert not (root / "pages/a.md").exists()          # 批量中任一来源命中即拒绝整批
+
+
+# ---------------------------------------------------------------------------
+# M1：目录来源枚举嵌套 .draft 内容（规格 §2.2/§2.3：嵌套 .draft 是普通内容）
+# ---------------------------------------------------------------------------
+
+
+def test_move_directory_promotes_nested_draft_content(
+    draft_factory: DraftFactory,
+) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    legacy = root / "legacy"
+    (legacy / ".draft").mkdir(parents=True)
+    (legacy / ".draft" / "index.md").write_text("嵌套枢纽。\n", encoding="utf-8")
+    (legacy / ".draft" / "notes.md").write_text("嵌套旧稿。\n", encoding="utf-8")
+    (legacy / "index.md").write_text("旧根 [注](.draft/notes.md)。\n", encoding="utf-8")
+
+    move_entries(root, ["legacy"], "pages")
+
+    assert (root / "pages/legacy/.draft/index.md").is_file()
+    moved = root / "pages/legacy/.draft/notes.md"
+    assert moved.is_file()
+    assert moved.read_text(encoding="utf-8") == "嵌套旧稿。\n"
+    assert not (legacy / ".draft" / "notes.md").exists()
+    # 旧根链接按新基址重算：同深度同批移动，相对形式不变
+    hub = (root / "pages/legacy/index.md").read_text(encoding="utf-8")
+    assert "[注](.draft/notes.md)" in hub
