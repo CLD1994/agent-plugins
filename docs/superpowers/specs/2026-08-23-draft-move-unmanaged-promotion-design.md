@@ -120,8 +120,9 @@ draft move SOURCE... TARGET --dry-run
 映射规则：
 
 - 文件 `SOURCE`：结果 = `TARGET/<SOURCE 基名>`；
-- 目录 `SOURCE`：结果 = `TARGET/<SOURCE 完整路径>`，目录自身名字作为第一级
-  保留。映射是纯词法拼接，不依赖目标位置的当前存在性，无歧义。
+- 目录 `SOURCE`：结果 = `TARGET/<SOURCE 目录名>/<成员相对 SOURCE 的路径>`，
+  目录自身名字作为第一级保留，与 `mv` 的追加语义一致。映射是纯词法拼接，
+  不依赖目标位置的当前存在性，无歧义。
 
 每个结果路径必须全部通过：
 
