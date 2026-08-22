@@ -285,3 +285,207 @@ def test_move_directory_promotes_nested_draft_content(
     # 旧根链接按新基址重算：同深度同批移动，相对形式不变
     hub = (root / "pages/legacy/index.md").read_text(encoding="utf-8")
     assert "[注](.draft/notes.md)" in hub
+
+
+# ---------------------------------------------------------------------------
+# H3：分类决策表 §2.2 未覆盖行（顺序 2/3/7/8）
+# ---------------------------------------------------------------------------
+
+
+def test_move_source_in_internal_territory_is_rejected(draft_factory: DraftFactory) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+
+    with pytest.raises(DraftError) as caught:
+        move_entries(root, [".draft/ops.md"], "pages/x.md")
+
+    assert caught.value.code == CheckCode.PATH_INTERNAL.value
+
+
+def test_move_nested_draft_file_operand_is_ordinary_content(
+    draft_factory: DraftFactory,
+) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "legacy" / ".draft").mkdir(parents=True)
+    (root / "legacy" / ".draft" / "notes.md").write_text("旧稿。\n", encoding="utf-8")
+
+    move_entries(root, ["legacy/.draft/notes.md"], "pages/notes.md")
+
+    assert (root / "pages/notes.md").is_file()
+    assert not (root / "legacy" / ".draft" / "notes.md").exists()
+
+
+def test_move_symlink_source_is_rejected(draft_factory: DraftFactory) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "real.md").write_text("x", encoding="utf-8")
+    (root / "link.md").symlink_to(root / "real.md")
+
+    with pytest.raises(DraftError) as caught:
+        move_entries(root, ["link.md"], "pages/link.md")
+
+    assert caught.value.code == CheckCode.PATH_SYMLINK_ESCAPE.value
+
+
+def test_move_non_markdown_file_source_is_rejected(draft_factory: DraftFactory) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "img.png").write_bytes(b"\x89PNG")
+
+    with pytest.raises(DraftError) as caught:
+        move_entries(root, ["img.png"], "pages/img.png")
+
+    assert caught.value.code == "path.not_markdown"
+
+
+def test_move_nonexistent_source_reports_unknown_page(draft_factory: DraftFactory) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+
+    with pytest.raises(DraftError) as caught:
+        move_entries(root, ["missing.md"], "pages/missing.md")
+
+    assert caught.value.code == "structure.unknown_page"
+
+
+# ---------------------------------------------------------------------------
+# H3：目录枚举契约 §2.3（符号链接条目拒绝整批 / 空枚举 / pages 保护）
+# ---------------------------------------------------------------------------
+
+
+def test_move_directory_source_with_symlink_entry_rejects_batch(
+    draft_factory: DraftFactory,
+) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    legacy = root / "legacy"
+    (legacy / "topic").mkdir(parents=True)
+    (legacy / "index.md").write_text("旧根。\n", encoding="utf-8")
+    (root / "real.md").write_text("x", encoding="utf-8")
+    (legacy / "topic" / "link.md").symlink_to(root / "real.md")
+
+    with pytest.raises(DraftError) as caught:
+        move_entries(root, ["legacy"], "pages")
+
+    assert caught.value.code == CheckCode.PATH_SYMLINK_ESCAPE.value
+    assert (legacy / "index.md").exists()      # 整批拒绝，零写入
+
+
+def test_move_empty_directory_source_reports_unknown_page(
+    draft_factory: DraftFactory,
+) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "legacy" / "topic").mkdir(parents=True)  # 无任何 .md
+
+    with pytest.raises(DraftError) as caught:
+        move_entries(root, ["legacy"], "pages")
+
+    assert caught.value.code == "structure.unknown_page"
+
+
+def test_move_pages_directory_source_is_protected(draft_factory: DraftFactory) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+
+    with pytest.raises(DraftError) as caught:
+        move_entries(root, ["pages"], "pages/archive")
+
+    assert caught.value.code == "structure.protected"
+
+
+# ---------------------------------------------------------------------------
+# H3：同批交叉链接与锚点保留
+# ---------------------------------------------------------------------------
+
+
+def test_move_batch_remaps_cross_links_within_moved_set(draft_factory: DraftFactory) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "a.md").write_text("甲引 [乙](b.md)。\n", encoding="utf-8")
+    (root / "b.md").write_text("乙正文。\n", encoding="utf-8")
+
+    move_entries(root, ["a.md", "b.md"], "pages")
+
+    moved_a = (root / "pages/a.md").read_text(encoding="utf-8")
+    assert "[乙](b.md)" in moved_a        # 同批同目录移动，相对形式不变且指向新位置
+    assert "[乙](pages/b.md)" not in moved_a
+
+
+def test_move_preserves_anchors_in_rebased_links(draft_factory: DraftFactory) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "legacy").mkdir()
+    (root / "src.md").write_text("看 [节](legacy/other.md#sec)。\n", encoding="utf-8")
+    (root / "legacy" / "other.md").write_text("旧稿。\n", encoding="utf-8")
+
+    move_entries(root, ["src.md"], "pages/src.md")
+
+    text = (root / "pages/src.md").read_text(encoding="utf-8")
+    assert "[节](../legacy/other.md#sec)" in text   # 锚点保留，路径按新基址重算
+
+
+# ---------------------------------------------------------------------------
+# H3：受管理目录来源父声明无法重写 → parent_mismatch
+# ---------------------------------------------------------------------------
+
+
+def test_move_managed_directory_source_parent_mismatch(draft_factory: DraftFactory) -> None:
+    hub_topic = (
+        "# 主题枢纽\n\n> 状态：`已确认：枢纽`\n>\n"
+        "> 父主题：[根索引](../../index.md)\n\n正文。\n"
+    )
+    page_a = (
+        "# 页面 A\n\n> 状态：`已确认：说明`\n>\n"
+        "> 父主题：[主题枢纽](index.md)\n\n正文。\n"
+    )
+    hub_archive = (
+        "# 归档枢纽\n\n> 状态：`已确认：枢纽`\n>\n"
+        "> 父主题：[根索引](../../index.md)\n\n正文。\n"
+    )
+    # pages/other/x.md 声明父主题指向将被移走的 pages/topic/index.md；x 自身不移动，
+    # 其物理父页（pages/other/index.md 位置的页面）不是枢纽移动后的位置 → 无法重写。
+    page_x = (
+        "# 异页\n\n> 状态：`已确认：说明`\n>\n"
+        "> 父主题：[主题枢纽](../topic/index.md)\n\n正文。\n"
+    )
+    root = draft_factory(
+        {
+            "index.md": PAGE_INDEX,
+            "pages/topic/index.md": hub_topic,
+            "pages/topic/a.md": page_a,
+            "pages/archive/index.md": hub_archive,
+            "pages/other/x.md": page_x,
+        },
+        root_state=RootState.CANDIDATE,
+    )
+
+    with pytest.raises(DraftError) as caught:
+        move_entries(root, ["pages/topic"], "pages/archive")
+
+    assert caught.value.code == "structure.parent_mismatch"
+
+
+# ---------------------------------------------------------------------------
+# H3：闭包扩展只对 move 生效（promote 不受不可解码未受管理文件影响）
+# ---------------------------------------------------------------------------
+
+
+def test_move_closure_extension_does_not_leak_to_promote(draft_factory: DraftFactory) -> None:
+    from draft.structure import promote_page
+
+    index = (
+        "# 根\n\n> 状态：`已确认：根索引`\n\n正文。\n"
+        "\n## 子主题\n\n"
+        "- [主题](pages/topic.md)\n"
+        "- [子页](pages/child.md)\n"
+    )
+    topic = (
+        "# 主题\n\n> 状态：`待讨论`\n>\n"
+        "> 父主题：[根索引](../index.md)\n\n正文。\n"
+    )
+    child = (
+        "# 子页\n\n> 状态：`待讨论`\n>\n"
+        "> 父主题：[根索引](../index.md)\n\n正文。\n"
+    )
+    root = draft_factory(
+        {"index.md": index, "pages/topic.md": topic, "pages/child.md": child},
+        root_state=RootState.CANDIDATE,
+    )
+    (root / "gbk-legacy.md").write_bytes("旧稿。".encode("gb18030"))
+
+    promote_page(root, Path("pages/topic.md"), [Path("pages/child.md")])
+
+    assert (root / "pages/topic/index.md").is_file()
+    assert (root / "pages/topic/child.md").is_file()

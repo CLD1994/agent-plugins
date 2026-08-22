@@ -920,6 +920,26 @@ def test_move_file_target_rejects_multiple_sources(
     assert error["code"] == "cli.move_operands_invalid"
 
 
+def test_move_file_target_rejects_directory_source(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    legacy = root / "legacy"
+    legacy.mkdir()
+    (legacy / "index.md").write_text("旧稿。\n", encoding="utf-8")
+
+    code, payload = run_json(
+        ["move", "legacy", "pages/x.md", "--root", str(root), "--json"], capsys
+    )
+
+    assert code == 2
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "cli.move_operands_invalid"
+    assert (legacy / "index.md").exists()      # 拒绝零写入
+    assert not (root / "pages/x.md").exists()
+
+
 def test_move_prefix_target_promotes_unmanaged_file(
     draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
 ) -> None:
