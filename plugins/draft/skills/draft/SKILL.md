@@ -38,7 +38,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 - init 初始化新草稿
 - adopt 接管格式完整的未登记目录
 - check 检查草稿一致性
-- move 移动页面
+- move 移动页面或未受管理文件：`TARGET` 以 `.md` 结尾时是文件目标，只允许单个文件 `SOURCE`；否则是前缀目标，来源按基名或目录名落入其下；目录 `SOURCE` 只移动其中的 `.md` 普通文件，其余内容原地留下；未受管理来源提升后由 `check` 报告协议欠账
 - promote 升格页面为枢纽
 - collapse 降级枢纽为普通页面
 - trash 回收页面为保留态
