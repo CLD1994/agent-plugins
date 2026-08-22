@@ -34,6 +34,7 @@ class CheckCode(StrEnum):
     LINK_UNAVAILABLE = "link.unavailable"
     LINK_ESCAPE = "link.escape"
     PATH_SYMLINK_ESCAPE = "path.symlink_escape"
+    PATH_INTERNAL = "path.internal"
     RELATION_DUPLICATE = "relation.duplicate"
     PARENT_ROOT_DECLARED = "parent.root_declared"
     PARENT_MISSING = "parent.missing"

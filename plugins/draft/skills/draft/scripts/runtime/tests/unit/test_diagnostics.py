@@ -336,6 +336,14 @@ VALID_RENDER_CASES = [
     ),
     RenderCase(
         CheckIssue(
+            CheckCode.PATH_INTERNAL.value,
+            IssueSeverity.ERROR,
+            Path("docs/internal/protocol.md"),
+            None,
+        ),
+    ),
+    RenderCase(
+        CheckIssue(
             CheckCode.RELATION_DUPLICATE.value,
             IssueSeverity.ERROR,
             Path("pages/question.md"),
