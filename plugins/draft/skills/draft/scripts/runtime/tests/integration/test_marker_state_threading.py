@@ -15,12 +15,14 @@ import pytest
 import draft.graph as graph_module
 import draft.operation_facts as facts_module
 from draft.checker import check_draft
+from draft.conclusions import CONCLUSIONS_PAGE, load_generation_graph
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import FORMAT_VERSION, MarkerSnapshot, MarkerState, load_graph, load_graph_tolerant
 from draft.lifecycle import adopt
 from draft.models import CheckReport, RootState
 from draft.operation_facts import load_operation_facts
+from draft.paths import resolve_draft_root
 from draft.query import load_tolerant_view
 from draft.structure import move_page
 from draft.vocabulary import ConclusionsState
@@ -210,6 +212,37 @@ def test_load_tolerant_view_consumes_passed_state_without_reading(
     assert marker_reads == [root]
     assert threaded.blocking_paths == direct.blocking_paths
     assert set(threaded.graph.pages) == set(direct.graph.pages)
+
+
+def test_generate_conclusions_dry_run_branch_consumes_snapshot(
+    draft_factory: DraftFactory, marker_reads: list[Path]
+) -> None:
+    """generate-conclusions 预演分支按同一快照单次读取。
+
+    组合 cli.py dry-run 分支自身（快照后调 load_tolerant_view 与
+    load_generation_graph）的读取序列，调用顺序与真实分支一致。真实 CLI 入口在
+    分支之前还会经 main 的 select_managed_root 门禁读取一次 marker（round-1
+    问题 4 已登记为根选择职责，不属于 marker 状态穿透不变量），故本用例只钉住
+    分支内部序列：穿透后快照读 1 次 + 两个入口各零读取 = 恰好 1 次。
+    """
+    from draft.graph import read_marker_snapshot
+
+    root = draft_factory({"index.md": PAGE_INDEX, "pages/a.md": PAGE_A})
+
+    resolved = resolve_draft_root(root)
+    marker = read_marker_snapshot(resolved)
+    state = marker.state.conclusions_state
+    view = load_tolerant_view(resolved, marker_state=marker.state)
+    blocking = [
+        path
+        for path in view.blocking_paths
+        if not (state is ConclusionsState.GENERATED and path == CONCLUSIONS_PAGE)
+    ]
+    assert blocking == []
+    graph = load_generation_graph(resolved, marker_state=marker.state)
+    assert set(graph.pages) == {Path("index.md"), Path("pages/a.md")}
+
+    assert marker_reads == [root]
 
 
 def test_registered_write_command_reads_marker_twice(

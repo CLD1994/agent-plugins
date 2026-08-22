@@ -518,13 +518,18 @@ def generate_conclusions(root: Path) -> GenerationPlan:
     return plan
 
 
-def load_generation_graph(root: Path) -> DraftGraph:
-    """读取所有权状态并加载生成器可重写结论页的容错快照。"""
+def load_generation_graph(root: Path, *, marker_state: MarkerState | None = None) -> DraftGraph:
+    """加载生成器可重写结论页的容错快照。
+
+    调用方持有同根 marker 状态时必须传入（与 load_graph_tolerant 同一不变量），
+    传入后零读取；缺省时自读一次所有权状态。
+    """
     from draft.graph import read_marker
     from draft.paths import resolve_draft_root
 
     resolved = resolve_draft_root(root)
-    marker_state = read_marker(resolved)
+    if marker_state is None:
+        marker_state = read_marker(resolved)
     return _load_graph_with_conclusions(resolved, marker_state)
 
 

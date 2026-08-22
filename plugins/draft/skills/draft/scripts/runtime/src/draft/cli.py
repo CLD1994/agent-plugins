@@ -978,7 +978,7 @@ def _dispatch(
 
             marker = read_marker_snapshot(resolved)
             state = marker.state.conclusions_state
-            view = load_tolerant_view(resolved)
+            view = load_tolerant_view(resolved, marker_state=marker.state)
             blocking = [
                 path
                 for path in view.blocking_paths
@@ -987,7 +987,7 @@ def _dispatch(
             if blocking:
                 details = tuple(path.as_posix() for path in blocking)
                 raise DraftError("conclusions.incomplete", resolved, details=details)
-            graph = load_generation_graph(resolved)
+            graph = load_generation_graph(resolved, marker_state=marker.state)
             plan = plan_generation(graph, marker=marker)
             if plan.operation is None:
                 # 无已确认页面或幂等无变化：成功返回空 effects 与业务事实。
