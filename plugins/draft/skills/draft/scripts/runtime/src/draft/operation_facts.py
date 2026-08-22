@@ -35,7 +35,9 @@ def load_operation_facts(root: Path, *, allow_hub_empty: Path | None = None) -> 
     """一次读取 marker snapshot 并按根状态选择健康门禁；返回图、快照、阻碍与读集观察。
 
     marker snapshot 是本计划唯一的根事实：root_state、原始 bytes 与观察摘要全部来自
-    同一个不可变对象（round-15 H1）。registered：完整健康门禁（check_draft，含操作/
+    同一个不可变对象（round-15 H1）。marker.state 贯穿 check 与加载边界，加载链
+    marker 恰好读取一次（另有 execute_plan 提交前校验对应用后状态的独立读取）。
+    registered：完整健康门禁（check_draft，含操作/
     trash/内部命名空间；任一错误即拒绝）。``allow_hub_empty`` 供 collapse 容忍目标枢纽
     的 HUB_EMPTY（折叠正是修复它）。candidate：全受管页可判定加载，具体页阻碍由业务
     模块按闭包拒绝。
@@ -46,7 +48,7 @@ def load_operation_facts(root: Path, *, allow_hub_empty: Path | None = None) -> 
     resolved = resolve_draft_root(root)
     marker = read_marker_snapshot(resolved)
     if marker.state.root_state is RootState.REGISTERED:
-        report = check_draft(resolved)
+        report = check_draft(resolved, marker_state=marker.state)
         errors = [
             issue
             for issue in report.errors
@@ -64,14 +66,14 @@ def load_operation_facts(root: Path, *, allow_hub_empty: Path | None = None) -> 
                 details=first.details,
                 line=first.line,
             )
-        graph = load_graph(resolved)
+        graph = load_graph(resolved, marker_state=marker.state)
         return OperationFacts(
             graph=graph,
             marker=marker,
             blocking_paths=(),
             observations=graph_observations(graph, marker=marker),
         )
-    view = load_tolerant_view(resolved)
+    view = load_tolerant_view(resolved, marker_state=marker.state)
     return OperationFacts(
         graph=view.graph,
         marker=marker,

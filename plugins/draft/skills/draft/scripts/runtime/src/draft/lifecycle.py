@@ -116,7 +116,7 @@ def adopt(root: Path) -> OperationResult:
     if (target / INTERNAL_DIR / "operation.lock").exists():
         raise DraftError("adopt.locked", target)
     # 完整候选检查（无过滤无分页）：candidate 与 registered 共享检查协议。
-    report = check_draft(target)
+    report = check_draft(target, marker_state=state)
     if report.errors:
         raise DraftError(
             "adopt.invalid_candidate",
@@ -128,7 +128,7 @@ def adopt(root: Path) -> OperationResult:
     if sha256_bytes(before_bytes) == sha256_bytes(after_bytes):
         # 结构性排除 before==after：不得写入前后摘要相同的 adopt journal。
         raise DraftError(CheckCode.FORMAT_INVALID.value, target / MARKER_PATH)
-    graph = load_graph_tolerant(target).graph
+    graph = load_graph_tolerant(target, marker_state=state).graph
     from draft.observations import (
         Observation,
         ObservationManifest,

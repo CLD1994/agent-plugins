@@ -21,6 +21,7 @@ from draft.graph import (
     ROOT_PAGE,
     DraftGraph,
     MarkerSnapshot,
+    MarkerState,
 )
 from draft.models import (
     FileMutation,
@@ -501,7 +502,7 @@ def generate_conclusions(root: Path) -> GenerationPlan:
     resolved = resolve_draft_root(root)
     marker = read_marker_snapshot(resolved)
     state = marker.state.conclusions_state
-    view = load_tolerant_view(resolved)
+    view = load_tolerant_view(resolved, marker_state=marker.state)
     blocking = [
         path
         for path in view.blocking_paths
@@ -510,7 +511,7 @@ def generate_conclusions(root: Path) -> GenerationPlan:
     if blocking:
         details = tuple(path.as_posix() for path in blocking)
         raise DraftError("conclusions.incomplete", resolved, details=details)
-    graph = _load_graph_with_conclusions(resolved, state)
+    graph = _load_graph_with_conclusions(resolved, marker.state)
     plan = plan_generation(graph, marker=marker)
     if plan.operation is not None:
         execute_plan(plan.operation)
@@ -523,17 +524,20 @@ def load_generation_graph(root: Path) -> DraftGraph:
     from draft.paths import resolve_draft_root
 
     resolved = resolve_draft_root(root)
-    state = read_marker(resolved).conclusions_state
-    return _load_graph_with_conclusions(resolved, state)
+    marker_state = read_marker(resolved)
+    return _load_graph_with_conclusions(resolved, marker_state)
 
 
-def _load_graph_with_conclusions(root: Path, state: ConclusionsState) -> DraftGraph:
+def _load_graph_with_conclusions(
+    root: Path, marker_state: MarkerState | None
+) -> DraftGraph:
     """专用容错加载：generated 时容忍缺失/损坏的结论页（可替换目标）。"""
     from draft.graph import load_graph_tolerant
 
+    state = marker_state.conclusions_state if marker_state is not None else None
     if state is ConclusionsState.GENERATED:
         conclusions = root / CONCLUSIONS_PAGE
         if conclusions.is_file() and not conclusions.is_symlink():
             # 保留文件以便生成器重写；不在这里做普通加载期检查。
             pass
-    return load_graph_tolerant(root).graph
+    return load_graph_tolerant(root, marker_state=marker_state).graph

@@ -18,10 +18,13 @@ from draft.checker import check_draft
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import FORMAT_VERSION, MarkerSnapshot, MarkerState, load_graph, load_graph_tolerant
+from draft.lifecycle import adopt
 from draft.models import CheckReport, RootState
+from draft.operation_facts import load_operation_facts
 from draft.query import load_tolerant_view
+from draft.structure import move_page
 from draft.vocabulary import ConclusionsState
-from tests.integration.support import DraftFactory, managed_marker_text
+from tests.integration.support import DraftFactory, build_valid_candidate, managed_marker_text
 
 PAGE_INDEX = """# Topic
 
@@ -207,3 +210,46 @@ def test_load_tolerant_view_consumes_passed_state_without_reading(
     assert marker_reads == [root]
     assert threaded.blocking_paths == direct.blocking_paths
     assert set(threaded.graph.pages) == set(direct.graph.pages)
+
+
+def test_registered_write_command_reads_marker_twice(
+    draft_factory: DraftFactory, marker_reads: list[Path]
+) -> None:
+    """registered move 全链 marker 事实恰好读取两次。
+
+    第 1 次是 load_operation_facts 的 snapshot；第 2 次是 execute_plan 提交前
+    校验（operations._check）对应用后状态的新鲜读取。加载链内的
+    check_draft/load_graph/load_graph_tolerant 消费传入状态，不再各自读取
+    （round-15 H1：同一操作计划的 marker 事实不得来自后续 live 读取）。
+    提交前校验不得改传 snapshot：GENERATE_CONCLUSIONS 会把 marker 推进为
+    generated，校验必须按应用后的所有权分类。
+    """
+    root = draft_factory({"index.md": PAGE_INDEX, "pages/a.md": PAGE_A})
+
+    move_page(root, Path("pages/a.md"), Path("pages/c.md"))
+
+    assert (root / "pages/c.md").is_file()
+    assert marker_reads == [root, root]
+
+
+def test_candidate_facts_read_marker_once(
+    tmp_path: Path, marker_reads: list[Path]
+) -> None:
+    """candidate facts 链：snapshot 一次，tolerant 视图消费传入状态。"""
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+
+    facts = load_operation_facts(root)
+
+    assert facts.root_state is RootState.CANDIDATE
+    assert marker_reads == [root]
+
+
+def test_adopt_reads_marker_once(tmp_path: Path, marker_reads: list[Path]) -> None:
+    """adopt 全链 marker 事实恰好读取一次（preallocate 前的 snapshot）。"""
+    root = tmp_path / "candidate"
+    build_valid_candidate(root)
+
+    adopt(root)
+
+    assert marker_reads == [root]

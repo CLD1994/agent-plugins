@@ -589,13 +589,15 @@ def _build_restore_plan_impl(
     if sha256_file(resolved / parent_path) != parent_hash:
         raise DraftError("operation.validation_failed", parent_path, details=("restore_conflict",))
     if root_state is RootState.REGISTERED:
-        report = check_draft(resolved, include_operation_state=False)
+        report = check_draft(
+            resolved, include_operation_state=False, marker_state=marker.state
+        )
         if report.errors:
             codes = tuple(issue.code for issue in report.errors)
             raise DraftError("operation.validation_failed", resolved, details=codes)
-        graph = load_graph(resolved)
+        graph = load_graph(resolved, marker_state=marker.state)
     else:
-        view = load_tolerant_view(resolved)
+        view = load_tolerant_view(resolved, marker_state=marker.state)
         graph = view.graph
         if view.blocking_paths and collapsed:
             # 折叠恢复需重写所有指向叶页的入站链接：不可解析页面可能隐藏链接。
