@@ -17,6 +17,7 @@ from draft.graph import (
 from draft.markdown import (
     append_parent_navigation,
     canonical_parent_navigation,
+    extract_body_links,
     insert_navigation_before_conclusions,
     navigation_removal_edits,
     rewrite_link_destinations,
@@ -30,15 +31,18 @@ from draft.models import (
     OperationResult,
     SourceSpan,
 )
+from draft.move_closure import MoveClosure
 from draft.observations import ObservationManifest
 from draft.operation_facts import OperationFacts
 from draft.operations import execute_plan, read_lock, sha256_bytes
 from draft.paths import physical_parent, resolve_draft_root
 from draft.plan_effects import PlanAction, PlanEffect
 from draft.resources import (
+    ProbeState,
     ResourceIdentity,
     ResourceKind,
     rebase_body_destination,
+    resolve_body_resource,
 )
 from draft.vocabulary import ConclusionsState, RelationCode
 
@@ -541,3 +545,87 @@ def collapse_hub(root: Path, hub: Path) -> OperationResult:
         observations=facts.observations,
     )
     return execute_plan(plan)
+
+
+def _unmanaged_moved_identities(
+    root: Path, unmanaged_moves: Mapping[Path, Path]
+) -> dict[ResourceIdentity, ResourceIdentity]:
+    """未受管理旧路径的资源身份按词法分类解析（根级/非 pages 为 LOCAL），
+    与链接者侧的解析保持一致，保证 moved_targets 命中。"""
+
+    def _present(_path: Path) -> ProbeState:
+        return ProbeState.FILE
+
+    identities: dict[ResourceIdentity, ResourceIdentity] = {}
+    for old, new in unmanaged_moves.items():
+        old_identity = resolve_body_resource(
+            root, ROOT_PAGE, old.as_posix(), target_probe=_present
+        ).identity
+        new_identity = resolve_body_resource(
+            root, ROOT_PAGE, new.as_posix(), target_probe=_present
+        ).identity
+        identities[old_identity] = new_identity
+    return identities
+
+
+def _assert_link_extractable(path: Path, text: str) -> None:
+    try:
+        extract_body_links(text)
+    except DraftError as error:
+        raise DraftError("operation.plan_invalid", path, details=(error.code,)) from error
+
+
+def _plan_unmanaged(
+    root: Path,
+    closure: MoveClosure,
+    unmanaged_moves: Mapping[Path, Path],
+    moved_targets: Mapping[ResourceIdentity, ResourceIdentity],
+) -> tuple[list[FileMutation], list[PlanEffect]]:
+    mutations: list[FileMutation] = []
+    effects: list[PlanEffect] = []
+    for path in sorted(closure.unmanaged, key=lambda item: item.as_posix()):
+        file = closure.unmanaged[path]
+        new_source = unmanaged_moves.get(path, path)
+        edits: dict[SourceSpan, str] = {}
+        for reference in file.references:
+            destination = rebase_body_destination(
+                reference.resource, new_source=new_source, moved_targets=moved_targets
+            )
+            if destination != reference.link.destination:
+                edits[reference.link.destination_span] = destination
+        rendered = rewrite_link_destinations(file.text, edits) if edits else file.text
+        if path in unmanaged_moves:
+            _assert_link_extractable(new_source, rendered)
+            rendered_bytes = rendered.encode("utf-8")
+            mutations.append(
+                FileMutation(
+                    new_source,
+                    MutationKind.WRITE,
+                    None,
+                    sha256_bytes(rendered_bytes),
+                    rendered_bytes,
+                )
+            )
+            mutations.append(
+                FileMutation(
+                    path,
+                    MutationKind.DELETE,
+                    sha256_bytes(file.text.encode("utf-8")),
+                    None,
+                    None,
+                )
+            )
+            effects.append(PlanEffect(action=PlanAction.MOVE, from_path=path, to_path=new_source))
+        elif rendered != file.text:
+            rendered_bytes = rendered.encode("utf-8")
+            mutations.append(
+                FileMutation(
+                    path,
+                    MutationKind.WRITE,
+                    sha256_bytes(file.text.encode("utf-8")),
+                    sha256_bytes(rendered_bytes),
+                    rendered_bytes,
+                )
+            )
+            effects.append(PlanEffect(action=PlanAction.MODIFY, path=path))
+    return mutations, effects
