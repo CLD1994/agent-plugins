@@ -11,6 +11,7 @@ from draft.diagnostic_codes import (
 from draft.errors import DraftError
 from draft.markdown import (
     append_parent_navigation,
+    extract_body_links,
     locate_status_value_span,
     parse_page,
     remove_link_markup,
@@ -451,3 +452,37 @@ def test_insert_navigation_before_conclusions_no_conclusion_returns_unchanged() 
         text, "乙", "pages/b.md", conclusions_target=Path("conclusions.md")
     )
     assert result == text
+
+
+def test_extract_body_links_without_machine_block() -> None:
+    text = "正文 [旧稿](00-background-and-evidence.md) 与 ![图](img/a.png)。\n"
+
+    links = extract_body_links(text)
+
+    assert [(link.destination, link.is_image) for link in links] == [
+        ("00-background-and-evidence.md", False),
+        ("img/a.png", True),
+    ]
+    assert links[0].destination_span == SourceSpan(
+        text.index("00-background-and-evidence.md"),
+        text.index("00-background-and-evidence.md") + len("00-background-and-evidence.md"),
+    )
+
+
+def test_extract_body_links_resolves_defined_reference_links() -> None:
+    text = "看 [旧稿][legacy]。\n\n[legacy]: 00-bg.md \"标题\"\n"
+
+    assert [link.destination for link in extract_body_links(text)] == ["00-bg.md"]
+
+
+def test_extract_body_links_ignores_undefined_reference_forms() -> None:
+    text = "看 [旧稿][legacy] 与 <00-bg.md>。\n"
+
+    assert extract_body_links(text) == ()
+
+
+def test_extract_body_links_alignment_failure_raises_parse_error() -> None:
+    text = "看 [x](a\\.md)。\n"
+
+    with pytest.raises(DraftError, match=CheckCode.PAGE_PARSE_ERROR.value):
+        extract_body_links(text)

@@ -669,6 +669,36 @@ def parse_page(path: Path, text: str) -> PageDocument:
     )
 
 
+def extract_body_links(text: str) -> tuple[MarkdownLink, ...]:
+    """提取正文 CommonMark 链接，不要求标题与机器块。
+
+    供未受管理文件的链接可判定性判定与改写使用（规格 §4.1）：与
+    parse_page 共享同一对齐管线，对齐失败同样抛 page.parse_error，
+    由调用方归类为阻碍。
+    """
+    tokens = COMMONMARK.parse(text, {})
+    starts = _line_starts(text)
+    lines = text.split("\n")
+    definitions = _scan_definitions(lines, starts, _fenced_line_ranges(lines))
+    candidates = _scan_candidates(text, starts, definitions)
+    token_links = _token_links(tokens)
+    aligned = _align_candidates(candidates, token_links)
+    links: list[MarkdownLink] = []
+    for candidate, _token in aligned:
+        links.append(
+            MarkdownLink(
+                label=candidate.raw_label,
+                destination=candidate.destination,
+                destination_span=SourceSpan(candidate.dest_start, candidate.dest_end),
+                whole_span=SourceSpan(candidate.start, candidate.end),
+                line=_line_of(starts, candidate.start),
+                is_image=candidate.is_image,
+                reference_label=candidate.reference_label,
+            )
+        )
+    return tuple(links)
+
+
 def locate_status_value_span(text: str) -> SourceSpan:
     """Return the span of the backticked status value, including backticks."""
     tokens = COMMONMARK.parse(text, {})
