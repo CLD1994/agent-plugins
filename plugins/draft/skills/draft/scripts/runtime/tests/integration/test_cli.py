@@ -11,12 +11,21 @@ import pytest
 from draft import __version__
 from draft.cli import main
 from draft.diagnostic_codes import CheckCode
+from draft.models import RootState
 from draft.vocabulary import ConclusionsState
 from tests.integration.support import (
+    DraftFactory,
     build_valid_candidate,
     managed_marker_text,
     snapshot_tree,
 )
+
+PAGE_INDEX = """# 根
+
+> 状态：`已确认：根索引`
+
+正文。
+"""
 
 
 def test_version_prints_package_version(capsys: pytest.CaptureFixture[str]) -> None:
@@ -872,6 +881,81 @@ def test_move_with_relative_root_from_cwd(
     assert code == 0
     assert "ok" not in payload
     assert (root / "pages/renamed.md").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Task 9：move 命令面 SOURCE... TARGET 双类型形态与分派。
+# ---------------------------------------------------------------------------
+
+
+def test_move_shape_requires_source_and_target(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+
+    code, payload = run_json(
+        ["move", "pages/a.md", "--root", str(root), "--json"], capsys
+    )
+
+    assert code == 2
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "cli.move_operands_invalid"
+
+
+def test_move_file_target_rejects_multiple_sources(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "a.md").write_text("甲。\n", encoding="utf-8")
+    (root / "b.md").write_text("乙。\n", encoding="utf-8")
+
+    code, payload = run_json(
+        ["move", "a.md", "b.md", "pages/c.md", "--root", str(root), "--json"], capsys
+    )
+
+    assert code == 2
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "cli.move_operands_invalid"
+
+
+def test_move_prefix_target_promotes_unmanaged_file(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "stray.md").write_text("正文。\n", encoding="utf-8")
+
+    code, payload = run_json(
+        ["move", "stray.md", "pages", "--root", str(root), "--json"], capsys
+    )
+
+    assert code == 0
+    assert payload["result_type"] == "move"
+    assert (root / "pages/stray.md").is_file()
+    assert not (root / "stray.md").exists()
+
+
+def test_move_dry_run_reports_effects_without_writing(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "stray.md").write_text("正文。\n", encoding="utf-8")
+
+    code, _payload = run_json(
+        ["move", "stray.md", "pages", "--root", str(root), "--dry-run", "--json"],
+        capsys,
+    )
+
+    assert code == 0
+    assert (root / "stray.md").is_file()            # 预演零写入
+    assert not (root / "pages/stray.md").exists()
+
+    code, _payload = run_json(
+        ["move", "stray.md", "pages", "--root", str(root), "--json"], capsys
+    )
+    assert code == 0
+    assert (root / "pages/stray.md").is_file()      # 正式执行后就位
 
 
 # ---------------------------------------------------------------------------

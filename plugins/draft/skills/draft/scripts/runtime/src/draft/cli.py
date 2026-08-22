@@ -6,7 +6,7 @@ import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 
 from draft import __version__
@@ -105,11 +105,20 @@ def build_parser() -> argparse.ArgumentParser:
     move = subparsers.add_parser(
         "move",
         parents=[rooted],
-        help="移动页面",
-        description="把 SOURCE 页面连同其子页移动到 TARGET 位置，并更新网络链接。",
+        help="移动页面或未受管理文件",
+        description=(
+            "把一个或多个 SOURCE 移动到 TARGET，并重算全部可证明的相关链接。"
+            "TARGET 以 .md 结尾时是文件目标，只允许单个文件 SOURCE；"
+            "否则是前缀目标，来源按基名或目录名落入其下。"
+            "目录 SOURCE 只移动其中的 .md 普通文件，其余内容原地留下。"
+        ),
     )
-    move.add_argument("source", metavar="SOURCE", help="源页面相对路径（如 pages/a.md）")
-    move.add_argument("target", metavar="TARGET", help="目标页面相对路径")
+    move.add_argument(
+        "operands",
+        metavar="OPERAND",
+        nargs="+",
+        help="SOURCE... TARGET（最后一个操作数是 TARGET）",
+    )
     _add_dry_run_args(move)
 
     promote = subparsers.add_parser(
@@ -345,8 +354,6 @@ def _emit(payload: dict[str, object], json_mode: bool, human: str) -> None:
 
 def _check_path_prefix(value: str) -> Path:
     """校验 --path-prefix：必须是规范根内 POSIX 相对路径，绝对/..//空 都拒绝。"""
-    from pathlib import PurePosixPath
-
     posix = PurePosixPath(value)
     if not value or posix.is_absolute() or ".." in posix.parts:
         raise argparse.ArgumentTypeError(f"非法的根内路径前缀：{value!r}")
@@ -756,28 +763,32 @@ def _dispatch(
         adopt(root)
         return {"result_type": ResultType.ADOPT.value, "root": str(root)}, f"已接管草稿：{root}", 0
     if command == "move":
-        from draft.structure import move_page, plan_move
+        from draft.structure import move_entries, plan_move_from_arguments
 
-        source = _page_operand(root, cast(str, args.source))
-        target = _page_operand(root, cast(str, args.target))
+        operands = [cast(str, value) for value in args.operands]
+        if len(operands) < 2:
+            raise DraftError(
+                "cli.move_operands_invalid", details=("至少需要一个 SOURCE 和一个 TARGET",)
+            )
+        sources, target = operands[:-1], operands[-1]
+        if PurePosixPath(target).suffix == ".md" and len(sources) > 1:
+            raise DraftError(
+                "cli.move_operands_invalid", details=("文件目标只允许一个文件 SOURCE",)
+            )
         if _is_dry_run(args):
             return _dry_run_write(
                 args,
                 root=root,
                 operation=DryRunOperation.MOVE,
-                build=lambda facts: plan_move(
-                    facts.graph,
-                    source,
-                    target,
-                    marker=facts.marker,
-                    observations=facts.observations,
-                ),
+                build=lambda facts: plan_move_from_arguments(root, facts, sources, target),
             )
         _reject_pagination_without_dry_run(args)
-        result = move_page(root, source, target)
+        result = move_entries(root, sources, target)
         payload: dict[str, object] = {"result_type": ResultType.MOVE.value}
         payload.update(_write_payload(result))
-        return payload, f"已移动 {source} → {target}", 0
+        if len(sources) == 1:
+            return payload, f"已移动 {sources[0]} → {target}", 0
+        return payload, f"已移动 {len(sources)} 个来源 → {target}", 0
     if command == "promote":
         from draft.structure import plan_promote, promote_page
 

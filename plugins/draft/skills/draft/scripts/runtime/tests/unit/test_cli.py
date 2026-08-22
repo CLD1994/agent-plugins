@@ -177,19 +177,17 @@ def test_dispatch_adopt_calls_adopt_and_returns_success(mocker: MockerFixture) -
 # ---------------------------------------------------------------------------
 
 
-def test_dispatch_move_calls_move_page_with_paged_operands(mocker: MockerFixture) -> None:
+def test_dispatch_move_calls_move_entries_with_operands(mocker: MockerFixture) -> None:
     args = cli.build_parser().parse_args(["move", "--root", "/draft", "pages/a.md", "pages/b.md"])
-    resolve_page_operand = mocker.patch("draft.paths.resolve_page_operand", autospec=True)
-    move_page = mocker.patch("draft.structure.move_page", autospec=True)
-    resolve_page_operand.side_effect = [_resolved("pages/a.md"), _resolved("pages/b.md")]
-    move_page.return_value = _operation_result(kind="move")
-    payload, human, exit_code = cli._dispatch(args, root=Path("/draft"))  # pyright: ignore[reportPrivateUsage]  # 验证 move 分派到 move_page 并组装操作载荷
-    move_page.assert_called_once_with(Path("/draft"), Path("pages/a.md"), Path("pages/b.md"))
+    move_entries = mocker.patch("draft.structure.move_entries", autospec=True)
+    move_entries.return_value = _operation_result(kind="move")
+    payload, human, exit_code = cli._dispatch(args, root=Path("/draft"))  # pyright: ignore[reportPrivateUsage]  # 验证 move 分派到 move_entries 并组装操作载荷
+    move_entries.assert_called_once_with(Path("/draft"), ["pages/a.md"], "pages/b.md")
     assert payload == {
         "result_type": "move",
         "changed_paths": ["pages/a.md", "pages/b.md"],
     }
-    _assert_human_result(human, Path("pages/a.md"), Path("pages/b.md"))
+    _assert_human_result(human, "pages/a.md", "pages/b.md")
     assert exit_code == 0
 
 
