@@ -290,6 +290,13 @@ _SPECS: dict[CheckCode, DiagnosticSpec] = {
     CheckCode.OPERATION_JOURNAL_CORRUPT: DiagnosticSpec(
         _FILE, _fixed(0), _text("操作锁或日志损坏")
     ),
+    CheckCode.OPERATION_JOURNAL_VERSION_UNSUPPORTED: DiagnosticSpec(
+        _FILE,
+        _fixed(2),
+        lambda details: (
+            f"journal 版本 {_safe(details[0])} 不受支持，仅接受版本 {_safe(details[1])}"
+        ),
+    ),
     CheckCode.OPERATION_RECOVERY_REQUIRED: DiagnosticSpec(
         _FILE, _fixed(1), lambda details: f"操作 {_safe(details[0])} 需要恢复"
     ),
