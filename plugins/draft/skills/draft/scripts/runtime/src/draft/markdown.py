@@ -683,6 +683,9 @@ def extract_body_links(text: str) -> tuple[MarkdownLink, ...]:
     candidates = _scan_candidates(text, starts, definitions)
     token_links = _token_links(tokens)
     aligned = _align_candidates(candidates, token_links)
+    # 与 parse_page 的链接组装仅 label 来源不同：此处取 candidate.raw_label 而非
+    # token_link.label（round-1 L2）。闭包扫描的消费者只使用 destination_span 做改写
+    # 判定，label 差异无语义影响；raw_label 是候选文本原样，不依赖 token 对齐结果。
     links: list[MarkdownLink] = []
     for candidate, _token in aligned:
         links.append(

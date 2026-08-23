@@ -83,9 +83,15 @@ def _expand_mapping(graph: DraftGraph, page_map: Mapping[Path, Path]) -> dict[Pa
             else:
                 expanded[child] = base / child.name
             queue.append(child)
-    targets = list(expanded.values())
-    if len(set(targets)) != len(targets):
-        raise DraftError("structure.duplicate_basename")
+    if len(set(expanded.values())) != len(expanded):
+        # 规格 §2.4：批量内目标唯一性碰撞以 structure.conflict 点名双方来源。
+        seen: dict[Path, Path] = {}
+        for old, new in expanded.items():
+            if new in seen:
+                raise DraftError(
+                    "structure.conflict", new, details=(old.as_posix(), seen[new].as_posix())
+                )
+            seen[new] = old
     for target in expanded.values():
         if target in graph.pages and target not in expanded:
             raise DraftError("structure.target_exists", target)
@@ -259,40 +265,16 @@ def _render_pages(
     return rendered
 
 
-def plan_path_remap(
+def _assemble_managed_changes(
     graph: DraftGraph,
-    page_map: Mapping[Path, Path],
-    parent_changes: Mapping[Path, Path],
-    *,
-    kind: OperationKind = OperationKind.MOVE,
-    marker: MarkerSnapshot,
-    observations: ObservationManifest,
-    extra_moved_targets: Mapping[ResourceIdentity, ResourceIdentity] | None = None,
-    pre_expanded: Mapping[Path, Path] | None = None,
-) -> OperationPlan:
-    # 结构变换不把全图 check_graph 结果当门禁：已可解析的无关全局错误不阻止本次
-    # 操作（计划 Task 10 Step 1）。registered 的完整健康门禁由 load_operation_facts
-    # 在规划前强制执行；candidate 只拒绝不可解析页（blocking_paths）。
-    expanded = dict(pre_expanded) if pre_expanded is not None else _expand_mapping(graph, page_map)
-    final_parents = _final_parents(graph, expanded, parent_changes)
-    for page, final_parent in final_parents.items():
-        final_path = expanded.get(page, page)
-        if physical_parent(final_path) != final_parent:
-            raise DraftError("structure.parent_mismatch", page)
-    _collapse_empty_hubs(graph, expanded, final_parents)
-    # 降级改变枢纽最终路径后重新推导父映射；不级联再次降级。
-    final_parents = _final_parents(graph, expanded, parent_changes)
-    # 机器结论所有权只由 conclusions_state 判定：candidate 与 registered 的 generated
-    # 都表示机器拥有 conclusions.md（round-15 M2），不得绑定 root_state。
-    conclusions_generated = marker.state.conclusions_state is ConclusionsState.GENERATED
-    rendered = _render_pages(
-        graph,
-        expanded,
-        parent_changes,
-        skip_conclusions_links=conclusions_generated,
-        extra_moved_targets=extra_moved_targets,
-    )
+    expanded: Mapping[Path, Path],
+    rendered: Mapping[Path, str],
+) -> tuple[list[FileMutation], list[PlanEffect]]:
+    """把渲染结果集与展开映射组装为受管理页 mutation/effect。
 
+    plan_path_remap 与纯未受管理移动分支共用同一组装（M2）：``final_path != path``
+    产生 WRITE+DELETE 移动对，原地仅产生 MODIFY；字节恒等者跳过。
+    """
     mutations: list[FileMutation] = []
     effects: list[PlanEffect] = []
     for path in sorted(graph.pages, key=str):
@@ -332,6 +314,44 @@ def plan_path_remap(
                 )
             )
             effects.append(PlanEffect(action=PlanAction.MODIFY, path=path))
+    return mutations, effects
+
+
+def plan_path_remap(
+    graph: DraftGraph,
+    page_map: Mapping[Path, Path],
+    parent_changes: Mapping[Path, Path],
+    *,
+    kind: OperationKind = OperationKind.MOVE,
+    marker: MarkerSnapshot,
+    observations: ObservationManifest,
+    extra_moved_targets: Mapping[ResourceIdentity, ResourceIdentity] | None = None,
+    pre_expanded: Mapping[Path, Path] | None = None,
+) -> OperationPlan:
+    # 结构变换不把全图 check_graph 结果当门禁：已可解析的无关全局错误不阻止本次
+    # 操作（计划 Task 10 Step 1）。registered 的完整健康门禁由 load_operation_facts
+    # 在规划前强制执行；candidate 只拒绝不可解析页（blocking_paths）。
+    expanded = dict(pre_expanded) if pre_expanded is not None else _expand_mapping(graph, page_map)
+    final_parents = _final_parents(graph, expanded, parent_changes)
+    for page, final_parent in final_parents.items():
+        final_path = expanded.get(page, page)
+        if physical_parent(final_path) != final_parent:
+            raise DraftError("structure.parent_mismatch", page)
+    _collapse_empty_hubs(graph, expanded, final_parents)
+    # 降级改变枢纽最终路径后重新推导父映射；不级联再次降级。
+    final_parents = _final_parents(graph, expanded, parent_changes)
+    # 机器结论所有权只由 conclusions_state 判定：candidate 与 registered 的 generated
+    # 都表示机器拥有 conclusions.md（round-15 M2），不得绑定 root_state。
+    conclusions_generated = marker.state.conclusions_state is ConclusionsState.GENERATED
+    rendered = _render_pages(
+        graph,
+        expanded,
+        parent_changes,
+        skip_conclusions_links=conclusions_generated,
+        extra_moved_targets=extra_moved_targets,
+    )
+
+    mutations, effects = _assemble_managed_changes(graph, expanded, rendered)
     writes = sorted(
         (mutation for mutation in mutations if mutation.kind is MutationKind.WRITE),
         key=lambda mutation: str(mutation.path),
@@ -444,13 +464,15 @@ def plan_move_request(
         and len(request.sources) == 1
         and request.sources[0].kind is SourceKind.MANAGED_PAGE
     ):
+        # 委托 plan_move：其 _validate_operand/_validate_target 已等价覆盖 validate_results
+        # 的命名空间/既有页/父缺失检查（round-1 已实证），单来源无批内碰撞，无需
+        # _validate_cross_collisions。
         source = request.sources[0].path
         return plan_move(
             graph, source, request.target.path, marker=marker, observations=observations
         )
 
-    directory_sources = [s.path for s in request.sources if s.kind is SourceKind.DIRECTORY]
-    validate_results(graph, request.results, directory_sources)
+    validate_results(graph, request)
 
     managed_pairs: dict[Path, Path] = {}
     physical_pairs: dict[Path, Path] = {}
@@ -494,7 +516,8 @@ def plan_move_request(
         )
         for old, new in expanded.items()
     }
-    moved_targets.update(_unmanaged_moved_identities(graph.root, unmanaged_moves))
+    unmanaged_identities = _unmanaged_moved_identities(graph.root, unmanaged_moves)
+    moved_targets.update(unmanaged_identities)
 
     if expanded or parent_changes:
         managed_plan = plan_path_remap(
@@ -505,7 +528,7 @@ def plan_move_request(
             marker=marker,
             observations=observations,
             pre_expanded=expanded,
-            extra_moved_targets=_unmanaged_moved_identities(graph.root, unmanaged_moves),
+            extra_moved_targets=unmanaged_identities,
         )
         base_mutations = list(managed_plan.mutations)
         base_effects = list(managed_plan.effects)
@@ -513,31 +536,17 @@ def plan_move_request(
     elif unmanaged_moves:
         # 无受管理移动但存在未受管理来源移动：受管理链接者仍须重写指向移动目标的正文
         # 链接。此路径只重渲染正文，不经过 plan_path_remap 的父映射门禁——未声明父
-        # 关系的受管理页仍可参与链接重写（纯未受管理移动不改变父结构）。
+        # 关系的受管理页仍可参与链接重写（纯未受管理移动不改变父结构）。展开为空时
+        # _assemble_managed_changes 只产生原地 MODIFY，与受管理路径同一组装。
         conclusions_generated = marker.state.conclusions_state is ConclusionsState.GENERATED
         rendered = _render_pages(
             graph,
             {},
             {},
             skip_conclusions_links=conclusions_generated,
-            extra_moved_targets=_unmanaged_moved_identities(graph.root, unmanaged_moves),
+            extra_moved_targets=unmanaged_identities,
         )
-        base_mutations: list[FileMutation] = []
-        base_effects: list[PlanEffect] = []
-        for path in sorted(graph.pages, key=str):
-            rendered_bytes = rendered[path].encode("utf-8")
-            if rendered_bytes == graph.pages[path].text.encode("utf-8"):
-                continue
-            base_mutations.append(
-                FileMutation(
-                    path,
-                    MutationKind.WRITE,
-                    graph.page_digest(path),
-                    sha256_bytes(rendered_bytes),
-                    rendered_bytes,
-                )
-            )
-            base_effects.append(PlanEffect(action=PlanAction.MODIFY, path=path))
+        base_mutations, base_effects = _assemble_managed_changes(graph, {}, rendered)
         removable: tuple[Path, ...] = ()
     else:
         base_mutations = list[FileMutation]()
@@ -567,14 +576,18 @@ def _validate_cross_collisions(
     expanded: Mapping[Path, Path],
     unmanaged_moves: Mapping[Path, Path],
 ) -> None:
-    all_targets = [*expanded.values(), *unmanaged_moves.values()]
-    if len(set(all_targets)) != len(all_targets):
-        raise DraftError("structure.duplicate_basename")
+    combined = {**expanded, **unmanaged_moves}
+    if len(set(combined.values())) != len(combined):
+        # 规格 §2.4：跨类型（受管理展开 ∪ 未受管理）结果碰撞以 structure.conflict 点名双方。
+        seen: dict[Path, Path] = {}
+        for old, new in combined.items():
+            if new in seen:
+                raise DraftError(
+                    "structure.conflict", new, details=(old.as_posix(), seen[new].as_posix())
+                )
+            seen[new] = old
     for target in unmanaged_moves.values():
         if target in graph.pages and target not in expanded:
-            raise DraftError("structure.target_exists", target)
-    for target in expanded.values():
-        if target in unmanaged_moves.values():
             raise DraftError("structure.target_exists", target)
 
 
@@ -656,7 +669,14 @@ def _load_structure_facts(root: Path, *, allow_empty_hub: Path | None = None) ->
 
 
 def _load_clean_graph(root: Path, *, allow_empty_hub: Path | None = None) -> OperationFacts:
-    """（现行语义保持：事实加载 + blocking 即拒绝。）"""
+    """旧入口（move_page/promote_page/collapse_hub）的事实加载：任何 blocking 即拒绝。
+
+    blocking 即拒绝的根因：这些入口走 plan_move/plan_promote/plan_collapse，链接改写
+    依赖整图可解析；blocking_paths 非空时以部分事实改写链接不可靠，故直接以
+    structure.dirty 停止。统一 move 命令（move_entries）不在此列——它经 scan_move_closure
+    把未受管理链接者纳入闭包后用 merged_blocking 一并判断（规格 §4），事实加载不设
+    全局拒绝。
+    """
     facts = _load_structure_facts(root, allow_empty_hub=allow_empty_hub)
     if facts.blocking_paths:
         details = tuple(path.as_posix() for path in facts.blocking_paths)
@@ -692,6 +712,11 @@ def move_entries(
 
 
 def move_page(root: Path, source: Path, target: Path) -> OperationResult:
+    """旧单页移动入口：不含统一入站闭包（未受管理链接者指向被移页的链接不改写）。
+
+    CLI 的 move 命令已改用 move_entries；本入口保留给程序化调用方，其闭包范围与
+    move_entries 不同，需要命令一致语义时应改用 move_entries。
+    """
     resolved = resolve_draft_root(root)
     facts = _load_clean_graph(resolved)
     plan = plan_move(
@@ -799,6 +824,8 @@ def _plan_unmanaged(
             )
             effects.append(PlanEffect(action=PlanAction.MOVE, from_path=path, to_path=new_source))
         elif rendered != file.text:
+            # 规格 §4.3：本命令"改写"的文件同样必须可被对应解析器读取，与移动分支一致。
+            _assert_link_extractable(path, rendered)
             rendered_bytes = rendered.encode("utf-8")
             mutations.append(
                 FileMutation(

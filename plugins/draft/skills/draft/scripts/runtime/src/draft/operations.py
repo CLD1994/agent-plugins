@@ -25,7 +25,13 @@ from draft.models import (
     OperationResult,
     RootState,
 )
-from draft.observations import EntryKind, Observation, ObservationManifest, ObservationProbe
+from draft.observations import (
+    EntryKind,
+    Observation,
+    ObservationManifest,
+    ObservationProbe,
+    classify_node,
+)
 from draft.paths import resolve_draft_root
 from draft.plan_effects import public_changed_paths
 
@@ -655,26 +661,6 @@ def reject_symlink_components(root: Path, relative: Path) -> None:
         cursor = cursor / part
         if cursor.is_symlink():
             raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, cursor)
-
-
-def classify_node(path: Path) -> EntryKind:
-    """lstat 节点分类：missing/普通文件/目录/符号链接/其他。
-
-    悬空符号链接是 SYMLINK 而不是 MISSING：``Path.exists()`` 对悬空链接返回 False，
-    会把本应按链接/路径错误处理的现实状态折叠成幂等缺失（回归 M2）。所有清理与
-    恢复分支必须先分类再决策，不得用 ``exists()`` 作为类型判断前置。
-    """
-    try:
-        mode = os.lstat(path).st_mode
-    except FileNotFoundError:
-        return EntryKind.MISSING
-    if stat.S_ISLNK(mode):
-        return EntryKind.SYMLINK
-    if stat.S_ISREG(mode):
-        return EntryKind.FILE
-    if stat.S_ISDIR(mode):
-        return EntryKind.DIRECTORY
-    return EntryKind.OTHER
 
 
 def classify_node_or_error(path: Path, *, code: str, code_path: Path) -> EntryKind:

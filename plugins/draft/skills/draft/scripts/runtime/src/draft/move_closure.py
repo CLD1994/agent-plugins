@@ -63,7 +63,10 @@ def _scan_entry(
     blocking: set[Path],
 ) -> None:
     if absolute.is_symlink():
-        # 符号链接目标由 check 的 link.escape 问题进入既有 blocking。
+        # 闭包只承诺根内 .md 普通文件（规格 §4.1），符号链接不在扫描范围——此处跳过。
+        # 根级符号链接是否阻碍 move 不取决于本闭包：load_graph_tolerant 会对根级符号
+        # 链接产生 link.escape issue 进入既有 blocking_paths（round-1 L5 实证），move
+        # 经 merged_blocking 一并判断而被拒。
         return
     if absolute.is_dir():
         for descendant in sorted(absolute.rglob("*"), key=lambda item: item.as_posix()):

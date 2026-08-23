@@ -1,21 +1,29 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from pathlib import Path
+from collections.abc import Mapping, Sequence
+from pathlib import Path, PurePosixPath
 
 import pytest
 
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import DraftGraph, resolve_local_destination
 from draft.markdown import parse_page
 from draft.models import MarkdownLink, PageDocument, SourceSpan
 from draft.move_operands import (
+    MOVE_OPERANDS_INVALID,
+    MoveRequest,
+    MoveSource,
     MoveTarget,
+    SourceKind,
     TargetKind,
+    classify_move_request,
     is_internal_territory,
     map_sources,
     validate_results,
 )
+from draft.observations import EntryKind
+from draft.paths import ResolvedPath
 from draft.resources import resolve_page_resources
 from draft.vocabulary import RelationCode
 
@@ -165,28 +173,61 @@ def test_map_sources_file_takes_basename_directory_takes_own_name() -> None:
     }
 
 
+def _request_for_validation(
+    results: Mapping[Path, Path],
+    *,
+    directory_sources: Sequence[Path] = (),
+    target: Path = Path("pages"),
+) -> MoveRequest:
+    """按结果键与目录来源构造 MoveRequest：目录来源携带其结果键成员，其余键作文件来源。
+
+    validate_results 只依赖 results 与 DIRECTORY 来源的目录集，target 值不影响判定；
+    members 以结果键表达，满足 MoveRequest 键不变量。
+    """
+    sources: list[MoveSource] = []
+    claimed: set[Path] = set()
+    for directory in directory_sources:
+        members = tuple(
+            path for path in results if path != directory and path.is_relative_to(directory)
+        )
+        sources.append(MoveSource(directory, SourceKind.DIRECTORY, members))
+        claimed.update(members)
+    for key in results:
+        if key not in claimed:
+            sources.append(MoveSource(key, SourceKind.UNMANAGED_FILE, (key,)))
+    return MoveRequest(tuple(sources), MoveTarget(target, TargetKind.PREFIX), dict(results))
+
+
 def test_validate_results_rejects_outside_namespace() -> None:
     graph = _graph_from_texts({Path("index.md"): _INDEX})
 
     with pytest.raises(DraftError) as caught:
-        validate_results(graph, {Path("s.md"): Path("notes/s.md")}, ())
+        validate_results(
+            graph, _request_for_validation({Path("s.md"): Path("notes/s.md")})
+        )
     assert caught.value.code == "structure.invalid_target"
 
 
-def test_validate_results_rejects_existing_page_and_collision() -> None:
+def test_validate_results_rejects_existing_page() -> None:
     graph = _graph_from_texts({Path("index.md"): _INDEX, Path("pages/b.md"): _PAGE_B})
 
     with pytest.raises(DraftError) as caught:
-        validate_results(graph, {Path("s.md"): Path("pages/b.md")}, ())
+        validate_results(graph, _request_for_validation({Path("b.md"): Path("pages/b.md")}))
     assert caught.value.code == "structure.target_exists"
+
+
+def test_validate_results_rejects_collision() -> None:
+    graph = _graph_from_texts({Path("index.md"): _INDEX})
 
     with pytest.raises(DraftError) as caught:
         validate_results(
             graph,
-            {Path("s1.md"): Path("pages/x.md"), Path("s2.md"): Path("pages/x.md")},
-            (),
+            _request_for_validation(
+                {Path("s1.md"): Path("pages/x.md"), Path("s2.md"): Path("pages/x.md")}
+            ),
         )
     assert caught.value.code == "structure.conflict"
+    assert caught.value.paths == (Path("s2.md"),)  # 点名第二个碰撞来源
 
 
 def test_validate_results_rejects_result_inside_directory_source() -> None:
@@ -197,44 +238,225 @@ def test_validate_results_rejects_result_inside_directory_source() -> None:
     with pytest.raises(DraftError) as caught:
         validate_results(
             graph,
-            {Path("pages/topic/index.md"): Path("pages/topic/index.md")},
-            (Path("pages/topic"),),
+            _request_for_validation(
+                {Path("pages/topic/index.md"): Path("pages/topic/index.md")},
+                directory_sources=(Path("pages/topic"),),
+            ),
         )
     assert caught.value.code == "structure.descendant"
 
 
-def test_validate_results_parent_occupied_by_existing_or_co_moved_page() -> None:
+def test_validate_results_accepts_parent_occupied_by_root_index() -> None:
     graph = _graph_from_texts({Path("index.md"): _INDEX})
 
     # 父页 = 根 index.md（存在）→ 通过
-    validate_results(graph, {Path("s.md"): Path("pages/s.md")}, ())
+    validate_results(graph, _request_for_validation({Path("s.md"): Path("pages/s.md")}))
+
+
+def test_validate_results_accepts_parent_occupied_by_co_moved_file() -> None:
+    graph = _graph_from_texts({Path("index.md"): _INDEX})
 
     # 父页 = pages/topic/index.md，由同批文件占据 → 通过
     validate_results(
         graph,
-        {
-            Path("t/index.md"): Path("pages/topic/index.md"),
-            Path("t/a.md"): Path("pages/topic/a.md"),
-        },
-        (),
+        _request_for_validation(
+            {
+                Path("t/index.md"): Path("pages/topic/index.md"),
+                Path("t/a.md"): Path("pages/topic/a.md"),
+            }
+        ),
     )
+
+
+def test_validate_results_rejects_missing_parent() -> None:
+    graph = _graph_from_texts({Path("index.md"): _INDEX})
 
     # 父页 pages/topic/index.md 无人占据 → missing_parent
     with pytest.raises(DraftError) as caught:
-        validate_results(graph, {Path("t/a.md"): Path("pages/topic/a.md")}, ())
+        validate_results(
+            graph, _request_for_validation({Path("t/a.md"): Path("pages/topic/a.md")})
+        )
     assert caught.value.code == "structure.missing_parent"
 
-    # 父页是受管理页面但被同批移走且无文件落回原位 → missing_parent
+
+def test_validate_results_rejects_moved_away_parent_without_replacement() -> None:
     graph_with_hub = _graph_from_texts(
         {Path("index.md"): _INDEX, Path("pages/topic/index.md"): _HUB}
     )
+    # 父页是受管理页面但被同批移走且无文件落回原位 → missing_parent
     with pytest.raises(DraftError) as caught:
         validate_results(
             graph_with_hub,
-            {
-                Path("pages/topic/index.md"): Path("pages/archive/topic/index.md"),
-                Path("s.md"): Path("pages/topic/s.md"),
-            },
-            (),
+            _request_for_validation(
+                {
+                    Path("pages/topic/index.md"): Path("pages/archive/topic/index.md"),
+                    Path("s.md"): Path("pages/topic/s.md"),
+                }
+            ),
         )
     assert caught.value.code == "structure.missing_parent"
+
+
+# ---------------------------------------------------------------------------
+# classify_move_request 决策表（round-1 M4）：词法判定与文件系统探测经注入探针
+# 解耦，顺序 1—8 在「单元测试不访问真实 FS」约束下逐行可单测。
+# ---------------------------------------------------------------------------
+
+
+class FakeMoveProbe:
+    """受 MoveOperandProbe 签名约束的探测 fake：分类与枚举由测试显式提供。
+
+    ``resolve_operand`` 按词法构造 ResolvedPath；需模拟符号链接拒绝时由测试显式
+    把值加入 ``symlink_values``（生产路径中该拒绝发生在真实 resolve_move_operand）。
+    """
+
+    def __init__(self) -> None:
+        self.kinds: dict[Path, EntryKind] = {}
+        self.members: dict[Path, tuple[Path, ...]] = {}
+        self.symlink_values: set[str] = set()
+
+    def resolve_operand(self, root: Path, value: str) -> ResolvedPath:
+        if value in self.symlink_values:
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, root / value)
+        relative = Path(*PurePosixPath(value).parts)
+        return ResolvedPath(root=root, relative=relative, absolute=root / relative)
+
+    def node_kind(self, absolute: Path) -> EntryKind:
+        return self.kinds.get(absolute, EntryKind.MISSING)
+
+    def enumerate_directory(self, root: Path, relative: Path) -> tuple[Path, ...]:
+        return self.members.get(relative, ())
+
+
+def test_classify_move_request_order1_rejects_escape_lexically() -> None:
+    graph = _graph_from_texts({Path("index.md"): _INDEX})
+
+    with pytest.raises(DraftError) as caught:
+        classify_move_request(ROOT, graph, ["../outside.md"], "pages/", probe=FakeMoveProbe())
+    assert caught.value.code == "path.escape"
+
+
+def test_classify_move_request_order2_rejects_internal_territory_lexically() -> None:
+    graph = _graph_from_texts({Path("index.md"): _INDEX})
+
+    with pytest.raises(DraftError) as caught:
+        classify_move_request(ROOT, graph, [".draft/x.md"], "pages/", probe=FakeMoveProbe())
+    assert caught.value.code == CheckCode.PATH_INTERNAL.value
+
+
+def test_classify_move_request_order3_rejects_symlink_operand() -> None:
+    graph = _graph_from_texts({Path("index.md"): _INDEX})
+    probe = FakeMoveProbe()
+    probe.symlink_values.add("link.md")
+
+    with pytest.raises(DraftError) as caught:
+        classify_move_request(ROOT, graph, ["link.md"], "pages/", probe=probe)
+    assert caught.value.code == CheckCode.PATH_SYMLINK_ESCAPE.value
+
+
+def test_classify_move_request_order4_directory_source_enumerates_members() -> None:
+    graph = _graph_from_texts({Path("index.md"): _INDEX})
+    probe = FakeMoveProbe()
+    probe.kinds[ROOT / "legacy"] = EntryKind.DIRECTORY
+    probe.members[Path("legacy")] = (Path("legacy/a.md"), Path("legacy/index.md"))
+
+    request = classify_move_request(ROOT, graph, ["legacy"], "pages/", probe=probe)
+
+    assert request.sources[0].kind is SourceKind.DIRECTORY
+    assert request.sources[0].members == (Path("legacy/a.md"), Path("legacy/index.md"))
+
+
+def test_classify_move_request_rejects_pages_directory_source() -> None:
+    graph = _graph_from_texts({Path("index.md"): _INDEX})
+    probe = FakeMoveProbe()
+    probe.kinds[ROOT / "pages"] = EntryKind.DIRECTORY
+
+    with pytest.raises(DraftError) as caught:
+        classify_move_request(ROOT, graph, ["pages"], "pages/out/", probe=probe)
+    assert caught.value.code == "structure.protected"
+    assert caught.value.paths == (Path("pages"),)
+
+
+def test_classify_move_request_order5_managed_file_source() -> None:
+    graph = _graph_from_texts({Path("index.md"): _INDEX, Path("pages/a.md"): _PAGE_B})
+    probe = FakeMoveProbe()
+    probe.kinds[ROOT / "pages/a.md"] = EntryKind.FILE
+
+    request = classify_move_request(ROOT, graph, ["pages/a.md"], "pages/out/", probe=probe)
+
+    assert request.sources[0].kind is SourceKind.MANAGED_PAGE
+
+
+def test_classify_move_request_root_index_and_conclusions_always_protected() -> None:
+    """候选根（无 conclusions.md，not_generated）根级 conclusions.md 仍必须保护（H1 回归）。"""
+    graph = _graph_from_texts({Path("index.md"): _INDEX})
+    probe = FakeMoveProbe()
+    probe.kinds[ROOT / "conclusions.md"] = EntryKind.FILE
+    probe.kinds[ROOT / "index.md"] = EntryKind.FILE
+
+    for name in ("conclusions.md", "index.md"):
+        with pytest.raises(DraftError) as caught:
+            classify_move_request(ROOT, graph, [name], "pages/x.md", probe=probe)
+        assert caught.value.code == "structure.protected"
+        assert caught.value.paths == (Path(name),)
+
+
+def test_classify_move_request_order6_unmanaged_file_source() -> None:
+    graph = _graph_from_texts({Path("index.md"): _INDEX})
+    probe = FakeMoveProbe()
+    probe.kinds[ROOT / "stray.md"] = EntryKind.FILE
+
+    request = classify_move_request(ROOT, graph, ["stray.md"], "pages/", probe=probe)
+
+    assert request.sources[0].kind is SourceKind.UNMANAGED_FILE
+
+
+def test_classify_move_request_order7_rejects_non_markdown_file_source() -> None:
+    graph = _graph_from_texts({Path("index.md"): _INDEX})
+    probe = FakeMoveProbe()
+    probe.kinds[ROOT / "img.png"] = EntryKind.FILE
+
+    with pytest.raises(DraftError) as caught:
+        classify_move_request(ROOT, graph, ["img.png"], "pages/", probe=probe)
+    assert caught.value.code == "path.not_markdown"
+
+
+def test_classify_move_request_order8_reports_unknown_page_for_missing() -> None:
+    graph = _graph_from_texts({Path("index.md"): _INDEX})
+
+    with pytest.raises(DraftError) as caught:
+        classify_move_request(ROOT, graph, ["ghost.md"], "pages/", probe=FakeMoveProbe())
+    assert caught.value.code == "structure.unknown_page"
+    assert caught.value.paths == (Path("ghost.md"),)
+
+
+def test_classify_move_request_rejects_empty_and_dot_source_operand() -> None:
+    """round-1 L9：根本身作为来源显式以 structure.protected 拒绝，不做全根枚举。"""
+    graph = _graph_from_texts({Path("index.md"): _INDEX})
+
+    for value in ("", "."):
+        with pytest.raises(DraftError) as caught:
+            classify_move_request(ROOT, graph, [value], "pages/", probe=FakeMoveProbe())
+        assert caught.value.code == "structure.protected"
+
+
+def test_classify_move_request_file_target_requires_single_file_source() -> None:
+    graph = _graph_from_texts({Path("index.md"): _INDEX})
+    probe = FakeMoveProbe()
+    probe.kinds[ROOT / "a.md"] = EntryKind.FILE
+    probe.kinds[ROOT / "b.md"] = EntryKind.FILE
+
+    with pytest.raises(DraftError) as caught:
+        classify_move_request(ROOT, graph, ["a.md", "b.md"], "pages/x.md", probe=probe)
+    assert caught.value.code == MOVE_OPERANDS_INVALID
+
+
+def test_classify_move_request_file_target_rejects_directory_source() -> None:
+    graph = _graph_from_texts({Path("index.md"): _INDEX})
+    probe = FakeMoveProbe()
+    probe.kinds[ROOT / "legacy"] = EntryKind.DIRECTORY
+    probe.members[Path("legacy")] = (Path("legacy/a.md"),)
+
+    with pytest.raises(DraftError) as caught:
+        classify_move_request(ROOT, graph, ["legacy"], "pages/x.md", probe=probe)
+    assert caught.value.code == MOVE_OPERANDS_INVALID

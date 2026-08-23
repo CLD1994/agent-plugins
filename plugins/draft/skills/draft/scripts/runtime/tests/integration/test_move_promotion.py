@@ -160,7 +160,8 @@ def test_promoted_file_reports_protocol_debts_and_not_unmanaged_path(
 
     report = check_draft(root)
     legacy_codes = {i.code for i in report.errors if i.path == Path("pages/legacy.md")}
-    assert legacy_codes                       # 协议欠账被报告（如 page.missing_title）
+    # round-1 L8：钉住具体协议欠账码，而非只断言非空。
+    assert CheckCode.PAGE_MISSING_TITLE.value in legacy_codes
     assert CheckCode.PAGE_UNMANAGED_PATH.value not in legacy_codes
     assert any(
         i.path == Path("other-stray.md") and i.code == CheckCode.PAGE_UNMANAGED_PATH.value
@@ -323,6 +324,43 @@ def test_move_symlink_source_is_rejected(draft_factory: DraftFactory) -> None:
         move_entries(root, ["link.md"], "pages/link.md")
 
     assert caught.value.code == CheckCode.PATH_SYMLINK_ESCAPE.value
+
+
+def test_move_root_level_symlink_blocks_via_check_escape(
+    draft_factory: DraftFactory,
+) -> None:
+    """根级符号链接由 check/事实加载的 link.escape 进入既有 blocking，move 被拒。
+
+    round-1 L5 实证：load_graph_tolerant 对根级符号链接产生 link.escape issue，
+    进入 blocking_paths；move 经 merged_blocking 一并判断而被 structure.dirty 拒绝。
+    """
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "real.md").write_text("x", encoding="utf-8")
+    (root / "link.md").symlink_to(root / "real.md")
+    (root / "stray.md").write_text("正文。\n", encoding="utf-8")
+
+    with pytest.raises(DraftError) as caught:
+        move_entries(root, ["stray.md"], "pages/stray.md")
+
+    assert caught.value.code == "structure.dirty"
+    assert "link.md" in caught.value.details
+
+
+def test_move_empty_or_dot_source_reports_protected(draft_factory: DraftFactory) -> None:
+    """round-1 L9：根本身作为来源显式以 structure.protected 拒绝，零写入。"""
+    root = draft_factory(
+        {"index.md": PAGE_INDEX, "pages/a.md": _page("页面 A")},
+        root_state=RootState.CANDIDATE,
+    )
+    (root / "stray.md").write_text("正文。\n", encoding="utf-8")
+
+    for operand in ("", "."):
+        with pytest.raises(DraftError) as caught:
+            move_entries(root, [operand], "pages/")
+        assert caught.value.code == "structure.protected"
+
+    assert not (root / "pages/stray.md").exists()  # 零写入
+    assert (root / "stray.md").exists()
 
 
 def test_move_non_markdown_file_source_is_rejected(draft_factory: DraftFactory) -> None:

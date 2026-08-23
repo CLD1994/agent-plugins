@@ -23,13 +23,11 @@ from draft.move_operands import MoveRequest, MoveSource, MoveTarget, SourceKind,
 from draft.observations import EMPTY_OBSERVATIONS, ObservationManifest, graph_observations
 from draft.resources import (
     ProbeState,
-    ResourceIdentity,
-    ResourceKind,
     ResourceReference,
     resolve_body_resource,
     resolve_page_resources,
 )
-from draft.structure import _render_pages, plan_move, plan_move_request
+from draft.structure import plan_move, plan_move_request
 from draft.vocabulary import ConclusionsState, RelationCode
 
 ROOT = Path("/draft")
@@ -214,15 +212,21 @@ def test_plan_unmanaged_rewrites_inbound_links_from_stationary_files() -> None:
     assert "[目标](../pages/00-background.md)" in linker_write.content.decode("utf-8")
 
 
-def test_plan_unmanaged_rejects_rendered_text_that_lost_extractability(
+def test_plan_move_request_rejects_rendered_text_that_lost_extractability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """故障注入替身经公开入口触发：改写结果不可提取 → operation.plan_invalid（round-1 L11）。"""
     from draft import structure
-    from draft.structure import _plan_unmanaged
 
+    graph = _graph_from_texts({Path("index.md"): _INDEX, Path("pages/a.md"): _LEAF_A})
     source = Path("00-background.md")
     text, ref = _reference(source, "", "other.md")
     closure = MoveClosure(unmanaged={source: UnmanagedFile(text, (ref,))}, blocking=())
+    request = MoveRequest(
+        sources=(MoveSource(source, SourceKind.UNMANAGED_FILE, (source,)),),
+        target=MoveTarget(Path("pages"), TargetKind.PREFIX),
+        results={source: Path("pages/00-background.md")},
+    )
 
     def _broken_rewrite(text: str, replacements: Mapping[SourceSpan, str]) -> str:
         # 目标含转义序列，提取管线对齐必然失败（source_alignment_failed）
@@ -231,38 +235,45 @@ def test_plan_unmanaged_rejects_rendered_text_that_lost_extractability(
     monkeypatch.setattr(structure, "rewrite_link_destinations", _broken_rewrite)
 
     with pytest.raises(DraftError) as caught:
-        _plan_unmanaged(ROOT, closure, {source: Path("pages/00-background.md")}, {})
+        plan_move_request(
+            graph, closure, request, marker=_CANDIDATE_SNAPSHOT, observations=EMPTY_OBSERVATIONS
+        )
 
     assert caught.value.code == "operation.plan_invalid"
 
 
 # ---------------------------------------------------------------------------
-# _render_pages: 未受管理移动目标的入站链接统一闭合（规格 §4.1）
+# 纯未受管理移动的入站链接统一闭合（规格 §4.1），经 plan_move_request 公开路径验证
 # ---------------------------------------------------------------------------
 
 
-def test_render_pages_extra_moved_targets_rewrite_managed_links() -> None:
+def test_plan_move_request_unmanaged_move_rewrites_managed_linkers() -> None:
+    """纯未受管理移动经公开入口：受管理链接者指向移动目标的正文链接被重写（round-1 L11）。"""
     page_a = (
         "# 页面 A\n\n> 状态：`已确认：说明`\n>\n"
         "> 父主题：[根索引](../index.md)\n\n"
         "参考 [旧稿](../00-bg.md)。\n"
     )
     graph = _graph_from_texts({Path("index.md"): _INDEX, Path("pages/a.md"): page_a})
-
-    rendered = _render_pages(
-        graph,
-        {},
-        {},
-        extra_moved_targets={
-            ResourceIdentity(ResourceKind.LOCAL, "00-bg.md"): ResourceIdentity(
-                ResourceKind.PAGE, "pages/00-bg.md"
-            )
-        },
+    source = Path("00-bg.md")
+    text, ref = _reference(source, "", "other.md")
+    closure = MoveClosure(unmanaged={source: UnmanagedFile(text, (ref,))}, blocking=())
+    request = MoveRequest(
+        sources=(MoveSource(source, SourceKind.UNMANAGED_FILE, (source,)),),
+        target=MoveTarget(Path("pages"), TargetKind.PREFIX),
+        results={source: Path("pages/00-bg.md")},
     )
 
-    text = rendered[Path("pages/a.md")]
-    assert "[旧稿](00-bg.md)" in text      # 按 pages/a.md 新基址重算
-    assert "../00-bg.md" not in text
+    plan = plan_move_request(
+        graph, closure, request, marker=_CANDIDATE_SNAPSHOT, observations=EMPTY_OBSERVATIONS
+    )
+
+    by_path = {m.path: m for m in plan.mutations}
+    linker_write = by_path[Path("pages/a.md")]
+    assert linker_write.content is not None
+    rewritten = linker_write.content.decode("utf-8")
+    assert "[旧稿](00-bg.md)" in rewritten      # 按 pages/a.md 新基址重算
+    assert "../00-bg.md" not in rewritten
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +448,7 @@ _MOVE_BATCH_OUT = """# 归档
 
 
 def test_plan_move_request_mixed_batch_bfs_expansion_collides_with_unmanaged() -> None:
-    """混合批：受管理文件来源 BFS 展开目标与未受管理结果相同 → duplicate_basename。"""
+    """混合批：受管理文件来源 BFS 展开目标与未受管理结果相同 → structure.conflict 点名双方。"""
     graph = _graph_from_texts(
         {
             Path("index.md"): _MOVE_BATCH_INDEX,
@@ -471,7 +482,9 @@ def test_plan_move_request_mixed_batch_bfs_expansion_collides_with_unmanaged() -
             marker=_REGISTERED_SNAPSHOT,
             observations=_structure_observations(graph),
         )
-    assert caught.value.code == "structure.duplicate_basename"
+    assert caught.value.code == "structure.conflict"
+    assert caught.value.paths == (Path("pages/out/sub/a.md"),)
+    assert set(caught.value.details) == {"a.md", "pages/topic/a.md"}
 
 
 def test_plan_move_request_rejects_prefix_outside_pages() -> None:

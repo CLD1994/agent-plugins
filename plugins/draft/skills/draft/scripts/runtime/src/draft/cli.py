@@ -23,6 +23,7 @@ from draft.models import (
     RootState,
     TrashResult,
 )
+from draft.move_operands import MOVE_OPERANDS_INVALID, TargetKind, target_kind_of
 from draft.operation_facts import OperationFacts
 from draft.paths import FilesystemProbe, ManagedRoot, select_managed_root
 from draft.plan_effects import PlanEffect
@@ -768,12 +769,12 @@ def _dispatch(
         operands = [cast(str, value) for value in args.operands]
         if len(operands) < 2:
             raise DraftError(
-                "cli.move_operands_invalid", details=("至少需要一个 SOURCE 和一个 TARGET",)
+                MOVE_OPERANDS_INVALID, details=("至少需要一个 SOURCE 和一个 TARGET",)
             )
         sources, target = operands[:-1], operands[-1]
-        if PurePosixPath(target).suffix == ".md" and len(sources) > 1:
+        if target_kind_of(target) is TargetKind.FILE and len(sources) > 1:
             raise DraftError(
-                "cli.move_operands_invalid", details=("文件目标只允许一个文件 SOURCE",)
+                MOVE_OPERANDS_INVALID, details=("文件目标只允许一个文件 SOURCE",)
             )
         if _is_dry_run(args):
             return _dry_run_write(
