@@ -482,6 +482,7 @@ def test_commit_revision_advanced_abandons_candidate(
     prepared = PreparedLinkIndexUpdate(
         observed_revision="5", scan=_scan(changed=True), requires_rebuild=False
     )
+    preallocated: dict[str, bool] = {"called": False}
     writes: list[Journal] = []
     monkeypatch.setattr(_maintenance, "acquire_lock", lambda root, operation_id: None)
     monkeypatch.setattr(_maintenance, "release_lock", lambda root, operation_id: None)
@@ -490,9 +491,12 @@ def test_commit_revision_advanced_abandons_candidate(
         "read_link_index_authority",
         lambda root: LinkIndexAuthority("6", LinkIndexResult.PUBLISHED, "b" * 64),
     )
-    monkeypatch.setattr(
-        _maintenance, "preallocate_journal", lambda root, **kwargs: _allocating_journal()
-    )
+
+    def preallocate(root: Path, **kwargs: object) -> Journal:
+        preallocated["called"] = True
+        return _allocating_journal()
+
+    monkeypatch.setattr(_maintenance, "preallocate_journal", preallocate)
     monkeypatch.setattr(_maintenance, "write_journal", writes.append)
 
     def fail_stage(journal: Journal, index: object) -> str:
@@ -503,9 +507,9 @@ def test_commit_revision_advanced_abandons_candidate(
     result = commit_link_index_update(Path("/draft"), prepared)
 
     assert result == LinkIndexMaintenanceResult(index=None, warnings=(), published=False)
-    # 已预分配的空 allocating journal 写 rolled_back（spec §15 / 纪律 #3）。
-    assert len(writes) == 1
-    assert writes[0].phase is OperationPhase.ROLLED_BACK
+    # 并发令牌（spec §15）：revision 已推进时不预分配、不创建新结果、不写降级。
+    assert not preallocated["called"]
+    assert writes == []
 
 
 def test_commit_rebuild_required_records_degradation_warning(
@@ -525,7 +529,8 @@ def test_commit_rebuild_required_records_degradation_warning(
 
     result = commit_link_index_update(Path("/draft"), prepared)
 
-    assert result.published is True
+    # P2-1：published 只表示已发布索引制品；rebuild_required 路径 published=False。
+    assert result.published is False
     assert result.index is None
     assert result.warnings == (ResultWarning("link_index.rebuild_required"),)
 
@@ -546,6 +551,7 @@ def test_commit_rebuild_required_flag_failure_warning_order(
 
     result = commit_link_index_update(Path("/draft"), prepared)
 
+    assert result.published is False
     assert result.warnings == (
         ResultWarning("link_index.rebuild_required"),
         ResultWarning("link_index.rebuild_flag_update_failed"),

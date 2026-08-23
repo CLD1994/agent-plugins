@@ -26,9 +26,12 @@ from draft.link_index_maintenance import (
     LINK_INDEX_STAGED_FILE_NAME,
     REBUILD_FLAG_RELATIVE_PATH,
     cleanup_link_index_staging,
+    commit_link_index_update,
     ensure_rebuild_flag,
     maintain_link_index,
+    prepare_link_index_update,
     publish_staged_link_index,
+    read_link_index_authority,
     remove_rebuild_flag,
     stage_link_index,
 )
@@ -1011,7 +1014,8 @@ def test_maintain_scan_failure_records_rebuild_required(
     result = maintain_link_index(root)
 
     monkeypatch.undo()
-    assert result.published is True
+    # P2-1：published 只表示已发布索引制品；rebuild_required 路径 published=False。
+    assert result.published is False
     assert result.index is None
     assert result.warnings == (ResultWarning("link_index.rebuild_required"),)
     payload = _journal_payload(root)
@@ -1035,7 +1039,67 @@ def test_maintain_publish_failure_degrades_to_rebuild_required(
     result = maintain_link_index(root)
 
     monkeypatch.undo()
-    assert result.published is True
+    assert result.published is False
+    assert result.index is None
+    assert result.warnings == (ResultWarning("link_index.rebuild_required"),)
+    payload = _journal_payload(root)
+    assert payload["phase"] == "completed"
+    assert payload["link_index_result"] == "rebuild_required"
+    assert (root / REBUILD_FLAG_RELATIVE_PATH).is_file()
+    # P3-2：降级路径写 completed 前清理残留 staging。
+    dirs = _operation_dirs(root)
+    assert not (dirs[0] / LINK_INDEX_STAGED_FILE_NAME).exists()
+    assert read_lock(root) is None
+
+
+def test_revision_advance_race_abandons_candidate(tmp_path: Path) -> None:
+    """spec §15 并发令牌：取锁后 authority 已推进，放弃旧候选，不发布/不降级。
+
+    第一个 maintenance 发布 revision "1"；第二个修改文件并发布 "2"；携带 observed
+    revision "1" 的旧候选 commit 必须放弃——不创建新 operation、不写 rebuild_required。
+    """
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    assert maintain_link_index(root).published is True  # revision "1"
+    (root / "pages" / "a.md").write_text("# A changed\n", encoding="utf-8")
+
+    # 扫描时观察到 revision "1"。
+    prepared = prepare_link_index_update(root)
+    assert prepared.observed_revision == "1"
+    assert prepared.scan is not None
+
+    # 另一个受协调 operation 在 commit 前发布了 "2"。
+    assert maintain_link_index(root).published is True
+    assert read_link_index_authority(root).revision == "2"
+
+    result = commit_link_index_update(root, prepared)
+
+    assert result.published is False
+    assert result.index is None
+    assert result.warnings == ()
+    # 旧候选被放弃：没有产生 revision "3" 的新 operation，也没有降级。
+    assert len(_operation_dirs(root)) == 2
+    assert read_link_index_authority(root).revision == "2"
+    assert not (root / REBUILD_FLAG_RELATIVE_PATH).exists()
+
+
+def test_maintain_scan_external_change_records_rebuild_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """spec §14/§15：扫描期间根再次变化时不发布混合时点索引，耐久记录 rebuild_required。"""
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def unstable_verify(
+        root: Path, expected_directories: object, expected_identities: object
+    ) -> None:
+        raise DraftError("operation.external_change", root)
+
+    monkeypatch.setattr(maintenance, "_verify_root_stable", unstable_verify)
+
+    result = maintain_link_index(root)
+
+    monkeypatch.undo()
+    assert result.published is False
     assert result.index is None
     assert result.warnings == (ResultWarning("link_index.rebuild_required"),)
     payload = _journal_payload(root)

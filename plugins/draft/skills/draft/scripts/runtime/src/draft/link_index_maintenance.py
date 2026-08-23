@@ -715,7 +715,11 @@ class PreparedLinkIndexUpdate:
 
 @dataclass(frozen=True)
 class LinkIndexMaintenanceResult:
-    """maintenance 公开结果（spec §11）：``published=True`` 表示耐久记录了一个维护结果。"""
+    """maintenance 公开结果（spec §11）：``published=True`` 只表示已发布索引制品。
+
+    ``rebuild_required`` 降级与锁持有/未发布路径均为 ``published=False``；调用方以
+    ``index`` + ``warnings`` 区分「已发布索引」与「已记录降级 / 未发布进程内结果」。
+    """
 
     index: LinkIndex | None
     warnings: tuple[ResultWarning, ...]
@@ -766,13 +770,13 @@ def commit_link_index_update(
     """取锁、核对并发令牌并耐久收敛维护结果（spec §15/§10/§11）。
 
     fresh/no-change 不分配 operation（``published=False``，``.draft/operations`` 为空）。
-    需要维护时：取得写锁 → 预分配空 ``link-index.update`` journal → 重读 authority →
-    observed_revision/absent 未推进才写 ``link_index_updating`` 与下一 revision →
-    发布或记录 ``rebuild_required`` → 写 ``completed`` → 释放锁。
+    需要维护时：取得写锁 → 重读 authority → 比较 observed_revision/absent，未推进才
+    预分配空 ``link-index.update`` journal → 写 ``link_index_updating`` 与下一 revision
+    → 发布或记录 ``rebuild_required`` → 写 ``completed`` → 释放锁。
 
-    并发令牌（spec §15）：revision/absent 已推进时，已预分配的空 journal 写
-    ``rolled_back``，放弃候选、不记录降级；锁已由另一 operation 持有时保留进程内扫描
-    事实而不发布。发布失败但可耐久记录时降级到 ``rebuild_required``（spec §10/§14）。
+    并发令牌（spec §15）：revision/absent 已推进时不预分配、放弃候选、不记录降级；
+    锁已由另一 operation 持有时保留进程内扫描事实而不发布。发布失败但可耐久记录时
+    降级到 ``rebuild_required``（spec §10/§14）。
     """
     if prepared.scan is None and not prepared.requires_rebuild:
         return LinkIndexMaintenanceResult(index=None, warnings=(), published=False)
@@ -790,6 +794,13 @@ def commit_link_index_update(
         raise
 
     try:
+        authority = read_link_index_authority(root)
+        if authority.revision != prepared.observed_revision:
+            # 并发令牌：另一受协调 operation 已推进 revision/absent，放弃旧候选，
+            # 不预分配、不创建新结果、不记录降级（spec §15）。
+            release_lock(root, operation_id)
+            return LinkIndexMaintenanceResult(index=None, warnings=(), published=False)
+
         journal = preallocate_journal(
             root,
             kind=OperationKind.LINK_INDEX_UPDATE,
@@ -798,14 +809,6 @@ def commit_link_index_update(
             observations=EMPTY_OBSERVATIONS,
             metadata={},
         )
-        authority = read_link_index_authority(root)
-        if authority.revision != prepared.observed_revision:
-            # 并发令牌：另一受协调 operation 已推进 revision/absent，放弃旧候选。
-            rolled = with_phase(journal, OperationPhase.ROLLED_BACK)
-            write_journal(rolled)
-            release_lock(root, operation_id)
-            return LinkIndexMaintenanceResult(index=None, warnings=(), published=False)
-
         next_revision = next_link_index_revision(authority)
         updating = with_link_index_state(
             with_phase(journal, OperationPhase.LINK_INDEX_UPDATING),
@@ -845,7 +848,11 @@ def _finish_rebuild_required(
     next_revision: str,
     operation_id: str,
 ) -> LinkIndexMaintenanceResult:
-    """耐久记录 rebuild_required 并完成（spec §10/§11）：warning 去重且按序。"""
+    """耐久记录 rebuild_required 并完成（spec §10/§11）：warning 去重且按序。
+
+    ``published=False``：没有发布索引制品，只耐久记录了降级结果（P2-1）。
+    写 ``completed`` 前幂等清理可能残留的 staging（发布失败降级路径，P3-2）。
+    """
     rebuild = with_link_index_state(
         with_phase(updating, OperationPhase.LINK_INDEX_REBUILD_REQUIRED),
         revision=next_revision,
@@ -857,10 +864,11 @@ def _finish_rebuild_required(
     flag_warning = ensure_rebuild_flag(root)
     if flag_warning is not None:
         warnings.append(flag_warning)
+    cleanup_link_index_staging(updating)
     completed = with_phase(rebuild, OperationPhase.COMPLETED)
     write_journal(completed)
     release_lock(root, operation_id)
-    return LinkIndexMaintenanceResult(index=None, warnings=tuple(warnings), published=True)
+    return LinkIndexMaintenanceResult(index=None, warnings=tuple(warnings), published=False)
 
 
 def _finish_published(
