@@ -410,6 +410,9 @@ def test_verify_recovery_uses_probe_not_direct_fs(
         remove_empty_directories=(),
         metadata={},
         directory=Path(".draft/operations") / ("a" * 32),
+        link_index_revision=None,
+        link_index_result=None,
+        link_index_sha256=None,
     )
     changed, _ = _verify_observations_for_recovery(
         Path("."),
@@ -682,9 +685,17 @@ def test_without_metadata_nonexistent_key_preserves_all_fields() -> None:
 @pytest.mark.parametrize(
     ("phase", "revision", "result", "sha256", "valid"),
     [
+        # 索引阶段前：三个字段全部禁止。
         (OperationPhase.VALIDATING, None, None, None, True),
         (OperationPhase.VALIDATING, "1", None, None, False),
+        (OperationPhase.VALIDATING, None, LinkIndexResult.PUBLISHED, None, False),
+        (OperationPhase.VALIDATING, None, None, "a" * 64, False),
+        # link_index_updating：必须 revision，禁止 result/sha256。
         (OperationPhase.LINK_INDEX_UPDATING, "1", None, None, True),
+        (OperationPhase.LINK_INDEX_UPDATING, None, None, None, False),
+        (OperationPhase.LINK_INDEX_UPDATING, "1", LinkIndexResult.PUBLISHED, None, False),
+        (OperationPhase.LINK_INDEX_UPDATING, "1", None, "a" * 64, False),
+        # link_index_published：必须 revision + published + sha256。
         (
             OperationPhase.LINK_INDEX_PUBLISHED,
             "1",
@@ -693,6 +704,15 @@ def test_without_metadata_nonexistent_key_preserves_all_fields() -> None:
             True,
         ),
         (
+            OperationPhase.LINK_INDEX_PUBLISHED,
+            "1",
+            LinkIndexResult.REBUILD_REQUIRED,
+            "a" * 64,
+            False,
+        ),
+        (OperationPhase.LINK_INDEX_PUBLISHED, "1", LinkIndexResult.PUBLISHED, None, False),
+        # link_index_rebuild_required：必须 revision + rebuild_required，禁止 sha256。
+        (
             OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
             "2",
             LinkIndexResult.REBUILD_REQUIRED,
@@ -700,12 +720,23 @@ def test_without_metadata_nonexistent_key_preserves_all_fields() -> None:
             True,
         ),
         (
-            OperationPhase.ROLLED_BACK,
+            OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
             "2",
             LinkIndexResult.REBUILD_REQUIRED,
-            None,
+            "a" * 64,
             False,
         ),
+        # 终态保留：全缺省合法，或 revision+result 原样保留；sha256 仅 published 保留。
+        (OperationPhase.COMPLETED, None, None, None, True),
+        (OperationPhase.COMPLETED, "1", LinkIndexResult.PUBLISHED, "a" * 64, True),
+        (OperationPhase.COMPLETED, "2", LinkIndexResult.REBUILD_REQUIRED, None, True),
+        (OperationPhase.COMPLETED, None, LinkIndexResult.PUBLISHED, None, False),
+        (OperationPhase.COMPLETED, "1", LinkIndexResult.REBUILD_REQUIRED, "a" * 64, False),
+        (OperationPhase.COMPLETED, "1", LinkIndexResult.PUBLISHED, None, False),
+        # rollback 路径：三个字段全部禁止。
+        (OperationPhase.ROLLED_BACK, "2", LinkIndexResult.REBUILD_REQUIRED, None, False),
+        (OperationPhase.ROLLED_BACK, "1", None, None, False),
+        (OperationPhase.ROLLED_BACK, None, LinkIndexResult.PUBLISHED, None, False),
     ],
 )
 def test_journal_link_index_field_matrix(
@@ -1034,6 +1065,9 @@ def _journal_with_metadata(metadata: dict[str, str]) -> Journal:
         remove_empty_directories=(),
         metadata=metadata,
         directory=Path("/draft/.draft/operations/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        link_index_revision=None,
+        link_index_result=None,
+        link_index_sha256=None,
     )
 
 
@@ -1389,6 +1423,9 @@ def _j(
         remove_empty_directories=remove_empty,
         metadata=dict(metadata or {}),
         directory=Path(".draft/operations") / op_id,
+        link_index_revision=None,
+        link_index_result=None,
+        link_index_sha256=None,
     )
 
 

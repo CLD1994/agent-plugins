@@ -112,11 +112,12 @@ _REVISION_PATTERN = re.compile(r"[1-9][0-9]*")
 
 
 def validate_link_index_revision(value: object, *, path: Path) -> str:
-    """链接索引 revision 的唯一校验边界（规格 §3）。
+    """链接索引 revision 的格式校验边界（规格 §3）。
 
-    只接受匹配 ``[1-9][0-9]*`` 的规范十进制字符串：不接受前导零、符号、小数、
-    指数、空白或 JSON 数字（含 ``int``）。数值比较按任意精度正整数进行，不按
-    字符串字典序。
+    只接受匹配 ``[1-9][0-9]*`` 的规范十进制字符串并原样返回：不接受前导零、
+    符号、小数、指数、空白或 JSON 数字（含 ``int``）。本函数只做格式与规范串
+    校验，不做数值比较；取数值最大 revision 由后续 journal authority 扫描按
+    任意精度整数执行（不按字符串字典序）。
     """
     if not isinstance(value, str) or _REVISION_PATTERN.fullmatch(value) is None:
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, path)
@@ -1170,10 +1171,10 @@ class Journal:
     remove_empty_directories: tuple[Path, ...]
     metadata: dict[str, str]
     directory: Path
-    # 链接索引结果（规格 §4）：合法性由 phase 决定，pre-index/rollback 阶段必须为 None。
-    link_index_revision: str | None = None
-    link_index_result: LinkIndexResult | None = None
-    link_index_sha256: str | None = None
+    # 链接索引结果（规格 §4）：必填字段，合法性由 phase 决定，pre-index/rollback 阶段必须为 None。
+    link_index_revision: str | None
+    link_index_result: LinkIndexResult | None
+    link_index_sha256: str | None
 
 
 def _journal_to_json(journal: Journal) -> bytes:
@@ -1592,7 +1593,7 @@ def _validate_link_index_fields(journal: Journal, *, path: Path) -> None:
             _raise_journal_invalid(path)
         validate_link_index_revision(revision, path=path)
         return
-    # 终态保留阶段：全缺省，或 revision+result 保留且 sha256 仅 published 保留。
+    # 终态保留阶段：全缺省合法，或 revision+result 原样保留；sha256 仅 published 保留。
     if revision is None:
         if result is not None or sha256 is not None:
             _raise_journal_invalid(path)
@@ -1600,11 +1601,11 @@ def _validate_link_index_fields(journal: Journal, *, path: Path) -> None:
     if result is None:
         _raise_journal_invalid(path)
     validate_link_index_revision(revision, path=path)
-    if sha256 is not None:
-        if result is not LinkIndexResult.PUBLISHED:
+    if result is LinkIndexResult.PUBLISHED:
+        if sha256 is None or not _valid_sha256(sha256):
             _raise_journal_invalid(path)
-        if not _valid_sha256(sha256):
-            _raise_journal_invalid(path)
+    elif sha256 is not None:  # REBUILD_REQUIRED：禁止 sha256。
+        _raise_journal_invalid(path)
 
 
 _LINK_INDEX_FIELD_SET_EDGES = frozenset(

@@ -226,7 +226,7 @@ def test_version_one_journal_is_explicitly_unsupported(operation_draft: Path) ->
 
 
 @pytest.mark.parametrize("version", [3, "2"])
-def test_unknown_or_malformed_journal_version_is_rejected(
+def test_non_current_journal_version_is_rejected(
     operation_draft: Path, version: object
 ) -> None:
     # version=None 由 write_raw_journal 默认取当前权威版本，不再表示损坏。
