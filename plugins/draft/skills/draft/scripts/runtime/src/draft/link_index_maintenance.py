@@ -14,6 +14,7 @@ from __future__ import annotations
 import errno
 import os
 import stat
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,22 +27,36 @@ from draft.link_index import (
     LinkIndex,
     LinkIndexScan,
     build_index_content,
+    materialize_index,
 )
-from draft.models import LinkIndexResult, ResultWarning
-from draft.observations import EntryKind
+from draft.models import (
+    LinkIndexResult,
+    OperationKind,
+    OperationPhase,
+    ResultWarning,
+    RootState,
+)
+from draft.observations import EMPTY_OBSERVATIONS, EntryKind
 from draft.operations import (
     OPERATIONS_RELATIVE,
     Journal,
+    acquire_lock,
     classify_node_or_error,
     durable_write,
     ensure_directory_chain,
     fsync_directory,
     operation_journal_path,
+    preallocate_journal,
     read_journal,
+    read_lock,
     reject_symlink_components,
+    release_lock,
     sha256_bytes,
     validate_link_index_revision,
     validate_operation_id,
+    with_link_index_state,
+    with_phase,
+    write_journal,
 )
 
 _INDEX_UPDATE_FAILED = "operation.index_update_failed"
@@ -680,3 +695,207 @@ def cleanup_link_index_staging(journal: Journal) -> None:
         fsync_directory(journal.directory)
     except OSError as exc:
         raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, staging) from exc
+
+
+# ---------------------------------------------------------------------------
+# 独立 link-index.update maintenance operation（spec §5/§14/§15，Task 5）
+# ---------------------------------------------------------------------------
+
+_REBUILD_REQUIRED_WARNING = "link_index.rebuild_required"
+
+
+@dataclass(frozen=True)
+class PreparedLinkIndexUpdate:
+    """维护候选（spec §15 并发令牌起点）：``observed_revision`` 在扫描开始时记录。"""
+
+    observed_revision: str | None
+    scan: LinkIndexScan | None
+    requires_rebuild: bool
+
+
+@dataclass(frozen=True)
+class LinkIndexMaintenanceResult:
+    """maintenance 公开结果（spec §11）：``published=True`` 表示耐久记录了一个维护结果。"""
+
+    index: LinkIndex | None
+    warnings: tuple[ResultWarning, ...]
+    published: bool
+
+
+def prepare_link_index_update(
+    root: Path,
+    known_documents: tuple[IndexedFile, ...] = (),
+) -> PreparedLinkIndexUpdate:
+    """读取权威并严格扫描，返回维护候选（spec §14/§15）。
+
+    - absent / rebuild_required：全根构建候选（``scan`` 非空，``requires_rebuild=False``）；
+    - published 且根事实未变（fresh/no-change）：无写候选（``scan=None``）；
+    - published 且根事实已变（stale）：增量候选（``scan`` 非空）；
+    - 扫描失败但可降级（index_update_failed / external_change）：``scan=None,
+      requires_rebuild=True``；journal/制品矛盾（inconsistent_state）立即传播。
+    """
+    authority = read_link_index_authority(root)
+    baseline = load_link_index_baseline(root)
+    try:
+        scan = scan_link_index(root, baseline, known_documents=known_documents)
+    except DraftError as exc:
+        if exc.code in (_SCAN_READ_FAILED, _SCAN_UNSTABLE):
+            return PreparedLinkIndexUpdate(
+                observed_revision=authority.revision,
+                scan=None,
+                requires_rebuild=True,
+            )
+        raise
+    if scan.changed:
+        return PreparedLinkIndexUpdate(
+            observed_revision=authority.revision,
+            scan=scan,
+            requires_rebuild=False,
+        )
+    return PreparedLinkIndexUpdate(
+        observed_revision=authority.revision,
+        scan=None,
+        requires_rebuild=False,
+    )
+
+
+def commit_link_index_update(
+    root: Path,
+    prepared: PreparedLinkIndexUpdate,
+) -> LinkIndexMaintenanceResult:
+    """取锁、核对并发令牌并耐久收敛维护结果（spec §15/§10/§11）。
+
+    fresh/no-change 不分配 operation（``published=False``，``.draft/operations`` 为空）。
+    需要维护时：取得写锁 → 预分配空 ``link-index.update`` journal → 重读 authority →
+    observed_revision/absent 未推进才写 ``link_index_updating`` 与下一 revision →
+    发布或记录 ``rebuild_required`` → 写 ``completed`` → 释放锁。
+
+    并发令牌（spec §15）：revision/absent 已推进时，已预分配的空 journal 写
+    ``rolled_back``，放弃候选、不记录降级；锁已由另一 operation 持有时保留进程内扫描
+    事实而不发布。发布失败但可耐久记录时降级到 ``rebuild_required``（spec §10/§14）。
+    """
+    if prepared.scan is None and not prepared.requires_rebuild:
+        return LinkIndexMaintenanceResult(index=None, warnings=(), published=False)
+
+    operation_id = uuid.uuid4().hex
+    try:
+        acquire_lock(root, operation_id)
+    except DraftError as exc:
+        if exc.code == CheckCode.OPERATION_RECOVERY_REQUIRED.value:
+            return LinkIndexMaintenanceResult(
+                index=_in_process_index(prepared),
+                warnings=(),
+                published=False,
+            )
+        raise
+
+    try:
+        journal = preallocate_journal(
+            root,
+            kind=OperationKind.LINK_INDEX_UPDATE,
+            operation_id=operation_id,
+            root_state=RootState.REGISTERED,
+            observations=EMPTY_OBSERVATIONS,
+            metadata={},
+        )
+        authority = read_link_index_authority(root)
+        if authority.revision != prepared.observed_revision:
+            # 并发令牌：另一受协调 operation 已推进 revision/absent，放弃旧候选。
+            rolled = with_phase(journal, OperationPhase.ROLLED_BACK)
+            write_journal(rolled)
+            release_lock(root, operation_id)
+            return LinkIndexMaintenanceResult(index=None, warnings=(), published=False)
+
+        next_revision = next_link_index_revision(authority)
+        updating = with_link_index_state(
+            with_phase(journal, OperationPhase.LINK_INDEX_UPDATING),
+            revision=next_revision,
+            result=None,
+            sha256=None,
+        )
+        write_journal(updating)
+        if prepared.requires_rebuild:
+            return _finish_rebuild_required(root, updating, next_revision, operation_id)
+        try:
+            return _finish_published(root, updating, prepared, next_revision, operation_id)
+        except DraftError as exc:
+            if exc.code in (_INDEX_UPDATE_FAILED, _EXTERNAL_CHANGE):
+                # 发布失败但可耐久记录：降级到 rebuild_required（spec §10/§14）。
+                return _finish_rebuild_required(root, updating, next_revision, operation_id)
+            raise
+    except DraftError:
+        # 保留锁和现场（spec §11/§12）：journal 耐久失败或内部不一致由 recover 收敛。
+        raise
+
+
+def maintain_link_index(
+    root: Path,
+    known_documents: tuple[IndexedFile, ...] = (),
+) -> LinkIndexMaintenanceResult:
+    """独立 maintenance 入口：扫描前读锁，已有锁直接返回未发布结果（spec §13/§14）。"""
+    if read_lock(root) is not None:
+        return LinkIndexMaintenanceResult(index=None, warnings=(), published=False)
+    prepared = prepare_link_index_update(root, known_documents=known_documents)
+    return commit_link_index_update(root, prepared)
+
+
+def _finish_rebuild_required(
+    root: Path,
+    updating: Journal,
+    next_revision: str,
+    operation_id: str,
+) -> LinkIndexMaintenanceResult:
+    """耐久记录 rebuild_required 并完成（spec §10/§11）：warning 去重且按序。"""
+    rebuild = with_link_index_state(
+        with_phase(updating, OperationPhase.LINK_INDEX_REBUILD_REQUIRED),
+        revision=next_revision,
+        result=LinkIndexResult.REBUILD_REQUIRED,
+        sha256=None,
+    )
+    write_journal(rebuild)
+    warnings: list[ResultWarning] = [ResultWarning(_REBUILD_REQUIRED_WARNING)]
+    flag_warning = ensure_rebuild_flag(root)
+    if flag_warning is not None:
+        warnings.append(flag_warning)
+    completed = with_phase(rebuild, OperationPhase.COMPLETED)
+    write_journal(completed)
+    release_lock(root, operation_id)
+    return LinkIndexMaintenanceResult(index=None, warnings=tuple(warnings), published=True)
+
+
+def _finish_published(
+    root: Path,
+    updating: Journal,
+    prepared: PreparedLinkIndexUpdate,
+    next_revision: str,
+    operation_id: str,
+) -> LinkIndexMaintenanceResult:
+    """staging 写入、原子发布并完成（spec §10）：失败传播给 commit 决定是否降级。"""
+    if prepared.scan is None:
+        raise AssertionError("publish path requires a scan")
+    index = materialize_index(next_revision, prepared.scan.content)
+    digest = stage_link_index(updating, index)
+    publish_staged_link_index(root, updating, digest)
+    published = with_link_index_state(
+        with_phase(updating, OperationPhase.LINK_INDEX_PUBLISHED),
+        revision=next_revision,
+        result=LinkIndexResult.PUBLISHED,
+        sha256=digest,
+    )
+    write_journal(published)
+    warnings: list[ResultWarning] = []
+    flag_warning = remove_rebuild_flag(root)
+    if flag_warning is not None:
+        warnings.append(flag_warning)
+    completed = with_phase(published, OperationPhase.COMPLETED)
+    write_journal(completed)
+    release_lock(root, operation_id)
+    return LinkIndexMaintenanceResult(index=index, warnings=tuple(warnings), published=True)
+
+
+def _in_process_index(prepared: PreparedLinkIndexUpdate) -> LinkIndex | None:
+    """取锁失败时保留进程内扫描事实：未发布索引只供当前命令使用（spec §14）。"""
+    if prepared.scan is None:
+        return None
+    authority = LinkIndexAuthority(prepared.observed_revision, None, None)
+    return materialize_index(next_link_index_revision(authority), prepared.scan.content)

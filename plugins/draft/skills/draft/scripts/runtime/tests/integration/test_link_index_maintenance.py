@@ -27,6 +27,7 @@ from draft.link_index_maintenance import (
     REBUILD_FLAG_RELATIVE_PATH,
     cleanup_link_index_staging,
     ensure_rebuild_flag,
+    maintain_link_index,
     publish_staged_link_index,
     remove_rebuild_flag,
     stage_link_index,
@@ -39,7 +40,7 @@ from draft.models import (
     RootState,
 )
 from draft.observations import EMPTY_OBSERVATIONS
-from draft.operations import JOURNAL_VERSION, Journal, sha256_bytes
+from draft.operations import JOURNAL_VERSION, Journal, read_lock, sha256_bytes
 
 _STAGED_NAME = LINK_INDEX_STAGED_FILE_NAME
 
@@ -899,3 +900,302 @@ def test_cleanup_link_index_staging_rejects_symlink(tmp_path: Path) -> None:
         cleanup_link_index_staging(journal)
     assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
     assert (directory / _STAGED_NAME).is_symlink()
+
+
+# ---------------------------------------------------------------------------
+# Task 5：独立 link-index.update maintenance operation（spec §5/§14/§15）
+# ---------------------------------------------------------------------------
+
+
+def _maintenance_root(tmp_path: Path, files: dict[str, str]) -> Path:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / ".draft" / "operations").mkdir(parents=True)
+    for relative, text in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return root
+
+
+def _operation_dirs(root: Path) -> list[Path]:
+    operations = root / ".draft" / "operations"
+    if not operations.is_dir():
+        return []
+    return sorted(
+        (operations / entry.name for entry in operations.iterdir()),
+        key=lambda path: path.name,
+    )
+
+
+def _journal_payload(root: Path) -> dict[str, object]:
+    """返回最新权威（数值最大 revision）operation 的 journal 负载。"""
+    best: tuple[int, dict[str, object]] | None = None
+    for directory in _operation_dirs(root):
+        payload = json.loads((directory / "journal.json").read_text(encoding="utf-8"))
+        revision = payload.get("link_index_revision")
+        if revision is None:
+            continue
+        numeric = int(revision)
+        if best is None or numeric > best[0]:
+            best = (numeric, payload)
+    assert best is not None, "no journal with a link_index_revision found"
+    return best[1]
+
+
+def _journal_phase(root: Path) -> str:
+    """返回最新权威 operation 的 phase；只有一个 operation 时等价于现场 phase。"""
+    dirs = _operation_dirs(root)
+    assert len(dirs) == 1
+    payload = json.loads((dirs[0] / "journal.json").read_text(encoding="utf-8"))
+    return payload["phase"]
+
+
+def test_maintain_first_publish_creates_revision_one(tmp_path: Path) -> None:
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+
+    result = maintain_link_index(root)
+
+    assert result.published is True
+    assert result.index is not None
+    assert result.index.revision == "1"
+    assert result.warnings == ()
+    target = root / INDEX_RELATIVE_PATH
+    assert target.is_file()
+    payload = _journal_payload(root)
+    assert payload["phase"] == "completed"
+    assert payload["link_index_revision"] == "1"
+    assert payload["link_index_result"] == "published"
+    assert read_lock(root) is None
+
+
+def test_maintain_no_change_does_not_allocate_operation(tmp_path: Path) -> None:
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    assert maintain_link_index(root).published is True
+    before = _operation_dirs(root)
+
+    result = maintain_link_index(root)
+
+    assert result.published is False
+    assert result.index is None
+    assert result.warnings == ()
+    assert _operation_dirs(root) == before
+
+
+def test_maintain_stale_increments_revision_numerically(tmp_path: Path) -> None:
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    assert maintain_link_index(root).published is True
+    (root / "pages" / "a.md").write_text("# A changed\n", encoding="utf-8")
+
+    result = maintain_link_index(root)
+
+    assert result.published is True
+    assert result.index is not None
+    assert result.index.revision == "2"
+    payload = _journal_payload(root)
+    assert payload["link_index_revision"] == "2"
+    assert payload["link_index_result"] == "published"
+
+
+def test_maintain_scan_failure_records_rebuild_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def fail_scan(root: Path, baseline: object, *, known_documents: object = ()) -> object:
+        raise DraftError("operation.index_update_failed", root)
+
+    monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+
+    result = maintain_link_index(root)
+
+    monkeypatch.undo()
+    assert result.published is True
+    assert result.index is None
+    assert result.warnings == (ResultWarning("link_index.rebuild_required"),)
+    payload = _journal_payload(root)
+    assert payload["phase"] == "completed"
+    assert payload["link_index_result"] == "rebuild_required"
+    assert (root / REBUILD_FLAG_RELATIVE_PATH).is_file()
+    assert read_lock(root) is None
+
+
+def test_maintain_publish_failure_degrades_to_rebuild_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def fail_publish(root: Path, journal: object, expected_sha256: str) -> None:
+        raise DraftError("operation.index_update_failed", root / INDEX_RELATIVE_PATH)
+
+    monkeypatch.setattr(maintenance, "publish_staged_link_index", fail_publish)
+
+    result = maintain_link_index(root)
+
+    monkeypatch.undo()
+    assert result.published is True
+    assert result.index is None
+    assert result.warnings == (ResultWarning("link_index.rebuild_required"),)
+    payload = _journal_payload(root)
+    assert payload["phase"] == "completed"
+    assert payload["link_index_result"] == "rebuild_required"
+    assert (root / REBUILD_FLAG_RELATIVE_PATH).is_file()
+    assert read_lock(root) is None
+
+
+def test_maintain_lock_held_returns_unpublished_without_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    from draft.operations import acquire_lock
+
+    acquire_lock(root, "f" * 32)
+    scanned: dict[str, bool] = {"called": False}
+    import draft.link_index_maintenance as maintenance
+
+    def scan_spy(root: Path, baseline: object, *, known_documents: object = ()) -> object:
+        scanned["called"] = True
+        raise AssertionError("must not scan when lock is held")
+
+    monkeypatch.setattr(maintenance, "scan_link_index", scan_spy)
+
+    result = maintain_link_index(root)
+
+    monkeypatch.undo()
+    assert result.published is False
+    assert result.index is None
+    assert result.warnings == ()
+    assert not scanned["called"]
+
+
+# ---------------------------------------------------------------------------
+# maintenance phase 中断现场（spec §12；恢复由 Task 7 接入）
+# ---------------------------------------------------------------------------
+
+
+def _fail_write_at(monkeypatch: pytest.MonkeyPatch, fail_at: frozenset[int]) -> None:
+    import draft.link_index_maintenance as maintenance
+
+    real_write = maintenance.write_journal
+    calls = {"n": 0}
+
+    def flaky_write(journal: object) -> None:
+        calls["n"] += 1
+        if calls["n"] in fail_at:
+            raise DraftError(
+                CheckCode.OPERATION_DURABILITY_FAILED.value, Path("/draft/.draft/operations")
+            )
+        real_write(journal)
+
+    monkeypatch.setattr(maintenance, "write_journal", flaky_write)
+
+
+def test_interrupt_at_allocating_preserves_scene(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    _fail_write_at(monkeypatch, frozenset({1}))  # 第一次 maintenance 写是 link_index_updating
+
+    with pytest.raises(DraftError):
+        maintain_link_index(root)
+
+    monkeypatch.undo()
+    assert _journal_phase(root) == "allocating"
+    assert not (root / INDEX_RELATIVE_PATH).exists()
+    assert read_lock(root) is not None
+
+
+def test_interrupt_at_link_index_updating_preserves_scene(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def crash_in_stage(journal: object, index: object) -> str:
+        raise RuntimeError("process crash during staging")
+
+    monkeypatch.setattr(maintenance, "stage_link_index", crash_in_stage)
+
+    with pytest.raises(RuntimeError):
+        maintain_link_index(root)
+
+    monkeypatch.undo()
+    assert _journal_phase(root) == "link_index_updating"
+    assert not (root / INDEX_RELATIVE_PATH).exists()
+    assert read_lock(root) is not None
+
+
+def test_interrupt_after_target_replace_preserves_scene(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    _fail_write_at(monkeypatch, frozenset({2}))  # 第二次是 link_index_published
+
+    with pytest.raises(DraftError):
+        maintain_link_index(root)
+
+    monkeypatch.undo()
+    assert _journal_phase(root) == "link_index_updating"
+    assert (root / INDEX_RELATIVE_PATH).is_file()
+    dirs = _operation_dirs(root)
+    assert not (dirs[0] / LINK_INDEX_STAGED_FILE_NAME).exists()
+    assert read_lock(root) is not None
+
+
+def test_interrupt_at_link_index_published_preserves_scene(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    _fail_write_at(monkeypatch, frozenset({3}))  # 第三次是 completed
+
+    with pytest.raises(DraftError):
+        maintain_link_index(root)
+
+    monkeypatch.undo()
+    assert _journal_phase(root) == "link_index_published"
+    assert (root / INDEX_RELATIVE_PATH).is_file()
+    assert read_lock(root) is not None
+
+
+def test_interrupt_at_link_index_rebuild_required_preserves_scene(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def fail_scan(root: Path, baseline: object, *, known_documents: object = ()) -> object:
+        raise DraftError("operation.index_update_failed", root)
+
+    monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+    _fail_write_at(monkeypatch, frozenset({3}))  # rebuild 路径第三次是 completed
+
+    with pytest.raises(DraftError):
+        maintain_link_index(root)
+
+    monkeypatch.undo()
+    assert _journal_phase(root) == "link_index_rebuild_required"
+    assert (root / REBUILD_FLAG_RELATIVE_PATH).is_file()
+    assert read_lock(root) is not None
+
+
+def test_interrupt_at_completed_preserves_scene(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def fail_release(root: Path, operation_id: str) -> None:
+        raise DraftError(
+            CheckCode.OPERATION_DURABILITY_FAILED.value, root / ".draft" / "operation.lock"
+        )
+
+    monkeypatch.setattr(maintenance, "release_lock", fail_release)
+
+    with pytest.raises(DraftError):
+        maintain_link_index(root)
+
+    monkeypatch.undo()
+    assert _journal_phase(root) == "completed"
+    assert read_lock(root) is not None
