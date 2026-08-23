@@ -1,7 +1,10 @@
-"""可失效的 Markdown 反向链接索引。
+"""Markdown 反向链接索引：v2 schema 与纯增量事实计算，及 v1 遗留维护层。
 
-索引是性能缓存，不改变 move 的全根闭包语义。文件格式有明确版本、根身份和
-完整性字段；读取失败统一归类为 ``corrupt``，不存在归类为 ``unknown``。
+v2 索引制品只保存严格证明与查询所需事实（spec §7），提供确定序列化、严格解析与
+``build_index_content`` 纯增量计算。v1 类型（``LegacyLinkIndex``/``LegacyIndexedFile``）
+及其文件系统维护函数（``build_index``/``check_index_freshness`` 等）被保留，供
+``draft.structure`` 在迁移到统一索引阶段（Task 6）前继续使用；v1/v2 共用基础类型
+``LinkSpan``/``OutboundEdge``/``Backlink``/``DirectoryMember``。
 """
 
 from __future__ import annotations
@@ -9,7 +12,9 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -18,14 +23,34 @@ from typing import TYPE_CHECKING, cast
 from draft.errors import DraftError
 from draft.markdown import extract_body_links
 from draft.operations import sha256_bytes
-from draft.resources import ResourceIdentity, ResourceKind, resolve_body_resource
+from draft.resources import (
+    ProbeState,
+    ResourceIdentity,
+    ResourceKind,
+    resolve_body_resource,
+)
 
 if TYPE_CHECKING:
+    from typing import Protocol
+
     from draft.models import FileMutation
 
-INDEX_SCHEMA_VERSION = 1
+    class _IndexedFileLike(Protocol):
+        @property
+        def path(self) -> Path: ...
+
+        @property
+        def outbound(self) -> tuple[OutboundEdge, ...]: ...
+
+
+LEGACY_INDEX_SCHEMA_VERSION = 1
+INDEX_SCHEMA_VERSION = 2
 INDEX_RELATIVE_PATH = Path(".draft") / "link-index.json"
 INVALID_RELATIVE_PATH = Path(".draft") / "link-index.invalid"
+
+_REVISION = re.compile(r"[1-9][0-9]*\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_DIRECTORY_MEMBER_KINDS = frozenset({"directory", "file", "symlink", "other"})
 
 
 class Completeness(StrEnum):
@@ -72,7 +97,7 @@ class DirectoryMember:
 
 
 @dataclass(frozen=True)
-class IndexedFile:
+class LegacyIndexedFile:
     path: Path
     fingerprint: FileFingerprint
     sha256: str
@@ -81,12 +106,12 @@ class IndexedFile:
 
 
 @dataclass(frozen=True)
-class LinkIndex:
+class LegacyLinkIndex:
     root_id: str
     generation: int
     completeness: Completeness
-    files: dict[Path, IndexedFile] = field(
-        default_factory=lambda: dict[Path, IndexedFile]()
+    files: dict[Path, LegacyIndexedFile] = field(
+        default_factory=lambda: dict[Path, LegacyIndexedFile]()
     )
     backlinks: dict[ResourceIdentity, tuple[Backlink, ...]] = field(
         default_factory=lambda: dict[ResourceIdentity, tuple[Backlink, ...]]()
@@ -94,11 +119,11 @@ class LinkIndex:
     directories: dict[Path, tuple[DirectoryMember, ...]] = field(
         default_factory=lambda: dict[Path, tuple[DirectoryMember, ...]]()
     )
-    schema_version: int = INDEX_SCHEMA_VERSION
+    schema_version: int = LEGACY_INDEX_SCHEMA_VERSION
     event_seq: int | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != INDEX_SCHEMA_VERSION:
+        if self.schema_version != LEGACY_INDEX_SCHEMA_VERSION:
             raise ValueError("unsupported index schema")
         if self.generation < 0:
             raise ValueError("generation must be non-negative")
@@ -161,11 +186,11 @@ class LinkIndex:
         ).encode()
 
     @classmethod
-    def from_dict(cls, payload: object) -> LinkIndex:
+    def from_dict(cls, payload: object) -> LegacyLinkIndex:
         if not isinstance(payload, dict):
             raise ValueError("index root must be an object")
         data = cast("dict[str, object]", payload)
-        if data.get("schema_version") != INDEX_SCHEMA_VERSION:
+        if data.get("schema_version") != LEGACY_INDEX_SCHEMA_VERSION:
             raise ValueError("unsupported index schema")
         root_id = _required_str(data, "root_id")
         generation = _required_int(data, "generation")
@@ -183,15 +208,15 @@ class LinkIndex:
         )
 
     @classmethod
-    def from_json(cls, raw: bytes) -> LinkIndex:
+    def from_json(cls, raw: bytes) -> LegacyLinkIndex:
         return cls.from_dict(json.loads(raw.decode("utf-8")))
 
-    def add_backlink(self, identity: ResourceIdentity, backlink: Backlink) -> LinkIndex:
+    def add_backlink(self, identity: ResourceIdentity, backlink: Backlink) -> LegacyLinkIndex:
         current = set(self.backlinks.get(identity, ()))
         current.add(backlink)
         updated = dict(self.backlinks)
         updated[identity] = tuple(sorted(current))
-        return LinkIndex(
+        return LegacyLinkIndex(
             self.root_id,
             self.generation,
             self.completeness,
@@ -202,14 +227,14 @@ class LinkIndex:
             self.event_seq,
         )
 
-    def remove_backlink(self, identity: ResourceIdentity, backlink: Backlink) -> LinkIndex:
+    def remove_backlink(self, identity: ResourceIdentity, backlink: Backlink) -> LegacyLinkIndex:
         current = tuple(edge for edge in self.backlinks.get(identity, ()) if edge != backlink)
         updated = dict(self.backlinks)
         if current:
             updated[identity] = current
         else:
             updated.pop(identity, None)
-        return LinkIndex(
+        return LegacyLinkIndex(
             self.root_id,
             self.generation,
             self.completeness,
@@ -235,11 +260,11 @@ def _required_int(data: dict[str, object], key: str) -> int:
     return value
 
 
-def _decode_files(value: object) -> dict[Path, IndexedFile]:
+def _decode_files(value: object) -> dict[Path, LegacyIndexedFile]:
     if not isinstance(value, dict):
         raise ValueError("invalid files")
     value = cast("dict[str, object]", value)
-    result: dict[Path, IndexedFile] = {}
+    result: dict[Path, LegacyIndexedFile] = {}
     for raw_path, raw_item in value.items():
         if not isinstance(raw_item, dict):
             raise ValueError("invalid file record")
@@ -260,7 +285,7 @@ def _decode_files(value: object) -> dict[Path, IndexedFile]:
                     LinkSpan(_required_int(edge, "start"), _required_int(edge, "end")),
                 )
             )
-        result[Path(raw_path)] = IndexedFile(
+        result[Path(raw_path)] = LegacyIndexedFile(
             Path(raw_path),
             FileFingerprint(
                 _required_int(item, "file_id"),
@@ -320,7 +345,8 @@ def _decode_directories(value: object) -> dict[Path, tuple[DirectoryMember, ...]
 
 
 def _validate_reverse_edges(
-    files: dict[Path, IndexedFile], backlinks: dict[ResourceIdentity, tuple[Backlink, ...]]
+    files: Mapping[Path, _IndexedFileLike],
+    backlinks: Mapping[ResourceIdentity, tuple[Backlink, ...]],
 ) -> None:
     expected: dict[ResourceIdentity, set[Backlink]] = {}
     for item in files.values():
@@ -331,18 +357,330 @@ def _validate_reverse_edges(
         raise ValueError("backlink table inconsistent")
 
 
+# ---------------------------------------------------------------------------
+# v2 schema：只保存严格证明和查询所需事实，确定序列化 + 严格解析（spec §7）
+# ---------------------------------------------------------------------------
+
+
+def validate_revision(revision: object) -> None:
+    """按 spec §3 校验规范十进制 revision；比较在需要处用任意精度整数。"""
+    if not isinstance(revision, str) or not _REVISION.fullmatch(revision):
+        raise ValueError("invalid revision")
+
+
+def _validate_sha256(value: str) -> None:
+    if not _SHA256.fullmatch(value):
+        raise ValueError("invalid sha256")
+
+
+@dataclass(frozen=True)
+class IndexedFile:
+    path: Path
+    sha256: str
+    outbound: tuple[OutboundEdge, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.path.is_absolute():
+            raise ValueError("invalid path")
+        _validate_sha256(self.sha256)
+        for edge in self.outbound:
+            if edge.span.start < 0 or edge.span.end < edge.span.start:
+                raise ValueError("invalid span")
+
+
+@dataclass(frozen=True)
+class LinkIndexContent:
+    files: dict[Path, IndexedFile]
+    backlinks: dict[ResourceIdentity, tuple[Backlink, ...]]
+    directories: dict[Path, tuple[DirectoryMember, ...]]
+
+
+@dataclass(frozen=True)
+class LinkIndexScanStats:
+    read_files: int
+    read_bytes: int
+    parsed_files: int
+
+
+@dataclass(frozen=True)
+class LinkIndexScan:
+    content: LinkIndexContent
+    changed: bool
+    stats: LinkIndexScanStats
+
+
+@dataclass(frozen=True)
+class LinkIndex:
+    revision: str
+    files: dict[Path, IndexedFile]
+    backlinks: dict[ResourceIdentity, tuple[Backlink, ...]]
+    directories: dict[Path, tuple[DirectoryMember, ...]]
+    schema_version: int = INDEX_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != INDEX_SCHEMA_VERSION:
+            raise ValueError("unsupported index schema")
+        validate_revision(self.revision)
+        _validate_reverse_edges(self.files, self.backlinks)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "revision": self.revision,
+            "files": {
+                path.as_posix(): {
+                    "sha256": item.sha256,
+                    "outbound": [
+                        {
+                            "kind": edge.resource_identity.kind.value,
+                            "value": edge.resource_identity.value,
+                            "start": edge.span.start,
+                            "end": edge.span.end,
+                        }
+                        for edge in item.outbound
+                    ],
+                }
+                for path, item in sorted(self.files.items(), key=lambda pair: pair[0].as_posix())
+            },
+            "backlinks": {
+                f"{identity.kind.value}:{identity.value}": [
+                    {
+                        "source_path": edge.source_path.as_posix(),
+                        "start": edge.span.start,
+                        "end": edge.span.end,
+                    }
+                    for edge in sorted(edges)
+                ]
+                for identity, edges in sorted(
+                    self.backlinks.items(), key=lambda pair: (pair[0].kind.value, pair[0].value)
+                )
+            },
+            "directories": {
+                path.as_posix(): [
+                    {"name": member.name, "kind": member.kind}
+                    for member in sorted(members, key=lambda member: (member.name, member.kind))
+                ]
+                for path, members in sorted(
+                    self.directories.items(), key=lambda pair: pair[0].as_posix()
+                )
+            },
+        }
+
+    def to_json(self) -> bytes:
+        return (
+            json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        ).encode()
+
+    @classmethod
+    def from_dict(cls, payload: object) -> LinkIndex:
+        if not isinstance(payload, dict):
+            raise ValueError("index root must be an object")
+        data = cast("dict[str, object]", payload)
+        if data.get("schema_version") != INDEX_SCHEMA_VERSION:
+            raise ValueError("unsupported index schema")
+        revision = _required_str(data, "revision")
+        validate_revision(revision)
+        files = _decode_v2_files(data.get("files"))
+        backlinks = _decode_v2_backlinks(data.get("backlinks"))
+        directories = _decode_v2_directories(data.get("directories"))
+        return cls(revision, files, backlinks, directories)
+
+    @classmethod
+    def from_json(cls, raw: bytes) -> LinkIndex:
+        return cls.from_dict(json.loads(raw.decode("utf-8")))
+
+
+def _decode_v2_files(value: object) -> dict[Path, IndexedFile]:
+    if not isinstance(value, dict):
+        raise ValueError("invalid files")
+    value = cast("dict[str, object]", value)
+    result: dict[Path, IndexedFile] = {}
+    for raw_path, raw_item in value.items():
+        if not isinstance(raw_item, dict):
+            raise ValueError("invalid file record")
+        item = cast("dict[str, object]", raw_item)
+        outbound_raw = item.get("outbound")
+        if not isinstance(outbound_raw, list):
+            raise ValueError("invalid outbound")
+        outbound: list[OutboundEdge] = []
+        seen: set[tuple[ResourceIdentity, LinkSpan]] = set()
+        for raw_edge in cast("list[object]", outbound_raw):
+            if not isinstance(raw_edge, dict):
+                raise ValueError("invalid outbound edge")
+            edge = cast("dict[str, object]", raw_edge)
+            identity = ResourceIdentity(
+                ResourceKind(_required_str(edge, "kind")), _required_str(edge, "value")
+            )
+            span = LinkSpan(_required_int(edge, "start"), _required_int(edge, "end"))
+            if (identity, span) in seen:
+                raise ValueError("duplicate outbound edge")
+            seen.add((identity, span))
+            outbound.append(OutboundEdge(identity, span))
+        result[Path(raw_path)] = IndexedFile(
+            Path(raw_path), _required_str(item, "sha256"), tuple(outbound)
+        )
+    return result
+
+
+def _decode_v2_backlinks(value: object) -> dict[ResourceIdentity, tuple[Backlink, ...]]:
+    if not isinstance(value, dict):
+        raise ValueError("invalid backlinks")
+    value = cast("dict[str, object]", value)
+    result: dict[ResourceIdentity, tuple[Backlink, ...]] = {}
+    for key, raw_edges in value.items():
+        if ":" not in key or not isinstance(raw_edges, list):
+            raise ValueError("invalid backlink record")
+        kind, value_ = key.split(":", 1)
+        identity = ResourceIdentity(ResourceKind(kind), value_)
+        edges: list[Backlink] = []
+        seen: set[Backlink] = set()
+        for raw_edge in cast("list[object]", raw_edges):
+            if not isinstance(raw_edge, dict):
+                raise ValueError("invalid backlink edge")
+            edge = cast("dict[str, object]", raw_edge)
+            backlink = Backlink(
+                Path(_required_str(edge, "source_path")),
+                LinkSpan(_required_int(edge, "start"), _required_int(edge, "end")),
+            )
+            if backlink in seen:
+                raise ValueError("duplicate backlink")
+            seen.add(backlink)
+            edges.append(backlink)
+        result[identity] = tuple(edges)
+    return result
+
+
+def _decode_v2_directories(value: object) -> dict[Path, tuple[DirectoryMember, ...]]:
+    if not isinstance(value, dict):
+        raise ValueError("invalid directories")
+    value = cast("dict[str, object]", value)
+    result: dict[Path, tuple[DirectoryMember, ...]] = {}
+    for raw_path, raw_members in value.items():
+        if not isinstance(raw_members, list):
+            raise ValueError("invalid directory record")
+        members: list[DirectoryMember] = []
+        seen: set[DirectoryMember] = set()
+        for raw_member in cast("list[object]", raw_members):
+            if not isinstance(raw_member, dict):
+                raise ValueError("invalid directory member")
+            member = cast("dict[str, object]", raw_member)
+            kind = _required_str(member, "kind")
+            if kind not in _DIRECTORY_MEMBER_KINDS:
+                raise ValueError("invalid directory member kind")
+            directory_member = DirectoryMember(_required_str(member, "name"), kind)
+            if directory_member in seen:
+                raise ValueError("duplicate directory member")
+            seen.add(directory_member)
+            members.append(directory_member)
+        result[Path(raw_path)] = tuple(members)
+    return result
+
+
+def _derive_backlinks(
+    files: Mapping[Path, IndexedFile],
+) -> dict[ResourceIdentity, tuple[Backlink, ...]]:
+    backlinks: dict[ResourceIdentity, list[Backlink]] = {}
+    for item in files.values():
+        for edge in item.outbound:
+            backlinks.setdefault(edge.resource_identity, []).append(Backlink(item.path, edge.span))
+    return {identity: tuple(sorted(edges)) for identity, edges in backlinks.items()}
+
+
+def _probe_no_filesystem(path: Path) -> ProbeState:
+    """纯计算不访问文件系统；身份解析不依赖探针结果。"""
+    return ProbeState.MISSING
+
+
+def _index_v2_file(root: Path, relative: Path, raw: bytes, digest: str) -> IndexedFile:
+    outbound: list[OutboundEdge] = []
+    for link in extract_body_links(raw.decode("utf-8")):
+        resource = resolve_body_resource(
+            root, relative, link.destination, target_probe=_probe_no_filesystem
+        )
+        outbound.append(
+            OutboundEdge(
+                resource.identity,
+                LinkSpan(link.destination_span.start, link.destination_span.end),
+            )
+        )
+    return IndexedFile(relative, digest, tuple(outbound))
+
+
+def _content_changed(
+    content: LinkIndexContent, baseline: LinkIndexContent | LinkIndex | None
+) -> bool:
+    if baseline is None:
+        return True
+    return not (
+        content.files == baseline.files
+        and content.backlinks == baseline.backlinks
+        and content.directories == baseline.directories
+    )
+
+
+def build_index_content(
+    documents: Mapping[Path, bytes],
+    directories: Mapping[Path, tuple[DirectoryMember, ...]],
+    baseline: LinkIndexContent | LinkIndex | None,
+    *,
+    root: Path = Path("."),
+) -> LinkIndexScan:
+    """纯增量事实计算：比较 path + sha256，未变化文件复用既有解析结果。"""
+    baseline_files = baseline.files if baseline is not None else {}
+    read_files = 0
+    read_bytes = 0
+    parsed_files = 0
+    files: dict[Path, IndexedFile] = {}
+    for path, raw in documents.items():
+        if path.suffix != ".md":
+            continue
+        read_files += 1
+        read_bytes += len(raw)
+        digest = sha256_bytes(raw)
+        prior = baseline_files.get(path)
+        if prior is not None and prior.sha256 == digest:
+            files[path] = prior
+        else:
+            parsed_files += 1
+            files[path] = _index_v2_file(root, path, raw, digest)
+    backlinks = _derive_backlinks(files)
+    content = LinkIndexContent(
+        files=files,
+        backlinks=backlinks,
+        directories=dict(directories),
+    )
+    return LinkIndexScan(
+        content=content,
+        changed=_content_changed(content, baseline),
+        stats=LinkIndexScanStats(
+            read_files=read_files,
+            read_bytes=read_bytes,
+            parsed_files=parsed_files,
+        ),
+    )
+
+
+def materialize_index(revision: str, content: LinkIndexContent) -> LinkIndex:
+    return LinkIndex(
+        revision=revision,
+        files=content.files,
+        backlinks=content.backlinks,
+        directories=content.directories,
+    )
+
+
 def index_path(root: Path) -> Path:
     return root / INDEX_RELATIVE_PATH
 
 
-def read_index(root: Path) -> tuple[Freshness, LinkIndex | None, tuple[str, ...]]:
+def read_index(root: Path) -> tuple[Freshness, LegacyLinkIndex | None, tuple[str, ...]]:
     status, index, details, _ = read_index_snapshot(root)
     return status, index, details
 
 
 def read_index_snapshot(
     root: Path,
-) -> tuple[Freshness, LinkIndex | None, tuple[str, ...], bytes | None]:
+) -> tuple[Freshness, LegacyLinkIndex | None, tuple[str, ...], bytes | None]:
     path = index_path(root)
     invalid = root / INVALID_RELATIVE_PATH
     try:
@@ -358,7 +696,7 @@ def read_index_snapshot(
     except OSError as exc:
         return Freshness.UNKNOWN, None, ("unavailable", exc.__class__.__name__), None
     try:
-        index = LinkIndex.from_json(raw)
+        index = LegacyLinkIndex.from_json(raw)
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         return Freshness.CORRUPT, None, ("corrupt", str(exc)), raw
     expected_root = str(root.resolve())
@@ -369,7 +707,7 @@ def read_index_snapshot(
     return Freshness.STALE, index, (), raw
 
 
-def write_index_atomic(root: Path, index: LinkIndex) -> None:
+def write_index_atomic(root: Path, index: LegacyLinkIndex) -> None:
     target = index_path(root)
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
@@ -402,8 +740,8 @@ def invalidate_index(root: Path, *, reason: str = "invalid") -> None:
         raise DraftError("operation.index_update_failed", marker) from exc
 
 
-def build_index(root: Path, *, generation: int = 0) -> LinkIndex:
-    files: dict[Path, IndexedFile] = {}
+def build_index(root: Path, *, generation: int = 0) -> LegacyLinkIndex:
+    files: dict[Path, LegacyIndexedFile] = {}
     directories: dict[Path, tuple[DirectoryMember, ...]] = {}
     for directory, dirnames, filenames in os.walk(root):
         directory_path = Path(directory)
@@ -453,7 +791,7 @@ def build_index(root: Path, *, generation: int = 0) -> LinkIndex:
                         LinkSpan(link.destination_span.start, link.destination_span.end),
                     )
                 )
-            files[relative] = IndexedFile(
+            files[relative] = LegacyIndexedFile(
                 relative,
                 FileFingerprint(
                     getattr(stat_result, "st_ino", 0), stat_result.st_size, stat_result.st_mtime_ns
@@ -466,7 +804,7 @@ def build_index(root: Path, *, generation: int = 0) -> LinkIndex:
     for item in files.values():
         for edge in item.outbound:
             backlinks.setdefault(edge.resource_identity, []).append(Backlink(item.path, edge.span))
-    return LinkIndex(
+    return LegacyLinkIndex(
         str(root.resolve()),
         generation,
         Completeness.COMPLETE,
@@ -477,8 +815,8 @@ def build_index(root: Path, *, generation: int = 0) -> LinkIndex:
 
 
 def update_index_from_mutations(
-    root: Path, index: LinkIndex, mutations: tuple[FileMutation, ...]
-) -> LinkIndex:
+    root: Path, index: LegacyLinkIndex, mutations: tuple[FileMutation, ...]
+) -> LegacyLinkIndex:
     """仅解析本次 mutation 改变的 Markdown；未变记录和边直接复用。"""
     files = dict(index.files)
     for mutation in mutations:
@@ -492,7 +830,7 @@ def update_index_from_mutations(
     for item in files.values():
         for edge in item.outbound:
             backlinks.setdefault(edge.resource_identity, []).append(Backlink(item.path, edge.span))
-    return LinkIndex(
+    return LegacyLinkIndex(
         str(root.resolve()),
         index.generation + 1,
         Completeness.COMPLETE,
@@ -502,7 +840,7 @@ def update_index_from_mutations(
     )
 
 
-def _index_file(root: Path, relative: Path, raw: bytes) -> IndexedFile:
+def _index_file(root: Path, relative: Path, raw: bytes) -> LegacyIndexedFile:
     try:
         stat_result = (root / relative).stat()
     except OSError as exc:
@@ -526,7 +864,7 @@ def _index_file(root: Path, relative: Path, raw: bytes) -> IndexedFile:
                 LinkSpan(link.destination_span.start, link.destination_span.end),
             )
         )
-    return IndexedFile(
+    return LegacyIndexedFile(
         relative,
         FileFingerprint(
             getattr(stat_result, "st_ino", 0), stat_result.st_size, stat_result.st_mtime_ns
@@ -561,7 +899,7 @@ def _directory_snapshot(root: Path) -> dict[Path, tuple[DirectoryMember, ...]]:
     return directories
 
 
-def check_index_freshness(root: Path, index: LinkIndex) -> Freshness:
+def check_index_freshness(root: Path, index: LegacyLinkIndex) -> Freshness:
     if index.root_id != str(root.resolve()) or index.completeness is not Completeness.COMPLETE:
         return Freshness.UNKNOWN
     try:
