@@ -19,6 +19,7 @@ from draft.link_index import (
     OutboundEdge,
     build_index_content,
     materialize_index,
+    validate_revision,
 )
 from draft.operations import sha256_bytes
 from draft.resources import ResourceIdentity, ResourceKind
@@ -151,6 +152,16 @@ def test_v2_rejects_invalid_revisions(revision: str) -> None:
         LinkIndex(revision=revision, files={}, backlinks={}, directories={})
 
 
+def test_v2_validate_revision_rejects_non_str_value() -> None:
+    with pytest.raises(ValueError):
+        validate_revision(cast("object", 4))
+
+
+def test_v2_link_index_rejects_non_str_revision() -> None:
+    with pytest.raises(ValueError):
+        LinkIndex(revision=cast("str", 4), files={}, backlinks={}, directories={})
+
+
 def test_v2_parse_rejects_invalid_sha256() -> None:
     payload = _v2_index().to_dict()
     files = cast("dict[str, dict[str, object]]", payload["files"])
@@ -186,6 +197,49 @@ def test_v2_parse_rejects_unknown_directory_member_kind() -> None:
     directories = cast("dict[str, list[dict[str, object]]]", payload["directories"])
     first = next(iter(directories.values()))
     first[0]["kind"] = "bogus"
+    with pytest.raises(ValueError):
+        LinkIndex.from_dict(payload)
+
+
+def test_v2_parse_rejects_duplicate_outbound_edge() -> None:
+    payload = _v2_index().to_dict()
+    files = cast("dict[str, dict[str, object]]", payload["files"])
+    first = next(iter(files.values()))
+    outbound = cast("list[dict[str, object]]", first["outbound"])
+    outbound.append(dict(outbound[0]))
+    with pytest.raises(ValueError):
+        LinkIndex.from_dict(payload)
+
+
+def test_v2_parse_rejects_duplicate_backlink() -> None:
+    payload = _v2_index().to_dict()
+    backlinks = cast("dict[str, list[dict[str, object]]]", payload["backlinks"])
+    first = next(iter(backlinks.values()))
+    first.append(dict(first[0]))
+    with pytest.raises(ValueError):
+        LinkIndex.from_dict(payload)
+
+
+def test_v2_parse_rejects_duplicate_directory_member() -> None:
+    payload = _v2_index().to_dict()
+    directories = cast("dict[str, list[dict[str, object]]]", payload["directories"])
+    first = next(iter(directories.values()))
+    first.append(dict(first[0]))
+    with pytest.raises(ValueError):
+        LinkIndex.from_dict(payload)
+
+
+def test_v2_parse_rejects_absolute_path() -> None:
+    payload = _v2_index().to_dict()
+    files = cast("dict[str, dict[str, object]]", payload["files"])
+    files["/abs/pages/a.md"] = files.pop("pages/a.md")
+    with pytest.raises(ValueError):
+        LinkIndex.from_dict(payload)
+
+
+def test_v2_parse_rejects_json_number_revision() -> None:
+    payload = _v2_index().to_dict()
+    payload["revision"] = 4
     with pytest.raises(ValueError):
         LinkIndex.from_dict(payload)
 
@@ -357,3 +411,20 @@ def test_build_index_content_directory_change_sets_changed() -> None:
     assert scan.stats.parsed_files == 0
     assert scan.stats.read_files == 1
     assert scan.changed is True
+
+
+def test_build_index_content_accepts_zero_width_span_for_empty_target() -> None:
+    # [b]() 产生零宽 destination span (4,4)；文件仍可判定，必须能发布 v2 索引。
+    scan = build_index_content(
+        documents={Path("pages/a.md"): b"[b]()\n"},
+        directories={Path("."): (DirectoryMember("pages", "directory"),)},
+        baseline=None,
+    )
+    assert scan.stats.parsed_files == 1
+    assert scan.content.files[Path("pages/a.md")].outbound == (
+        OutboundEdge(ResourceIdentity(ResourceKind.LOCAL, "pages"), LinkSpan(4, 4)),
+    )
+    materialized = materialize_index("1", scan.content)
+    assert materialized.files[Path("pages/a.md")].outbound == (
+        OutboundEdge(ResourceIdentity(ResourceKind.LOCAL, "pages"), LinkSpan(4, 4)),
+    )

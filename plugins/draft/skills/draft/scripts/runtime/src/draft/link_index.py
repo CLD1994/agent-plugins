@@ -362,9 +362,9 @@ def _validate_reverse_edges(
 # ---------------------------------------------------------------------------
 
 
-def validate_revision(revision: str) -> None:
+def validate_revision(revision: object) -> None:
     """按 spec §3 校验规范十进制 revision；比较在需要处用任意精度整数。"""
-    if not _REVISION.fullmatch(revision):
+    if not isinstance(revision, str) or not _REVISION.fullmatch(revision):
         raise ValueError("invalid revision")
 
 
@@ -384,7 +384,7 @@ class IndexedFile:
             raise ValueError("invalid path")
         _validate_sha256(self.sha256)
         for edge in self.outbound:
-            if edge.span.start < 0 or edge.span.end <= edge.span.start:
+            if edge.span.start < 0 or edge.span.end < edge.span.start:
                 raise ValueError("invalid span")
 
 
@@ -481,7 +481,7 @@ class LinkIndex:
         revision = _required_str(data, "revision")
         validate_revision(revision)
         files = _decode_v2_files(data.get("files"))
-        backlinks = _decode_backlinks(data.get("backlinks"))
+        backlinks = _decode_v2_backlinks(data.get("backlinks"))
         directories = _decode_v2_directories(data.get("directories"))
         return cls(revision, files, backlinks, directories)
 
@@ -522,6 +522,34 @@ def _decode_v2_files(value: object) -> dict[Path, IndexedFile]:
     return result
 
 
+def _decode_v2_backlinks(value: object) -> dict[ResourceIdentity, tuple[Backlink, ...]]:
+    if not isinstance(value, dict):
+        raise ValueError("invalid backlinks")
+    value = cast("dict[str, object]", value)
+    result: dict[ResourceIdentity, tuple[Backlink, ...]] = {}
+    for key, raw_edges in value.items():
+        if ":" not in key or not isinstance(raw_edges, list):
+            raise ValueError("invalid backlink record")
+        kind, value_ = key.split(":", 1)
+        identity = ResourceIdentity(ResourceKind(kind), value_)
+        edges: list[Backlink] = []
+        seen: set[Backlink] = set()
+        for raw_edge in cast("list[object]", raw_edges):
+            if not isinstance(raw_edge, dict):
+                raise ValueError("invalid backlink edge")
+            edge = cast("dict[str, object]", raw_edge)
+            backlink = Backlink(
+                Path(_required_str(edge, "source_path")),
+                LinkSpan(_required_int(edge, "start"), _required_int(edge, "end")),
+            )
+            if backlink in seen:
+                raise ValueError("duplicate backlink")
+            seen.add(backlink)
+            edges.append(backlink)
+        result[identity] = tuple(edges)
+    return result
+
+
 def _decode_v2_directories(value: object) -> dict[Path, tuple[DirectoryMember, ...]]:
     if not isinstance(value, dict):
         raise ValueError("invalid directories")
@@ -531,6 +559,7 @@ def _decode_v2_directories(value: object) -> dict[Path, tuple[DirectoryMember, .
         if not isinstance(raw_members, list):
             raise ValueError("invalid directory record")
         members: list[DirectoryMember] = []
+        seen: set[DirectoryMember] = set()
         for raw_member in cast("list[object]", raw_members):
             if not isinstance(raw_member, dict):
                 raise ValueError("invalid directory member")
@@ -538,8 +567,12 @@ def _decode_v2_directories(value: object) -> dict[Path, tuple[DirectoryMember, .
             kind = _required_str(member, "kind")
             if kind not in _DIRECTORY_MEMBER_KINDS:
                 raise ValueError("invalid directory member kind")
-            members.append(DirectoryMember(_required_str(member, "name"), kind))
-        result[Path(raw_path)] = tuple(sorted(set(members)))
+            directory_member = DirectoryMember(_required_str(member, "name"), kind)
+            if directory_member in seen:
+                raise ValueError("duplicate directory member")
+            seen.add(directory_member)
+            members.append(directory_member)
+        result[Path(raw_path)] = tuple(members)
     return result
 
 
