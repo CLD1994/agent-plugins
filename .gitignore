@@ -54,3 +54,6 @@ htmlcov/
 
 # Local Claude Code personal settings (keep shared .claude/ committed)
 .claude/settings.local.json
+
+# Local review notes
+docs/review-notes
