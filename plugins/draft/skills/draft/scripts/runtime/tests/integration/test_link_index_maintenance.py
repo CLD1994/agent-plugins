@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import errno
 import json
 import os
 from pathlib import Path
@@ -267,6 +269,49 @@ def test_stage_link_index_operation_directory_fsync_failure(
     assert (directory / f"{_STAGED_NAME}.pending").is_file()
 
 
+def test_stage_link_index_external_change_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """durable_write 的 external_change（pending/target 瞬时出现）必须原样传播。"""
+    root = _init_root(tmp_path)
+    directory = root / ".draft" / "operations" / ("a" * 32)
+    journal = _journal(directory, revision="1")
+    _persist_journal(journal)
+    real_open = os.open
+
+    def file_exists(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if flags & os.O_CREAT and "link-index.staged.json" in str(path):
+            raise FileExistsError("already exists")
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", file_exists)
+    with pytest.raises(DraftError) as caught:
+        stage_link_index(journal, _index("1"))
+    monkeypatch.undo()
+    assert caught.value.code == "operation.external_change"
+
+
+def test_stage_link_index_rejects_symlink_ancestor(tmp_path: Path) -> None:
+    """staging 祖先（``.draft/operations``）为符号链接时报不一致，与 publish 边界一致。"""
+    root = _init_root(tmp_path)
+    real_ops = root / ".draft" / "real-operations"
+    real_ops.mkdir()
+    target = real_ops / ("a" * 32)
+    target.mkdir()
+    journal = _journal(target, revision="1")
+    _persist_journal(journal)
+    # 把 .draft/operations 换成指向真实 operations 的符号链接。
+    (root / ".draft" / "operations").rmdir()
+    (root / ".draft" / "operations").symlink_to(real_ops, target_is_directory=True)
+    journal = dataclasses.replace(
+        journal, directory=root / ".draft" / "operations" / ("a" * 32)
+    )
+
+    with pytest.raises(DraftError) as caught:
+        stage_link_index(journal, _index("1"))
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+
+
 # ---------------------------------------------------------------------------
 # 发布目标分类与原子替换（spec §10 决策表）
 # ---------------------------------------------------------------------------
@@ -378,6 +423,24 @@ def test_publish_after_published_rejects_mismatched_artifact(tmp_path: Path) -> 
         publish_staged_link_index(root, journal, digest)
     assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
     assert (root / INDEX_RELATIVE_PATH).read_bytes() == b"tampered"
+
+
+def test_publish_after_published_rejects_non_monotonic_staged_revision(
+    tmp_path: Path,
+) -> None:
+    root = _init_root(tmp_path)
+    published_raw = _setup_published_artifact(root, revision="1")
+    directory = root / ".draft" / "operations" / ("a" * 32)
+    journal = _journal(directory, revision="1")
+    _persist_journal(journal)
+    digest = stage_link_index(journal, _index("1"))
+
+    with pytest.raises(DraftError) as caught:
+        publish_staged_link_index(root, journal, digest)
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    # 现场保留：目标未覆盖，staging 未消费。
+    assert (root / INDEX_RELATIVE_PATH).read_bytes() == published_raw
+    assert (directory / _STAGED_NAME).is_file()
 
 
 def test_publish_rejects_symlink_target(tmp_path: Path) -> None:
@@ -539,6 +602,90 @@ def test_publish_operation_directory_fsync_failure(
     assert not (directory / _STAGED_NAME).exists()
 
 
+def test_publish_staging_read_eacces_maps_to_index_update_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _init_root(tmp_path)
+    directory = root / ".draft" / "operations" / ("a" * 32)
+    journal = _journal(directory, revision="1")
+    _persist_journal(journal)
+    digest = stage_link_index(journal, _index("1"))
+    real_open = os.open
+
+    def fail_read(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if (
+            not (flags & os.O_DIRECTORY)
+            and (flags & os.O_NOFOLLOW)
+            and str(path).endswith(_STAGED_NAME)
+        ):
+            raise OSError(errno.EACCES, "injected")
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", fail_read)
+    with pytest.raises(DraftError) as caught:
+        publish_staged_link_index(root, journal, digest)
+    monkeypatch.undo()
+    assert caught.value.code == "operation.index_update_failed"
+    assert not (root / INDEX_RELATIVE_PATH).exists()
+    assert (directory / _STAGED_NAME).is_file()
+
+
+def test_publish_staging_read_enoent_maps_to_inconsistent_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _init_root(tmp_path)
+    directory = root / ".draft" / "operations" / ("a" * 32)
+    journal = _journal(directory, revision="1")
+    _persist_journal(journal)
+    digest = stage_link_index(journal, _index("1"))
+    real_open = os.open
+
+    def fail_read(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if (
+            not (flags & os.O_DIRECTORY)
+            and (flags & os.O_NOFOLLOW)
+            and str(path).endswith(_STAGED_NAME)
+        ):
+            raise OSError(errno.ENOENT, "injected")
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", fail_read)
+    with pytest.raises(DraftError) as caught:
+        publish_staged_link_index(root, journal, digest)
+    monkeypatch.undo()
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    assert not (root / INDEX_RELATIVE_PATH).exists()
+
+
+def test_publish_published_target_read_eacces_maps_to_index_update_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _init_root(tmp_path)
+    published_raw = _setup_published_artifact(root, revision="1")
+    directory = root / ".draft" / "operations" / ("a" * 32)
+    journal = _journal(directory, revision="2")
+    _persist_journal(journal)
+    digest = stage_link_index(journal, _index("2"))
+    real_open = os.open
+
+    def fail_read(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if (
+            not (flags & os.O_DIRECTORY)
+            and (flags & os.O_NOFOLLOW)
+            and str(path).endswith("link-index.json")
+        ):
+            raise OSError(errno.EACCES, "injected")
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", fail_read)
+    with pytest.raises(DraftError) as caught:
+        publish_staged_link_index(root, journal, digest)
+    monkeypatch.undo()
+    assert caught.value.code == "operation.index_update_failed"
+    assert (root / INDEX_RELATIVE_PATH).read_bytes() == published_raw
+    assert (directory / _STAGED_NAME).is_file()
+
+
 # ---------------------------------------------------------------------------
 # rebuild-required flag（spec §10/§11）
 # ---------------------------------------------------------------------------
@@ -656,6 +803,20 @@ def test_remove_rebuild_flag_rejects_directory(tmp_path: Path) -> None:
     with pytest.raises(DraftError) as caught:
         remove_rebuild_flag(root)
     assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+
+
+def test_remove_rebuild_flag_rejects_symlink_ancestor(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    target = tmp_path / "internal-target"
+    target.mkdir()
+    (target / "operations").mkdir()
+    (target / "link-index-rebuild-required.flag").write_bytes(b"")
+    (root / ".draft").symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(DraftError) as caught:
+        remove_rebuild_flag(root)
+    assert caught.value.code == CheckCode.PATH_SYMLINK_ESCAPE.value
 
 
 def test_remove_rebuild_flag_unlink_failure_returns_warning(
