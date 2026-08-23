@@ -229,6 +229,54 @@ def test_scan_rejects_instability_when_root_changes_during_scan(
     assert caught.value.code == "operation.external_change"
 
 
+def test_scan_fails_on_unreadable_subdirectory(tmp_path: Path) -> None:
+    root = _init_root(tmp_path)
+    locked = root / "locked"
+    locked.mkdir()
+    (locked / "hidden.md").write_text("# hidden\n", encoding="utf-8")
+    locked.chmod(0o000)
+    try:
+        with pytest.raises(DraftError) as caught:
+            scan_link_index(root, baseline=None)
+        assert caught.value.code == "operation.index_update_failed"
+    finally:
+        locked.chmod(0o755)
+
+
+def test_scan_marks_unstable_when_file_disappears_during_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _init_root(tmp_path)
+    import draft.link_index_maintenance as maintenance
+
+    original = maintenance.read_file_no_follow
+
+    def disappear(path: Path, relative: Path) -> bytes:
+        if path.name == "a.md":
+            raise FileNotFoundError("gone")
+        return original(path, relative)
+
+    monkeypatch.setattr(maintenance, "read_file_no_follow", disappear)
+
+    with pytest.raises(DraftError) as caught:
+        scan_link_index(root, baseline=None)
+    assert caught.value.code == "operation.external_change"
+
+
+def test_scan_rejects_duplicate_known_documents(tmp_path: Path) -> None:
+    root = _init_root(tmp_path)
+    from draft.link_index import IndexedFile, OutboundEdge
+
+    path = Path("pages/a.md")
+    raw = (root / path).read_bytes()
+    digest = sha256_bytes(raw)
+    edge = OutboundEdge(ResourceIdentity(ResourceKind.PAGE, "pages/b.md"), LinkSpan(4, 8))
+    known = IndexedFile(path=path, sha256=digest, outbound=(edge,))
+
+    with pytest.raises(ValueError):
+        scan_link_index(root, baseline=None, known_documents=(known, known))
+
+
 def test_authority_is_absent_when_no_operations(tmp_path: Path) -> None:
     root = _init_root(tmp_path)
     authority = read_link_index_authority(root)

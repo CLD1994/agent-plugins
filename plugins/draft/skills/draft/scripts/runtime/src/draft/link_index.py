@@ -633,20 +633,22 @@ def build_index_content(
     baseline: LinkIndexContent | LinkIndex | None,
     *,
     root: Path = Path("."),
-    known_documents: tuple[object, ...] = (),
+    known_documents: tuple[IndexedFile, ...] = (),
 ) -> LinkIndexScan:
     """纯增量事实计算：比较 path + sha256，未变化文件复用既有解析结果。
 
     ``known_documents`` 提供上层已经解析的 ``IndexedFile``（path+sha256+outbound）；
     只有路径与 SHA-256 均匹配时才复用其 links，不跳过正文读取或摘要比较（spec §8.6、
-    Task 9 seed）。增量判定始终对 ``baseline``（已发布制品）比较，known_documents 不
-    影响 ``changed``。
+    Task 9 seed）。同一路径重复出现是调用方契约错误，显式报 ``ValueError``，不静默
+    覆盖。增量判定始终对 ``baseline``（已发布制品）比较，known_documents 不影响
+    ``changed``。
     """
     baseline_files = baseline.files if baseline is not None else {}
     known_by_path: dict[Path, IndexedFile] = {}
     for document in known_documents:
-        if isinstance(document, IndexedFile):
-            known_by_path[document.path] = document
+        if document.path in known_by_path:
+            raise ValueError(f"duplicate known document: {document.path.as_posix()}")
+        known_by_path[document.path] = document
     read_files = 0
     read_bytes = 0
     parsed_files = 0

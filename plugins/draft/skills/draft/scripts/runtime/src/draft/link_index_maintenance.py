@@ -21,6 +21,7 @@ from draft.errors import DraftError
 from draft.link_index import (
     INDEX_RELATIVE_PATH,
     DirectoryMember,
+    IndexedFile,
     LinkIndex,
     LinkIndexScan,
     build_index_content,
@@ -177,7 +178,7 @@ def next_link_index_revision(authority: LinkIndexAuthority) -> str:
 def scan_link_index(
     root: Path,
     baseline: LinkIndexBaseline | None,
-    known_documents: tuple[object, ...] = (),
+    known_documents: tuple[IndexedFile, ...] = (),
 ) -> LinkIndexScan:
     """严格扫描根内 Markdown 与目录事实。
 
@@ -185,6 +186,8 @@ def scan_link_index(
     - 记录目录直接成员名称与节点类型（no-follow lstat 分类）；
     - 只读取普通 ``.md`` 文件，不跟随符号链接；
     - 每个覆盖文件读取正文并计算 SHA-256（inode/size/mtime 只作进程内变化探针）；
+    - 不可读子目录使遍历失败（``os.walk onerror`` → ``operation.index_update_failed``），
+      不静默跳过、不产生完整候选（spec §8）；
     - 扫描结束后二次观察目录与文件身份，发现变化返回 ``operation.external_change``，
       不产生完整候选；
     - 向 ``build_index_content``（纯增量）传递 bytes；``known_documents`` 只在
@@ -194,7 +197,7 @@ def scan_link_index(
     directories: dict[Path, tuple[DirectoryMember, ...]] = {}
     identities: dict[Path, tuple[int, int, int, int]] = {}
 
-    for current_root, dirnames, filenames in os.walk(root):
+    for current_root, dirnames, filenames in os.walk(root, onerror=_scan_walk_error):
         directory_path = Path(current_root)
         relative_dir = directory_path.relative_to(root)
         if relative_dir == Path(".draft") or relative_dir.parts[:1] == (".draft",):
@@ -211,12 +214,18 @@ def scan_link_index(
             relative = path.relative_to(root)
             try:
                 st = os.lstat(path)
+            except FileNotFoundError:
+                # 文件在 walk 与 lstat 之间被删除：根在扫描期间变化，不稳定扫描。
+                raise DraftError(_SCAN_UNSTABLE, root) from None
             except OSError as exc:
                 raise DraftError(_SCAN_READ_FAILED, relative) from exc
             if not stat.S_ISREG(st.st_mode):
                 continue  # 符号链接或非普通 .md 节点不读取（spec §8.3 no-follow）
             try:
                 raw = read_file_no_follow(path, relative)
+            except FileNotFoundError:
+                # 文件在 lstat 与读取之间被删除：不稳定扫描。
+                raise DraftError(_SCAN_UNSTABLE, root) from None
             except OSError as exc:
                 raise DraftError(_SCAN_READ_FAILED, relative) from exc
             documents[relative] = raw
@@ -255,9 +264,23 @@ def _list_directory_members(path: Path) -> tuple[DirectoryMember, ...]:
     return tuple(sorted(members, key=lambda member: (member.name, member.kind)))
 
 
+def _scan_walk_error(error: OSError) -> None:
+    """``os.walk`` 遍历到不可读目录时把扫描标记为失败，不静默跳过（spec §8）。"""
+    filename = error.filename or "."
+    raise DraftError(_SCAN_READ_FAILED, Path(filename)) from error
+
+
 def read_file_no_follow(path: Path, relative: Path) -> bytes:
+    """no-follow 读取普通文件正文。
+
+    文件在 walk 与读取之间被删除时传播 ``FileNotFoundError``，由扫描调用方映射为
+    不稳定扫描（``operation.external_change``）；其余 OSError（如 EACCES）映射为
+    扫描失败（``operation.index_update_failed``）。
+    """
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        raise  # 文件消失：不稳定扫描语义由调用方决定。
     except OSError as exc:
         raise DraftError(_SCAN_READ_FAILED, relative) from exc
     try:
@@ -297,9 +320,14 @@ def _verify_root_stable(
     expected_identities: dict[Path, tuple[int, int, int, int]],
 ) -> None:
     """二次观察：目录成员与文件身份在扫描期间变化则拒绝产生完整候选（spec §1）。"""
+
+    def _verify_walk_error(error: OSError) -> None:
+        # 首轮可读而二轮不可读：根在扫描期间变化，不稳定扫描。
+        raise DraftError(_SCAN_UNSTABLE, root) from error
+
     seen_directories: dict[Path, tuple[DirectoryMember, ...]] = {}
     seen_files: set[Path] = set()
-    for current_root, dirnames, filenames in os.walk(root):
+    for current_root, dirnames, filenames in os.walk(root, onerror=_verify_walk_error):
         directory_path = Path(current_root)
         relative_dir = directory_path.relative_to(root)
         if relative_dir == Path(".draft") or relative_dir.parts[:1] == (".draft",):
