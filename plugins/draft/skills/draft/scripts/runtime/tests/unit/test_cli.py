@@ -21,6 +21,7 @@ from draft.models import (
     LifecycleWarning,
     OperationPhase,
     OperationResult,
+    ResultWarning,
     RootState,
     TrashResult,
 )
@@ -52,7 +53,7 @@ def _operation_result(
     kind: str = "move",
     phase: OperationPhase = OperationPhase.COMPLETED,
     changed_paths: tuple[Path, ...] = (Path("pages/a.md"), Path("pages/b.md")),
-    warnings: tuple[LifecycleWarning, ...] = (),
+    warnings: tuple[ResultWarning, ...] = (),
 ) -> OperationResult:
     return OperationResult(
         operation_id=operation_id,

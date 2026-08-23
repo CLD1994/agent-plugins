@@ -51,6 +51,7 @@ class CheckCode(StrEnum):
     REPLACEMENT_CYCLE = "replacement.cycle"
     CHALLENGE_PAIR_MISSING = "challenge.pair_missing"
     OPERATION_JOURNAL_CORRUPT = "operation.journal_corrupt"
+    OPERATION_JOURNAL_VERSION_UNSUPPORTED = "operation.journal_version_unsupported"
     OPERATION_RECOVERY_REQUIRED = "operation.recovery_required"
     OPERATION_ORPHAN_ALLOCATING = "operation.orphan_allocating"
     OPERATION_INCONSISTENT_STATE = "operation.inconsistent_state"

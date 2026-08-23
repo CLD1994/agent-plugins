@@ -528,6 +528,16 @@ VALID_RENDER_CASES = [
     ),
     RenderCase(
         CheckIssue(
+            CheckCode.OPERATION_JOURNAL_VERSION_UNSUPPORTED.value,
+            IssueSeverity.ERROR,
+            Path(_JOURNAL),
+            None,
+            ("1", "4"),
+        ),
+        (0, 1),
+    ),
+    RenderCase(
+        CheckIssue(
             CheckCode.OPERATION_RECOVERY_REQUIRED.value,
             IssueSeverity.ERROR,
             Path(".draft/operation.lock"),

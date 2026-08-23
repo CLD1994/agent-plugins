@@ -564,6 +564,9 @@ def _op_journal(
         remove_empty_directories=(),
         metadata=dict(metadata or {}),
         directory=Path("/draft/.draft/operations") / operation_id,
+        link_index_revision=None,
+        link_index_result=None,
+        link_index_sha256=None,
     )
 
 

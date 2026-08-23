@@ -34,6 +34,21 @@ class OperationKind(StrEnum):
     RECOVER = "recover"
     GENERATE_CONCLUSIONS = "generate-conclusions"
     ADOPT = "adopt"
+    LINK_INDEX_UPDATE = "link-index.update"
+
+
+class LinkIndexResult(StrEnum):
+    """链接索引维护的权威结果（规格 §5）：published 与 rebuild_required 都是成功结果。"""
+
+    PUBLISHED = "published"
+    REBUILD_REQUIRED = "rebuild_required"
+
+
+@dataclass(frozen=True)
+class ResultWarning:
+    """公开的稳定索引 warning；不含 operation ID、内部路径或异常文本（规格 §11）。"""
+
+    code: str
 
 
 class IssueSeverity(StrEnum):
@@ -53,6 +68,9 @@ class OperationPhase(StrEnum):
     PREPARED = "prepared"
     APPLYING = "applying"
     VALIDATING = "validating"
+    LINK_INDEX_UPDATING = "link_index_updating"
+    LINK_INDEX_PUBLISHED = "link_index_published"
+    LINK_INDEX_REBUILD_REQUIRED = "link_index_rebuild_required"
     ROLLING_BACK = "rolling_back"
     TRASH_RETAINED = "trash_retained"
     TRASH_HANDOFF_PENDING = "trash_handoff_pending"
@@ -167,7 +185,7 @@ class OperationResult:
     kind: str
     phase: OperationPhase
     changed_paths: tuple[Path, ...]
-    warnings: tuple[LifecycleWarning, ...] = ()
+    warnings: tuple[ResultWarning, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -179,3 +197,4 @@ class TrashResult:
     purge_eligible_at: datetime | None = None
     warnings: tuple[LifecycleWarning, ...] = ()
     changed_paths: tuple[Path, ...] = ()
+    index_warnings: tuple[ResultWarning, ...] = ()

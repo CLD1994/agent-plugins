@@ -9,7 +9,13 @@ import pytest
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
-from draft.models import MutationKind, OperationKind, OperationPhase, RootState
+from draft.models import (
+    LinkIndexResult,
+    MutationKind,
+    OperationKind,
+    OperationPhase,
+    RootState,
+)
 from draft.observations import (
     EMPTY_OBSERVATIONS,
     EntryKind,
@@ -19,6 +25,8 @@ from draft.observations import (
     file_observation,
 )
 from draft.operations import (
+    _EDGES_BY_KIND,  # pyright: ignore[reportPrivateUsage]
+    _PHASES_BY_KIND,  # pyright: ignore[reportPrivateUsage]
     HANDOFF_ATTEMPTED_AT_KEY,
     HANDOFF_ERROR_MESSAGE_KEY,
     HANDOFF_ERROR_TYPE_KEY,
@@ -26,6 +34,7 @@ from draft.operations import (
     Journal,
     JournalMutation,
     TrashDeadlines,
+    _journal_to_json,  # pyright: ignore[reportPrivateUsage]
     _parse_journal,  # pyright: ignore[reportPrivateUsage]
     _verify_observations_for_recovery,  # pyright: ignore[reportPrivateUsage]
     _write_recovery_decision,  # pyright: ignore[reportPrivateUsage]
@@ -36,7 +45,9 @@ from draft.operations import (
     has_handoff_failure,
     normalize_utc,
     sha256_bytes,
+    validate_journal_kind_phase,
     validate_journal_transition,
+    validate_link_index_revision,
     validate_operation_id,
     with_metadata,
     with_phase,
@@ -399,6 +410,9 @@ def test_verify_recovery_uses_probe_not_direct_fs(
         remove_empty_directories=(),
         metadata={},
         directory=Path(".draft/operations") / ("a" * 32),
+        link_index_revision=None,
+        link_index_result=None,
+        link_index_sha256=None,
     )
     changed, _ = _verify_observations_for_recovery(
         Path("."),
@@ -600,7 +614,12 @@ def test_validate_operation_id_uses_custom_code() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _journal() -> Journal:
+def _journal(
+    *,
+    link_index_revision: str | None = None,
+    link_index_result: LinkIndexResult | None = None,
+    link_index_sha256: str | None = None,
+) -> Journal:
     return Journal(
         operation_id="a" * 32,
         kind=OperationKind.MOVE,
@@ -620,6 +639,9 @@ def _journal() -> Journal:
         ),
         remove_empty_directories=(Path("pages/old"),),
         metadata={"key1": "value1", "key2": "value2"},
+        link_index_revision=link_index_revision,
+        link_index_result=link_index_result,
+        link_index_sha256=link_index_sha256,
         directory=Path("/draft/.draft/operations/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
     )
 
@@ -653,6 +675,283 @@ def test_without_metadata_nonexistent_key_preserves_all_fields() -> None:
     original = _journal()
     updated = without_metadata(original, "nonexistent")
     assert updated == dataclasses.replace(original, metadata=original.metadata)
+
+
+# ---------------------------------------------------------------------------
+# journal v4 链接索引字段矩阵与 revision 校验
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("phase", "revision", "result", "sha256", "valid"),
+    [
+        # 索引阶段前：三个字段全部禁止。
+        (OperationPhase.VALIDATING, None, None, None, True),
+        (OperationPhase.VALIDATING, "1", None, None, False),
+        (OperationPhase.VALIDATING, None, LinkIndexResult.PUBLISHED, None, False),
+        (OperationPhase.VALIDATING, None, None, "a" * 64, False),
+        # link_index_updating：必须 revision，禁止 result/sha256。
+        (OperationPhase.LINK_INDEX_UPDATING, "1", None, None, True),
+        (OperationPhase.LINK_INDEX_UPDATING, None, None, None, False),
+        (OperationPhase.LINK_INDEX_UPDATING, "1", LinkIndexResult.PUBLISHED, None, False),
+        (OperationPhase.LINK_INDEX_UPDATING, "1", None, "a" * 64, False),
+        # link_index_published：必须 revision + published + sha256。
+        (
+            OperationPhase.LINK_INDEX_PUBLISHED,
+            "1",
+            LinkIndexResult.PUBLISHED,
+            "a" * 64,
+            True,
+        ),
+        (
+            OperationPhase.LINK_INDEX_PUBLISHED,
+            "1",
+            LinkIndexResult.REBUILD_REQUIRED,
+            "a" * 64,
+            False,
+        ),
+        (OperationPhase.LINK_INDEX_PUBLISHED, "1", LinkIndexResult.PUBLISHED, None, False),
+        # link_index_rebuild_required：必须 revision + rebuild_required，禁止 sha256。
+        (
+            OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
+            "2",
+            LinkIndexResult.REBUILD_REQUIRED,
+            None,
+            True,
+        ),
+        (
+            OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
+            "2",
+            LinkIndexResult.REBUILD_REQUIRED,
+            "a" * 64,
+            False,
+        ),
+        # 终态保留：全缺省合法，或 revision+result 原样保留；sha256 仅 published 保留。
+        (OperationPhase.COMPLETED, None, None, None, True),
+        (OperationPhase.COMPLETED, "1", LinkIndexResult.PUBLISHED, "a" * 64, True),
+        (OperationPhase.COMPLETED, "2", LinkIndexResult.REBUILD_REQUIRED, None, True),
+        (OperationPhase.COMPLETED, None, LinkIndexResult.PUBLISHED, None, False),
+        (OperationPhase.COMPLETED, "1", LinkIndexResult.REBUILD_REQUIRED, "a" * 64, False),
+        (OperationPhase.COMPLETED, "1", LinkIndexResult.PUBLISHED, None, False),
+        # rollback 路径：三个字段全部禁止。
+        (OperationPhase.ROLLED_BACK, "2", LinkIndexResult.REBUILD_REQUIRED, None, False),
+        (OperationPhase.ROLLED_BACK, "1", None, None, False),
+        (OperationPhase.ROLLED_BACK, None, LinkIndexResult.PUBLISHED, None, False),
+    ],
+)
+def test_journal_link_index_field_matrix(
+    phase: OperationPhase,
+    revision: str | None,
+    result: LinkIndexResult | None,
+    sha256: str | None,
+    valid: bool,
+) -> None:
+    journal = dataclasses.replace(
+        _journal(),
+        phase=phase,
+        link_index_revision=revision,
+        link_index_result=result,
+        link_index_sha256=sha256,
+    )
+    if valid:
+        validate_journal_kind_phase(journal, path=Path("journal.json"))
+    else:
+        with pytest.raises(DraftError) as caught:
+            validate_journal_kind_phase(journal, path=Path("journal.json"))
+        assert caught.value.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
+
+
+@pytest.mark.parametrize("revision", ["1", "9", "10", "9" * 100])
+def test_validate_link_index_revision_accepts_canonical_decimal(revision: str) -> None:
+    assert validate_link_index_revision(revision, path=Path("journal.json")) == revision
+
+
+@pytest.mark.parametrize(
+    "revision",
+    ["0", "01", "+1", "-1", "1.0", "1e3", " 1", "1 ", "", "abc"],
+)
+def test_validate_link_index_revision_rejects_invalid(revision: str) -> None:
+    with pytest.raises(DraftError) as caught:
+        validate_link_index_revision(revision, path=Path("journal.json"))
+    assert caught.value.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
+
+
+def test_validate_link_index_revision_rejects_json_number() -> None:
+    with pytest.raises(DraftError) as caught:
+        validate_link_index_revision(1, path=Path("journal.json"))
+    assert caught.value.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        OperationPhase.ROLLING_BACK,
+        OperationPhase.ROLLED_BACK,
+    ],
+)
+def test_rollback_phase_with_link_index_fields_rejected(phase: OperationPhase) -> None:
+    journal = dataclasses.replace(
+        _journal(),
+        phase=phase,
+        link_index_revision="1",
+        link_index_result=LinkIndexResult.PUBLISHED,
+        link_index_sha256="a" * 64,
+    )
+    with pytest.raises(DraftError) as caught:
+        validate_journal_kind_phase(journal, path=Path("journal.json"))
+    assert caught.value.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
+
+
+def test_link_index_published_fields_preserved_to_completed() -> None:
+    journal = dataclasses.replace(
+        _journal(),
+        phase=OperationPhase.LINK_INDEX_PUBLISHED,
+        link_index_revision="1",
+        link_index_result=LinkIndexResult.PUBLISHED,
+        link_index_sha256="a" * 64,
+    )
+    terminal = dataclasses.replace(journal, phase=OperationPhase.COMPLETED)
+    validate_journal_transition(journal, terminal, path=Path("journal.json"))
+
+
+def test_link_index_rebuild_fields_preserved_to_completed() -> None:
+    journal = dataclasses.replace(
+        _journal(),
+        phase=OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
+        link_index_revision="2",
+        link_index_result=LinkIndexResult.REBUILD_REQUIRED,
+        link_index_sha256=None,
+    )
+    terminal = dataclasses.replace(journal, phase=OperationPhase.COMPLETED)
+    validate_journal_transition(journal, terminal, path=Path("journal.json"))
+
+
+def test_link_index_published_fields_preserved_to_trash_retained() -> None:
+    journal = dataclasses.replace(
+        _journal(),
+        kind=OperationKind.TRASH,
+        phase=OperationPhase.LINK_INDEX_PUBLISHED,
+        link_index_revision="1",
+        link_index_result=LinkIndexResult.PUBLISHED,
+        link_index_sha256="a" * 64,
+    )
+    terminal = dataclasses.replace(journal, phase=OperationPhase.TRASH_RETAINED)
+    validate_journal_transition(journal, terminal, path=Path("journal.json"))
+
+
+def test_link_index_rebuild_fields_preserved_to_trash_retained() -> None:
+    journal = dataclasses.replace(
+        _journal(),
+        kind=OperationKind.TRASH,
+        phase=OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
+        link_index_revision="2",
+        link_index_result=LinkIndexResult.REBUILD_REQUIRED,
+        link_index_sha256=None,
+    )
+    terminal = dataclasses.replace(journal, phase=OperationPhase.TRASH_RETAINED)
+    validate_journal_transition(journal, terminal, path=Path("journal.json"))
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        OperationPhase.PREPARED,
+        OperationPhase.APPLYING,
+        OperationPhase.VALIDATING,
+        OperationPhase.TRASH_RETAINED,
+        OperationPhase.TRASH_HANDOFF_PENDING,
+        OperationPhase.ROLLING_BACK,
+    ],
+)
+def test_link_index_update_rejects_borrowed_phases(phase: OperationPhase) -> None:
+    journal = dataclasses.replace(_journal(), kind=OperationKind.LINK_INDEX_UPDATE, phase=phase)
+    with pytest.raises(DraftError) as caught:
+        validate_journal_kind_phase(journal, path=Path("journal.json"))
+    assert caught.value.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
+
+
+def test_authority_tables_model_link_index_phases() -> None:
+    assert (
+        OperationPhase.VALIDATING,
+        OperationPhase.LINK_INDEX_UPDATING,
+    ) in _EDGES_BY_KIND[OperationKind.MOVE]
+    assert (
+        OperationPhase.LINK_INDEX_UPDATING,
+        OperationPhase.ROLLING_BACK,
+    ) not in _EDGES_BY_KIND[OperationKind.MOVE]
+    assert _PHASES_BY_KIND[OperationKind.LINK_INDEX_UPDATE] == frozenset(
+        {
+            OperationPhase.ALLOCATING,
+            OperationPhase.LINK_INDEX_UPDATING,
+            OperationPhase.LINK_INDEX_PUBLISHED,
+            OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
+            OperationPhase.COMPLETED,
+            OperationPhase.ROLLED_BACK,
+        }
+    )
+
+
+def test_journal_to_json_omits_forbidden_index_fields_before_index_phase() -> None:
+    journal = _journal()
+    payload = json.loads(_journal_to_json(journal).decode("utf-8"))
+    assert "link_index_revision" not in payload
+    assert "link_index_result" not in payload
+    assert "link_index_sha256" not in payload
+
+
+def test_journal_to_json_serializes_published_index_fields() -> None:
+    journal = dataclasses.replace(
+        _journal(),
+        phase=OperationPhase.LINK_INDEX_PUBLISHED,
+        link_index_revision="1",
+        link_index_result=LinkIndexResult.PUBLISHED,
+        link_index_sha256="a" * 64,
+    )
+    payload = json.loads(_journal_to_json(journal).decode("utf-8"))
+    assert payload["link_index_revision"] == "1"
+    assert payload["link_index_result"] == "published"
+    assert payload["link_index_sha256"] == "a" * 64
+
+
+def test_journal_to_json_omits_rebuild_sha256() -> None:
+    journal = dataclasses.replace(
+        _journal(),
+        phase=OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
+        link_index_revision="2",
+        link_index_result=LinkIndexResult.REBUILD_REQUIRED,
+        link_index_sha256=None,
+    )
+    payload = json.loads(_journal_to_json(journal).decode("utf-8"))
+    assert payload["link_index_revision"] == "2"
+    assert payload["link_index_result"] == "rebuild_required"
+    assert "link_index_sha256" not in payload
+
+
+def test_parse_journal_round_trips_link_index_fields() -> None:
+    journal = dataclasses.replace(
+        _journal(),
+        mutations=(),
+        phase=OperationPhase.LINK_INDEX_PUBLISHED,
+        link_index_revision="1",
+        link_index_result=LinkIndexResult.PUBLISHED,
+        link_index_sha256="a" * 64,
+    )
+    decoded = json.loads(_journal_to_json(journal).decode("utf-8"))
+    parsed = _parse_journal(decoded, journal.directory / "journal.json")
+    assert parsed.link_index_revision == "1"
+    assert parsed.link_index_result is LinkIndexResult.PUBLISHED
+    assert parsed.link_index_sha256 == "a" * 64
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["link_index_revision", "link_index_result", "link_index_sha256"],
+)
+def test_parse_journal_rejects_explicit_null_index_field(field: str) -> None:
+    payload = _journal_payload([])
+    payload[field] = None
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
+        _parse_journal(payload, _parse_path())
 
 
 # ---------------------------------------------------------------------------
@@ -766,6 +1065,9 @@ def _journal_with_metadata(metadata: dict[str, str]) -> Journal:
         remove_empty_directories=(),
         metadata=metadata,
         directory=Path("/draft/.draft/operations/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        link_index_revision=None,
+        link_index_result=None,
+        link_index_sha256=None,
     )
 
 
@@ -839,9 +1141,16 @@ def _journal_payload(
     operation_id: str = "a" * 32,
     kind: str = OperationKind.CREATE.value,
     phase: str = OperationPhase.PREPARED.value,
+    link_index_revision: str | None | object = ...,
+    link_index_result: LinkIndexResult | None | object = ...,
+    link_index_sha256: str | None | object = ...,
 ) -> dict[str, object]:
-    """构造解析输入；mutation 缺省字段由各用例显式给出，不再复制默认值。"""
-    return {
+    """构造解析输入；mutation 缺省字段由各用例显式给出，不再复制默认值。
+
+    ``...`` 表示索引键缺省（合法阶段必须缺失）；传入 ``None`` 表示显式 null
+    （解析器必须拒绝）。索引阶段字段由 ``validate_journal_kind_phase`` 校验。
+    """
+    payload: dict[str, object] = {
         "journal_version": JOURNAL_VERSION,
         "operation_id": operation_id,
         "kind": kind,
@@ -852,6 +1161,17 @@ def _journal_payload(
         "remove_empty_directories": [],
         "metadata": {},
     }
+    if link_index_revision is not ...:
+        payload["link_index_revision"] = link_index_revision
+    if link_index_result is not ...:
+        payload["link_index_result"] = (
+            link_index_result.value
+            if isinstance(link_index_result, LinkIndexResult)
+            else link_index_result
+        )
+    if link_index_sha256 is not ...:
+        payload["link_index_sha256"] = link_index_sha256
+    return payload
 
 
 def _parse_path(operation_id: str = "a" * 32) -> Path:
@@ -1103,6 +1423,9 @@ def _j(
         remove_empty_directories=remove_empty,
         metadata=dict(metadata or {}),
         directory=Path(".draft/operations") / op_id,
+        link_index_revision=None,
+        link_index_result=None,
+        link_index_sha256=None,
     )
 
 

@@ -12,12 +12,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Literal, Protocol, cast
+from typing import Literal, NoReturn, Protocol, cast
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import INTERNAL_DIR, MARKER_PATH
 from draft.models import (
+    LinkIndexResult,
     MutationKind,
     OperationKind,
     OperationPhase,
@@ -41,7 +42,7 @@ class _MutationLike(Protocol):
     def path(self) -> Path: ...
 
 
-JOURNAL_VERSION = 3
+JOURNAL_VERSION = 4
 LOCK_RELATIVE = Path(INTERNAL_DIR) / "operation.lock"
 OPERATIONS_RELATIVE = Path(INTERNAL_DIR) / "operations"
 
@@ -72,6 +73,55 @@ _MID_WRITE_PHASES = frozenset(
         OperationPhase.ROLLING_BACK,
     }
 )
+
+# 链接索引字段的 phase 分组（规格 §4 字段矩阵）：唯一权威来源，序列化、解析、
+# 逐条校验与后继转换共享。
+_PRE_LINK_INDEX_PHASES = frozenset(
+    {
+        OperationPhase.ALLOCATING,
+        OperationPhase.PREPARED,
+        OperationPhase.APPLYING,
+        OperationPhase.VALIDATING,
+    }
+)
+_LINK_INDEX_PHASES = frozenset(
+    {
+        OperationPhase.LINK_INDEX_UPDATING,
+        OperationPhase.LINK_INDEX_PUBLISHED,
+        OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
+    }
+)
+_ROLLBACK_PHASES = frozenset(
+    {
+        OperationPhase.ROLLING_BACK,
+        OperationPhase.ROLLED_BACK,
+    }
+)
+# 经索引阶段到达的原有成功终态：字段原样保留，sha256 仅 published 保留。
+_PRESERVED_LINK_INDEX_PHASES = frozenset(
+    {
+        OperationPhase.COMPLETED,
+        OperationPhase.TRASH_RETAINED,
+        OperationPhase.TRASH_HANDOFF_PENDING,
+        OperationPhase.TRASH_HANDOFF_SUCCEEDED,
+        OperationPhase.TRASH_PURGE_COMMITTED,
+    }
+)
+
+_REVISION_PATTERN = re.compile(r"[1-9][0-9]*")
+
+
+def validate_link_index_revision(value: object, *, path: Path) -> str:
+    """链接索引 revision 的格式校验边界（规格 §3）。
+
+    只接受匹配 ``[1-9][0-9]*`` 的规范十进制字符串并原样返回：不接受前导零、
+    符号、小数、指数、空白或 JSON 数字（含 ``int``）。本函数只做格式与规范串
+    校验，不做数值比较；取数值最大 revision 由后续 journal authority 扫描按
+    任意精度整数执行（不按字符串字典序）。
+    """
+    if not isinstance(value, str) or _REVISION_PATTERN.fullmatch(value) is None:
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, path)
+    return value
 
 
 class MutationDirection(StrEnum):
@@ -1121,6 +1171,10 @@ class Journal:
     remove_empty_directories: tuple[Path, ...]
     metadata: dict[str, str]
     directory: Path
+    # 链接索引结果（规格 §4）：必填字段，合法性由 phase 决定，pre-index/rollback 阶段必须为 None。
+    link_index_revision: str | None
+    link_index_result: LinkIndexResult | None
+    link_index_sha256: str | None
 
 
 def _journal_to_json(journal: Journal) -> bytes:
@@ -1157,6 +1211,14 @@ def _journal_to_json(journal: Journal) -> bytes:
         "remove_empty_directories": [path.as_posix() for path in journal.remove_empty_directories],
         "metadata": journal.metadata,
     }
+    # 序列化只输出当前 phase 允许且有值的索引键；禁止字段必须缺失，不写 JSON null。
+    allowed = _link_index_allowed_fields(journal.phase)
+    if journal.link_index_revision is not None and "link_index_revision" in allowed:
+        payload["link_index_revision"] = journal.link_index_revision
+    if journal.link_index_result is not None and "link_index_result" in allowed:
+        payload["link_index_result"] = journal.link_index_result.value
+    if journal.link_index_sha256 is not None and "link_index_sha256" in allowed:
+        payload["link_index_sha256"] = journal.link_index_sha256
     return (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
@@ -1331,43 +1393,63 @@ _GENERIC_STRUCTURAL_KINDS = frozenset(
 # kind 拥有的 phase 与边的单一权威来源（回归 M1）：解析单条 journal 与验证后继转换
 # 都从这里读取，不允许普通操作借用 adopt/trash 生命周期边。RECOVER 不允许形成持久
 # journal，phase 集为空。
-_PHASES_BY_KIND: dict[OperationKind, frozenset[OperationPhase]] = {
-    kind: frozenset(
-        {
-            OperationPhase.ALLOCATING,
-            OperationPhase.PREPARED,
-            OperationPhase.APPLYING,
-            OperationPhase.VALIDATING,
-            OperationPhase.ROLLING_BACK,
-            OperationPhase.COMPLETED,
-            OperationPhase.ROLLED_BACK,
-        }
-    )
-    for kind in _GENERIC_STRUCTURAL_KINDS
-}
-_PHASES_BY_KIND[OperationKind.ADOPT] = _PHASES_BY_KIND[OperationKind.CREATE]
-_PHASES_BY_KIND[OperationKind.RESTORE] = _PHASES_BY_KIND[OperationKind.CREATE]
-_PHASES_BY_KIND[OperationKind.TRASH] = frozenset(
+_BASE_PHASES = frozenset(
     {
         OperationPhase.ALLOCATING,
         OperationPhase.PREPARED,
         OperationPhase.APPLYING,
         OperationPhase.VALIDATING,
         OperationPhase.ROLLING_BACK,
-        OperationPhase.TRASH_RETAINED,
-        OperationPhase.TRASH_HANDOFF_PENDING,
-        OperationPhase.TRASH_HANDOFF_SUCCEEDED,
-        OperationPhase.TRASH_PURGE_COMMITTED,
         OperationPhase.COMPLETED,
         OperationPhase.ROLLED_BACK,
     }
 )
+_GENERIC_STRUCTURAL_PHASES = _BASE_PHASES | _LINK_INDEX_PHASES
+
+_PHASES_BY_KIND: dict[OperationKind, frozenset[OperationPhase]] = {
+    kind: _GENERIC_STRUCTURAL_PHASES for kind in _GENERIC_STRUCTURAL_KINDS
+}
+# adopt 只修改 `.draft/` 内 marker，不进入索引阶段（规格 §5）。
+_PHASES_BY_KIND[OperationKind.ADOPT] = _BASE_PHASES
+# restore 与普通结构 kind 一样进入索引阶段后到达 completed。
+_PHASES_BY_KIND[OperationKind.RESTORE] = _GENERIC_STRUCTURAL_PHASES
+_PHASES_BY_KIND[OperationKind.TRASH] = _GENERIC_STRUCTURAL_PHASES | frozenset(
+    {
+        OperationPhase.TRASH_RETAINED,
+        OperationPhase.TRASH_HANDOFF_PENDING,
+        OperationPhase.TRASH_HANDOFF_SUCCEEDED,
+        OperationPhase.TRASH_PURGE_COMMITTED,
+    }
+)
 _PHASES_BY_KIND[OperationKind.RECOVER] = frozenset()
+# 专用 maintenance kind：allocating → updating → published/rebuild_required → completed。
+_PHASES_BY_KIND[OperationKind.LINK_INDEX_UPDATE] = frozenset(
+    {
+        OperationPhase.ALLOCATING,
+        OperationPhase.LINK_INDEX_UPDATING,
+        OperationPhase.LINK_INDEX_PUBLISHED,
+        OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
+        OperationPhase.COMPLETED,
+        OperationPhase.ROLLED_BACK,
+    }
+)
+
+_BASE_STRUCTURAL_EDGES = _COMMON_PRE_COMMIT_EDGES | _FORWARD_COMPLETE_EDGE
+_GENERIC_LINK_INDEX_EDGES = frozenset(
+    {
+        (OperationPhase.VALIDATING, OperationPhase.LINK_INDEX_UPDATING),
+        (OperationPhase.LINK_INDEX_UPDATING, OperationPhase.LINK_INDEX_PUBLISHED),
+        (OperationPhase.LINK_INDEX_UPDATING, OperationPhase.LINK_INDEX_REBUILD_REQUIRED),
+        (OperationPhase.LINK_INDEX_PUBLISHED, OperationPhase.COMPLETED),
+        (OperationPhase.LINK_INDEX_REBUILD_REQUIRED, OperationPhase.COMPLETED),
+    }
+)
+_GENERIC_STRUCTURAL_EDGES = _BASE_STRUCTURAL_EDGES | _GENERIC_LINK_INDEX_EDGES
 
 _EDGES_BY_KIND: dict[OperationKind, frozenset[tuple[OperationPhase, OperationPhase]]] = {
-    kind: _COMMON_PRE_COMMIT_EDGES | _FORWARD_COMPLETE_EDGE for kind in _GENERIC_STRUCTURAL_KINDS
+    kind: _GENERIC_STRUCTURAL_EDGES for kind in _GENERIC_STRUCTURAL_KINDS
 }
-_EDGES_BY_KIND[OperationKind.ADOPT] = _EDGES_BY_KIND[OperationKind.CREATE] | frozenset(
+_EDGES_BY_KIND[OperationKind.ADOPT] = _BASE_STRUCTURAL_EDGES | frozenset(
     {
         # adopt：marker 已生效恢复允许 prepared/applying 直接提交（规格 §12.2）。
         (OperationPhase.PREPARED, OperationPhase.COMPLETED),
@@ -1378,7 +1460,7 @@ _EDGES_BY_KIND[OperationKind.ADOPT] = _EDGES_BY_KIND[OperationKind.CREATE] | fro
         (OperationPhase.VALIDATING, OperationPhase.ROLLED_BACK),
     }
 )
-_EDGES_BY_KIND[OperationKind.RESTORE] = _EDGES_BY_KIND[OperationKind.CREATE] | frozenset(
+_EDGES_BY_KIND[OperationKind.RESTORE] = _GENERIC_STRUCTURAL_EDGES | frozenset(
     {
         # restore：proven-unapplied 放弃（未应用任何 mutation）直接写 rolled_back。
         (OperationPhase.PREPARED, OperationPhase.ROLLED_BACK),
@@ -1395,9 +1477,25 @@ _EDGES_BY_KIND[OperationKind.TRASH] = _COMMON_PRE_COMMIT_EDGES | frozenset(
         (OperationPhase.TRASH_HANDOFF_PENDING, OperationPhase.TRASH_HANDOFF_SUCCEEDED),
         (OperationPhase.TRASH_HANDOFF_SUCCEEDED, OperationPhase.COMPLETED),
         (OperationPhase.TRASH_PURGE_COMMITTED, OperationPhase.COMPLETED),
+        (OperationPhase.VALIDATING, OperationPhase.LINK_INDEX_UPDATING),
+        (OperationPhase.LINK_INDEX_UPDATING, OperationPhase.LINK_INDEX_PUBLISHED),
+        (OperationPhase.LINK_INDEX_UPDATING, OperationPhase.LINK_INDEX_REBUILD_REQUIRED),
+        (OperationPhase.LINK_INDEX_PUBLISHED, OperationPhase.TRASH_RETAINED),
+        (OperationPhase.LINK_INDEX_REBUILD_REQUIRED, OperationPhase.TRASH_RETAINED),
     }
 )
 _EDGES_BY_KIND[OperationKind.RECOVER] = frozenset()
+_EDGES_BY_KIND[OperationKind.LINK_INDEX_UPDATE] = frozenset(
+    {
+        (OperationPhase.ALLOCATING, OperationPhase.ALLOCATING),
+        (OperationPhase.ALLOCATING, OperationPhase.LINK_INDEX_UPDATING),
+        (OperationPhase.ALLOCATING, OperationPhase.ROLLED_BACK),
+        (OperationPhase.LINK_INDEX_UPDATING, OperationPhase.LINK_INDEX_PUBLISHED),
+        (OperationPhase.LINK_INDEX_UPDATING, OperationPhase.LINK_INDEX_REBUILD_REQUIRED),
+        (OperationPhase.LINK_INDEX_PUBLISHED, OperationPhase.COMPLETED),
+        (OperationPhase.LINK_INDEX_REBUILD_REQUIRED, OperationPhase.COMPLETED),
+    }
+)
 
 _HANDOFF_KEYS = frozenset(
     {
@@ -1450,8 +1548,118 @@ _JOURNAL_METADATA_DELTA: dict[
 }
 
 
-def _raise_journal_invalid(path: Path) -> None:
+def _raise_journal_invalid(path: Path) -> NoReturn:
     raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, path)
+
+
+def _link_index_allowed_fields(phase: OperationPhase) -> frozenset[str]:
+    """序列化允许的索引键集合：禁止字段必须缺失，不写 JSON null（规格 §4）。"""
+    if phase in _PRE_LINK_INDEX_PHASES or phase in _ROLLBACK_PHASES:
+        return frozenset()
+    if phase is OperationPhase.LINK_INDEX_UPDATING:
+        return frozenset({"link_index_revision"})
+    if phase is OperationPhase.LINK_INDEX_PUBLISHED:
+        return frozenset({"link_index_revision", "link_index_result", "link_index_sha256"})
+    if phase is OperationPhase.LINK_INDEX_REBUILD_REQUIRED:
+        return frozenset({"link_index_revision", "link_index_result"})
+    return frozenset({"link_index_revision", "link_index_result", "link_index_sha256"})
+
+
+def _validate_link_index_fields(journal: Journal, *, path: Path) -> None:
+    """逐条 journal 的链接索引字段矩阵（规格 §4）：pre-index/rollback 禁止、
+    索引阶段按行约束、终态保留阶段原样保留。"""
+    phase = journal.phase
+    revision = journal.link_index_revision
+    result = journal.link_index_result
+    sha256 = journal.link_index_sha256
+    if phase in _PRE_LINK_INDEX_PHASES or phase in _ROLLBACK_PHASES:
+        if revision is not None or result is not None or sha256 is not None:
+            _raise_journal_invalid(path)
+        return
+    if phase is OperationPhase.LINK_INDEX_UPDATING:
+        if revision is None or result is not None or sha256 is not None:
+            _raise_journal_invalid(path)
+        validate_link_index_revision(revision, path=path)
+        return
+    if phase is OperationPhase.LINK_INDEX_PUBLISHED:
+        if revision is None or result is not LinkIndexResult.PUBLISHED or sha256 is None:
+            _raise_journal_invalid(path)
+        validate_link_index_revision(revision, path=path)
+        if not _valid_sha256(sha256):
+            _raise_journal_invalid(path)
+        return
+    if phase is OperationPhase.LINK_INDEX_REBUILD_REQUIRED:
+        if revision is None or result is not LinkIndexResult.REBUILD_REQUIRED or sha256 is not None:
+            _raise_journal_invalid(path)
+        validate_link_index_revision(revision, path=path)
+        return
+    # 终态保留阶段：全缺省合法，或 revision+result 原样保留；sha256 仅 published 保留。
+    if revision is None:
+        if result is not None or sha256 is not None:
+            _raise_journal_invalid(path)
+        return
+    if result is None:
+        _raise_journal_invalid(path)
+    validate_link_index_revision(revision, path=path)
+    if result is LinkIndexResult.PUBLISHED:
+        if sha256 is None or not _valid_sha256(sha256):
+            _raise_journal_invalid(path)
+    elif sha256 is not None:  # REBUILD_REQUIRED：禁止 sha256。
+        _raise_journal_invalid(path)
+
+
+_LINK_INDEX_FIELD_SET_EDGES = frozenset(
+    {
+        (OperationPhase.VALIDATING, OperationPhase.LINK_INDEX_UPDATING),
+        (OperationPhase.ALLOCATING, OperationPhase.LINK_INDEX_UPDATING),
+    }
+)
+
+
+def _validate_link_index_transition(old: Journal, new: Journal, *, path: Path) -> None:
+    """链接索引字段的后继增量（规格 §5）：只在索引阶段边建立/收敛字段，
+    其余边必须原样保留；``link_index_updating`` 之后不得进入 rollback。"""
+    old_state = (old.link_index_revision, old.link_index_result, old.link_index_sha256)
+    new_state = (new.link_index_revision, new.link_index_result, new.link_index_sha256)
+    if (old.phase, new.phase) in _LINK_INDEX_FIELD_SET_EDGES:
+        # 进入 updating：从全空变为只设 revision，result/sha256 仍禁止。
+        if old_state != (None, None, None):
+            _raise_journal_invalid(path)
+        if new.link_index_revision is None or new.link_index_result is not None:
+            _raise_journal_invalid(path)
+        if new.link_index_sha256 is not None:
+            _raise_journal_invalid(path)
+        return
+    if (old.phase, new.phase) == (
+        OperationPhase.LINK_INDEX_UPDATING,
+        OperationPhase.LINK_INDEX_PUBLISHED,
+    ):
+        if old.link_index_revision is None or old.link_index_result is not None:
+            _raise_journal_invalid(path)
+        if old.link_index_sha256 is not None:
+            _raise_journal_invalid(path)
+        if (new.link_index_revision, new.link_index_result) != (
+            old.link_index_revision,
+            LinkIndexResult.PUBLISHED,
+        ):
+            _raise_journal_invalid(path)
+        if new.link_index_sha256 is None:
+            _raise_journal_invalid(path)
+        return
+    if (old.phase, new.phase) == (
+        OperationPhase.LINK_INDEX_UPDATING,
+        OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
+    ):
+        if old.link_index_revision is None or old.link_index_result is not None:
+            _raise_journal_invalid(path)
+        if old.link_index_sha256 is not None:
+            _raise_journal_invalid(path)
+        if new_state != (old.link_index_revision, LinkIndexResult.REBUILD_REQUIRED, None):
+            _raise_journal_invalid(path)
+        return
+    # 其余边（pre-index 保持空、终态保留索引结果）字段必须原样保留。
+    if old_state != new_state:
+        _raise_journal_invalid(path)
 
 
 def _validate_mutation_transition(old: Journal, new: Journal, *, path: Path) -> None:
@@ -1498,6 +1706,7 @@ def validate_journal_kind_phase(journal: Journal, *, path: Path) -> None:
     """
     if journal.phase not in _PHASES_BY_KIND.get(journal.kind, frozenset()):
         _raise_journal_invalid(path)
+    _validate_link_index_fields(journal, path=path)
 
 
 def _validate_journal_transition(old: Journal | None, new: Journal, *, path: Path) -> None:
@@ -1527,6 +1736,7 @@ def _validate_journal_transition(old: Journal | None, new: Journal, *, path: Pat
     if (old.phase, new.phase) not in _EDGES_BY_KIND.get(new.kind, frozenset()):
         _raise_journal_invalid(path)
     _validate_mutation_transition(old, new, path=path)
+    _validate_link_index_transition(old, new, path=path)
     if (
         not (old.phase is OperationPhase.ALLOCATING and new.phase is OperationPhase.ALLOCATING)
         and old.observations != new.observations
@@ -1674,7 +1884,7 @@ def _parse_journal(data: object, journal_path: Path) -> Journal:
     version = parsed.get("journal_version")
     if version != JOURNAL_VERSION:
         raise DraftError(
-            "operation.journal_version_unsupported",
+            CheckCode.OPERATION_JOURNAL_VERSION_UNSUPPORTED.value,
             journal_path,
             details=(str(version), str(JOURNAL_VERSION)),
         )
@@ -1759,6 +1969,31 @@ def _parse_journal(data: object, journal_path: Path) -> Journal:
         metadata_raw = parsed.get("metadata")
         if not isinstance(metadata_raw, dict):
             raise TypeError("metadata must be an object")
+        # 链接索引字段：区分键缺失（None）与显式 null（拒绝）；键缺失与值语义由
+        # validate_journal_kind_phase 按 phase 字段矩阵校验。
+        if "link_index_revision" in parsed:
+            raw_revision = parsed["link_index_revision"]
+            if raw_revision is None:
+                raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+            link_index_revision = _expect_str(raw_revision, journal_path)
+        else:
+            link_index_revision = None
+        if "link_index_result" in parsed:
+            raw_result = parsed["link_index_result"]
+            if raw_result is None:
+                raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+            link_index_result = LinkIndexResult(_expect_str(raw_result, journal_path))
+        else:
+            link_index_result = None
+        if "link_index_sha256" in parsed:
+            raw_sha256 = parsed["link_index_sha256"]
+            if raw_sha256 is None:
+                raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+            link_index_sha256 = _expect_str(raw_sha256, journal_path)
+            if not _valid_sha256(link_index_sha256):
+                raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+        else:
+            link_index_sha256 = None
     except (TypeError, ValueError) as exc:
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path) from exc
     metadata = {
@@ -1782,9 +2017,12 @@ def _parse_journal(data: object, journal_path: Path) -> Journal:
         ),
         metadata=metadata,
         directory=journal_path.parent,
+        link_index_revision=link_index_revision,
+        link_index_result=link_index_result,
+        link_index_sha256=link_index_sha256,
     )
     # 磁盘读取验证 kind 拥有该 phase（回归 M1）：跨 kind 借用 adopt/trash 状态的
-    # journal 即使结构合法也不是权威状态。
+    # journal 即使结构合法也不是权威状态。链接索引字段矩阵在同一边界校验（规格 §4）。
     validate_journal_kind_phase(journal, path=journal_path)
     return journal
 
@@ -1827,6 +2065,33 @@ def with_phase(journal: Journal, phase: OperationPhase) -> Journal:
         remove_empty_directories=journal.remove_empty_directories,
         metadata=journal.metadata,
         directory=journal.directory,
+        link_index_revision=journal.link_index_revision,
+        link_index_result=journal.link_index_result,
+        link_index_sha256=journal.link_index_sha256,
+    )
+
+
+def with_link_index_state(
+    journal: Journal,
+    *,
+    revision: str | None,
+    result: LinkIndexResult | None,
+    sha256: str | None,
+) -> Journal:
+    """公开的不可变链接索引状态替换；索引阶段收敛路径使用（规格 §4/§5）。"""
+    return Journal(
+        operation_id=journal.operation_id,
+        kind=journal.kind,
+        phase=journal.phase,
+        root_state=journal.root_state,
+        observations=journal.observations,
+        mutations=journal.mutations,
+        remove_empty_directories=journal.remove_empty_directories,
+        metadata=journal.metadata,
+        directory=journal.directory,
+        link_index_revision=revision,
+        link_index_result=result,
+        link_index_sha256=sha256,
     )
 
 
@@ -1842,6 +2107,9 @@ def with_observations(journal: Journal, observations: ObservationManifest) -> Jo
         remove_empty_directories=journal.remove_empty_directories,
         metadata=journal.metadata,
         directory=journal.directory,
+        link_index_revision=journal.link_index_revision,
+        link_index_result=journal.link_index_result,
+        link_index_sha256=journal.link_index_sha256,
     )
 
 
@@ -1857,6 +2125,9 @@ def with_metadata(journal: Journal, extra: Mapping[str, str]) -> Journal:
         remove_empty_directories=journal.remove_empty_directories,
         metadata={**journal.metadata, **extra},
         directory=journal.directory,
+        link_index_revision=journal.link_index_revision,
+        link_index_result=journal.link_index_result,
+        link_index_sha256=journal.link_index_sha256,
     )
 
 
@@ -1873,6 +2144,9 @@ def without_metadata(journal: Journal, key: str) -> Journal:
         remove_empty_directories=journal.remove_empty_directories,
         metadata=remaining,
         directory=journal.directory,
+        link_index_revision=journal.link_index_revision,
+        link_index_result=journal.link_index_result,
+        link_index_sha256=journal.link_index_sha256,
     )
 
 
@@ -1901,6 +2175,9 @@ def _with_applied(journal: Journal, path: Path) -> Journal:
         remove_empty_directories=journal.remove_empty_directories,
         metadata=journal.metadata,
         directory=journal.directory,
+        link_index_revision=journal.link_index_revision,
+        link_index_result=journal.link_index_result,
+        link_index_sha256=journal.link_index_sha256,
     )
 
 
@@ -2470,6 +2747,9 @@ def preallocate_journal(
         remove_empty_directories=(),
         metadata=dict(metadata),
         directory=directory,
+        link_index_revision=None,
+        link_index_result=None,
+        link_index_sha256=None,
     )
     write_journal(journal)
     return journal
@@ -2678,6 +2958,9 @@ def _execute_allocated_plan(
         remove_empty_directories=plan.remove_empty_directories,
         metadata={**plan.metadata, **metadata},
         directory=directory,
+        link_index_revision=None,
+        link_index_result=None,
+        link_index_sha256=None,
     )
     # 先在文件创建前耐久登记全部 original/staged 路径与摘要（回归 H4）：allocating
     # 阶段永远不会有未登记文件；崩溃 mid-prepare 留下 PREPARED 日志 + 部分缺失文件，

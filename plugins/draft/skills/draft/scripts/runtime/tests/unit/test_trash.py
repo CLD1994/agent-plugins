@@ -326,6 +326,9 @@ def _trash_journal(
         remove_empty_directories=(),
         metadata=deadlines.to_metadata(),
         directory=Path("/draft/.draft/operations") / operation_id,
+        link_index_revision=None,
+        link_index_result=None,
+        link_index_sha256=None,
     )
 
 
@@ -793,6 +796,9 @@ def _package_auth_journal(*mutations: JournalMutation) -> Journal:
         remove_empty_directories=(),
         metadata={},
         directory=Path("/draft/.draft/operations") / FIXED_OPERATION_ID,
+        link_index_revision=None,
+        link_index_result=None,
+        link_index_sha256=None,
     )
 
 
@@ -1314,6 +1320,9 @@ def _restore_bootstrap_journal(*, change: str = "none") -> tuple[Journal, str]:
         remove_empty_directories=(),
         metadata={"restores_trash_operation": trash_id},
         directory=Path("/draft/.draft/operations") / ("a" * 32),
+        link_index_revision=None,
+        link_index_result=None,
+        link_index_sha256=None,
     )
     if change == "none":
         return journal, trash_id
