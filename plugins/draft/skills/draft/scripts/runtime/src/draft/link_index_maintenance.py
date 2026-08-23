@@ -26,21 +26,34 @@ from draft.link_index import (
     LinkIndexScan,
     build_index_content,
 )
-from draft.models import LinkIndexResult
+from draft.models import LinkIndexResult, ResultWarning
 from draft.observations import EntryKind
 from draft.operations import (
     OPERATIONS_RELATIVE,
     Journal,
     classify_node_or_error,
+    durable_write,
+    ensure_directory_chain,
+    fsync_directory,
     operation_journal_path,
     read_journal,
+    reject_symlink_components,
     sha256_bytes,
     validate_link_index_revision,
     validate_operation_id,
 )
 
-_SCAN_READ_FAILED = "operation.index_update_failed"
+_INDEX_UPDATE_FAILED = "operation.index_update_failed"
+_SCAN_READ_FAILED = _INDEX_UPDATE_FAILED
 _SCAN_UNSTABLE = "operation.external_change"
+_INCONSISTENT = CheckCode.OPERATION_INCONSISTENT_STATE.value
+
+# 候选制品精确文件名（operation 目录内，spec §2）：operation ID 唯一推导。
+LINK_INDEX_STAGED_FILE_NAME = "link-index.staged.json"
+# rebuild-required 纯存在性 flag 精确相对路径（spec §2/§10）。
+REBUILD_FLAG_RELATIVE_PATH = Path(".draft") / "link-index-rebuild-required.flag"
+# flag 普通 I/O 失败的稳定 warning code（spec §11）。
+_REBUILD_FLAG_UPDATE_FAILED = "link_index.rebuild_flag_update_failed"
 
 
 @dataclass(frozen=True)
@@ -355,3 +368,232 @@ def _verify_root_stable(
                 raise DraftError(_SCAN_UNSTABLE, root)
     if seen_directories != expected_directories or seen_files != set(expected_identities):
         raise DraftError(_SCAN_UNSTABLE, root)
+
+
+# ---------------------------------------------------------------------------
+# 耐久存储：staging、目标原子发布与 rebuild flag（spec §10，Task 4）
+# ---------------------------------------------------------------------------
+
+
+def _reject_ancestor_symlinks(root: Path, relative: Path, *, code: str) -> None:
+    """拒绝相对路径祖先中的符号链接（spec §10 no-follow 边界）。
+
+    只检查叶节点之前的祖先组件（从根逐层 lstat）；祖先缺失时叶必然缺失，由后续
+    分类边界处理。祖先为符号链接时按 ``code`` 报内部状态错误，程序不得跟随异常
+    内部节点解析新路径。
+    """
+    cursor = root
+    for part in relative.parts[:-1]:
+        cursor = cursor / part
+        try:
+            mode = os.lstat(cursor).st_mode
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(mode):
+            raise DraftError(code, cursor)
+
+
+def _ensure_dot_draft(root: Path) -> None:
+    """确保目标父目录 ``.draft/`` 存在并同步（发布前置，spec §10）。"""
+    parent_fd = ensure_directory_chain(
+        root,
+        INDEX_RELATIVE_PATH.parent,
+        code=_INDEX_UPDATE_FAILED,
+        code_path=root / INDEX_RELATIVE_PATH.parent,
+    )
+    os.close(parent_fd)
+
+
+def stage_link_index(journal: Journal, index: LinkIndex) -> str:
+    """把 ``index`` 确定序列化耐久写入 operation 专属 staging（spec §10）。
+
+    staging 精确位于 ``journal.directory / "link-index.staged.json"``。流程 create-only
+    （复用 ``operations.durable_write``）或对既有普通 staging 精确摘要验证后的幂等续写：
+    相同摘要直接返回，不重复写入；摘要不符或异常节点报内部状态错误。写入/同步失败
+    映射 ``operation.index_update_failed``（索引发布失败可降级为 rebuild_required，
+    不是 journal 耐久失败）。
+    """
+    raw = index.to_json()
+    digest = sha256_bytes(raw)
+    staging = journal.directory / LINK_INDEX_STAGED_FILE_NAME
+    if (
+        classify_node_or_error(journal.directory, code=_INCONSISTENT, code_path=journal.directory)
+        is not EntryKind.DIRECTORY
+    ):
+        raise DraftError(_INCONSISTENT, journal.directory)
+    node = classify_node_or_error(staging, code=_INCONSISTENT, code_path=staging)
+    if node is EntryKind.FILE:
+        if sha256_bytes(_read_no_follow(staging, _INCONSISTENT)) != digest:
+            raise DraftError(_INCONSISTENT, staging)
+        return digest
+    if node is not EntryKind.MISSING:
+        raise DraftError(_INCONSISTENT, staging)
+    try:
+        durable_write(journal.directory, Path(LINK_INDEX_STAGED_FILE_NAME), raw)
+    except DraftError as exc:
+        error = DraftError(_INDEX_UPDATE_FAILED, staging)
+        error.__cause__ = exc
+        raise error from exc
+    return digest
+
+
+def publish_staged_link_index(root: Path, journal: Journal, expected_sha256: str) -> None:
+    """把 staging 原子发布为 ``.draft/link-index.json``（spec §10 决策表）。
+
+    发布目标分类以最新权威状态（``read_link_index_authority``）为准：absent 只允许
+    缺失目标首次发布；rebuild_required 允许缺失或普通旧文件替换；published 必须与
+    journal 完全一致（SHA-256/revision/schema/反向表）才允许更高 revision 替换。
+    目标/staging/祖先为符号链接、目录或其他异常节点时保留现场报内部状态错误。
+    staging 摘要必须等于 ``expected_sha256``；否则为内部不一致。
+
+    替换使用同文件系统原子 ``os.replace``（消费 staging），成功后分别同步目标父目录
+    ``.draft/`` 与 operation 目录；替换或同步失败映射 ``operation.index_update_failed``。
+    """
+    _reject_ancestor_symlinks(root, INDEX_RELATIVE_PATH, code=_INCONSISTENT)
+    target = root / INDEX_RELATIVE_PATH
+    target_node = classify_node_or_error(target, code=_INCONSISTENT, code_path=target)
+
+    staging = journal.directory / LINK_INDEX_STAGED_FILE_NAME
+    _reject_ancestor_symlinks(root, staging.relative_to(root), code=_INCONSISTENT)
+    staging_node = classify_node_or_error(staging, code=_INCONSISTENT, code_path=staging)
+    if staging_node is not EntryKind.FILE:
+        raise DraftError(_INCONSISTENT, staging)
+    staged = _read_no_follow(staging, _INCONSISTENT)
+    if sha256_bytes(staged) != expected_sha256:
+        raise DraftError(_INCONSISTENT, staging)
+
+    authority = read_link_index_authority(root)
+    if authority.result is None:
+        if target_node is not EntryKind.MISSING:
+            raise DraftError(_INCONSISTENT, target)
+    elif authority.result is LinkIndexResult.REBUILD_REQUIRED:
+        if target_node not in (EntryKind.MISSING, EntryKind.FILE):
+            raise DraftError(_INCONSISTENT, target)
+    elif authority.result is LinkIndexResult.PUBLISHED:
+        if target_node is not EntryKind.FILE:
+            raise DraftError(_INCONSISTENT, target)
+        existing = _read_no_follow(target, _INCONSISTENT)
+        if sha256_bytes(existing) != authority.sha256:
+            raise DraftError(_INCONSISTENT, target)
+        try:
+            existing_index = LinkIndex.from_json(existing)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise DraftError(_INCONSISTENT, target) from exc
+        if existing_index.revision != authority.revision:
+            raise DraftError(_INCONSISTENT, target)
+    else:
+        raise DraftError(_INCONSISTENT, target)
+
+    _ensure_dot_draft(root)
+    try:
+        os.replace(staging, target)
+    except OSError as exc:
+        raise DraftError(_INDEX_UPDATE_FAILED, target) from exc
+
+    # 发布后复核：目标必须是我们的精确 staging 内容，不覆盖未知节点。
+    if (
+        classify_node_or_error(target, code=_INCONSISTENT, code_path=target) is not EntryKind.FILE
+        or sha256_bytes(_read_no_follow(target, _INCONSISTENT)) != expected_sha256
+    ):
+        raise DraftError(_INCONSISTENT, target)
+
+    try:
+        fsync_directory(target.parent)
+        fsync_directory(journal.directory)
+    except DraftError as exc:
+        error = DraftError(_INDEX_UPDATE_FAILED, target)
+        error.__cause__ = exc
+        raise error from exc
+
+
+def ensure_rebuild_flag(root: Path) -> ResultWarning | None:
+    """尽力耐久创建零字节 rebuild-required flag（spec §10/§11）。
+
+    flag 只表达存在性，不写 JSON 或原因文本。已存在普通文件视为幂等成功；符号链接、
+    目录或其他异常节点是内部状态错误。普通 I/O 失败（创建、目录同步）转换为
+    ``link_index.rebuild_flag_update_failed`` warning 返回，不改变 journal 结果。
+    """
+    flag = root / REBUILD_FLAG_RELATIVE_PATH
+    node = classify_node_or_error(flag, code=_INCONSISTENT, code_path=flag)
+    if node is EntryKind.FILE:
+        return None
+    if node is not EntryKind.MISSING:
+        raise DraftError(_INCONSISTENT, flag)
+    reject_symlink_components(root, REBUILD_FLAG_RELATIVE_PATH)
+    try:
+        parent_fd = ensure_directory_chain(
+            root,
+            REBUILD_FLAG_RELATIVE_PATH.parent,
+            code=CheckCode.OPERATION_DURABILITY_FAILED.value,
+            code_path=flag.parent,
+        )
+    except DraftError:
+        return ResultWarning(_REBUILD_FLAG_UPDATE_FAILED)
+    try:
+        try:
+            descriptor = os.open(
+                REBUILD_FLAG_RELATIVE_PATH.name,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                0o644,
+                dir_fd=parent_fd,
+            )
+        except FileExistsError:
+            # 分类与创建之间 flag 已出现：普通文件视为幂等存在，异常节点报不一致。
+            reappeared = classify_node_or_error(flag, code=_INCONSISTENT, code_path=flag)
+            if reappeared is EntryKind.FILE:
+                return None
+            raise DraftError(_INCONSISTENT, flag) from None
+        os.close(descriptor)
+        fsync_directory(flag.parent)
+    except DraftError as exc:
+        if exc.code == _INCONSISTENT:
+            raise
+        return ResultWarning(_REBUILD_FLAG_UPDATE_FAILED)
+    except OSError:
+        return ResultWarning(_REBUILD_FLAG_UPDATE_FAILED)
+    finally:
+        os.close(parent_fd)
+    return None
+
+
+def remove_rebuild_flag(root: Path) -> ResultWarning | None:
+    """尽力耐久删除 rebuild-required flag（spec §10/§11）。
+
+    删除前先 lstat 分类，只删除普通文件并同步 ``.draft/``；缺失视为幂等成功。符号
+    链接、目录或其他异常节点是内部状态错误。普通 I/O 失败（删除、目录同步）转换为
+    ``link_index.rebuild_flag_update_failed`` warning 返回。
+    """
+    flag = root / REBUILD_FLAG_RELATIVE_PATH
+    node = classify_node_or_error(flag, code=_INCONSISTENT, code_path=flag)
+    if node is EntryKind.MISSING:
+        return None
+    if node is not EntryKind.FILE:
+        raise DraftError(_INCONSISTENT, flag)
+    reject_symlink_components(root, REBUILD_FLAG_RELATIVE_PATH)
+    try:
+        flag.unlink()
+        fsync_directory(flag.parent)
+    except FileNotFoundError:
+        return None
+    except (OSError, DraftError):
+        return ResultWarning(_REBUILD_FLAG_UPDATE_FAILED)
+    return None
+
+
+def cleanup_link_index_staging(journal: Journal) -> None:
+    """幂等清理当前 operation 的 ``link-index.staged.json``（spec §12）。
+
+    只处理精确 staging 路径；缺失视为已经收敛。符号链接、目录或其他异常节点是内部
+    状态错误，保留现场不按文件名删除未知节点。
+    """
+    staging = journal.directory / LINK_INDEX_STAGED_FILE_NAME
+    node = classify_node_or_error(staging, code=_INCONSISTENT, code_path=staging)
+    if node is EntryKind.MISSING:
+        return
+    if node is not EntryKind.FILE:
+        raise DraftError(_INCONSISTENT, staging)
+    try:
+        staging.unlink()
+        fsync_directory(journal.directory)
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, staging) from exc
