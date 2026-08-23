@@ -19,6 +19,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from draft.errors import DraftError
+
 if TYPE_CHECKING:
     from draft.graph import DraftGraph, MarkerSnapshot
     from draft.models import PageDocument
@@ -73,6 +75,7 @@ class Observation:
     kind: EntryKind
     sha256: str | None = None
     members: tuple[str, ...] = ()
+    member_types: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -87,6 +90,31 @@ class ObservationManifest:
 
 
 EMPTY_OBSERVATIONS = ObservationManifest(entries=())
+
+
+def merge_observations(*manifests: ObservationManifest) -> ObservationManifest:
+    """合并读集；同一路径只能出现相同事实，冲突不得静默覆盖。"""
+    if manifests and all(not manifest.entries for manifest in manifests):
+        return manifests[0]
+    by_path: dict[Path, Observation] = {}
+    for manifest in manifests:
+        for entry in manifest.entries:
+            previous = by_path.get(entry.path)
+            if previous is not None and previous != entry:
+                if (
+                    previous.path == entry.path
+                    and previous.kind is entry.kind
+                    and previous.sha256 == entry.sha256
+                    and previous.members == entry.members
+                    and (not previous.member_types or not entry.member_types)
+                ):
+                    by_path[entry.path] = entry if entry.member_types else previous
+                    continue
+                raise DraftError("operation.plan_invalid", entry.path)
+            by_path[entry.path] = entry
+    return ObservationManifest(
+        entries=tuple(by_path[path] for path in sorted(by_path, key=lambda item: item.as_posix()))
+    )
 
 
 def file_observation(path: Path, data: bytes) -> Observation:
@@ -111,8 +139,15 @@ def marker_observation(snapshot: MarkerSnapshot) -> Observation:
     return file_digest_observation(MARKER_PATH, snapshot.sha256)
 
 
-def directory_observation(path: Path, members: tuple[str, ...]) -> Observation:
-    return Observation(path=path, kind=EntryKind.DIRECTORY, members=tuple(sorted(members)))
+def directory_observation(
+    path: Path, members: tuple[str, ...], member_types: tuple[tuple[str, str], ...] = ()
+) -> Observation:
+    return Observation(
+        path=path,
+        kind=EntryKind.DIRECTORY,
+        members=tuple(sorted(members)),
+        member_types=tuple(sorted(member_types)),
+    )
 
 
 def missing_observation(path: Path) -> Observation:
@@ -163,6 +198,21 @@ class FilesystemObservationProbe:
                 path=path,
                 kind=EntryKind.DIRECTORY,
                 members=tuple(sorted(entry.name for entry in target.iterdir())),
+                member_types=tuple(
+                    sorted(
+                        (
+                            entry.name,
+                            "directory"
+                            if entry.is_dir()
+                            else "file"
+                            if entry.is_file()
+                            else "symlink"
+                            if entry.is_symlink()
+                            else "other",
+                        )
+                        for entry in target.iterdir()
+                    )
+                ),
             )
         if target.is_file():
             return Observation(
@@ -188,6 +238,13 @@ def verify_observations(
         if entry.path in explained:
             continue
         current = probe.observe(entry.path)
+        if entry.kind is EntryKind.DIRECTORY and not entry.member_types:
+            current = Observation(
+                path=current.path,
+                kind=current.kind,
+                sha256=current.sha256,
+                members=current.members,
+            )
         if current != entry:
             changed.append(entry.path)
     return tuple(sorted(changed))
@@ -230,12 +287,26 @@ def graph_observations(graph: _GraphLike, *, marker: MarkerSnapshot) -> Observat
     root = graph.root
     for directory in sorted(directories):
         target = root / directory
-        members = (
-            tuple(sorted(entry.name for entry in target.iterdir()))
-            if target.is_dir() and not target.is_symlink()
-            else ()
+        child_entries = (
+            tuple(target.iterdir()) if target.is_dir() and not target.is_symlink() else ()
         )
-        entries.append(directory_observation(directory, members))
+        members = tuple(sorted(entry.name for entry in child_entries))
+        member_types = tuple(
+            sorted(
+                (
+                    entry.name,
+                    "directory"
+                    if entry.is_dir()
+                    else "file"
+                    if entry.is_file()
+                    else "symlink"
+                    if entry.is_symlink()
+                    else "other",
+                )
+                for entry in child_entries
+            )
+        )
+        entries.append(directory_observation(directory, members, member_types))
     # marker 观察由调用方持有的 snapshot 直接生成，不访问 marker 文件系统路径
     # （round-15 H1）；同一计划的 state/bytes/digest 与观察摘要同源。
     entries.append(marker_observation(marker))

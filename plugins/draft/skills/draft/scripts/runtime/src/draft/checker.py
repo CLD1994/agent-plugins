@@ -1182,6 +1182,8 @@ _ALLOWED_INTERNAL_ENTRIES = frozenset(
         Path(INTERNAL_DIR) / "operation.lock",
         Path(INTERNAL_DIR) / "operations",
         Path(INTERNAL_DIR) / "trash",
+        Path(INTERNAL_DIR) / "link-index.json",
+        Path(INTERNAL_DIR) / "link-index.invalid",
     }
 )
 

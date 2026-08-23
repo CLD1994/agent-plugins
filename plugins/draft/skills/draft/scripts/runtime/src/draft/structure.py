@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import posixpath
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import quote
 
@@ -13,6 +15,16 @@ from draft.graph import (
     DraftGraph,
     MarkerSnapshot,
     resolve_local_destination,
+)
+from draft.link_index import (
+    Freshness,
+    build_index,
+    check_index_freshness,
+    invalidate_index,
+    read_index,
+    read_index_snapshot,
+    update_index_from_mutations,
+    write_index_atomic,
 )
 from draft.markdown import (
     append_parent_navigation,
@@ -31,15 +43,26 @@ from draft.models import (
     OperationResult,
     SourceSpan,
 )
-from draft.move_closure import MoveClosure, merged_blocking, scan_move_closure
+from draft.move_closure import (
+    MoveClosure,
+    merged_blocking,
+    scan_indexed_move_closure,
+    scan_move_closure,
+)
 from draft.move_operands import (
     MoveRequest,
     SourceKind,
-    TargetKind,
     classify_move_request,
+    precheck_move_shape,
     validate_results,
 )
-from draft.observations import ObservationManifest
+from draft.observations import (
+    ObservationManifest,
+    directory_observation,
+    file_digest_observation,
+    file_observation,
+    merge_observations,
+)
 from draft.operation_facts import OperationFacts, load_operation_facts
 from draft.operations import execute_plan, read_lock, sha256_bytes
 from draft.paths import physical_parent, resolve_draft_root
@@ -428,6 +451,7 @@ def plan_move(
     *,
     marker: MarkerSnapshot,
     observations: ObservationManifest,
+    extra_moved_targets: Mapping[ResourceIdentity, ResourceIdentity] | None = None,
 ) -> OperationPlan:
     _validate_operand(graph, source)
     _validate_target(graph, target)
@@ -448,6 +472,7 @@ def plan_move(
         kind=OperationKind.MOVE,
         marker=marker,
         observations=observations,
+        extra_moved_targets=extra_moved_targets,
     )
 
 
@@ -459,19 +484,6 @@ def plan_move_request(
     marker: MarkerSnapshot,
     observations: ObservationManifest,
 ) -> OperationPlan:
-    if (
-        request.target.kind is TargetKind.FILE
-        and len(request.sources) == 1
-        and request.sources[0].kind is SourceKind.MANAGED_PAGE
-    ):
-        # 委托 plan_move：其 _validate_operand/_validate_target 已等价覆盖 validate_results
-        # 的命名空间/既有页/父缺失检查（round-1 已实证），单来源无批内碰撞，无需
-        # _validate_cross_collisions。
-        source = request.sources[0].path
-        return plan_move(
-            graph, source, request.target.path, marker=marker, observations=observations
-        )
-
     validate_results(graph, request)
 
     managed_pairs: dict[Path, Path] = {}
@@ -560,12 +572,27 @@ def plan_move_request(
     deletes = [m for m in [*base_mutations, *unmanaged_mutations] if m.kind is MutationKind.DELETE]
     writes.sort(key=lambda m: m.path.as_posix())
     deletes.sort(key=lambda m: m.path.as_posix())
+    closure_observations = ObservationManifest(
+        entries=tuple(
+            [
+                *(
+                    file_digest_observation(path, file.sha256)
+                    for path, file in closure.unmanaged.items()
+                    if file.sha256 is not None
+                ),
+                *(
+                    directory_observation(path, tuple(name for name, _ in members), members)
+                    for path, members in closure.directories.items()
+                ),
+            ]
+        )
+    )
     return OperationPlan(
         kind=OperationKind.MOVE,
         root=graph.root,
         mutations=tuple([*writes, *deletes]),
         root_state=marker.state.root_state,
-        observations=observations,
+        observations=merge_observations(observations, closure_observations),
         remove_empty_directories=removable,
         effects=tuple([*base_effects, *unmanaged_effects]),
     )
@@ -691,42 +718,118 @@ def plan_move_from_arguments(
     target_value: str,
 ) -> OperationPlan:
     request = classify_move_request(root, facts.graph, source_values, target_value)
-    closure = scan_move_closure(root, facts.graph)
+    moved_paths = {member for source in request.sources for member in source.members}
+    moved_identities: set[ResourceIdentity] = set()
+    for member in moved_paths:
+        if member in facts.graph.pages:
+            moved_identities.add(ResourceIdentity(ResourceKind.PAGE, member.as_posix()))
+        else:
+            moved_identities.add(
+                resolve_body_resource(root, ROOT_PAGE, member.as_posix()).identity
+            )
+    index_status, index, _, index_raw = read_index_snapshot(root)
+    if index is not None and index_status is not Freshness.CORRUPT:
+        index_status = check_index_freshness(root, index)
+    if index is not None and index_status is Freshness.FRESH:
+        closure = scan_indexed_move_closure(
+            root, facts.graph, index, moved_identities, moved_paths
+        )
+    else:
+        closure = scan_move_closure(root, facts.graph)
     blocking = merged_blocking(facts.blocking_paths, closure)
     if blocking:
-        raise DraftError(
-            "structure.dirty", root, details=tuple(p.as_posix() for p in blocking)
-        )
-    return plan_move_request(
+        raise DraftError("structure.dirty", root, details=tuple(p.as_posix() for p in blocking))
+    plan = plan_move_request(
         facts.graph, closure, request, marker=facts.marker, observations=facts.observations
     )
+    if index is not None and index_status is Freshness.FRESH and index_raw is not None:
+        return replace(
+            plan,
+            observations=merge_observations(
+                plan.observations,
+                ObservationManifest(
+                    entries=(file_observation(Path(".draft/link-index.json"), index_raw),)
+                ),
+            ),
+        )
+    return plan
 
 
-def move_entries(
-    root: Path, source_values: Sequence[str], target_value: str
-) -> OperationResult:
+def move_entries(root: Path, source_values: Sequence[str], target_value: str) -> OperationResult:
     resolved = resolve_draft_root(root)
+    precheck_move_shape(resolved, source_values, target_value)
     facts = _load_structure_facts(resolved)
     plan = plan_move_from_arguments(resolved, facts, source_values, target_value)
-    return execute_plan(plan)
+    result = execute_plan(plan)
+    _refresh_move_index(resolved, plan)
+    return result
 
 
 def move_page(root: Path, source: Path, target: Path) -> OperationResult:
-    """旧单页移动入口：不含统一入站闭包（未受管理链接者指向被移页的链接不改写）。
-
-    CLI 的 move 命令已改用 move_entries；本入口保留给程序化调用方，其闭包范围与
-    move_entries 不同，需要命令一致语义时应改用 move_entries。
-    """
+    """程序化单页入口，保留单页校验并共享完整入站链接闭包。"""
     resolved = resolve_draft_root(root)
+    precheck_move_shape(resolved, (source.as_posix(),), target.as_posix())
     facts = _load_clean_graph(resolved)
+    closure = scan_move_closure(resolved, facts.graph)
+    blocking = merged_blocking(facts.blocking_paths, closure)
+    if blocking:
+        raise DraftError(
+            "structure.dirty", resolved, details=tuple(path.as_posix() for path in blocking)
+        )
+    moved_targets = {
+        ResourceIdentity(ResourceKind.PAGE, source.as_posix()): ResourceIdentity(
+            ResourceKind.PAGE, target.as_posix()
+        )
+    }
     plan = plan_move(
         facts.graph,
         source,
         target,
         marker=facts.marker,
         observations=facts.observations,
+        extra_moved_targets=moved_targets,
     )
-    return execute_plan(plan)
+    unmanaged_mutations, unmanaged_effects = _plan_unmanaged(resolved, closure, {}, moved_targets)
+    closure_observations = ObservationManifest(
+        entries=tuple(
+            [
+                *(
+                    file_digest_observation(path, file.sha256)
+                    for path, file in closure.unmanaged.items()
+                    if file.sha256 is not None
+                ),
+                *(
+                    directory_observation(path, tuple(name for name, _ in members), members)
+                    for path, members in closure.directories.items()
+                ),
+            ]
+        )
+    )
+    final_plan = replace(
+            plan,
+            mutations=tuple([*plan.mutations, *unmanaged_mutations]),
+            observations=merge_observations(plan.observations, closure_observations),
+            effects=tuple([*plan.effects, *unmanaged_effects]),
+    )
+    result = execute_plan(final_plan)
+    _refresh_move_index(resolved, final_plan)
+    return result
+
+
+def _refresh_move_index(root: Path, plan: OperationPlan) -> None:
+    """提交后增量发布索引；未变 Markdown 的记录不读取、不解析。"""
+    _status, existing, _ = read_index(root)
+    try:
+        updated = (
+            update_index_from_mutations(root, existing, plan.mutations)
+            if existing is not None
+            else build_index(root)
+        )
+        write_index_atomic(root, updated)
+    except DraftError:
+        with contextlib.suppress(DraftError):
+            invalidate_index(root, reason="update_failed")
+        raise
 
 
 def promote_page(root: Path, page: Path, children: list[Path]) -> OperationResult:

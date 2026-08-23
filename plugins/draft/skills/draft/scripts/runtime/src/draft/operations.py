@@ -1136,6 +1136,7 @@ def _journal_to_json(journal: Journal) -> bytes:
                 "kind": observation.kind.value,
                 "sha256": observation.sha256,
                 "members": list(observation.members),
+                "member_types": [list(member) for member in observation.member_types],
             }
             for observation in journal.observations.entries
         ],
@@ -1230,6 +1231,14 @@ def _parse_observations(data: object, journal_path: Path) -> ObservationManifest
             isinstance(member, str) for member in cast("list[object]", members_raw)
         ):
             raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+        member_types_raw = item.get("member_types", [])
+        if not isinstance(member_types_raw, list) or not all(
+            isinstance(member, list)
+            and len(cast("list[object]", member)) == 2
+            and all(isinstance(value, str) for value in cast("list[object]", member))
+            for member in cast("list[object]", member_types_raw)
+        ):
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
         path = _validate_observation_path(_expect_str(item.get("path"), journal_path), journal_path)
         if path in seen:
             raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
@@ -1239,6 +1248,10 @@ def _parse_observations(data: object, journal_path: Path) -> ObservationManifest
             kind=kind,
             sha256=sha256,
             members=tuple(cast("list[str]", members_raw)),
+            member_types=tuple(
+                (cast("str", member[0]), cast("str", member[1]))
+                for member in cast("list[list[object]]", member_types_raw)
+            ),
         )
         if observation_shape_error(entry) is not None:
             raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
@@ -3135,7 +3148,17 @@ def _verify_observations_for_recovery(
                 members = tuple(
                     member for member in observed.members if (path / member) not in consume_temps
                 )
-                return Observation(path=path, kind=EntryKind.DIRECTORY, members=members)
+                member_types = tuple(
+                    member
+                    for member in observed.member_types
+                    if (path / member[0]) not in consume_temps
+                )
+                return Observation(
+                    path=path,
+                    kind=EntryKind.DIRECTORY,
+                    members=members,
+                    member_types=member_types,
+                )
             return observed
 
     changed = verify_observations(_RecoveryProbe(probe), adjusted, explained_mutations=())

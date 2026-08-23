@@ -84,6 +84,30 @@ def map_sources(sources: Sequence[MoveSource], target: MoveTarget) -> dict[Path,
     return results
 
 
+def precheck_move_shape(
+    root: Path,
+    source_values: Sequence[str],
+    target_value: str,
+    *,
+    probe: MoveOperandProbe | None = None,
+) -> None:
+    """在加载根事实前拒绝只由参数形状决定的组合。"""
+    if probe is None:
+        probe = FilesystemMoveProbe()
+    target_kind = target_kind_of(target_value)
+    for value in source_values:
+        relative = _lexical_operand(value)
+        if is_internal_territory(relative):
+            raise DraftError(CheckCode.PATH_INTERNAL.value, relative)
+    if target_kind is not TargetKind.FILE:
+        return
+    if len(source_values) != 1:
+        raise DraftError(MOVE_OPERANDS_INVALID, details=("文件目标只允许一个文件 SOURCE",))
+    resolved = probe.resolve_operand(root, source_values[0])
+    if probe.node_kind(resolved.absolute) is EntryKind.DIRECTORY:
+        raise DraftError(MOVE_OPERANDS_INVALID, details=("文件目标只允许一个文件 SOURCE",))
+
+
 def validate_results(graph: DraftGraph, request: MoveRequest) -> None:
     """规格 §2.4 结果校验：命名空间、既有页、来源目录内部、碰撞、父页占据。
 
@@ -215,6 +239,18 @@ def classify_move_request(
                 continue
             raise DraftError("path.not_markdown", relative)
         raise DraftError("structure.unknown_page", relative)
+
+    owners: dict[Path, Path] = {}
+    for source in sources:
+        for member in source.members:
+            previous = owners.get(member)
+            if previous is not None:
+                raise DraftError(
+                    "structure.conflict",
+                    member,
+                    details=tuple(sorted((previous.as_posix(), source.path.as_posix()))),
+                )
+            owners[member] = source.path
 
     if target_kind is TargetKind.FILE:
         if len(sources) != 1 or sources[0].kind is SourceKind.DIRECTORY:

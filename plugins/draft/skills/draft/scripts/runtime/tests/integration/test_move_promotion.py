@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,7 @@ from draft.checker import check_draft
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import RootState
-from draft.structure import move_entries
+from draft.structure import move_entries, move_page
 from tests.integration.support import DraftFactory
 
 PAGE_INDEX = """# 根
@@ -48,6 +49,219 @@ def test_move_promotes_unmanaged_file_and_rewrites_all_linkers(
     assert "[旧稿](00-background.md)" in page_a  # 受管理链接者
     sibling = (root / "sibling.md").read_text(encoding="utf-8")
     assert "[旧稿](pages/00-background.md)" in sibling  # 未受管理链接者
+
+
+def test_move_managed_page_rewrites_unmanaged_linkers(
+    draft_factory: DraftFactory,
+) -> None:
+    root = draft_factory(
+        {
+            "index.md": PAGE_INDEX,
+            "pages/a.md": _page("页面 A"),
+        },
+        root_state=RootState.CANDIDATE,
+    )
+    (root / "legacy.md").write_text("旧稿 [A](pages/a.md)。\n", encoding="utf-8")
+
+    move_entries(root, ["pages/a.md"], "pages/b.md")
+
+    assert "[A](pages/b.md)" in (root / "legacy.md").read_text(encoding="utf-8")
+
+
+def test_fresh_index_path_does_not_read_unmatched_markdown(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = draft_factory(
+        {
+            "index.md": PAGE_INDEX,
+            "pages/a.md": _page("页面 A"),
+        },
+        root_state=RootState.CANDIDATE,
+    )
+    (root / "legacy.md").write_text("[A](pages/a.md)\n", encoding="utf-8")
+    unrelated = root / "unrelated.md"
+    unrelated.write_text("无关正文。\n", encoding="utf-8")
+    move_entries(root, ["pages/a.md"], "pages/b.md")
+    original = Path.read_bytes
+
+    def fail_unrelated(path: Path) -> bytes:
+        if path == unrelated:
+            raise AssertionError("fresh index read an unmatched file")
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_unrelated)
+    move_entries(root, ["pages/b.md"], "pages/c.md")
+
+
+def test_programmatic_move_page_rewrites_unmanaged_linkers(
+    draft_factory: DraftFactory,
+) -> None:
+    root = draft_factory(
+        {
+            "index.md": PAGE_INDEX,
+            "pages/a.md": _page("页面 A"),
+        },
+        root_state=RootState.CANDIDATE,
+    )
+    (root / "legacy.md").write_text("旧稿 [A](pages/a.md)。\n", encoding="utf-8")
+
+    move_page(root, Path("pages/a.md"), Path("pages/b.md"))
+
+    assert "[A](pages/b.md)" in (root / "legacy.md").read_text(encoding="utf-8")
+
+
+def test_programmatic_move_page_refreshes_index_from_merged_plan(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = draft_factory(
+        {"index.md": PAGE_INDEX, "pages/a.md": _page("页面 A")},
+        root_state=RootState.CANDIDATE,
+    )
+    (root / "legacy.md").write_text("旧稿 [A](pages/a.md)。\n", encoding="utf-8")
+    captured: list[object] = []
+    from draft.models import OperationPhase, OperationPlan, OperationResult
+
+    def capture_plan(plan: OperationPlan) -> OperationResult:
+        captured.append(plan)
+        return OperationResult("id", "move", OperationPhase.COMPLETED, ())
+
+    def skip_refresh(_root: Path, _plan: OperationPlan) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "draft.structure.execute_plan",
+        capture_plan,
+    )
+    monkeypatch.setattr(
+        "draft.structure._refresh_move_index",
+        skip_refresh,
+    )
+    move_page(root, Path("pages/a.md"), Path("pages/b.md"))
+    assert captured
+    plan = captured[0]
+    assert isinstance(plan, OperationPlan)
+    assert any(mutation.path == Path("legacy.md") for mutation in plan.mutations)
+
+
+def test_move_plan_rejects_unmanaged_file_change_before_first_write(
+    draft_factory: DraftFactory,
+) -> None:
+    from draft.operation_facts import load_operation_facts
+    from draft.structure import plan_move_from_arguments
+
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "stray.md").write_text("正文。\n", encoding="utf-8")
+    (root / "quiet.md").write_text("原本没有入站链接。\n", encoding="utf-8")
+    facts = load_operation_facts(root)
+    plan = plan_move_from_arguments(root, facts, ["stray.md"], "pages/stray.md")
+    (root / "quiet.md").write_text("后来 [stray](stray.md)。\n", encoding="utf-8")
+
+    from draft.operations import execute_plan
+
+    with pytest.raises(DraftError) as caught:
+        execute_plan(plan)
+
+    assert caught.value.code == "operation.external_change"
+    assert (root / "stray.md").exists()
+    assert not (root / "pages/stray.md").exists()
+
+
+def test_move_plan_rejects_index_generation_change_before_write(
+    draft_factory: DraftFactory,
+) -> None:
+    from draft.operation_facts import load_operation_facts
+    from draft.operations import execute_plan
+    from draft.structure import plan_move_from_arguments
+
+    root = draft_factory(
+        {"index.md": PAGE_INDEX, "pages/a.md": _page("页面 A")},
+        root_state=RootState.CANDIDATE,
+    )
+    move_entries(root, ["pages/a.md"], "pages/b.md")
+    facts = load_operation_facts(root)
+    plan = plan_move_from_arguments(root, facts, ["pages/b.md"], "pages/c.md")
+    index_path = root / ".draft" / "link-index.json"
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    payload["generation"] = int(payload["generation"]) + 1
+    index_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(DraftError) as caught:
+        execute_plan(plan)
+    assert caught.value.code == "operation.external_change"
+    assert (root / "pages/b.md").exists()
+    assert not (root / "pages/c.md").exists()
+    journals = list((root / ".draft" / "operations").glob("*/journal.json"))
+    phases = {json.loads(path.read_text(encoding="utf-8"))["phase"] for path in journals}
+    assert phases == {"completed", "rolled_back"}
+    assert not (root / ".draft" / "operation.lock").exists()
+
+
+def test_move_rejects_overlapping_sources_independent_of_argument_order(
+    draft_factory: DraftFactory,
+) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "legacy" / "topic").mkdir(parents=True)
+    (root / "legacy" / "index.md").write_text("旧根。\n", encoding="utf-8")
+    (root / "legacy" / "topic" / "a.md").write_text("旧页。\n", encoding="utf-8")
+
+    errors: list[tuple[str, tuple[str, ...]]] = []
+    for sources in (("legacy", "legacy/topic"), ("legacy/topic", "legacy")):
+        with pytest.raises(DraftError) as caught:
+            move_entries(root, list(sources), "pages")
+        errors.append((caught.value.code, caught.value.details))
+
+    assert errors[0] == errors[1]
+    assert errors[0][0] == "structure.conflict"
+
+
+def test_move_shape_error_precedes_damaged_marker(
+    draft_factory: DraftFactory,
+) -> None:
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "legacy").mkdir()
+    (root / "legacy" / "a.md").write_text("旧稿。\n", encoding="utf-8")
+    (root / ".draft" / "draft.json").write_text("not json\n", encoding="utf-8")
+
+    with pytest.raises(DraftError) as caught:
+        move_entries(root, ["legacy"], "pages/a.md")
+
+    assert caught.value.code == "cli.move_operands_invalid"
+
+
+@pytest.mark.parametrize(
+    "failure", [FileNotFoundError("gone"), PermissionError("denied"), OSError("io")]
+)
+def test_move_closure_io_failures_are_stable_draft_errors(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: OSError,
+) -> None:
+    from draft.operation_facts import load_operation_facts
+    from draft.structure import plan_move_from_arguments
+
+    root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
+    (root / "stray.md").write_text("正文。\n", encoding="utf-8")
+    facts = load_operation_facts(root)
+    original = Path.read_bytes
+
+    def fail_closure_read(path: Path) -> bytes:
+        if path == root / "stray.md":
+            raise failure
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_closure_read)
+    with pytest.raises(DraftError) as caught:
+        plan_move_from_arguments(root, facts, ["stray.md"], "pages/stray.md")
+
+    assert isinstance(caught.value, DraftError)
+    assert caught.value.paths == (Path("stray.md"),)
+    expected_reason = (
+        "not_found"
+        if isinstance(failure, FileNotFoundError)
+        else "permission_denied"
+        if isinstance(failure, PermissionError)
+        else "io_error"
+    )
+    assert caught.value.details == (expected_reason,)
 
 
 def test_move_rejects_and_names_undecodable_unmanaged_file(
