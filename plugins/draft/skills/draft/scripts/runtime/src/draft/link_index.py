@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, cast
 
 from draft.errors import DraftError
 from draft.markdown import extract_body_links
-from draft.operations import sha256_bytes
+from draft.operations import sha256_bytes, validate_link_index_revision
 from draft.resources import (
     ProbeState,
     ResourceIdentity,
@@ -48,8 +48,10 @@ INDEX_SCHEMA_VERSION = 2
 INDEX_RELATIVE_PATH = Path(".draft") / "link-index.json"
 INVALID_RELATIVE_PATH = Path(".draft") / "link-index.invalid"
 
-_REVISION = re.compile(r"[1-9][0-9]*\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+# validate_revision 委托 operations 时使用的占位路径：纯解析边界不携带真实路径，
+# DraftError 被捕获并转为 ValueError，path 不进入任何持久状态。
+_REVISION_SENTINEL = Path("<link-index>")
 _DIRECTORY_MEMBER_KINDS = frozenset({"directory", "file", "symlink", "other"})
 
 
@@ -363,9 +365,16 @@ def _validate_reverse_edges(
 
 
 def validate_revision(revision: object) -> None:
-    """按 spec §3 校验规范十进制 revision；比较在需要处用任意精度整数。"""
-    if not isinstance(revision, str) or not _REVISION.fullmatch(revision):
-        raise ValueError("invalid revision")
+    """按 spec §3 校验规范十进制 revision；格式判定委托 operations 的单一权威实现。
+
+    operations 的 ``validate_link_index_revision`` 是唯一格式实现（journal 边界抛
+    DraftError）；本纯解析边界保留既有 ValueError 契约（Task 2 测试），只共享格式
+    判定，不重复实现 ``[1-9][0-9]*``。比较在需要处用任意精度整数。
+    """
+    try:
+        validate_link_index_revision(revision, path=_REVISION_SENTINEL)
+    except DraftError:
+        raise ValueError("invalid revision") from None
 
 
 def _validate_sha256(value: str) -> None:
@@ -624,9 +633,20 @@ def build_index_content(
     baseline: LinkIndexContent | LinkIndex | None,
     *,
     root: Path = Path("."),
+    known_documents: tuple[object, ...] = (),
 ) -> LinkIndexScan:
-    """纯增量事实计算：比较 path + sha256，未变化文件复用既有解析结果。"""
+    """纯增量事实计算：比较 path + sha256，未变化文件复用既有解析结果。
+
+    ``known_documents`` 提供上层已经解析的 ``IndexedFile``（path+sha256+outbound）；
+    只有路径与 SHA-256 均匹配时才复用其 links，不跳过正文读取或摘要比较（spec §8.6、
+    Task 9 seed）。增量判定始终对 ``baseline``（已发布制品）比较，known_documents 不
+    影响 ``changed``。
+    """
     baseline_files = baseline.files if baseline is not None else {}
+    known_by_path: dict[Path, IndexedFile] = {}
+    for document in known_documents:
+        if isinstance(document, IndexedFile):
+            known_by_path[document.path] = document
     read_files = 0
     read_bytes = 0
     parsed_files = 0
@@ -641,8 +661,12 @@ def build_index_content(
         if prior is not None and prior.sha256 == digest:
             files[path] = prior
         else:
-            parsed_files += 1
-            files[path] = _index_v2_file(root, path, raw, digest)
+            known = known_by_path.get(path)
+            if known is not None and known.sha256 == digest:
+                files[path] = known
+            else:
+                parsed_files += 1
+                files[path] = _index_v2_file(root, path, raw, digest)
     backlinks = _derive_backlinks(files)
     content = LinkIndexContent(
         files=files,
