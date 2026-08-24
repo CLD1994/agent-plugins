@@ -7,7 +7,7 @@ import pytest
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
-from draft.models import OperationPhase
+from draft.models import OperationKind, OperationPhase
 from draft.operations import JOURNAL_VERSION, TrashDeadlines
 from draft.trash import trash_page
 from draft.trash_lifecycle import (
@@ -1010,3 +1010,53 @@ def test_list_recoverable_corruption_fails_whole(
 
     with pytest.raises(DraftError):
         list_recoverable(root, as_of=EXPIRY)
+
+
+def test_no_lock_trash_at_index_phase_is_inconsistent(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """无锁 trash 停在链接索引 phase：锁已丢失属内部异常，recover 保留现场报 inconsistent。
+
+    索引 phase 的 trash 必须持锁（锁在终态 trash_retained 才释放）；无锁出现即
+    operation.lock 被外部移除的损坏现场，不得静默跳过或按生命周期推进。
+    """
+
+    class ProcessExit(BaseException):
+        pass
+
+    import draft.operations as operations_module
+    from draft.operations import Journal
+
+    root = build_trashable_draft(draft_factory)
+    real_write = operations_module.write_journal
+    fired = False
+
+    def write_then_crash(journal: Journal) -> None:
+        nonlocal fired
+        real_write(journal)
+        if (
+            not fired
+            and journal.kind is OperationKind.TRASH
+            and journal.phase is OperationPhase.LINK_INDEX_UPDATING
+        ):
+            fired = True
+            raise ProcessExit
+
+    monkeypatch.setattr(operations_module, "write_journal", write_then_crash)
+    with pytest.raises(ProcessExit):
+        trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    monkeypatch.undo()
+
+    from draft.operations import read_journal, read_lock
+
+    trash_id = read_lock(root)
+    assert trash_id is not None
+    assert read_journal(_journal_path(root, trash_id)).phase is OperationPhase.LINK_INDEX_UPDATING
+    (root / ".draft/operation.lock").unlink()  # 模拟锁丢失。
+
+    report = recover_draft(root, now=CREATED)
+
+    assert report.error is not None
+    assert report.error.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    journal = read_journal(_journal_path(root, trash_id))
+    assert journal.phase is OperationPhase.LINK_INDEX_UPDATING

@@ -1045,6 +1045,124 @@ def test_restore_forward_mid_phase_crash_recovers_through_public_entry(
 
 
 @pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
+def test_trash_link_index_phase_crash_recovers_to_retained_with_index_result(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_name: str,
+) -> None:
+    """trash 在索引 phase 中断：索引结果先于 trash_retained 耐久（spec §5/§12）。
+
+    真实 trash 在 R 耐久进入 link_index_updating 后中断；公开入口先收敛索引结果，
+    再进入 trash_retained（而不是释放锁后停在索引 phase）。
+    """
+    root = build_trashable_draft(draft_factory)
+    import draft.operations as operations_module
+
+    real_write = operations_module.write_journal
+    fired = False
+
+    def write_then_crash(journal: Journal) -> None:
+        nonlocal fired
+        real_write(journal)
+        if (
+            not fired
+            and journal.kind is OperationKind.TRASH
+            and journal.phase is OperationPhase.LINK_INDEX_UPDATING
+        ):
+            fired = True
+            raise SimulatedProcessExit
+
+    monkeypatch.setattr(operations_module, "write_journal", write_then_crash)
+    with pytest.raises(SimulatedProcessExit):
+        trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    monkeypatch.undo()
+
+    from draft.operations import read_lock
+
+    trash_id = read_lock(root)
+    assert trash_id is not None
+    journal = _read_journal(root, trash_id)
+    assert journal["phase"] == "link_index_updating"
+    assert journal["link_index_revision"] == "1"
+
+    _recover_through_public_entry(root, entry_name)
+
+    journal = _read_journal(root, trash_id)
+    assert journal["phase"] == "trash_retained"
+    assert journal["link_index_result"] == "rebuild_required"
+    assert journal["link_index_revision"] == "1"
+    assert not (root / ".draft/operation.lock").exists()
+    assert not (root / "pages/obsolete.md").exists()  # 页面已在索引阶段前回收。
+
+
+@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
+def test_restore_link_index_phase_crash_recovers_through_public_entry(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_name: str,
+) -> None:
+    """restore 在索引 phase 中断：R 先收敛 completed（索引结果耐久、锁保留），再解关联 T。
+
+    恢复不产生独立 revision：R 保持崩溃时已分配的 revision（spec §5/§12）。
+    """
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    crash_after_restore_phase(monkeypatch, OperationPhase.LINK_INDEX_UPDATING)
+    with pytest.raises(SimulatedProcessExit):
+        restore_retained_trash(root, pending.operation_id, now=NOW)
+    monkeypatch.undo()
+
+    restore_id = _read_journal(root, pending.operation_id)["metadata"]["restore_operation_id"]
+    assert _read_journal(root, restore_id)["phase"] == "link_index_updating"
+    assert _read_journal(root, restore_id)["link_index_revision"] == "2"
+
+    _recover_through_public_entry(root, entry_name)
+
+    assert _read_journal(root, restore_id)["phase"] == "completed"
+    assert _read_journal(root, restore_id)["link_index_result"] == "rebuild_required"
+    assert _read_journal(root, restore_id)["link_index_revision"] == "2"
+    t = _read_journal(root, pending.operation_id)
+    assert t["phase"] == "rolled_back"
+    # 提交路径（VERIFY_AND_COMMIT）保留 claim 作为审计痕迹；T 已 rolled_back，claim 惰性。
+    assert t["metadata"].get("restore_operation_id") == restore_id
+    assert not (root / ".draft/operation.lock").exists()
+    assert (root / "pages/obsolete.md").read_text(encoding="utf-8") == OBSOLETE
+
+
+def test_restore_link_index_phase_recovery_retains_lock_and_materials(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """retain_terminal_lock=True：索引终态已耐久，但锁和材料仍由双 journal 协调层拥有。"""
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    crash_after_restore_phase(monkeypatch, OperationPhase.LINK_INDEX_UPDATING)
+    with pytest.raises(SimulatedProcessExit):
+        restore_retained_trash(root, pending.operation_id, now=NOW)
+    monkeypatch.undo()
+    restore_id = _read_journal(root, pending.operation_id)["metadata"]["restore_operation_id"]
+    r_dir = root / ".draft/operations" / restore_id
+    assert (r_dir / "originals/0000.bin").exists()
+
+    from draft.operations import read_lock, recover_locked_operation
+
+    result = recover_locked_operation(root, restore_id, retain_terminal_lock=True)
+
+    # 索引终态已耐久，但锁与恢复材料仍由协调层保留，供 VERIFY_AND_COMMIT 继续。
+    assert result.phase is OperationPhase.COMPLETED
+    journal = _read_journal(root, restore_id)
+    assert journal["phase"] == "completed"
+    assert journal["link_index_result"] == "rebuild_required"
+    assert journal["link_index_revision"] == "2"
+    assert read_lock(root) == restore_id
+    assert (r_dir / "originals/0000.bin").exists()
+
+    # 公开恢复入口接手协调：验证、解关联、清材料、释放锁。
+    _recover_through_public_entry(root, "recover_draft")
+    assert _read_journal(root, pending.operation_id)["phase"] == "rolled_back"
+    assert not (root / ".draft/operation.lock").exists()
+
+
+@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 def test_restore_rollback_mid_phase_crash_recovers_through_public_entry(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,

@@ -3307,6 +3307,11 @@ def _recover_terminal(
             for relative in journal.remove_empty_directories:
                 with suppress(OSError):
                     (root / relative).rmdir()
+        if journal.kind is OperationKind.LINK_INDEX_UPDATE:
+            # maintenance completed：幂等清理锁和已知 staging（spec §12）。
+            from draft import link_index_maintenance as maintenance
+
+            maintenance.cleanup_link_index_staging(journal)
         release_lock(root, operation_id)
     return OperationResult(
         operation_id=operation_id,
@@ -3314,6 +3319,103 @@ def _recover_terminal(
         phase=journal.phase,
         changed_paths=_recover_changed_paths(journal),
     )
+
+
+def recover_link_index_phase(
+    root: Path,
+    journal: Journal,
+    *,
+    retain_terminal_lock: bool = False,
+) -> OperationResult:
+    """按 spec §12 前向收敛三个链接索引 phase（公开恢复入口）。
+
+    - ``link_index_updating``：不读取目标外观猜测发布成功，耐久记录同 revision 的
+      ``rebuild_required``，尽力补建 flag，清理 staging/.pending 后进入原 kind 终态；
+    - ``link_index_published``：验证 journal 绑定制品（目标 SHA-256/revision 与 journal
+      一致）后才补终态，不一致停止保留现场；
+    - ``link_index_rebuild_required``：尽力补建 flag，清理 staging/.pending 后补终态。
+
+    trash 的原有成功终态为 ``trash_retained``，其余（含 restore 与 maintenance
+    ``link-index.update``）为 ``completed``。``link_index_updating`` 之后不再允许业务
+    rollback。``retain_terminal_lock=True`` 只耐久写终态，锁与恢复材料由调用方
+    （trash/restore 双 journal 协调层）统一解关联、清理与释放。恢复不产生独立
+    revision：原样保留 journal 已分配的 revision。
+    """
+    from draft import link_index_maintenance as maintenance
+
+    terminal_phase = (
+        OperationPhase.TRASH_RETAINED
+        if journal.kind is OperationKind.TRASH
+        else OperationPhase.COMPLETED
+    )
+    changed_paths = _recover_changed_paths(journal)
+    if journal.phase is OperationPhase.LINK_INDEX_UPDATING:
+        # 发布结果未知：不猜测已发布、不重复增量发布（spec §12），耐久记录同 revision
+        # 的 rebuild_required，再尽力补建 flag 并清理 staging/.pending。
+        rebuild = with_link_index_state(
+            with_phase(journal, OperationPhase.LINK_INDEX_REBUILD_REQUIRED),
+            revision=journal.link_index_revision,
+            result=LinkIndexResult.REBUILD_REQUIRED,
+            sha256=None,
+        )
+        write_journal(rebuild)
+        maintenance.ensure_rebuild_flag(root)
+        maintenance.cleanup_link_index_staging(rebuild)
+        return finalize_operation(
+            root,
+            rebuild,
+            terminal_phase,
+            journal.kind,
+            retain_terminal_lock=retain_terminal_lock,
+            settle_empty_directories=False,
+            changed_paths=changed_paths,
+        )
+    if journal.phase is OperationPhase.LINK_INDEX_PUBLISHED:
+        maintenance.verify_published_link_index(root, journal)
+        maintenance.cleanup_link_index_staging(journal)
+        return finalize_operation(
+            root,
+            journal,
+            terminal_phase,
+            journal.kind,
+            retain_terminal_lock=retain_terminal_lock,
+            settle_empty_directories=False,
+            changed_paths=changed_paths,
+        )
+    # LINK_INDEX_REBUILD_REQUIRED：尽力补建 flag，然后补原有成功终态。
+    maintenance.ensure_rebuild_flag(root)
+    maintenance.cleanup_link_index_staging(journal)
+    return finalize_operation(
+        root,
+        journal,
+        terminal_phase,
+        journal.kind,
+        retain_terminal_lock=retain_terminal_lock,
+        settle_empty_directories=False,
+        changed_paths=changed_paths,
+    )
+
+
+def _allocating_has_index_artifacts(journal: Journal) -> bool:
+    """allocating 阶段不允许存在任何索引副作用（spec §12 恢复）。
+
+    索引 staging/.pending 只在 ``link_index_updating`` 耐久后才写入；allocating 下
+    出现任何该协议路径节点都属内部不一致，恢复必须保留现场而非静默清理。
+    """
+    from draft import link_index_maintenance as maintenance
+
+    for name in (
+        maintenance.LINK_INDEX_STAGED_FILE_NAME,
+        _pending_name(maintenance.LINK_INDEX_STAGED_FILE_NAME),
+    ):
+        node = classify_node_or_error(
+            journal.directory / name,
+            code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+            code_path=journal.directory / name,
+        )
+        if node is not EntryKind.MISSING:
+            return True
+    return False
 
 
 def _plan_time_missing_index(
@@ -4366,6 +4468,10 @@ def _recover_locked(
             root, journal, operation_id, retain_terminal_lock=retain_terminal_lock
         )
     if journal.phase is OperationPhase.ALLOCATING:
+        # allocating 不应有任何索引副作用（spec §12）：staging/.pending 出现即内部
+        # 不一致，保留现场，不得静默放弃。
+        if _allocating_has_index_artifacts(journal):
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
         # 完整计划尚未耐久形成：不得前向完成，只能放弃、清理分配材料并释放锁。
         # retain_terminal_lock=True 时只耐久终态，材料与锁交由恢复包装层统一处理。
         abandoned = _with_phase(journal, OperationPhase.ROLLED_BACK)
@@ -4378,6 +4484,11 @@ def _recover_locked(
             kind=journal.kind.value,
             phase=OperationPhase.ROLLED_BACK,
             changed_paths=(),
+        )
+    if journal.phase in _LINK_INDEX_PHASES:
+        # 三个链接索引 phase 前向收敛（spec §12）：不进入通用 mutation 恢复。
+        return recover_link_index_phase(
+            root, journal, retain_terminal_lock=retain_terminal_lock
         )
     if journal.phase not in _MID_WRITE_PHASES:
         raise DraftError(
@@ -4529,9 +4640,12 @@ def recover(root_path: Path) -> OperationResult:
             entry.rmdir()
         elif (
             journal.phase in _MID_WRITE_PHASES
+            or journal.phase in _LINK_INDEX_PHASES
             or journal.phase is OperationPhase.TRASH_HANDOFF_SUCCEEDED
             or journal.phase is OperationPhase.TRASH_PURGE_COMMITTED
         ):
+            # 索引 phase 的 operation 必须持锁（锁在终态才释放）：无锁出现即锁已丢失
+            # 的损坏现场，保留证据报 inconsistent（spec §12）。
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal_path)
         # completed / rolled_back / trash_retained / trash_handoff_pending：终态或非写入状态，
         # trash 子系统负责推进 trash_retained 与 trash_handoff_pending。

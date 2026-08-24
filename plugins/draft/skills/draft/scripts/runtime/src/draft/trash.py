@@ -477,6 +477,12 @@ def restore_recovery_decision(
     if pair in (
         (OperationPhase.APPLYING, OperationPhase.TRASH_RETAINED),
         (OperationPhase.VALIDATING, OperationPhase.TRASH_RETAINED),
+        # 三个链接索引 phase 都是严格前向阶段（spec §5）：复用通用锁内恢复
+        # （recover_locked_operation retain_terminal_lock=True）先收敛索引结果，
+        # 再重读 R/T 按提交前/后分支继续协调。
+        (OperationPhase.LINK_INDEX_UPDATING, OperationPhase.TRASH_RETAINED),
+        (OperationPhase.LINK_INDEX_PUBLISHED, OperationPhase.TRASH_RETAINED),
+        (OperationPhase.LINK_INDEX_REBUILD_REQUIRED, OperationPhase.TRASH_RETAINED),
     ):
         return RestoreRecoveryAction.RESUME_FORWARD
     if pair == (OperationPhase.ROLLING_BACK, OperationPhase.TRASH_RETAINED):

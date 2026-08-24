@@ -46,6 +46,7 @@ from draft.observations import EMPTY_OBSERVATIONS, EntryKind
 from draft.operations import (
     OPERATIONS_RELATIVE,
     Journal,
+    _pending_name,  # pyright: ignore[reportPrivateUsage]
     acquire_lock,
     classify_node_or_error,
     durable_write,
@@ -681,23 +682,57 @@ def remove_rebuild_flag(root: Path) -> ResultWarning | None:
     return None
 
 
-def cleanup_link_index_staging(journal: Journal) -> None:
-    """幂等清理当前 operation 的 ``link-index.staged.json``（spec §12）。
+def _unlink_protocol_file(path: Path) -> None:
+    """删除 operation 目录内的协议命名普通文件；缺失幂等，异常节点报不一致。
 
-    只处理精确 staging 路径；缺失视为已经收敛。符号链接、目录或其他异常节点是内部
-    状态错误，保留现场不按文件名删除未知节点。
+    ``link-index.staged.json`` 及其 ``.pending`` 都位于 operation 专属目录（mkdir
+    exist_ok=False 独占创建），协议命名普通文件可安全删除；符号链接、目录或其他
+    异常节点保留现场，不按文件名删除未知节点（spec §12）。
     """
-    staging = journal.directory / LINK_INDEX_STAGED_FILE_NAME
-    node = classify_node_or_error(staging, code=_INCONSISTENT, code_path=staging)
+    node = classify_node_or_error(path, code=_INCONSISTENT, code_path=path)
     if node is EntryKind.MISSING:
         return
     if node is not EntryKind.FILE:
-        raise DraftError(_INCONSISTENT, staging)
+        raise DraftError(_INCONSISTENT, path)
     try:
-        staging.unlink()
-        fsync_directory(journal.directory)
+        path.unlink()
+        fsync_directory(path.parent)
     except OSError as exc:
-        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, staging) from exc
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, path) from exc
+
+
+def cleanup_link_index_staging(journal: Journal) -> None:
+    """幂等清理当前 operation 的 ``link-index.staged.json`` 及其 ``.pending``（spec §12）。
+
+    只处理精确 staging 路径（及 durable_write 中间态 ``.pending``）；缺失视为已经
+    收敛。符号链接、目录或其他异常节点是内部状态错误，保留现场不按文件名删除未知
+    节点。
+    """
+    _unlink_protocol_file(journal.directory / LINK_INDEX_STAGED_FILE_NAME)
+    _unlink_protocol_file(journal.directory / Path(_pending_name(LINK_INDEX_STAGED_FILE_NAME)))
+
+
+def verify_published_link_index(root: Path, journal: Journal) -> None:
+    """验证已发布制品与 journal 绑定字段一致（spec §12 恢复）。
+
+    journal.phase 必须为 ``link_index_published``。目标 ``.draft/link-index.json``
+    必须为普通文件，SHA-256 与 revision 必须与 journal 一致；缺失、类型异常或摘要/
+    revision 不符时保留现场报 ``operation.inconsistent_state``，不创建新 revision
+    掩盖状态。
+    """
+    artifact = root / INDEX_RELATIVE_PATH
+    node = classify_node_or_error(artifact, code=_INCONSISTENT, code_path=artifact)
+    if node is not EntryKind.FILE:
+        raise DraftError(_INCONSISTENT, artifact)
+    raw = _read_artifact_bytes(artifact)
+    if sha256_bytes(raw) != journal.link_index_sha256:
+        raise DraftError(_INCONSISTENT, artifact)
+    try:
+        index = LinkIndex.from_json(raw)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise DraftError(_INCONSISTENT, artifact) from exc
+    if index.revision != journal.link_index_revision:
+        raise DraftError(_INCONSISTENT, artifact)
 
 
 # ---------------------------------------------------------------------------

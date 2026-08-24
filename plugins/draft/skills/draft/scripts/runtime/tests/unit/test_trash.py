@@ -1062,6 +1062,21 @@ _VALID_RESTORE_TRIPLES: dict[
         RestoreLinkState.MATCHED,
     ): RestoreRecoveryAction.RESUME_FORWARD,
     (
+        OperationPhase.LINK_INDEX_UPDATING,
+        OperationPhase.TRASH_RETAINED,
+        RestoreLinkState.MATCHED,
+    ): RestoreRecoveryAction.RESUME_FORWARD,
+    (
+        OperationPhase.LINK_INDEX_PUBLISHED,
+        OperationPhase.TRASH_RETAINED,
+        RestoreLinkState.MATCHED,
+    ): RestoreRecoveryAction.RESUME_FORWARD,
+    (
+        OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
+        OperationPhase.TRASH_RETAINED,
+        RestoreLinkState.MATCHED,
+    ): RestoreRecoveryAction.RESUME_FORWARD,
+    (
         OperationPhase.ROLLING_BACK,
         OperationPhase.TRASH_RETAINED,
         RestoreLinkState.MATCHED,

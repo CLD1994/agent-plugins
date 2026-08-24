@@ -39,6 +39,7 @@ from draft.models import (
     LinkIndexResult,
     OperationKind,
     OperationPhase,
+    OperationResult,
     ResultWarning,
     RootState,
 )
@@ -1263,3 +1264,179 @@ def test_interrupt_at_completed_preserves_scene(
     monkeypatch.undo()
     assert _journal_phase(root) == "completed"
     assert read_lock(root) is not None
+
+
+# ---------------------------------------------------------------------------
+# maintenance 恢复（spec §12）：allocating 可回滚，三索引 phase 前向收敛，completed 幂等清理。
+# ---------------------------------------------------------------------------
+
+
+def _recover_maintenance(root: Path) -> OperationResult:
+    from draft.operations import recover
+
+    return recover(root)
+
+
+def _operation_journal(root: Path, op_id: str) -> Journal:
+    from draft.operations import operation_journal_path, read_journal
+
+    return read_journal(operation_journal_path(root, op_id))
+
+
+def test_recover_maintenance_allocating_rolls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """allocating 中断且无索引副作用：maintenance 写 rolled_back 并释放锁（spec §12）。"""
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    _fail_write_at(monkeypatch, frozenset({1}))  # 停在 allocating（updating 未耐久）
+    with pytest.raises(DraftError):
+        maintain_link_index(root)
+    monkeypatch.undo()
+    assert _journal_phase(root) == "allocating"
+    op_id = read_lock(root)
+    assert op_id is not None
+
+    result = _recover_maintenance(root)
+
+    assert result.phase is OperationPhase.ROLLED_BACK
+    journal = _operation_journal(root, op_id)
+    assert journal.phase is OperationPhase.ROLLED_BACK
+    assert read_lock(root) is None
+
+
+def test_recover_maintenance_allocating_with_staging_is_inconsistent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """allocating 不应有 staging：出现未知内部文件时报不一致并保留现场（spec §12）。"""
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    _fail_write_at(monkeypatch, frozenset({1}))
+    with pytest.raises(DraftError):
+        maintain_link_index(root)
+    monkeypatch.undo()
+    op_id = read_lock(root)
+    assert op_id is not None
+    op_dir = root / ".draft/operations" / op_id
+    (op_dir / LINK_INDEX_STAGED_FILE_NAME).write_text("{}", encoding="utf-8")
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        _recover_maintenance(root)
+
+    assert read_lock(root) == op_id
+    assert (op_dir / LINK_INDEX_STAGED_FILE_NAME).exists()
+    journal = _operation_journal(root, op_id)
+    assert journal.phase is OperationPhase.ALLOCATING
+
+
+def test_recover_maintenance_updating_enters_rebuild_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """maintenance 在 link_index_updating 中断：进入 rebuild_required 并完成（spec §12）。"""
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def crash_in_stage(journal: object, index: object) -> str:
+        raise RuntimeError("process crash during staging")
+
+    monkeypatch.setattr(maintenance, "stage_link_index", crash_in_stage)
+    with pytest.raises(RuntimeError):
+        maintain_link_index(root)
+    monkeypatch.undo()
+    assert _journal_phase(root) == "link_index_updating"
+    op_id = read_lock(root)
+    assert op_id is not None
+
+    result = _recover_maintenance(root)
+
+    assert result.phase is OperationPhase.COMPLETED
+    journal = _operation_journal(root, op_id)
+    assert journal.link_index_result is LinkIndexResult.REBUILD_REQUIRED
+    assert journal.link_index_revision == "1"
+    assert (root / REBUILD_FLAG_RELATIVE_PATH).is_file()
+    assert read_lock(root) is None
+
+
+def test_recover_maintenance_published_completes_and_preserves_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """maintenance 在 link_index_published 中断：验证制品后完成，不产生新 revision（spec §12）。"""
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    _fail_write_at(monkeypatch, frozenset({3}))  # 停在 published（completed 未耐久）
+    with pytest.raises(DraftError):
+        maintain_link_index(root)
+    monkeypatch.undo()
+    assert _journal_phase(root) == "link_index_published"
+    op_id = read_lock(root)
+    assert op_id is not None
+    artifact = root / INDEX_RELATIVE_PATH
+    artifact_bytes = artifact.read_bytes()
+    journal_before = _operation_journal(root, op_id)
+
+    result = _recover_maintenance(root)
+
+    assert result.phase is OperationPhase.COMPLETED
+    journal = _operation_journal(root, op_id)
+    assert journal.link_index_result is LinkIndexResult.PUBLISHED
+    assert journal.link_index_revision == journal_before.link_index_revision
+    assert journal.link_index_sha256 == journal_before.link_index_sha256
+    assert artifact.read_bytes() == artifact_bytes
+    assert read_lock(root) is None
+
+
+def test_recover_maintenance_rebuild_required_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """maintenance 在 link_index_rebuild_required 中断：补 flag 后完成（spec §12）。"""
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def fail_scan(root: Path, baseline: object, *, known_documents: object = ()) -> object:
+        raise DraftError("operation.index_update_failed", root)
+
+    monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+    _fail_write_at(monkeypatch, frozenset({3}))  # rebuild 路径停在 rebuild_required
+    with pytest.raises(DraftError):
+        maintain_link_index(root)
+    monkeypatch.undo()
+    assert _journal_phase(root) == "link_index_rebuild_required"
+    op_id = read_lock(root)
+    assert op_id is not None
+
+    result = _recover_maintenance(root)
+
+    assert result.phase is OperationPhase.COMPLETED
+    journal = _operation_journal(root, op_id)
+    assert journal.link_index_result is LinkIndexResult.REBUILD_REQUIRED
+    assert journal.link_index_revision == "1"
+    assert (root / REBUILD_FLAG_RELATIVE_PATH).is_file()
+    assert read_lock(root) is None
+
+
+def test_recover_maintenance_completed_releases_lock_and_cleans_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """completed 中断于释放锁前：recover 幂等清理锁和已知 staging（spec §12）。"""
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def fail_release(root: Path, operation_id: str) -> None:
+        raise DraftError(
+            CheckCode.OPERATION_DURABILITY_FAILED.value, root / ".draft" / "operation.lock"
+        )
+
+    monkeypatch.setattr(maintenance, "release_lock", fail_release)
+    with pytest.raises(DraftError):
+        maintain_link_index(root)
+    monkeypatch.undo()
+    assert _journal_phase(root) == "completed"
+    op_id = read_lock(root)
+    assert op_id is not None
+    op_dir = root / ".draft/operations" / op_id
+    (op_dir / LINK_INDEX_STAGED_FILE_NAME).write_text("{}", encoding="utf-8")
+
+    result = _recover_maintenance(root)
+
+    assert result.phase is OperationPhase.COMPLETED
+    journal = _operation_journal(root, op_id)
+    assert journal.phase is OperationPhase.COMPLETED
+    assert not (op_dir / LINK_INDEX_STAGED_FILE_NAME).exists()
+    assert read_lock(root) is None

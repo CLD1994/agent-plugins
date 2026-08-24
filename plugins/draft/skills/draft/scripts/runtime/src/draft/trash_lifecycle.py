@@ -21,6 +21,7 @@ from draft.models import (
     TrashResult,
 )
 from draft.operations import (
+    _LINK_INDEX_PHASES,  # pyright: ignore[reportPrivateUsage]
     DISPOSITION_KEY,
     HANDOFF_ATTEMPTED_AT_KEY,
     HANDOFF_ERROR_MESSAGE_KEY,
@@ -580,6 +581,16 @@ def _recover_locked_trash(
             package=root / OUTGOING_RELATIVE / operation_id,
             changed_paths=result.changed_paths,
         )
+    if journal.phase in _LINK_INDEX_PHASES:
+        # 链接索引 phase 是严格前向阶段（spec §5）：复用公开 recovery 先收敛索引
+        # 结果再进入 trash_retained 并释放锁，不得按生命周期推进或跳过现场。
+        result = recover(root)
+        return TrashResult(
+            operation_id=result.operation_id,
+            phase=result.phase,
+            package=root / OUTGOING_RELATIVE / operation_id,
+            changed_paths=result.changed_paths,
+        )
     # trash_retained/trash_handoff_pending 持锁：用持锁变体推进，不再重新获取锁。
     return _advance_one_locked(root, operation_id, now=now, handoff=handoff)
 
@@ -631,6 +642,11 @@ def _handle_no_lock_dir(
         if journal.phase in (
             OperationPhase.TRASH_HANDOFF_SUCCEEDED,
             OperationPhase.TRASH_PURGE_COMMITTED,
+            # 索引 phase 必须持锁（锁在 trash_retained 才释放）：无锁出现即锁已丢失
+            # 的损坏现场，保留证据报 inconsistent，不得静默跳过。
+            OperationPhase.LINK_INDEX_UPDATING,
+            OperationPhase.LINK_INDEX_PUBLISHED,
+            OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
         ):
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
         # trash_retained/trash_handoff_pending：交给批量推进。

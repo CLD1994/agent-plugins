@@ -23,6 +23,7 @@ from draft.models import (
 from draft.observations import EMPTY_OBSERVATIONS, graph_observations
 from draft.operations import (
     JOURNAL_VERSION,
+    Journal,
     acquire_lock,
     execute_plan,
     operation_journal_path,
@@ -1111,6 +1112,260 @@ def test_recover_without_link_index_result_still_cleans_planned_directories(
     # 无链接索引结果：恢复侧既有清理行为不变。
     assert not target.exists()
     assert read_lock(root) is None
+
+
+# ---------------------------------------------------------------------------
+# 链接索引 phase 的恢复（spec §12）：公开 recover 前向收敛三个索引 phase。
+# ---------------------------------------------------------------------------
+
+
+def crash_after_link_index_write(
+    monkeypatch: pytest.MonkeyPatch, phase: OperationPhase
+) -> None:
+    """真实 writer 耐久写入目标索引 phase 后抛进程退出；只命中该 phase 的首次写入。"""
+    import draft.operations as operations_module
+
+    real_write = operations_module.write_journal
+    fired = False
+
+    def write_then_crash(journal: Journal) -> None:
+        nonlocal fired
+        real_write(journal)
+        if not fired and journal.phase is phase:
+            fired = True
+            raise RuntimeError("injected crash")
+
+    monkeypatch.setattr(operations_module, "write_journal", write_then_crash)
+
+
+def crash_before_link_index_write(
+    monkeypatch: pytest.MonkeyPatch, phase: OperationPhase
+) -> None:
+    """在目标索引 phase 的 journal 耐久写入前抛进程退出（副作用已发生、日志未推进）。"""
+    import draft.operations as operations_module
+
+    real_write = operations_module.write_journal
+
+    def crash_before(journal: Journal) -> None:
+        if journal.phase is phase:
+            raise RuntimeError("injected crash before journal write")
+        return real_write(journal)
+
+    monkeypatch.setattr(operations_module, "write_journal", crash_before)
+
+
+def _persist_interrupted_operation(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: OperationPhase,
+) -> str:
+    """建立业务 operation 耐久停在目标索引 phase 的真实现场，返回 operation_id。"""
+    plan, _old_a, _old_b, _new_a, _new_b = two_write_plan(root)
+    if phase is OperationPhase.LINK_INDEX_REBUILD_REQUIRED:
+        import draft.link_index_maintenance as maintenance
+
+        def fail_scan(
+            _root: Path, baseline: object = None, known_documents: object = ()
+        ) -> object:
+            raise DraftError("operation.index_update_failed", _root)
+
+        monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+    crash_after_link_index_write(monkeypatch, phase)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        execute_plan(plan)
+    monkeypatch.undo()
+    operation_id = read_lock(root)
+    assert operation_id is not None
+    return operation_id
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected"),
+    [
+        (OperationPhase.LINK_INDEX_UPDATING, LinkIndexResult.REBUILD_REQUIRED),
+        (OperationPhase.LINK_INDEX_PUBLISHED, LinkIndexResult.PUBLISHED),
+        (
+            OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
+            LinkIndexResult.REBUILD_REQUIRED,
+        ),
+    ],
+)
+def test_recover_link_index_phase(
+    operation_draft: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: OperationPhase,
+    expected: LinkIndexResult,
+) -> None:
+    """每个索引 phase 崩溃：公开 recover 按原 kind 收敛终态并保留 revision（spec §12）。"""
+    root = operation_draft
+    operation_id = _persist_interrupted_operation(root, monkeypatch, phase)
+    journal_before = read_journal(operation_journal_path(root, operation_id))
+    assert journal_before.phase is phase
+    revision = journal_before.link_index_revision
+
+    result = recover(root)
+
+    assert result.phase is OperationPhase.COMPLETED
+    journal = read_journal(operation_journal_path(root, operation_id))
+    assert journal.link_index_result is expected
+    assert journal.link_index_revision == revision
+    assert read_lock(root) is None
+
+    # 幂等：再次 recover 不改变结果、revision、flag 和制品。
+    flag_before = (root / ".draft/link-index-rebuild-required.flag").exists()
+    artifact_path = root / ".draft/link-index.json"
+    artifact_before = artifact_path.read_bytes() if artifact_path.exists() else None
+    recover(root)
+    journal_after = read_journal(operation_journal_path(root, operation_id))
+    assert journal_after.link_index_result is expected
+    assert journal_after.link_index_revision == revision
+    assert (root / ".draft/link-index-rebuild-required.flag").exists() == flag_before
+    artifact_after = artifact_path.read_bytes() if artifact_path.exists() else None
+    assert artifact_after == artifact_before
+
+
+def test_recover_link_index_updating_cleans_pending_and_staging(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """updating 下 ``.pending`` 残留：收敛 rebuild_required 并清理 staging/.pending。"""
+    root = operation_draft
+    operation_id = _persist_interrupted_operation(
+        root, monkeypatch, OperationPhase.LINK_INDEX_UPDATING
+    )
+    op_dir = root / ".draft/operations" / operation_id
+    # 模拟 stage 的 durable_write 中途崩溃：pending 已耐久、staging 尚未发布。
+    (op_dir / "link-index.staged.json.pending").write_text("{partial", encoding="utf-8")
+
+    result = recover(root)
+
+    assert result.phase is OperationPhase.COMPLETED
+    journal = read_journal(operation_journal_path(root, operation_id))
+    assert journal.link_index_result is LinkIndexResult.REBUILD_REQUIRED
+    assert not (op_dir / "link-index.staged.json.pending").exists()
+    assert not (op_dir / "link-index.staged.json").exists()
+
+
+def test_recover_link_index_updating_with_complete_staging_enters_rebuild_required(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """updating 下完整 staging（stage 后、publish 前崩溃）：收敛 rebuild_required 并清理。"""
+    root = operation_draft
+    plan, _old_a, _old_b, _new_a, _new_b = two_write_plan(root)
+    import draft.link_index_maintenance as maintenance
+
+    def crash_publish(_root: Path, journal: object, expected_sha256: str) -> None:
+        raise RuntimeError("injected crash during publish")
+
+    monkeypatch.setattr(maintenance, "publish_staged_link_index", crash_publish)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        execute_plan(plan)
+    monkeypatch.undo()
+    operation_id = read_lock(root)
+    assert operation_id is not None
+    op_dir = root / ".draft/operations" / operation_id
+    journal = read_journal(operation_journal_path(root, operation_id))
+    assert journal.phase is OperationPhase.LINK_INDEX_UPDATING
+    assert (op_dir / "link-index.staged.json").exists()
+
+    result = recover(root)
+
+    assert result.phase is OperationPhase.COMPLETED
+    journal = read_journal(operation_journal_path(root, operation_id))
+    assert journal.link_index_result is LinkIndexResult.REBUILD_REQUIRED
+    assert not (op_dir / "link-index.staged.json").exists()
+
+
+def test_recover_link_index_updating_does_not_guess_published_from_replaced_target(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """updating 下目标已被替换（publish 后、published 耐久前崩溃）：不猜测已发布。"""
+    root = operation_draft
+    plan, _old_a, _old_b, _new_a, _new_b = two_write_plan(root)
+    crash_before_link_index_write(monkeypatch, OperationPhase.LINK_INDEX_PUBLISHED)
+    with pytest.raises(RuntimeError, match="injected crash before journal write"):
+        execute_plan(plan)
+    monkeypatch.undo()
+    operation_id = read_lock(root)
+    assert operation_id is not None
+    journal = read_journal(operation_journal_path(root, operation_id))
+    assert journal.phase is OperationPhase.LINK_INDEX_UPDATING
+    revision = journal.link_index_revision
+    target = root / ".draft/link-index.json"
+    assert target.is_file()  # 目标已被原子替换，但 journal 尚未耐久 published。
+
+    result = recover(root)
+
+    assert result.phase is OperationPhase.COMPLETED
+    journal = read_journal(operation_journal_path(root, operation_id))
+    assert journal.link_index_result is LinkIndexResult.REBUILD_REQUIRED
+    assert journal.link_index_revision == revision
+    assert target.is_file()  # 恢复只清理 staging，不猜测也不删除已替换目标。
+
+
+def test_recover_link_index_published_verifies_target_before_terminal(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """published 必须验证目标 SHA-256/revision：不一致则停止并保留现场（spec §12）。"""
+    root = operation_draft
+    operation_id = _persist_interrupted_operation(
+        root, monkeypatch, OperationPhase.LINK_INDEX_PUBLISHED
+    )
+    target = root / ".draft/link-index.json"
+    assert target.is_file()
+    tampered = b"tampered artifact bytes"
+    target.write_bytes(tampered)
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        recover(root)
+
+    # 现场保留：锁仍持有、journal 仍在 published、目标未被改写。
+    assert read_lock(root) == operation_id
+    journal = read_journal(operation_journal_path(root, operation_id))
+    assert journal.phase is OperationPhase.LINK_INDEX_PUBLISHED
+    assert target.read_bytes() == tampered
+
+
+def test_recover_link_index_cleans_only_current_operation_staging(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """恢复只清理当前 operation 的 staging/.pending，不删除其他 operation 或未知文件。"""
+    root = operation_draft
+    operation_id = _persist_interrupted_operation(
+        root, monkeypatch, OperationPhase.LINK_INDEX_UPDATING
+    )
+    op_dir = root / ".draft/operations" / operation_id
+    (op_dir / "link-index.staged.json").write_text("{}", encoding="utf-8")
+    other_id = "f" * 32
+    other_dir = root / ".draft/operations" / other_id
+    other_dir.mkdir(parents=True)
+    (other_dir / "link-index.staged.json").write_text("other", encoding="utf-8")
+    (other_dir / "stray.txt").write_text("unknown", encoding="utf-8")
+
+    recover(root)
+
+    assert not (op_dir / "link-index.staged.json").exists()
+    assert not (op_dir / "link-index.staged.json.pending").exists()
+    assert (other_dir / "link-index.staged.json").read_text(encoding="utf-8") == "other"
+    assert (other_dir / "stray.txt").read_text(encoding="utf-8") == "unknown"
+
+
+def test_recover_allocating_with_staging_is_inconsistent(operation_draft: Path) -> None:
+    """allocating 不应有 staging：出现未知内部文件时报不一致并保留现场（spec §12）。"""
+    root = operation_draft
+    op_id = "a" * 32
+    directory = root / ".draft/operations" / op_id
+    directory.mkdir(parents=True)
+    write_journal(root, op_id, "allocating")
+    (directory / "link-index.staged.json").write_text("{}", encoding="utf-8")
+    acquire_lock(root, op_id)
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        recover(root)
+
+    assert read_lock(root) == op_id
+    assert (directory / "link-index.staged.json").exists()
+    journal = read_journal(operation_journal_path(root, op_id))
+    assert journal.phase is OperationPhase.ALLOCATING
 
 
 def test_mutation_path_escape_rejected_before_allocation(operation_draft: Path) -> None:
