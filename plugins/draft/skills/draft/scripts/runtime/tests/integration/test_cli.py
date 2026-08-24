@@ -2546,6 +2546,12 @@ def test_notification_rebuild_flag_exception_recovers_after_node_removed(
     assert _sha256(artifact.read_bytes()) == _PUBLIC_ARTIFACT_SHA256
     assert not (root / ".draft/link-index-rebuild-required.flag").exists()
     assert read_lock(root) is None
+    final_operations = _operation_dirs(root)
+    assert len(final_operations) == 2
+    for final_operation in final_operations:
+        assert not (final_operation / "link-index.staged.json").exists()
+        assert not (final_operation / "link-index.staged.json.pending").exists()
+        assert not (final_operation / "journal.json.pending").exists()
 
 
 def test_notify_rebuild_required_state_rebuilds_and_delivers(
