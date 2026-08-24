@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+from pytest_mock import MockerFixture
 
 from draft.checker import (
     InternalDirectoryState,
@@ -11,12 +12,24 @@ from draft.checker import (
     OperationDirectoryRole,
     PackageOwnership,
     check_graph,
+    check_link_index_maintenance,
     operation_directory_role,
     operation_entry_kind,
     package_ownership_decision,
 )
-from draft.diagnostic_codes import CheckCode, ReplacementStatusReason
+from draft.diagnostic_codes import (
+    LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED,
+    LINK_INDEX_REBUILD_REQUIRED,
+    CheckCode,
+    ReplacementStatusReason,
+)
+from draft.errors import DraftError
 from draft.graph import ROOT_PAGE, DraftGraph
+from draft.link_index import LinkIndexContent, LinkIndexScan, LinkIndexScanStats
+from draft.link_index_maintenance import (
+    LinkIndexMaintenanceResult,
+    PreparedLinkIndexUpdate,
+)
 from draft.models import (
     CheckIssue,
     IssueSeverity,
@@ -25,6 +38,7 @@ from draft.models import (
     OperationPhase,
     PageDocument,
     Relation,
+    ResultWarning,
     RootState,
     SourceSpan,
     StatusValue,
@@ -795,3 +809,111 @@ def test_operation_entry_kind_protocol(name: str, expected: EntryKind) -> None:
 def test_operation_entry_kind_unknown_name() -> None:
     """协议表只登记内部协议名字；未知名字返回 None，不是任意类型。"""
     assert operation_entry_kind("not-registered.bin") is None
+
+
+# ---------------------------------------------------------------------------
+# Task 9：check 的机会式维护投影（spec §16 检查决策表）
+# ---------------------------------------------------------------------------
+
+
+def _scan() -> LinkIndexScan:
+    return LinkIndexScan(
+        content=LinkIndexContent(files={}, backlinks={}, directories={}),
+        changed=True,
+        stats=LinkIndexScanStats(read_files=0, read_bytes=0, parsed_files=0),
+    )
+
+
+def _prepared(
+    *, scan: LinkIndexScan | None, requires_rebuild: bool = False
+) -> PreparedLinkIndexUpdate:
+    return PreparedLinkIndexUpdate(
+        observed_revision="1", scan=scan, requires_rebuild=requires_rebuild
+    )
+
+
+def test_check_link_index_maintenance_fresh_returns_no_issues(
+    mocker: MockerFixture,
+) -> None:
+    """fresh：严格扫描证明磁盘索引当前，无需维护、无索引 issue（spec §16）。"""
+    prepare = mocker.patch(
+        "draft.link_index_maintenance.prepare_link_index_update",
+        return_value=_prepared(scan=None),
+    )
+    commit = mocker.patch("draft.link_index_maintenance.commit_link_index_update")
+    issues = check_link_index_maintenance(ROOT, _graph(), RootState.REGISTERED)
+    assert issues == ()
+    prepare.assert_called_once()
+    commit.assert_not_called()
+
+
+def test_check_link_index_maintenance_projects_warning_issues(
+    mocker: MockerFixture,
+) -> None:
+    """维护后仍 rebuild_required / flag 降级：投影 WARNING issue（spec §16）。"""
+    mocker.patch(
+        "draft.link_index_maintenance.prepare_link_index_update",
+        return_value=_prepared(scan=_scan()),
+    )
+    mocker.patch(
+        "draft.link_index_maintenance.commit_link_index_update",
+        return_value=LinkIndexMaintenanceResult(
+            index=None,
+            warnings=(
+                ResultWarning(LINK_INDEX_REBUILD_REQUIRED),
+                ResultWarning(LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED),
+            ),
+            published=False,
+        ),
+    )
+    issues = check_link_index_maintenance(ROOT, _graph(), RootState.REGISTERED)
+    assert [issue.code for issue in issues] == [
+        LINK_INDEX_REBUILD_REQUIRED,
+        LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED,
+    ]
+    assert all(issue.severity is IssueSeverity.WARNING for issue in issues)
+
+
+def test_check_link_index_maintenance_durability_failure_is_error(
+    mocker: MockerFixture,
+) -> None:
+    """journal 耐久失败：保留已计算事实并报告 operation error（spec §14/§16）。"""
+    mocker.patch(
+        "draft.link_index_maintenance.prepare_link_index_update",
+        return_value=_prepared(scan=_scan()),
+    )
+    mocker.patch(
+        "draft.link_index_maintenance.commit_link_index_update",
+        side_effect=DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, ROOT),
+    )
+    issues = check_link_index_maintenance(ROOT, _graph(), RootState.REGISTERED)
+    assert issues == (
+        _issue(CheckCode.OPERATION_DURABILITY_FAILED.value, ROOT),
+    )
+
+
+def test_check_link_index_maintenance_artifact_inconsistency_is_error(
+    mocker: MockerFixture,
+) -> None:
+    """journal 与 published 制品矛盾：内部一致性 error，阻止 adopt（spec §16）。"""
+    artifact = ROOT / ".draft" / "link-index.json"
+    mocker.patch(
+        "draft.link_index_maintenance.prepare_link_index_update",
+        side_effect=DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, artifact),
+    )
+    issues = check_link_index_maintenance(ROOT, _graph(), RootState.REGISTERED)
+    assert issues == (_issue(CheckCode.OPERATION_INCONSISTENT_STATE.value, artifact),)
+
+
+def test_check_link_index_maintenance_pre_reported_journal_corrupt_not_projected(
+    mocker: MockerFixture,
+) -> None:
+    """journal 损坏已由 operation-state pass 报告，维护失败不重复投影（spec §16）。"""
+    mocker.patch(
+        "draft.link_index_maintenance.prepare_link_index_update",
+        side_effect=DraftError(
+            CheckCode.OPERATION_JOURNAL_CORRUPT.value, ROOT / ".draft" / "operations"
+        ),
+    )
+    issues = check_link_index_maintenance(ROOT, _graph(), RootState.REGISTERED)
+    assert issues == ()

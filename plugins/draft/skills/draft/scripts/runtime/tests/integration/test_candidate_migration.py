@@ -146,3 +146,40 @@ def test_adopt_rejects_candidate_with_errors_and_keeps_candidate(
     assert code == 2
     assert payload["ok"] is False
     assert _marker(target)["root_state"] == RootState.CANDIDATE.value
+
+
+def test_adopt_precheck_completes_opportunistic_maintenance(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """adopt 预检查先结束独立 maintenance operation，再开始 adopt（spec §14/§16）。"""
+    target = tmp_path / "target"
+    assert main(["init", "--candidate", str(target), "--json"]) == 0
+    capsys.readouterr()
+    _write(target, "pages/a.md", _write_page("甲", "待讨论", "index.md", "甲的正文。"))
+    _write(
+        target,
+        "index.md",
+        "# target\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n\n"
+        "## 子主题\n\n- [甲](pages/a.md)\n",
+    )
+
+    assert main(["adopt", "--root", str(target), "--json"]) == 0
+    capsys.readouterr()
+
+    assert _marker(target)["root_state"] == RootState.REGISTERED.value
+    operations = target / ".draft" / "operations"
+    journals = (
+        [
+            json.loads((directory / "journal.json").read_text(encoding="utf-8"))
+            for directory in operations.iterdir()
+        ]
+        if operations.is_dir()
+        else []
+    )
+    index_journals = [
+        journal for journal in journals if journal.get("link_index_result") is not None
+    ]
+    assert index_journals, "adopt 预检查未完成索引维护"
+    latest = max(index_journals, key=lambda journal: int(journal["link_index_revision"]))
+    assert latest["link_index_result"] == "published"
+    assert latest["root_state"] == RootState.CANDIDATE.value

@@ -10,7 +10,13 @@ from pathlib import Path, PurePosixPath
 from typing import cast
 
 from draft import __version__
-from draft.cli_results import CheckSlice, DryRunOperation, ResultType, project_check
+from draft.cli_results import (
+    CheckSlice,
+    DryRunOperation,
+    ResultType,
+    project_check,
+    result_warnings_payload,
+)
 from draft.diagnostic_codes import (
     OPERATION_EXTERNAL_CHANGE,
     OPERATION_INDEX_UPDATE_FAILED,
@@ -540,7 +546,14 @@ def _dispatch_query(
 
     if q == "page":
         from draft.diagnostic_codes import QueryCode
-        from draft.query import PAGE_NOT_FOUND, load_tolerant_view, page_summary
+        from draft.query import (
+            PAGE_NOT_FOUND,
+            backlinks_from_index,
+            load_tolerant_view,
+            maintain_link_index_for_query,
+            page_summary,
+        )
+        from draft.resources import ResourceIdentity, ResourceKind
 
         page = _page_operand(root, cast(str, args.page))
         view = load_tolerant_view(root)
@@ -554,22 +567,31 @@ def _dispatch_query(
                 page,
                 details=(str(len(paths)), *paths[:20]),
             )
-        summary = page_summary(view.graph, page)
+        # 机会式维护（spec §14）：为 backlink count 尝试维护，索引可用时用完整反向表。
+        maintained = maintain_link_index_for_query(root, view.graph, root_state)
+        backlink_count: int | None = None
+        if maintained.index is not None:
+            identity = ResourceIdentity(ResourceKind.PAGE, page.as_posix())
+            backlink_count = len(backlinks_from_index(maintained.index, identity))
+        summary = page_summary(view.graph, page, backlink_count=backlink_count)
+        payload: dict[str, object] = {
+            "result_type": ResultType.QUERY_PAGE.value,
+            "complete": True,
+            "blocking_paths": [],
+            "path": summary.path.as_posix(),
+            "title": summary.title,
+            "status": summary.status.value,
+            "parent": None if summary.parent is None else summary.parent.as_posix(),
+            "child_count": summary.child_count,
+            "link_count": summary.link_count,
+            "backlink_count": summary.backlink_count,
+            "outgoing_relation_count": summary.outgoing_relation_count,
+            "incoming_relation_count": summary.incoming_relation_count,
+        }
+        if maintained.warnings:
+            payload["warnings"] = result_warnings_payload(maintained.warnings)
         return (
-            {
-                "result_type": ResultType.QUERY_PAGE.value,
-                "complete": True,
-                "blocking_paths": [],
-                "path": summary.path.as_posix(),
-                "title": summary.title,
-                "status": summary.status.value,
-                "parent": None if summary.parent is None else summary.parent.as_posix(),
-                "child_count": summary.child_count,
-                "link_count": summary.link_count,
-                "backlink_count": summary.backlink_count,
-                "outgoing_relation_count": summary.outgoing_relation_count,
-                "incoming_relation_count": summary.incoming_relation_count,
-            },
+            payload,
             f"{summary.path.as_posix()} {summary.title} {summary.status.value}",
             0,
         )
@@ -601,13 +623,25 @@ def _dispatch_query(
             0,
         )
     if q == "backlinks":
-        from draft.query import backlinks, load_tolerant_view
+        from draft.query import (
+            backlinks,
+            backlinks_from_index,
+            load_tolerant_view,
+            maintain_link_index_for_query,
+        )
         from draft.resources import resource_identity_from_operand
 
         target = resource_identity_from_operand(root, cast(str, args.target))
         view = load_tolerant_view(root)
         _raise_for_blocking(root, view, root_state)
-        items = [{"page": path.as_posix()} for path in backlinks(view.graph, target)]
+        # 机会式维护（spec §14）：利用完整链接事实尝试维护；索引可用时读反向表，
+        # 否则使用图内完整事实。
+        maintained = maintain_link_index_for_query(root, view.graph, root_state)
+        if maintained.index is not None:
+            sources = backlinks_from_index(maintained.index, target)
+        else:
+            sources = backlinks(view.graph, target)
+        items = [{"page": path.as_posix()} for path in sources]
         payload = _collection_payload(
             items,
             blocking_paths=view.blocking_paths,
@@ -616,8 +650,14 @@ def _dispatch_query(
             offset=offset,
             count_only=count_only,
         )
+        envelope: dict[str, object] = {
+            "result_type": ResultType.QUERY_BACKLINKS.value,
+            **payload,
+        }
+        if maintained.warnings:
+            envelope["warnings"] = result_warnings_payload(maintained.warnings)
         return (
-            {"result_type": ResultType.QUERY_BACKLINKS.value, **payload},
+            envelope,
             f"反向链接 {payload['total']} 项",
             0,
         )
@@ -849,6 +889,8 @@ def _dispatch(
         result = move_entries(root, sources, target)
         payload: dict[str, object] = {"result_type": ResultType.MOVE.value}
         payload.update(_write_payload(result))
+        if result.warnings:
+            payload["warnings"] = result_warnings_payload(result.warnings)
         if len(sources) == 1:
             return payload, f"已移动 {sources[0]} → {target}", 0
         return payload, f"已移动 {len(sources)} 个来源 → {target}", 0
@@ -874,6 +916,8 @@ def _dispatch(
         result = promote_page(root, page, children)
         payload = {"result_type": ResultType.PROMOTE.value}
         payload.update(_write_payload(result))
+        if result.warnings:
+            payload["warnings"] = result_warnings_payload(result.warnings)
         return payload, f"已升格 {page}（{len(children)} 个子页）", 0
     if command == "collapse":
         from draft.structure import collapse_hub, plan_collapse
@@ -895,6 +939,8 @@ def _dispatch(
         result = collapse_hub(root, hub)
         payload = {"result_type": ResultType.COLLAPSE.value}
         payload.update(_write_payload(result))
+        if result.warnings:
+            payload["warnings"] = result_warnings_payload(result.warnings)
         return payload, f"已降级 {hub}", 0
     if command == "trash":
         from draft.trash import trash_page, trash_plan
@@ -913,6 +959,8 @@ def _dispatch(
         result = trash_page(root, page)
         payload: dict[str, object] = {"result_type": ResultType.TRASH.value}
         payload.update(_trash_payload(result))
+        if result.index_warnings:
+            payload["warnings"] = result_warnings_payload(result.index_warnings)
         human = f"已回收 {page}（{result.phase.value}）"
         if result.warnings:
             human = f"{human}；警告：{_warning_text(result.warnings[0])}"
@@ -962,6 +1010,8 @@ def _dispatch(
             "target": target.as_posix(),
             "changed_paths": [path.as_posix() for path in result.changed_paths],
         }
+        if result.warnings:
+            payload["warnings"] = result_warnings_payload(result.warnings)
         return payload, f"已{sub} {code.value} {source} → {target}", 0
     if command == "status":
         from draft.page_metadata import plan_set_status, set_status
@@ -992,6 +1042,8 @@ def _dispatch(
             "status": code.value,
             "changed_paths": [path.as_posix() for path in result.changed_paths],
         }
+        if result.warnings:
+            payload["warnings"] = result_warnings_payload(result.warnings)
         return payload, f"已将 {page} 状态设为 {code.value}", 0
     if command == "create":
         from draft.page_create import create_page, plan_create_page
@@ -1026,6 +1078,8 @@ def _dispatch(
             "status": status.value,
             "changed_paths": [path.as_posix() for path in result.changed_paths],
         }
+        if result.warnings:
+            payload["warnings"] = result_warnings_payload(result.warnings)
         return payload, f"已创建 {page}", 0
     if command == "generate-conclusions":
         from draft.conclusions import generate_conclusions
@@ -1120,6 +1174,8 @@ def _dispatch(
                 3,
             )
         payload = {"result_type": ResultType.RESTORE.value, **_operation_payload(result)}
+        if result.warnings:
+            payload["warnings"] = result_warnings_payload(result.warnings)
         return payload, f"已恢复操作 {operation_id} 的页面", 0
     if command == "recover":
         from draft.trash_lifecycle import recover_interrupted_operations
@@ -1210,7 +1266,7 @@ def main(
 
         assert root is not None
         try:
-            report = check_draft(root)
+            report = check_draft(root, maintain_index=True)
         except DraftError as error:
             _emit_error(error, json_mode)
             return _exit_for_error(error)

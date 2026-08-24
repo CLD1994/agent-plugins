@@ -115,8 +115,9 @@ def adopt(root: Path) -> OperationResult:
         raise DraftError("adopt.already_registered", target)
     if (target / INTERNAL_DIR / "operation.lock").exists():
         raise DraftError("adopt.locked", target)
-    # 完整候选检查（无过滤无分页）：candidate 与 registered 共享检查协议。
-    report = check_draft(target, marker_state=state)
+    # 完整候选检查（无过滤无分页）：candidate 与 registered 共享检查协议；预检查先
+    # 结束独立 maintenance operation，再开始 adopt（spec §14/§16）。
+    report = check_draft(target, marker_state=state, maintain_index=True)
     if report.errors:
         raise DraftError(
             "adopt.invalid_candidate",

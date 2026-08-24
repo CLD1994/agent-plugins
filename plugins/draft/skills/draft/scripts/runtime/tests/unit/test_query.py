@@ -1,18 +1,36 @@
 from __future__ import annotations
 
+import argparse
 from collections.abc import Mapping
 from pathlib import Path
+from unittest.mock import MagicMock
 
+from pytest_mock import MockerFixture
+
+import draft.cli as cli
+from draft.graph import DraftGraph
+from draft.link_index import Backlink, LinkIndexContent, LinkSpan
+from draft.link_index_maintenance import (
+    LinkIndexMaintenanceResult,
+    PreparedLinkIndexUpdate,
+)
 from draft.markdown import parse_page
 from draft.models import (
     PageDocument,
     RelationCode,
+    ResultWarning,
+    RootState,
     StatusCode,
 )
+from draft.paths import ResolvedPath
 from draft.query import (
+    OpportunisticIndexResult,
     PageSummary,
     backlinks,
+    backlinks_from_index,
     incoming_relations,
+    known_documents_from_graph,
+    maintain_link_index_for_query,
     outgoing_relations,
     page_links,
     page_summary,
@@ -176,3 +194,258 @@ def test_page_summary_counts_match_links_and_relations() -> None:
     assert summary.outgoing_relation_count == 1  # parent
     assert summary.incoming_relation_count == 1  # B 的依赖
     assert summary.backlink_count == 1  # B 的正文链接
+
+
+# ---------------------------------------------------------------------------
+# Task 9：索引事实服务与机会式维护（spec §14/§16）
+# ---------------------------------------------------------------------------
+
+
+def _real_graph() -> DraftGraph:
+    """受真实接口约束的 DraftGraph：page_digest 与 known_documents 复用需要。"""
+    text = "# A\n\n> 状态：`待讨论`\n\n见 [乙](b.md)。\n"
+    return DraftGraph(
+        root=ROOT,
+        pages={A: parse_page(A, text)},
+        parents={},
+        children={},
+        inbound_links={},
+        relations={},
+    )
+
+
+def test_backlinks_from_index_dedupes_and_sorts_sources() -> None:
+    """反向表来源去重并按来源路径排序（spec §14 完整索引事实）。"""
+    identity = ResourceIdentity(ResourceKind.PAGE, "pages/a.md")
+    content = LinkIndexContent(
+        files={},
+        backlinks={
+            identity: (
+                Backlink(Path("pages/b.md"), LinkSpan(10, 20)),
+                Backlink(Path("index.md"), LinkSpan(5, 9)),
+                Backlink(Path("pages/b.md"), LinkSpan(30, 40)),
+            ),
+        },
+        directories={},
+    )
+    sources = backlinks_from_index(content, identity)
+    assert [path.as_posix() for path in sources] == ["index.md", "pages/b.md"]
+
+
+def test_backlinks_from_index_missing_target_is_empty() -> None:
+    content = LinkIndexContent(files={}, backlinks={}, directories={})
+    assert (
+        backlinks_from_index(content, ResourceIdentity(ResourceKind.PAGE, "pages/none.md"))
+        == ()
+    )
+
+
+def test_page_summary_injects_backlink_count() -> None:
+    graph = _make_graph()
+    summary = page_summary(graph, A, backlink_count=7)
+    assert summary.backlink_count == 7
+
+
+def test_known_documents_from_graph_extracts_path_digest_and_outbound() -> None:
+    """上层已解析页面成为可验证 scan seed：path + sha256 + 出站边（spec §8.6）。"""
+    graph = _real_graph()
+    documents = known_documents_from_graph(ROOT, graph)
+    assert len(documents) == 1
+    document = documents[0]
+    assert document.path == A
+    assert document.sha256 == graph.page_digest(A)
+    identities = {edge.resource_identity for edge in document.outbound}
+    assert ResourceIdentity(ResourceKind.PAGE, "pages/b.md") in identities
+
+
+def _resolved(relative: str) -> ResolvedPath:
+    return ResolvedPath(
+        root=Path("/draft"),
+        relative=Path(relative),
+        absolute=Path("/draft") / relative,
+    )
+
+
+def _query_args(command: str, *operands: str) -> argparse.Namespace:
+    return cli.build_parser().parse_args(["query", command, "--root", "/draft", *operands])
+
+
+def _empty_view() -> MagicMock:
+    view = MagicMock()
+    view.first_blocking = None
+    view.blocking_paths = ()
+    return view
+
+
+def test_query_backlinks_calls_opportunistic_maintenance(mocker: MockerFixture) -> None:
+    """query backlinks 入口尝试机会式维护（spec §14 路由决策表）。"""
+    mocker.patch("draft.cli._query_root_state", return_value=RootState.REGISTERED)
+    mocker.patch(
+        "draft.resources.resource_identity_from_operand",
+        return_value=ResourceIdentity(ResourceKind.PAGE, "pages/a.md"),
+    )
+    view = _empty_view()
+    mocker.patch("draft.query.load_tolerant_view", return_value=view)
+    mocker.patch("draft.query.backlinks", return_value=())
+    maintain = mocker.patch(
+        "draft.query.maintain_link_index_for_query",
+        return_value=OpportunisticIndexResult(None, ()),
+    )
+    args = _query_args("backlinks", "pages/a.md")
+    payload, _human, exit_code = cli._dispatch(args, root=Path("/draft"))  # pyright: ignore[reportPrivateUsage]
+    maintain.assert_called_once_with(Path("/draft"), view.graph, RootState.REGISTERED)
+    assert exit_code == 0
+    assert payload["result_type"] == "query.backlinks"
+    assert "warnings" not in payload
+
+
+def test_query_page_calls_opportunistic_maintenance(mocker: MockerFixture) -> None:
+    """query page 入口为 backlink count 尝试机会式维护（spec §14 路由决策表）。"""
+    mocker.patch("draft.cli._query_root_state", return_value=RootState.REGISTERED)
+    mocker.patch("draft.paths.resolve_page_operand", return_value=_resolved("pages/a.md"))
+    view = _empty_view()
+    view.graph.pages = {Path("pages/a.md"): object()}
+    mocker.patch("draft.query.load_tolerant_view", return_value=view)
+    summary = PageSummary(
+        path=Path("pages/a.md"),
+        title="甲",
+        status=StatusCode.PENDING,
+        parent=None,
+        child_count=0,
+        link_count=0,
+        backlink_count=0,
+        outgoing_relation_count=0,
+        incoming_relation_count=0,
+    )
+    page_summary_mock = mocker.patch("draft.query.page_summary", return_value=summary)
+    maintain = mocker.patch(
+        "draft.query.maintain_link_index_for_query",
+        return_value=OpportunisticIndexResult(None, ()),
+    )
+    args = _query_args("page", "pages/a.md")
+    payload, _human, exit_code = cli._dispatch(args, root=Path("/draft"))  # pyright: ignore[reportPrivateUsage]
+    maintain.assert_called_once_with(Path("/draft"), view.graph, RootState.REGISTERED)
+    page_summary_mock.assert_called_once()
+    assert exit_code == 0
+    assert payload["result_type"] == "query.page"
+
+
+def test_query_links_relations_status_recoverable_do_not_maintain(
+    mocker: MockerFixture,
+) -> None:
+    """不消费链接索引的查询不触发维护（spec §14 路由决策表）。"""
+    mocker.patch("draft.cli._query_root_state", return_value=RootState.REGISTERED)
+    maintain = mocker.patch("draft.query.maintain_link_index_for_query")
+
+    mocker.patch("draft.paths.resolve_page_operand", return_value=_resolved("pages/a.md"))
+    mocker.patch("draft.query.load_registered_page", return_value=MagicMock())
+    mocker.patch("draft.query.page_links", return_value=())
+    cli._dispatch(_query_args("links", "pages/a.md"), root=Path("/draft"))  # pyright: ignore[reportPrivateUsage]
+    maintain.assert_not_called()
+
+    mocker.patch("draft.query.outgoing_relations", return_value=())
+    cli._dispatch(  # pyright: ignore[reportPrivateUsage]
+        _query_args("relations", "pages/a.md", "--direction", "outgoing"),
+        root=Path("/draft"),
+    )
+    maintain.assert_not_called()
+
+    view = _empty_view()
+    mocker.patch("draft.query.load_tolerant_view", return_value=view)
+    mocker.patch("draft.query.pages_with_status", return_value=())
+    cli._dispatch(_query_args("status", "pending"), root=Path("/draft"))  # pyright: ignore[reportPrivateUsage]
+    maintain.assert_not_called()
+
+    mocker.patch("draft.trash_lifecycle.list_recoverable", return_value=())
+    cli._dispatch(_query_args("recoverable"), root=Path("/draft"))  # pyright: ignore[reportPrivateUsage]
+    maintain.assert_not_called()
+
+
+def test_maintain_link_index_for_query_fresh_reuses_published_baseline(
+    mocker: MockerFixture,
+) -> None:
+    """fresh：严格扫描证明磁盘索引当前后复用已发布制品，不重复 commit。"""
+    graph = _real_graph()
+    mocker.patch(
+        "draft.link_index_maintenance.prepare_link_index_update",
+        return_value=PreparedLinkIndexUpdate(
+            observed_revision="1", scan=None, requires_rebuild=False
+        ),
+    )
+    baseline = MagicMock()
+    baseline.index = LinkIndexContent(files={}, backlinks={}, directories={})
+    mocker.patch(
+        "draft.link_index_maintenance.load_link_index_baseline", return_value=baseline
+    )
+    commit = mocker.patch("draft.link_index_maintenance.commit_link_index_update")
+    result = maintain_link_index_for_query(ROOT, graph, RootState.REGISTERED)
+    assert result.index is baseline.index
+    assert result.warnings == ()
+    commit.assert_not_called()
+
+
+def test_maintain_link_index_for_query_uses_published_result(
+    mocker: MockerFixture,
+) -> None:
+    """维护成功：使用已发布制品。"""
+    graph = _real_graph()
+    scan = MagicMock()
+    mocker.patch(
+        "draft.link_index_maintenance.prepare_link_index_update",
+        return_value=PreparedLinkIndexUpdate(
+            observed_revision=None, scan=scan, requires_rebuild=False
+        ),
+    )
+    index = MagicMock()
+    commit = mocker.patch(
+        "draft.link_index_maintenance.commit_link_index_update",
+        return_value=LinkIndexMaintenanceResult(index=index, warnings=(), published=True),
+    )
+    result = maintain_link_index_for_query(ROOT, graph, RootState.REGISTERED)
+    assert result.index is index
+    commit.assert_called_once()
+
+
+def test_maintain_link_index_for_query_keeps_full_scan_when_commit_unpublished(
+    mocker: MockerFixture,
+) -> None:
+    """未发布（并发/锁持有）仍保留本次完整扫描事实（spec §14）。"""
+    graph = _real_graph()
+    scan = MagicMock()
+    scan.content = LinkIndexContent(files={}, backlinks={}, directories={})
+    mocker.patch(
+        "draft.link_index_maintenance.prepare_link_index_update",
+        return_value=PreparedLinkIndexUpdate(
+            observed_revision="1", scan=scan, requires_rebuild=False
+        ),
+    )
+    mocker.patch(
+        "draft.link_index_maintenance.commit_link_index_update",
+        return_value=LinkIndexMaintenanceResult(index=None, warnings=(), published=False),
+    )
+    result = maintain_link_index_for_query(ROOT, graph, RootState.REGISTERED)
+    assert result.index is scan.content
+
+
+def test_maintain_link_index_for_query_rebuild_required_returns_none_with_warnings(
+    mocker: MockerFixture,
+) -> None:
+    """扫描失败（rebuild_required）：返回 None 与降级 warning，由调用方回退图内事实。"""
+    graph = _real_graph()
+    mocker.patch(
+        "draft.link_index_maintenance.prepare_link_index_update",
+        return_value=PreparedLinkIndexUpdate(
+            observed_revision="1", scan=None, requires_rebuild=True
+        ),
+    )
+    mocker.patch(
+        "draft.link_index_maintenance.commit_link_index_update",
+        return_value=LinkIndexMaintenanceResult(
+            index=None,
+            warnings=(ResultWarning("link_index.rebuild_required"),),
+            published=False,
+        ),
+    )
+    result = maintain_link_index_for_query(ROOT, graph, RootState.REGISTERED)
+    assert result.index is None
+    assert result.warnings == (ResultWarning("link_index.rebuild_required"),)

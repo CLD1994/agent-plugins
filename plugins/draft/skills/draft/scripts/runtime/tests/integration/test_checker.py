@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -5,13 +6,22 @@ import pytest
 
 from draft.checker import check_draft
 from draft.diagnostic_codes import (
+    LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED,
+    LINK_INDEX_REBUILD_REQUIRED,
     CheckCode,
     LinkEscapeKind,
     ReplacementStatusReason,
 )
 from draft.errors import DraftError
-from draft.models import CheckIssue, CheckReport, IssueSeverity, OperationPhase, RootState
-from draft.operations import JOURNAL_VERSION, Journal
+from draft.models import (
+    CheckIssue,
+    CheckReport,
+    IssueSeverity,
+    OperationPhase,
+    ResultWarning,
+    RootState,
+)
+from draft.operations import JOURNAL_VERSION, Journal, acquire_lock
 from draft.trash import trash_page
 from draft.vocabulary import ConclusionsState
 from tests.integration.support import (
@@ -2765,3 +2775,195 @@ def test_checker_marker_lstat_io_error_is_stable(
     ]
     assert hits, f"缺少 format.invalid @ .draft/draft.json，实际 {codes(report)}"
     assert snapshot_tree(root) == before
+
+
+# ---------------------------------------------------------------------------
+# Task 9：check 的机会式索引维护（spec §16 检查决策表）
+# ---------------------------------------------------------------------------
+
+
+def _operation_dirs(root: Path) -> list[Path]:
+    operations = root / ".draft" / "operations"
+    if not operations.is_dir():
+        return []
+    return sorted(
+        (operations / entry.name for entry in operations.iterdir()),
+        key=lambda path: path.name,
+    )
+
+
+def _latest_index_journal(root: Path) -> dict[str, object]:
+    """返回最新权威（数值最大 revision）operation 的 journal 负载。"""
+    best: tuple[int, dict[str, object]] | None = None
+    for directory in _operation_dirs(root):
+        payload = json.loads((directory / "journal.json").read_text(encoding="utf-8"))
+        revision = payload.get("link_index_revision")
+        if revision is None:
+            continue
+        numeric = int(revision)
+        if best is None or numeric > best[0]:
+            best = (numeric, payload)
+    assert best is not None, "no journal with a link_index_revision found"
+    return best[1]
+
+
+def _warning_codes(report: CheckReport) -> list[str]:
+    return sorted(issue.code for issue in report.warnings)
+
+
+def test_check_absent_publishes_first_index_without_issue(
+    draft_factory: DraftFactory,
+) -> None:
+    """从未建立：完整检查、无索引 issue、机会式首次发布（spec §16）。"""
+    root = draft_factory(healthy())
+
+    report = check_draft(root, maintain_index=True)
+
+    assert report.errors == ()
+    assert report.warnings == ()
+    journal = _latest_index_journal(root)
+    assert journal["link_index_result"] == "published"
+    assert journal["link_index_revision"] == "1"
+
+
+def test_check_without_maintain_index_does_not_write_index(
+    draft_factory: DraftFactory,
+) -> None:
+    """init 与内部验证检查（maintain_index=False）不发布首次索引（spec §14/§17）。"""
+    root = draft_factory(healthy())
+
+    report = check_draft(root)
+
+    assert report.errors == ()
+    assert _operation_dirs(root) == []
+
+
+def test_check_fresh_reuses_index_without_new_operation(
+    draft_factory: DraftFactory,
+) -> None:
+    """fresh：复用等价索引事实，不创建新 operation（spec §16）。"""
+    root = draft_factory(healthy())
+    check_draft(root, maintain_index=True)
+    before = _operation_dirs(root)
+
+    report = check_draft(root, maintain_index=True)
+
+    assert report.errors == ()
+    assert report.warnings == ()
+    assert _operation_dirs(root) == before
+
+
+def test_check_stale_publishes_next_revision_without_issue(
+    draft_factory: DraftFactory,
+) -> None:
+    """stale 且维护成功：完整检查、无索引 issue、发布下一 revision（spec §16）。"""
+    root = draft_factory(healthy())
+    check_draft(root, maintain_index=True)
+    (root / "pages" / "question.md").write_text(
+        (root / "pages" / "question.md").read_text(encoding="utf-8") + "新增内容。\n",
+        encoding="utf-8",
+    )
+
+    report = check_draft(root, maintain_index=True)
+
+    assert report.errors == ()
+    assert report.warnings == ()
+    journal = _latest_index_journal(root)
+    assert journal["link_index_result"] == "published"
+    assert journal["link_index_revision"] == "2"
+
+
+def test_check_rebuild_required_state_publishes_and_clears(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """rebuild_required 且维护成功：发布并清理 flag，无索引 issue（spec §16）。"""
+    import draft.link_index_maintenance as maintenance
+
+    def fail_scan(root: Path, baseline: object, *, known_documents: object = ()) -> object:
+        raise DraftError("operation.index_update_failed", root)
+
+    root = draft_factory(healthy())
+    monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+    degraded = check_draft(root, maintain_index=True)
+    monkeypatch.undo()
+
+    assert degraded.errors == ()
+    assert LINK_INDEX_REBUILD_REQUIRED in _warning_codes(degraded)
+    assert (root / ".draft" / "link-index-rebuild-required.flag").is_file()
+    assert _latest_index_journal(root)["link_index_result"] == "rebuild_required"
+
+    recovered = check_draft(root, maintain_index=True)
+
+    assert recovered.errors == ()
+    assert recovered.warnings == ()
+    assert _latest_index_journal(root)["link_index_result"] == "published"
+    assert not (root / ".draft" / "link-index-rebuild-required.flag").exists()
+
+
+def test_check_flag_failure_reports_flag_warning(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """flag 普通 I/O 降级：完整检查并报告 flag warning（spec §16）。"""
+    import draft.link_index_maintenance as maintenance
+
+    def fail_scan(root: Path, baseline: object, *, known_documents: object = ()) -> object:
+        raise DraftError("operation.index_update_failed", root)
+
+    def flag_failed(root: Path) -> ResultWarning:
+        return ResultWarning(LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED)
+
+    root = draft_factory(healthy())
+    monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+    monkeypatch.setattr(maintenance, "ensure_rebuild_flag", flag_failed)
+
+    report = check_draft(root, maintain_index=True)
+
+    monkeypatch.undo()
+    assert _warning_codes(report) == [
+        LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED,
+        LINK_INDEX_REBUILD_REQUIRED,
+    ]
+    assert report.errors == ()
+
+
+def test_check_artifact_inconsistency_reports_error(
+    draft_factory: DraftFactory,
+) -> None:
+    """journal 与 published 制品矛盾：内部一致性 error，阻止 adopt（spec §16）。"""
+    root = draft_factory(healthy())
+    check_draft(root, maintain_index=True)
+    artifact = root / ".draft" / "link-index.json"
+    artifact.write_text("{corrupt", encoding="utf-8")
+
+    report = check_draft(root, maintain_index=True)
+
+    assert CheckCode.OPERATION_INCONSISTENT_STATE.value in codes(report)
+    assert CheckCode.OPERATION_INCONSISTENT_STATE.value in [i.code for i in report.errors]
+
+
+def test_check_journal_corrupt_reports_operation_error(
+    draft_factory: DraftFactory,
+) -> None:
+    """journal 损坏：operation error（operation-state pass 报告，不重复投影）。"""
+    root = draft_factory(healthy())
+    write_raw_journal(root, operation_id="7" * 32, directory_id="8" * 32)
+
+    report = check_draft(root, maintain_index=True)
+
+    assert CheckCode.OPERATION_JOURNAL_CORRUPT.value in codes(report)
+
+
+def test_check_recovery_pending_reports_operation_error(
+    draft_factory: DraftFactory,
+) -> None:
+    """recovery pending：operation error，维护不发布也不报降级（spec §16）。"""
+    root = draft_factory(healthy())
+    operation_id = "a" * 32
+    write_raw_journal(root, operation_id=operation_id)
+    acquire_lock(root, operation_id)
+
+    report = check_draft(root, maintain_index=True)
+
+    assert CheckCode.OPERATION_RECOVERY_REQUIRED.value in codes(report)
+    # 维护不发布：未新增独立 maintenance operation。
+    assert [directory.name for directory in _operation_dirs(root)] == [operation_id]

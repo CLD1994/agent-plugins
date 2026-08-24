@@ -15,15 +15,31 @@ from typing import Protocol
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import DraftGraph, MarkerState, load_graph
-from draft.models import CheckIssue, PageDocument, RelationCode, StatusCode
+from draft.link_index import (
+    IndexedFile,
+    LinkIndex,
+    LinkIndexContent,
+    LinkSpan,
+    OutboundEdge,
+)
+from draft.models import (
+    CheckIssue,
+    PageDocument,
+    RelationCode,
+    ResultWarning,
+    RootState,
+    StatusCode,
+)
 from draft.paths import resolve_draft_root, resolve_page_operand
 from draft.resources import (
     HostOS,
+    ProbeState,
     ResourceIdentity,
     ResourceKind,
     ResourceReference,
     ResourceScope,
     TargetState,
+    resolve_body_resource,
     resolve_page_resources,
 )
 
@@ -259,7 +275,9 @@ def pages_with_status(graph: GraphView, code: StatusCode) -> tuple[Path, ...]:
     return tuple(sorted(path for path, page in graph.pages.items() if page.status.code is code))
 
 
-def page_summary(graph: GraphView, page: Path) -> PageSummary:
+def page_summary(
+    graph: GraphView, page: Path, *, backlink_count: int | None = None
+) -> PageSummary:
     document = graph.pages.get(page)
     if document is None:
         raise DraftError(PAGE_NOT_FOUND, page)
@@ -269,6 +287,7 @@ def page_summary(graph: GraphView, page: Path) -> PageSummary:
     outgoing = outgoing_relations(graph, page)
     incoming = incoming_relations(graph, page)
     page_identity = ResourceIdentity(ResourceKind.PAGE, page.as_posix())
+    count = len(backlinks(graph, page_identity)) if backlink_count is None else backlink_count
     return PageSummary(
         path=page,
         title=document.title,
@@ -276,7 +295,91 @@ def page_summary(graph: GraphView, page: Path) -> PageSummary:
         parent=parent,
         child_count=len(children),
         link_count=len(links),
-        backlink_count=len(backlinks(graph, page_identity)),
+        backlink_count=count,
         outgoing_relation_count=len(outgoing),
         incoming_relation_count=len(incoming),
     )
+
+
+def backlinks_from_index(
+    index: LinkIndex | LinkIndexContent, target: ResourceIdentity
+) -> tuple[Path, ...]:
+    """从已验证索引的反向表读取去重排序的来源页面（spec §14）。
+
+    与 ``backlinks``（图内正文资源）不同，索引覆盖全部覆盖 Markdown（含未受管理
+    文件与关系位置），是查询可用的完整反向表事实。
+    """
+    sources = {edge.source_path for edge in index.backlinks.get(target, ())}
+    return tuple(sorted(sources))
+
+
+def _no_probe(_path: Path) -> ProbeState:
+    """目标存在性探针：不访问文件系统（索引出站边身份与探针结果无关）。"""
+    return ProbeState.MISSING
+
+
+def known_documents_from_graph(root: Path, graph: DraftGraph) -> tuple[IndexedFile, ...]:
+    """把上层已解析页面快照提取为可验证 scan seed（spec §8.6 / Task 9 Step 5）。
+
+    seed 只提供 path + SHA-256 + 已提取 links；严格扫描仍重新读取全部 Markdown 并
+    比较摘要，只有 path 与 SHA-256 均匹配才复用已解析 links（``build_index_content``
+    契约），不跳过正文读取。出站边与索引 ``_index_v2_file`` 使用同一
+    ``resolve_body_resource`` 词法解析，仅目标存在性探针不访问文件系统（身份与探针
+    无关）。
+    """
+    documents: list[IndexedFile] = []
+    for path, page in graph.pages.items():
+        outbound: list[OutboundEdge] = []
+        for link in page.links:
+            resource = resolve_body_resource(root, path, link.destination, target_probe=_no_probe)
+            outbound.append(
+                OutboundEdge(
+                    resource.identity,
+                    LinkSpan(link.destination_span.start, link.destination_span.end),
+                )
+            )
+        documents.append(IndexedFile(path, graph.page_digest(path), tuple(outbound)))
+    return tuple(documents)
+
+
+@dataclass(frozen=True)
+class OpportunisticIndexResult:
+    """机会式维护的查询可见结果（spec §14）：index 非 None 时其反向表可信。"""
+
+    index: LinkIndex | LinkIndexContent | None
+    warnings: tuple[ResultWarning, ...]
+
+
+def maintain_link_index_for_query(
+    root: Path,
+    graph: DraftGraph,
+    root_state: RootState,
+) -> OpportunisticIndexResult:
+    """查询入口的机会式维护：prepare + commit，保留本次完整扫描事实（spec §14）。
+
+    - fresh（严格扫描证明无变化）：复用已经验证的已发布制品，不重复 commit；
+    - absent/stale：commit 发布；未发布（并发令牌推进/锁持有）时仍返回本次完整
+      扫描内容；
+    - 扫描失败（rebuild_required）：commit 耐久记录降级，返回 ``None`` 与 warning，
+      由调用方回退图内完整事实。
+
+    journal 耐久失败、制品矛盾等按原错误传播（普通 query 非零退出，spec §14）。
+    """
+    from draft.link_index_maintenance import (
+        commit_link_index_update,
+        load_link_index_baseline,
+        prepare_link_index_update,
+    )
+
+    prepared = prepare_link_index_update(
+        root, known_documents=known_documents_from_graph(root, graph)
+    )
+    if prepared.scan is None and not prepared.requires_rebuild:
+        baseline = load_link_index_baseline(root)
+        return OpportunisticIndexResult(baseline.index, ())
+    result = commit_link_index_update(root, prepared, root_state=root_state)
+    if result.index is not None:
+        return OpportunisticIndexResult(result.index, result.warnings)
+    if prepared.scan is not None:
+        return OpportunisticIndexResult(prepared.scan.content, result.warnings)
+    return OpportunisticIndexResult(None, result.warnings)

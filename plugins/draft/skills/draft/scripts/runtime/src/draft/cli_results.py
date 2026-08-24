@@ -13,7 +13,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from draft.diagnostic_codes import CheckCode
-from draft.models import CheckIssue, CheckReport, IssueSeverity
+from draft.models import CheckIssue, CheckReport, IssueSeverity, ResultWarning
 
 
 class ResultType(StrEnum):
@@ -56,6 +56,14 @@ class DryRunOperation(StrEnum):
     STATUS_SET = "status.set"
     RELATION_ADD = "relation.add"
     RELATION_REMOVE = "relation.remove"
+
+
+def result_warnings_payload(warnings: Sequence[ResultWarning]) -> list[dict[str, str]]:
+    """统一索引 warning 信封（spec §11）：code + severity，不含 operation ID/内部细节。
+
+    写命令与 query 成功 payload 共用同一渲染；普通成功省略 ``warnings``。
+    """
+    return [{"code": warning.code, "severity": "warning"} for warning in warnings]
 
 
 @dataclass(frozen=True)

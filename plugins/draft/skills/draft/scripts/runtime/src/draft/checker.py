@@ -30,6 +30,7 @@ from draft.models import (
     IssueSeverity,
     OperationKind,
     OperationPhase,
+    RootState,
 )
 from draft.observations import EntryKind
 from draft.operations import (
@@ -1184,6 +1185,7 @@ _ALLOWED_INTERNAL_ENTRIES = frozenset(
         Path(INTERNAL_DIR) / "trash",
         Path(INTERNAL_DIR) / "link-index.json",
         Path(INTERNAL_DIR) / "link-index.invalid",
+        Path(INTERNAL_DIR) / "link-index-rebuild-required.flag",
     }
 )
 
@@ -1192,6 +1194,13 @@ _ALLOWED_INTERNAL_DIRECTORIES = frozenset(
     {
         Path(INTERNAL_DIR) / "operations",
         Path(INTERNAL_DIR) / "trash",
+    }
+)
+
+# 内部协议普通文件：只允许普通文件，目录/其他异常节点是非法形状（spec §10 flag 语义）。
+_ALLOWED_INTERNAL_FILES = frozenset(
+    {
+        Path(INTERNAL_DIR) / "link-index-rebuild-required.flag",
     }
 )
 
@@ -1231,7 +1240,62 @@ def _check_internal_namespace(resolved: Path) -> list[CheckIssue]:
         elif relative in _ALLOWED_INTERNAL_DIRECTORIES and kind is not EntryKind.DIRECTORY:
             # operations/trash 必须是目录：普通文件是内部命名空间非法形状。
             issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
+        elif relative in _ALLOWED_INTERNAL_FILES and kind is not EntryKind.FILE:
+            # rebuild flag 只允许普通文件：目录/其他异常节点是内部状态错误（spec §10）。
+            issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
     return issues
+
+
+# 已由 operation-state pass 报告的稳定状态错误：机会式维护失败不重复投影（spec §16
+# 检查决策表只要求 operation error 出现一次；重复诊断会污染 code_counts 与 adopt
+# 阻断判定）。维护新引入的耐久失败与制品矛盾不在此集合，由投影函数报告。
+_INDEX_MAINTENANCE_PRE_REPORTED = frozenset(
+    {
+        CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+        CheckCode.OPERATION_JOURNAL_VERSION_UNSUPPORTED.value,
+        CheckCode.OPERATION_RECOVERY_REQUIRED.value,
+        CheckCode.PATH_SYMLINK_ESCAPE.value,
+        CheckCode.INTERNAL_UNEXPECTED_ENTRY.value,
+    }
+)
+
+
+def _project_index_maintenance_error(exc: DraftError) -> tuple[CheckIssue, ...]:
+    """把维护失败投影为稳定 error issue（spec §16），不泄漏内部路径或异常文本。"""
+    if exc.code in _INDEX_MAINTENANCE_PRE_REPORTED:
+        return ()
+    path = exc.paths[0] if exc.paths else None
+    return (CheckIssue(code=exc.code, severity=IssueSeverity.ERROR, path=path, line=None),)
+
+
+def check_link_index_maintenance(
+    root: Path, graph: DraftGraph, root_state: RootState
+) -> tuple[CheckIssue, ...]:
+    """机会式维护并投影稳定 warning/error issue（spec §14/§16 检查决策表）。
+
+    fresh（严格扫描证明磁盘索引当前）返回空；维护记录降级时投影对应 warning；
+    journal 耐久失败与制品矛盾投影 error。调用方已持有同根图事实，seed 复用本次
+    已解析页面，不新建第二套扫描。
+    """
+    from draft.link_index_maintenance import (
+        commit_link_index_update,
+        prepare_link_index_update,
+    )
+    from draft.query import known_documents_from_graph
+
+    try:
+        prepared = prepare_link_index_update(
+            root, known_documents=known_documents_from_graph(root, graph)
+        )
+        if prepared.scan is None and not prepared.requires_rebuild:
+            return ()  # fresh：无需维护，无索引 issue。
+        result = commit_link_index_update(root, prepared, root_state=root_state)
+    except DraftError as exc:
+        return _project_index_maintenance_error(exc)
+    return tuple(
+        CheckIssue(code=warning.code, severity=IssueSeverity.WARNING, path=None, line=None)
+        for warning in result.warnings
+    )
 
 
 def check_draft(
@@ -1239,6 +1303,7 @@ def check_draft(
     *,
     include_operation_state: bool = True,
     marker_state: MarkerState | None = None,
+    maintain_index: bool = False,
 ) -> CheckReport:
     from draft.graph import read_marker
 
@@ -1316,6 +1381,15 @@ def check_draft(
         ordered.extend(
             sorted(
                 _check_conclusions_product(resolved, result.graph, conclusions_state),
+                key=_sort_key,
+            )
+        )
+    # 机会式维护：check/adopt 预检查入口触发；init 与内部验证检查保持只读（spec §14）。
+    # marker 无效时 root_state 未知，不做维护。
+    if maintain_index and state is not None:
+        ordered.extend(
+            sorted(
+                check_link_index_maintenance(resolved, result.graph, state.root_state),
                 key=_sort_key,
             )
         )

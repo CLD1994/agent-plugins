@@ -307,18 +307,20 @@ def test_candidate_check_and_adopt_accept_both_internal_layouts(
     assert (root / ".draft/operations").is_dir()
 
 
-def test_check_is_read_only_on_candidate_root(
+def test_check_maintains_index_on_candidate_root(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """check 对 candidate 根机会式维护：完整检查并发布索引（spec §14 不是只读命令）。"""
     root = tmp_path / "candidate"
     build_valid_candidate(root)
-    before = snapshot_tree(root)
 
     code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
 
     assert code == 0
     assert payload["ok"] is True
-    assert snapshot_tree(root) == before
+    journal = _journal_payload(root)
+    assert journal["link_index_result"] == "published"
+    assert journal["root_state"] == "candidate"
 
 
 def test_check_reports_retired_provisional_entry_as_unexpected(
@@ -328,7 +330,6 @@ def test_check_reports_retired_provisional_entry_as_unexpected(
     root = tmp_path / "candidate"
     build_valid_candidate(root)
     (root / ".draft" / "draft.provisional.json").write_text("{}", encoding="utf-8")
-    before = snapshot_tree(root)
 
     code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
 
@@ -337,7 +338,6 @@ def test_check_reports_retired_provisional_entry_as_unexpected(
     assert [issue["code"] for issue in as_dicts(payload["errors"])] == [
         CheckCode.INTERNAL_UNEXPECTED_ENTRY.value
     ]
-    assert snapshot_tree(root) == before
 
 
 def test_check_reports_unexpected_internal_entry(
@@ -395,12 +395,12 @@ def test_check_human_clean_prints_one_nonempty_line(
     assert lines[0]
 
 
-def test_check_human_is_read_only(
+def test_check_human_maintains_index(
     registered_draft: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    before = snapshot_tree(registered_draft)
-    main(["check", "--root", str(registered_draft)])
-    assert snapshot_tree(registered_draft) == before
+    """check 人类输出入口也机会式维护索引（spec §14/§16）。"""
+    assert main(["check", "--root", str(registered_draft)]) == 0
+    assert (registered_draft / ".draft" / "link-index.json").is_file()
 
 
 def test_check_human_reports_actionable_multiple_locations(

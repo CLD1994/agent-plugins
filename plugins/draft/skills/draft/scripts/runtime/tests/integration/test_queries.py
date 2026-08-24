@@ -7,6 +7,7 @@ import pytest
 
 from draft.cli import main
 from draft.diagnostic_codes import CheckCode, QueryCode
+from draft.errors import DraftError
 from draft.models import RootState
 from tests.integration.support import DraftFactory
 
@@ -420,6 +421,228 @@ def test_query_inbound_relations_require_existing_page(
     error = payload["error"]
     assert isinstance(error, dict)
     assert error["code"] == "page.not_found"
+
+
+# ---------------------------------------------------------------------------
+# Task 9：query 的机会式索引维护与缓存状态等价性（spec §14）
+# ---------------------------------------------------------------------------
+
+
+def _index_state(root: Path) -> tuple[dict[str, bytes] | None, bytes | None, bool]:
+    """记录 .draft/operations、索引制品与 flag 摘要（spec §14 无副作用判定）。"""
+    operations = root / ".draft" / "operations"
+    ops = None
+    if operations.is_dir():
+        ops = {
+            path.relative_to(operations).as_posix(): path.read_bytes()
+            for path in sorted(operations.rglob("*"))
+            if path.is_file()
+        }
+    index = root / ".draft" / "link-index.json"
+    index_bytes = index.read_bytes() if index.is_file() else None
+    flag = (root / ".draft" / "link-index-rebuild-required.flag").exists()
+    return (ops, index_bytes, flag)
+
+
+def test_query_backlinks_equivalence_across_index_states(
+    draft_factory: DraftFactory,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一根在 fresh/absent/stale/rebuild-required 状态返回相同结果（spec §14/§19）。"""
+    root = build_query_draft(draft_factory)
+    capsys.readouterr()
+    args = ["query", "backlinks", "--root", str(root), "pages/a.md", "--json"]
+    expected = ["index.md", "pages/b.md"]
+
+    code, absent = run_json(args, capsys)
+    assert code == 0
+    items = cast("list[dict[str, object]]", absent["items"])
+    assert [item["page"] for item in items] == expected
+    assert "warnings" not in absent
+
+    code, fresh = run_json(args, capsys)
+    assert code == 0
+    assert fresh == absent
+
+    # stale：修改正文后查询发布下一 revision，结果仍与完整事实计算相同。
+    (root / "pages" / "b.md").write_text(
+        (root / "pages" / "b.md").read_text(encoding="utf-8") + "再看 [甲](a.md)。\n",
+        encoding="utf-8",
+    )
+    code, stale = run_json(args, capsys)
+    assert code == 0
+    assert stale == absent
+
+    # rebuild_required：扫描失败时查询回退图内完整事实并返回一次降级 warning。
+    import draft.link_index_maintenance as maintenance
+
+    def fail_scan(root: Path, baseline: object, *, known_documents: object = ()) -> object:
+        raise DraftError("operation.index_update_failed", root)
+
+    monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+    code, rebuild = run_json(args, capsys)
+    monkeypatch.undo()
+    assert code == 0
+    items = cast("list[dict[str, object]]", rebuild["items"])
+    assert [item["page"] for item in items] == expected
+    assert rebuild["warnings"] == [
+        {"code": "link_index.rebuild_required", "severity": "warning"}
+    ]
+
+    # 恢复扫描后（rebuild_required 状态）查询发布并返回相同结果。
+    code, recovered = run_json(args, capsys)
+    assert code == 0
+    assert recovered == absent
+
+
+def test_query_page_backlink_count_equivalence_across_index_states(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """query page 的 backlink count 与 query backlinks 使用同一严格事实（spec §20）。"""
+    root = build_query_draft(draft_factory)
+    capsys.readouterr()
+    args = ["query", "page", "--root", str(root), "pages/a.md", "--json"]
+
+    code, absent = run_json(args, capsys)
+    assert code == 0
+    assert absent["backlink_count"] == 2  # index.md 导航 + b.md 正文
+    assert "warnings" not in absent
+
+    code, fresh = run_json(args, capsys)
+    assert code == 0
+    assert fresh == absent
+
+
+def test_query_backlinks_journal_durability_failure_is_nonzero(
+    draft_factory: DraftFactory,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """journal 耐久失败：普通 query 非零退出（spec §14）。"""
+    import draft.link_index_maintenance as maintenance
+
+    def fail_write(journal: object) -> None:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, root / ".draft")
+
+    root = build_query_draft(draft_factory)
+    capsys.readouterr()
+    monkeypatch.setattr(maintenance, "write_journal", fail_write)
+
+    code, payload = run_json(
+        ["query", "backlinks", "--root", str(root), "pages/a.md", "--json"], capsys
+    )
+
+    monkeypatch.undo()
+    assert code == 3
+    assert payload["ok"] is False
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == CheckCode.OPERATION_DURABILITY_FAILED.value
+
+
+def test_query_links_and_unrelated_queries_do_not_touch_index(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """query links 与不消费链接索引的查询不触发维护（spec §14/§22）。"""
+    root = build_query_draft(draft_factory)
+    capsys.readouterr()
+    before = _index_state(root)
+
+    assert run_json(["query", "links", "--root", str(root), "pages/a.md", "--json"], capsys)[0] == 0
+    assert (
+        run_json(
+            [
+                "query",
+                "relations",
+                "--root",
+                str(root),
+                "pages/b.md",
+                "--direction",
+                "outgoing",
+                "--json",
+            ],
+            capsys,
+        )[0]
+        == 0
+    )
+    assert (
+        run_json(
+            [
+                "query",
+                "relations",
+                "--root",
+                str(root),
+                "pages/a.md",
+                "--direction",
+                "incoming",
+                "--json",
+            ],
+            capsys,
+        )[0]
+        == 0
+    )
+    assert run_json(["query", "status", "--root", str(root), "pending", "--json"], capsys)[0] == 0
+    assert run_json(["query", "recoverable", "--root", str(root), "--json"], capsys)[0] == 0
+
+    assert _index_state(root) == before
+
+
+def test_dry_run_commands_leave_no_index_side_effects(
+    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """dry-run 不创建 journal、索引或 flag（spec §14/§23）。"""
+    root = build_query_draft(draft_factory)
+    # 提供无入站正文引用的隔离页供 trash 预演。
+    (root / "pages" / "isolated.md").write_text(
+        "# 隔离\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n\n正文。\n",
+        encoding="utf-8",
+    )
+    (root / "index.md").write_text(
+        (root / "index.md")
+        .read_text(encoding="utf-8")
+        .replace(
+            "- [结论汇总](conclusions.md)\n",
+            "- [隔离](pages/isolated.md)\n- [结论汇总](conclusions.md)\n",
+        ),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+    before = _index_state(root)
+
+    commands = [
+        ["move", "--root", str(root), "pages/a.md", "pages/z.md", "--dry-run"],
+        [
+            "create",
+            "--root",
+            str(root),
+            "pages/new.md",
+            "--title",
+            "新",
+            "--status",
+            "pending",
+            "--dry-run",
+        ],
+        ["status", "set", "--root", str(root), "pages/a.md", "confirmed", "--dry-run"],
+        [
+            "relation",
+            "add",
+            "--root",
+            str(root),
+            "pages/a.md",
+            "depends_on",
+            "index.md",
+            "--dry-run",
+        ],
+        ["promote", "--root", str(root), "pages/a.md", "pages/b.md", "--dry-run"],
+        ["trash", "--root", str(root), "pages/isolated.md", "--dry-run"],
+        ["generate-conclusions", "--root", str(root), "--dry-run"],
+    ]
+    for args in commands:
+        code, _payload = run_json([*args, "--json"], capsys)
+        assert code == 0, f"dry-run 失败: {args}"
+
+    assert _index_state(root) == before
 
 
 def test_query_status_invalid_code_is_usage_error(
