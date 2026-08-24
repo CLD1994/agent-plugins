@@ -1,7 +1,9 @@
 import errno
+import hashlib
 import json
 import os
 import shutil
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -13,10 +15,11 @@ from draft.cli import main
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import ResultWarning, RootState
-from draft.operations import DurabilityStep, durability_scope
+from draft.operations import DurabilityStep, durability_observer_scope, read_lock
 from draft.vocabulary import ConclusionsState
 from tests.integration.support import (
     DraftFactory,
+    FailingDurability,
     build_valid_candidate,
     managed_marker_text,
     snapshot_tree,
@@ -329,7 +332,7 @@ def test_check_journal_durability_failure_uses_error_envelope(
 ) -> None:
     root = registered_draft
 
-    with durability_scope({DurabilityStep.JOURNAL_WRITE: 1}):
+    with durability_observer_scope(FailingDurability({DurabilityStep.JOURNAL_WRITE: 1})):
         code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
 
     assert code == 1
@@ -342,7 +345,7 @@ def test_check_journal_durability_failure_uses_error_envelope(
 def test_query_journal_durability_failure_returns_exit_three(
     registered_draft: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    with durability_scope({DurabilityStep.JOURNAL_WRITE: 1}):
+    with durability_observer_scope(FailingDurability({DurabilityStep.JOURNAL_WRITE: 1})):
         code, payload = run_json(
             ["query", "backlinks", "--root", str(registered_draft), "index.md", "--json"],
             capsys,
@@ -1565,6 +1568,292 @@ def _notify(root: Path, capsys: pytest.CaptureFixture[str]) -> tuple[int, dict[s
     return run_json(["notify", "files-changed", "--root", str(root), "--json"], capsys)
 
 
+_STATUS_BEFORE = """# B
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+
+B。
+""".encode()
+_STATUS_AFTER = """# B
+
+> 状态：`已确认`
+>
+> 父主题：[根索引](../index.md)
+
+B。
+""".encode()
+
+
+@dataclass(frozen=True)
+class _CliDurabilityCase:
+    step: DurabilityStep
+    occurrence: int
+    setup: str
+    artifact: str
+    flag: bool
+
+
+_CLI_DURABILITY_CASES = (
+    pytest.param(
+        _CliDurabilityCase(DurabilityStep.STAGING_WRITE, 1, "published", "before", True),
+        id="staging-write",
+    ),
+    pytest.param(
+        _CliDurabilityCase(DurabilityStep.STAGING_FSYNC, 1, "published", "before", True),
+        id="staging-fsync",
+    ),
+    pytest.param(
+        _CliDurabilityCase(
+            DurabilityStep.STAGING_DIRECTORY_FSYNC, 1, "published", "before", True
+        ),
+        id="staging-directory-fsync",
+    ),
+    pytest.param(
+        _CliDurabilityCase(DurabilityStep.INDEX_REPLACE, 1, "published", "before", True),
+        id="index-replace",
+    ),
+    pytest.param(
+        _CliDurabilityCase(DurabilityStep.INDEX_DIRECTORY_FSYNC, 1, "published", "after", True),
+        id="index-directory-fsync-draft",
+    ),
+    pytest.param(
+        _CliDurabilityCase(DurabilityStep.INDEX_DIRECTORY_FSYNC, 2, "published", "after", True),
+        id="index-directory-fsync-operation",
+    ),
+    pytest.param(
+        _CliDurabilityCase(DurabilityStep.JOURNAL_WRITE, 7, "published", "after", False),
+        id="journal-write",
+    ),
+    pytest.param(
+        _CliDurabilityCase(
+            DurabilityStep.JOURNAL_DIRECTORY_FSYNC, 13, "published", "before", False
+        ),
+        id="journal-directory-fsync",
+    ),
+    pytest.param(
+        _CliDurabilityCase(DurabilityStep.FLAG_CREATE, 1, "flag-create", "before", False),
+        id="flag-create",
+    ),
+    pytest.param(
+        _CliDurabilityCase(
+            DurabilityStep.FLAG_DIRECTORY_FSYNC, 1, "flag-create", "before", True
+        ),
+        id="flag-directory-fsync-create",
+    ),
+    pytest.param(
+        _CliDurabilityCase(DurabilityStep.FLAG_DELETE, 1, "flag-delete", "after", True),
+        id="flag-delete",
+    ),
+    pytest.param(
+        _CliDurabilityCase(
+            DurabilityStep.FLAG_DIRECTORY_FSYNC, 1, "flag-delete", "after", False
+        ),
+        id="flag-directory-fsync-delete",
+    ),
+)
+
+
+_SCAN_MUTATIONS = ("add", "delete", "rename", "node-type")
+
+
+def _mutate_scanned_root(root: Path, mutation: str) -> None:
+    source = root / "pages/a.md"
+    if mutation == "add":
+        (root / "pages/added.md").write_bytes(source.read_bytes())
+    elif mutation == "delete":
+        source.unlink()
+    elif mutation == "rename":
+        source.rename(root / "pages/renamed.md")
+    elif mutation == "node-type":
+        source.unlink()
+        source.mkdir()
+    else:
+        raise AssertionError(f"unknown scan mutation: {mutation}")
+
+
+def _mutate_after_sentinel_read(
+    monkeypatch: pytest.MonkeyPatch, root: Path, mutation: str
+) -> dict[str, int]:
+    import draft.link_index_maintenance as maintenance
+
+    original = maintenance.read_file_no_follow
+    state = {"sentinel_reads": 0, "mutations": 0}
+
+    def read_with_mutation(path: Path, relative: Path) -> bytes:
+        raw = original(path, relative)
+        if relative == Path("pages/a.md") and state["mutations"] == 0:
+            state["sentinel_reads"] += 1
+            _mutate_scanned_root(root, mutation)
+            state["mutations"] += 1
+        return raw
+
+    monkeypatch.setattr(maintenance, "read_file_no_follow", read_with_mutation)
+    return state
+
+
+def _sha256(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+@pytest.mark.parametrize("case", _CLI_DURABILITY_CASES)
+def test_status_set_durability_matrix_closes_public_recovery_loop(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    case: _CliDurabilityCase,
+) -> None:
+    root = _trashable_cli_root(tmp_path)
+    capsys.readouterr()
+    page = root / "pages/b.md"
+    assert page.read_bytes() == _STATUS_BEFORE
+
+    invalid = root / "unmanaged.md"
+    if case.setup == "flag-delete":
+        invalid.write_bytes(b"\xff\xfe\x00\x01")
+    code, _payload = _notify(root, capsys)
+    assert code == 0
+    first = _journal_payload(root)
+    if case.setup == "flag-delete":
+        assert first["link_index_revision"] == "1"
+        assert first["link_index_result"] == "rebuild_required"
+        assert (root / ".draft/link-index-rebuild-required.flag").is_file()
+        artifact_before: bytes | None = None
+        invalid.unlink()
+    else:
+        assert first["link_index_revision"] == "1"
+        assert first["link_index_result"] == "published"
+        artifact_before = (root / ".draft/link-index.json").read_bytes()
+
+    artifact = root / ".draft/link-index.json"
+    if case.setup == "flag-create":
+        invalid.write_bytes(b"\xff\xfe\x00\x01")
+
+    fake = FailingDurability({case.step: case.occurrence})
+    status_args = [
+        "status",
+        "set",
+        "--root",
+        str(root),
+        "pages/b.md",
+        "confirmed",
+        "--json",
+    ]
+    if case.setup == "flag-create":
+        with durability_observer_scope(fake):
+            fault_code, fault_payload = _notify(root, capsys)
+        assert fault_code == 0
+        assert fault_payload == {"result_type": "files_changed_notification"}
+        assert fake.occurrences[case.step] >= case.occurrence
+        assert page.read_bytes() == _STATUS_BEFORE
+        fault_journal = _journal_payload(root)
+        assert fault_journal["link_index_revision"] == "2"
+        assert fault_journal["link_index_result"] == "rebuild_required"
+        assert artifact.is_file()
+        assert artifact.read_bytes() == artifact_before
+        assert (root / ".draft/link-index-rebuild-required.flag").exists() is case.flag
+        fault_operation = root / ".draft/operations" / str(fault_journal["operation_id"])
+        assert not (fault_operation / "link-index.staged.json").exists()
+        assert not (fault_operation / "link-index.staged.json.pending").exists()
+        assert read_lock(root) is None
+        invalid.unlink()
+        status_code, status_payload = run_json(status_args, capsys)
+        assert status_code == 0
+        assert status_payload["result_type"] == "status.set"
+        assert page.read_bytes() == _STATUS_AFTER
+    else:
+        with durability_observer_scope(fake):
+            status_code, status_payload = run_json(status_args, capsys)
+        assert page.read_bytes() == _STATUS_AFTER
+
+    assert fake.occurrences[case.step] >= case.occurrence
+    lock_owner = read_lock(root)
+    if lock_owner is not None:
+        operation_id = lock_owner
+        operation_dir = root / ".draft/operations" / operation_id
+        journal = json.loads((operation_dir / "journal.json").read_text(encoding="utf-8"))
+    else:
+        journal = _journal_payload(root)
+        operation_id = str(journal["operation_id"])
+        operation_dir = root / ".draft/operations" / operation_id
+    staging = operation_dir / "link-index.staged.json"
+    pending = operation_dir / "link-index.staged.json.pending"
+
+    if case.setup == "flag-create":
+        assert journal["phase"] == "completed"
+        assert journal["link_index_result"] == "published"
+        assert journal["link_index_revision"] == "3"
+        assert artifact.is_file()
+        assert artifact.read_bytes() != artifact_before
+        assert not (root / ".draft/link-index-rebuild-required.flag").exists()
+    elif case.step in (DurabilityStep.JOURNAL_WRITE, DurabilityStep.JOURNAL_DIRECTORY_FSYNC):
+        assert status_code == 3
+        error = status_payload["error"]
+        assert isinstance(error, dict)
+        assert error["code"] == CheckCode.OPERATION_DURABILITY_FAILED.value
+        assert lock_owner == operation_id
+    else:
+        assert status_code == 0
+        assert status_payload["result_type"] == "status.set"
+        warning_codes = {
+            str(item["code"])
+            for item in as_dicts(status_payload.get("warnings", []))
+        }
+        if case.setup == "flag-delete":
+            assert "link_index.rebuild_flag_update_failed" in warning_codes
+        if case.setup != "flag-delete":
+            assert "link_index.rebuild_required" in warning_codes
+
+    if case.setup != "flag-create":
+        if case.step in (DurabilityStep.JOURNAL_WRITE, DurabilityStep.JOURNAL_DIRECTORY_FSYNC):
+            assert journal["phase"] == "link_index_updating"
+            assert "link_index_result" not in journal
+            assert "link_index_sha256" not in journal
+        elif case.setup == "flag-delete":
+            assert journal["phase"] == "completed"
+            assert journal["link_index_result"] == "published"
+        else:
+            assert journal["phase"] == "completed"
+            assert journal["link_index_result"] == "rebuild_required"
+            assert "link_index_sha256" not in journal
+
+        if case.artifact == "before":
+            assert artifact_before is not None
+            assert artifact.is_file()
+            assert artifact.read_bytes() == artifact_before
+        else:
+            assert artifact.is_file()
+            if artifact_before is not None:
+                assert artifact.read_bytes() != artifact_before
+    if case.setup != "flag-create" and case.artifact != "before":
+        assert artifact.read_bytes() != artifact_before
+    if case.setup != "flag-create":
+        assert (root / ".draft/link-index-rebuild-required.flag").exists() is case.flag
+        assert not staging.exists()
+        assert not pending.exists()
+
+    if lock_owner is not None:
+        recover_code, recover_payload = run_json(["recover", "--root", str(root), "--json"], capsys)
+        assert recover_code == 0
+        assert recover_payload["result_type"] == "recover"
+        assert read_lock(root) is None
+
+    query_code, query_payload = run_json(
+        ["query", "backlinks", "--root", str(root), "index.md", "--json"], capsys
+    )
+    assert query_code == 0
+    assert "pages/b.md" in {
+        str(item["page"]) for item in as_dicts(query_payload["items"])
+    }
+    final = _journal_payload(root)
+    assert final["phase"] == "completed"
+    assert final["link_index_result"] == "published"
+    assert artifact.is_file()
+    assert final["link_index_sha256"] == _sha256(artifact.read_bytes())
+    assert read_lock(root) is None
+    assert "warnings" not in query_payload
+
+
 def test_notify_registered_absent_delivers_and_publishes_first_index(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], draft_factory: DraftFactory
 ) -> None:
@@ -1660,26 +1949,31 @@ def test_notify_scan_failure_is_delivered_and_records_rebuild_required(
     assert _journal_payload(root)["link_index_result"] == "rebuild_required"
 
 
+@pytest.mark.parametrize("mutation", _SCAN_MUTATIONS)
 def test_notification_scanning_change_is_absorbed_by_fixed_envelope(
     capsys: pytest.CaptureFixture[str],
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
 ) -> None:
-    root = draft_factory({"pages/a.md": "# A\n"})
-    import draft.link_index_maintenance as maintenance
-
-    def unstable_scan(
-        _root: Path, _directories: object, _identities: object
-    ) -> None:
-        raise DraftError("operation.external_change", root)
-
-    monkeypatch.setattr(maintenance, "_verify_root_stable", unstable_scan)
+    root = draft_factory(
+        {
+            "index.md": PAGE_INDEX + "\n- [A](pages/a.md)\n",
+            "pages/a.md": "# A\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](../index.md)\n\nA。\n",
+        }
+    )
+    state = _mutate_after_sentinel_read(monkeypatch, root, mutation)
 
     code, payload = _notify(root, capsys)
 
     assert code == 0
     assert payload == {"result_type": "files_changed_notification"}
+    assert state == {"sentinel_reads": 1, "mutations": 1}
     assert _journal_payload(root)["link_index_result"] == "rebuild_required"
+    monkeypatch.undo()
+    assert _notify(root, capsys)[0] == 0
+    assert _journal_payload(root)["link_index_revision"] == "2"
+    assert _journal_payload(root)["link_index_result"] == "published"
 
 
 def test_notification_flag_durability_warning_is_absorbed(
@@ -1695,7 +1989,7 @@ def test_notification_flag_durability_warning_is_absorbed(
         raise DraftError("operation.index_update_failed", root)
 
     monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
-    with durability_scope({DurabilityStep.FLAG_CREATE: 1}):
+    with durability_observer_scope(FailingDurability({DurabilityStep.FLAG_CREATE: 1})):
         code, payload = _notify(root, capsys)
 
     assert code == 0
@@ -1704,60 +1998,256 @@ def test_notification_flag_durability_warning_is_absorbed(
     assert _journal_payload(root)["link_index_result"] == "rebuild_required"
 
 
+@pytest.mark.parametrize("mutation", _SCAN_MUTATIONS)
 def test_check_scanning_change_keeps_check_projection(
     capsys: pytest.CaptureFixture[str],
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
 ) -> None:
-    root = draft_factory({"index.md": "# Index\n", "pages/a.md": "# A\n"})
-    import draft.link_index_maintenance as maintenance
-
-    def unstable_scan(
-        _root: Path, _directories: object, _identities: object
-    ) -> None:
-        raise DraftError("operation.external_change", root)
-
-    monkeypatch.setattr(maintenance, "_verify_root_stable", unstable_scan)
+    root = draft_factory(
+        {
+            "index.md": PAGE_INDEX + "\n- [A](pages/a.md)\n",
+            "pages/a.md": "# A\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](../index.md)\n\nA。\n",
+        }
+    )
+    state = _mutate_after_sentinel_read(monkeypatch, root, mutation)
 
     code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
 
-    assert code == 1
+    assert code == 0
     assert payload["result_type"] == "check"
+    assert state == {"sentinel_reads": 1, "mutations": 1}
     assert _journal_payload(root)["link_index_result"] == "rebuild_required"
-    assert all(issue["severity"] == "error" for issue in as_dicts(payload["errors"]))
+    assert "link_index.rebuild_required" in {
+        str(issue["code"]) for issue in as_dicts(payload["warnings"])
+    }
+    monkeypatch.undo()
+    run_json(["check", "--root", str(root), "--json"], capsys)
+    assert _journal_payload(root)["link_index_result"] == "published"
 
 
+@pytest.mark.parametrize("mutation", _SCAN_MUTATIONS)
 def test_query_scanning_change_uses_current_full_facts(
     capsys: pytest.CaptureFixture[str],
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
 ) -> None:
     root = draft_factory(
         {
-            "index.md": "# Index\n\n[A](pages/a.md)\n",
-            "pages/a.md": "# A\n",
+            "index.md": PAGE_INDEX + "\n- [A](pages/a.md)\n",
+            "pages/a.md": "# A\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](../index.md)\n\nA。\n",
         },
         root_state=RootState.CANDIDATE,
     )
-    import draft.link_index_maintenance as maintenance
-
-    def unstable_scan(
-        _root: Path, _directories: object, _identities: object
-    ) -> None:
-        raise DraftError("operation.external_change", root)
-
-    monkeypatch.setattr(maintenance, "_verify_root_stable", unstable_scan)
+    state = _mutate_after_sentinel_read(monkeypatch, root, mutation)
 
     code, payload = run_json(
-        ["query", "backlinks", "--root", str(root), "pages/a.md", "--json"], capsys
+        ["query", "backlinks", "--root", str(root), "index.md", "--json"], capsys
     )
 
     assert code == 0
-    assert [item["page"] for item in as_dicts(payload["items"])] == ["index.md"]
+    assert state == {"sentinel_reads": 1, "mutations": 1}
+    expected: set[str] = {
+        "add": {"pages/a.md", "pages/added.md"},
+        "delete": set[str](),
+        "rename": {"pages/renamed.md"},
+        "node-type": set[str](),
+    }[mutation]
+    assert {str(item["page"]) for item in as_dicts(payload["items"])} == expected
     assert [warning["code"] for warning in as_dicts(payload["warnings"])] == [
         "link_index.rebuild_required"
     ]
     assert _journal_payload(root)["link_index_result"] == "rebuild_required"
+    monkeypatch.undo()
+    assert _notify(root, capsys)[0] == 0
+    code, payload = run_json(
+        ["query", "backlinks", "--root", str(root), "index.md", "--json"], capsys
+    )
+    assert code == 0
+    assert {str(item["page"]) for item in as_dicts(payload["items"])} == expected
+    assert "warnings" not in payload
+
+
+def _public_index_root(draft_factory: DraftFactory) -> Path:
+    return draft_factory(
+        {
+            "index.md": PAGE_INDEX + "\n- [A](pages/a.md)\n",
+            "pages/a.md": (
+                "# A\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](../index.md)\n\nA。\n"
+            ),
+        }
+    )
+
+
+def _assert_rebuild_authority(root: Path, *, revision: str) -> None:
+    journal = _journal_payload(root)
+    assert journal["phase"] == "completed"
+    assert journal["link_index_revision"] == revision
+    assert journal["link_index_result"] == "rebuild_required"
+    assert "link_index_sha256" not in journal
+    assert (root / ".draft/link-index-rebuild-required.flag").is_file()
+    assert read_lock(root) is None
+
+
+def test_notification_non_utf8_unmanaged_markdown_records_rebuild_and_next_fresh(
+    capsys: pytest.CaptureFixture[str], draft_factory: DraftFactory
+) -> None:
+    root = _public_index_root(draft_factory)
+    assert _notify(root, capsys)[0] == 0
+    (root / "notes.md").write_bytes(b"\xff\xfe\x00\x01")
+
+    code, payload = _notify(root, capsys)
+
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+    _assert_rebuild_authority(root, revision="2")
+    (root / "notes.md").unlink()
+    assert _notify(root, capsys)[0] == 0
+    journal = _journal_payload(root)
+    assert journal["link_index_revision"] == "3"
+    assert journal["link_index_result"] == "published"
+
+
+def test_notification_read_failure_at_public_scan_reader_records_rebuild(
+    capsys: pytest.CaptureFixture[str],
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _public_index_root(draft_factory)
+    assert _notify(root, capsys)[0] == 0
+    import draft.link_index_maintenance as maintenance
+
+    original = maintenance.read_file_no_follow
+    state = {"reads": 0}
+
+    def deny_once(path: Path, relative: Path) -> bytes:
+        if relative == Path("pages/a.md") and state["reads"] == 0:
+            state["reads"] += 1
+            raise OSError(errno.EACCES, "permission denied")
+        return original(path, relative)
+
+    monkeypatch.setattr(maintenance, "read_file_no_follow", deny_once)
+    code, payload = _notify(root, capsys)
+
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+    assert state == {"reads": 1}
+    _assert_rebuild_authority(root, revision="2")
+    monkeypatch.undo()
+    assert _notify(root, capsys)[0] == 0
+    assert _journal_payload(root)["link_index_result"] == "published"
+
+
+def test_notification_extract_failure_at_public_collaborator_records_rebuild(
+    capsys: pytest.CaptureFixture[str],
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _public_index_root(draft_factory)
+    assert _notify(root, capsys)[0] == 0
+    import draft.link_index as link_index
+
+    calls = {"count": 0}
+
+    def fail_extract(text: str) -> tuple[object, ...]:
+        del text
+        calls["count"] += 1
+        raise DraftError(CheckCode.PAGE_PARSE_ERROR.value, root)
+
+    (root / "pages/a.md").write_bytes((root / "pages/a.md").read_bytes() + b"\n")
+    monkeypatch.setattr(link_index, "extract_body_links", fail_extract)
+    code, payload = _notify(root, capsys)
+
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+    assert calls["count"] == 1
+    _assert_rebuild_authority(root, revision="2")
+    monkeypatch.undo()
+    assert _notify(root, capsys)[0] == 0
+    assert _journal_payload(root)["link_index_result"] == "published"
+
+
+@pytest.mark.parametrize("node_type", ("directory", "symlink", "fifo"))
+def test_notification_index_target_exception_is_absorbed_without_side_effect(
+    capsys: pytest.CaptureFixture[str],
+    draft_factory: DraftFactory,
+    node_type: str,
+) -> None:
+    if node_type == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO is unavailable on this platform")
+    root = _public_index_root(draft_factory)
+    assert _notify(root, capsys)[0] == 0
+    artifact = root / ".draft/link-index.json"
+    saved = artifact.read_bytes()
+    artifact.unlink()
+    if node_type == "directory":
+        artifact.mkdir()
+    elif node_type == "symlink":
+        outside = root.parent / "outside-index.json"
+        outside.write_bytes(saved)
+        artifact.symlink_to(outside)
+    else:
+        os.mkfifo(artifact)
+
+    code, payload = _notify(root, capsys)
+
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+    assert _journal_payload(root)["link_index_revision"] == "1"
+    assert read_lock(root) is None
+    if artifact.is_dir() and not artifact.is_symlink():
+        artifact.rmdir()
+    else:
+        artifact.unlink()
+    artifact.write_bytes(saved)
+    assert _notify(root, capsys)[0] == 0
+    assert _journal_payload(root)["link_index_revision"] == "1"
+
+
+@pytest.mark.parametrize("node_type", ("directory", "symlink", "fifo"))
+def test_notification_rebuild_flag_exception_recovers_after_node_removed(
+    capsys: pytest.CaptureFixture[str],
+    draft_factory: DraftFactory,
+    node_type: str,
+) -> None:
+    if node_type == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO is unavailable on this platform")
+    root = _public_index_root(draft_factory)
+    invalid = root / "notes.md"
+    invalid.write_bytes(b"\xff\xfe\x00\x01")
+    flag = root / ".draft/link-index-rebuild-required.flag"
+    if node_type == "directory":
+        flag.mkdir()
+    elif node_type == "symlink":
+        outside = root.parent / "outside-flag"
+        outside.write_bytes(b"")
+        flag.symlink_to(outside)
+    else:
+        os.mkfifo(flag)
+
+    code, payload = _notify(root, capsys)
+
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+    operation_id = read_lock(root)
+    assert operation_id is not None
+    journal = json.loads(
+        (root / ".draft/operations" / operation_id / "journal.json").read_text(encoding="utf-8")
+    )
+    assert journal["link_index_result"] == "rebuild_required"
+    if flag.is_dir() and not flag.is_symlink():
+        flag.rmdir()
+    else:
+        flag.unlink()
+    recover_code, recover_payload = run_json(["recover", "--root", str(root), "--json"], capsys)
+    assert recover_code == 0
+    assert recover_payload["result_type"] == "recover"
+    assert read_lock(root) is None
+    invalid.unlink()
+    assert _notify(root, capsys)[0] == 0
+    assert _journal_payload(root)["link_index_result"] == "published"
 
 
 def test_notify_rebuild_required_state_rebuilds_and_delivers(

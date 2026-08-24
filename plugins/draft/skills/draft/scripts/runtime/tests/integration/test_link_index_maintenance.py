@@ -51,10 +51,11 @@ from draft.operations import (
     DurabilityStep,
     Journal,
     durability_checkpoint,
-    durability_scope,
+    durability_observer_scope,
     read_lock,
     sha256_bytes,
 )
+from tests.integration.support import FailingDurability
 
 _STAGED_NAME = LINK_INDEX_STAGED_FILE_NAME
 
@@ -183,14 +184,49 @@ def test_durability_steps_are_the_complete_protocol_boundary() -> None:
     )
 
 
-def test_durability_scope_isolated_between_calls() -> None:
-    with durability_scope({DurabilityStep.STAGING_WRITE: 1}), pytest.raises(OSError):
+class _CountingObserver:
+    def __init__(self) -> None:
+        self.steps: list[DurabilityStep] = []
+
+    def checkpoint(self, step: DurabilityStep) -> None:
+        self.steps.append(step)
+
+
+def test_durability_observer_scope_restores_default_after_exit() -> None:
+    observer = _CountingObserver()
+    with durability_observer_scope(observer):
         durability_checkpoint(DurabilityStep.STAGING_WRITE)
 
-    # 作用域退出后默认真实 I/O 边界不注入；下一次作用域从 occurrence 1 重新计数。
     durability_checkpoint(DurabilityStep.STAGING_WRITE)
-    with durability_scope({DurabilityStep.STAGING_WRITE: 1}), pytest.raises(OSError):
+    assert observer.steps == [DurabilityStep.STAGING_WRITE]
+
+
+def test_durability_observer_scope_restores_outer_observer_when_nested() -> None:
+    outer = _CountingObserver()
+    inner = _CountingObserver()
+    with durability_observer_scope(outer):
         durability_checkpoint(DurabilityStep.STAGING_WRITE)
+        with durability_observer_scope(inner):
+            durability_checkpoint(DurabilityStep.STAGING_FSYNC)
+        durability_checkpoint(DurabilityStep.STAGING_DIRECTORY_FSYNC)
+
+    assert outer.steps == [
+        DurabilityStep.STAGING_WRITE,
+        DurabilityStep.STAGING_DIRECTORY_FSYNC,
+    ]
+    assert inner.steps == [DurabilityStep.STAGING_FSYNC]
+
+
+def test_separately_installed_observers_do_not_share_state() -> None:
+    first = _CountingObserver()
+    second = _CountingObserver()
+    with durability_observer_scope(first):
+        durability_checkpoint(DurabilityStep.STAGING_WRITE)
+    with durability_observer_scope(second):
+        durability_checkpoint(DurabilityStep.STAGING_WRITE)
+
+    assert first.steps == [DurabilityStep.STAGING_WRITE]
+    assert second.steps == [DurabilityStep.STAGING_WRITE]
 
 
 # ---------------------------------------------------------------------------
@@ -1200,7 +1236,7 @@ def test_index_durability_steps_preserve_business_and_record_rebuild(
     root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
     before = (root / "pages/a.md").read_bytes()
 
-    with durability_scope({step: 1}):
+    with durability_observer_scope(FailingDurability({step: 1})):
         result = maintain_link_index(root)
 
     assert result.published is False
@@ -1248,7 +1284,7 @@ def test_flag_durability_steps_are_warnings_without_changing_journal_result(
     if action == "delete":
         assert ensure_rebuild_flag(root) is None
 
-    with durability_scope({step: 1}):
+    with durability_observer_scope(FailingDurability({step: 1})):
         warning = ensure_rebuild_flag(root) if action == "create" else remove_rebuild_flag(root)
 
     assert warning == ResultWarning("link_index.rebuild_flag_update_failed")
@@ -1297,7 +1333,7 @@ def test_two_process_revision_seven_to_eight_drops_late_candidate(tmp_path: Path
         assert result.index.revision == str(revision)
     (root / "pages/a.md").write_text("# A pending\n", encoding="utf-8")
 
-    context = get_context("fork")
+    context = get_context("spawn")
     ready = context.Queue()
     first_go = context.Event()
     second_go = context.Event()
@@ -1349,16 +1385,23 @@ def test_maintain_scan_external_change_records_rebuild_required(
     root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
     import draft.link_index_maintenance as maintenance
 
-    def unstable_verify(
-        root: Path, expected_directories: object, expected_identities: object
-    ) -> None:
-        raise DraftError("operation.external_change", root)
+    original = maintenance.read_file_no_follow
+    state = {"sentinel_reads": 0, "mutations": 0}
 
-    monkeypatch.setattr(maintenance, "_verify_root_stable", unstable_verify)
+    def inject_change(path: Path, relative: Path) -> bytes:
+        raw = original(path, relative)
+        if relative == Path("pages/a.md") and state["mutations"] == 0:
+            state["sentinel_reads"] += 1
+            (root / "pages" / "late.md").write_text("# late\n", encoding="utf-8")
+            state["mutations"] += 1
+        return raw
+
+    monkeypatch.setattr(maintenance, "read_file_no_follow", inject_change)
 
     result = maintain_link_index(root)
 
     monkeypatch.undo()
+    assert state == {"sentinel_reads": 1, "mutations": 1}
     assert result.published is False
     assert result.index is None
     assert result.warnings == (ResultWarning("link_index.rebuild_required"),)

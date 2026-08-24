@@ -1,10 +1,41 @@
+import errno
 import json
+from collections.abc import Iterable, Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Protocol
 
 from draft.models import OperationKind, RootState
-from draft.operations import JOURNAL_VERSION
+from draft.operations import JOURNAL_VERSION, DurabilityStep
 from draft.vocabulary import ConclusionsState
+
+
+class FailingDurability:
+    """Integration-only durability observer with per-step failure occurrences."""
+
+    def __init__(
+        self,
+        failures: Mapping[DurabilityStep, int | Iterable[int]],
+    ) -> None:
+        normalized: dict[DurabilityStep, frozenset[int]] = {}
+        for step, values in failures.items():
+            occurrences = (values,) if isinstance(values, int) else tuple(values)
+            if not occurrences or any(value < 1 for value in occurrences):
+                raise ValueError("durability failure occurrences must be positive")
+            normalized[step] = frozenset(occurrences)
+        self._failures = normalized
+        self._occurrences: dict[DurabilityStep, int] = {}
+
+    @property
+    def occurrences(self) -> Mapping[DurabilityStep, int]:
+        """Read-only occurrence counts for protocol assertions."""
+        return MappingProxyType(dict(self._occurrences))
+
+    def checkpoint(self, step: DurabilityStep) -> None:
+        occurrence = self._occurrences.get(step, 0) + 1
+        self._occurrences[step] = occurrence
+        if occurrence in self._failures.get(step, frozenset()):
+            raise OSError(errno.EIO, f"injected durability failure: {step.value}#{occurrence}")
 
 
 def managed_marker_text(

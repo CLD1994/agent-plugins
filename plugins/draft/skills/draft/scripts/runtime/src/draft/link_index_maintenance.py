@@ -1,12 +1,11 @@
 """链接索引维护：journal authority 读取与严格 no-follow 扫描（spec §3/§8/§9）。
 
-本模块只负责**读取权威状态**和**建立严格扫描候选**，不做耐久发布（Task 4）：
+本模块只负责**读取权威状态**和**建立严格扫描候选**，不做耐久发布：
 - ``select_link_index_authority``：从已解析 Journal 序列选出数值最大 revision 的权威结果；
 - ``read_link_index_authority``：枚举 ``.draft/operations/*/journal.json`` 并解析（复用
   ``operations.read_journal``，不复制 schema）；
 - ``load_link_index_baseline``：按 spec §9 决策表验证最新 ``published`` 制品；
-- ``scan_link_index``：no-follow 严格扫描根内 Markdown 与目录事实，向 Task 2 纯增量
-  计算传递 bytes。
+- ``scan_link_index``：no-follow 严格扫描根内 Markdown 与目录事实，向索引计算传递 bytes。
 """
 
 from __future__ import annotations
@@ -393,7 +392,7 @@ def _verify_root_stable(
 
 
 # ---------------------------------------------------------------------------
-# 耐久存储：staging、目标原子发布与 rebuild flag（spec §10，Task 4）
+# 耐久存储：staging、目标原子发布与 rebuild flag（spec §10）
 # ---------------------------------------------------------------------------
 
 
@@ -765,7 +764,7 @@ def verify_published_link_index(root: Path, journal: Journal) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 独立 link-index.update maintenance operation（spec §5/§14/§15，Task 5）
+# 独立 link-index.update maintenance operation（spec §5/§14/§15）
 # ---------------------------------------------------------------------------
 
 

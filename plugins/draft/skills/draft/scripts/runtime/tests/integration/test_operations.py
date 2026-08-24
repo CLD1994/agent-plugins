@@ -26,7 +26,7 @@ from draft.operations import (
     DurabilityStep,
     Journal,
     acquire_lock,
-    durability_scope,
+    durability_observer_scope,
     execute_plan,
     operation_journal_path,
     preallocate_journal,
@@ -39,7 +39,7 @@ from draft.operations import (
     write_journal as write_journal_durable,
 )
 from draft.vocabulary import ConclusionsState
-from tests.integration.support import managed_marker_text, write_raw_journal
+from tests.integration.support import FailingDurability, managed_marker_text, write_raw_journal
 
 
 @pytest.fixture
@@ -276,7 +276,10 @@ def test_journal_durability_steps_keep_last_durable_successor(
     )
     successor = dataclasses.replace(journal, phase=OperationPhase.PREPARED)
 
-    with durability_scope({step: 1}), pytest.raises(DraftError) as caught:
+    with (
+        durability_observer_scope(FailingDurability({step: 1})),
+        pytest.raises(DraftError) as caught,
+    ):
         write_journal_durable(successor)
 
     assert caught.value.code == CheckCode.OPERATION_DURABILITY_FAILED.value
@@ -303,7 +306,9 @@ def test_business_after_state_survives_journal_durability_failure(
     root = operation_draft
     plan, _old_a, _old_b, new_a, new_b = two_write_plan(root)
 
-    with durability_scope({step: occurrence}), pytest.raises(DraftError) as caught:
+    with durability_observer_scope(FailingDurability({step: occurrence})), pytest.raises(
+        DraftError
+    ) as caught:
         execute_plan(plan)
 
     assert caught.value.code == CheckCode.OPERATION_DURABILITY_FAILED.value

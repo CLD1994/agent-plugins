@@ -7,7 +7,7 @@ import os
 import re
 import stat
 import uuid
-from collections.abc import Callable, Generator, Iterable, Mapping, Set
+from collections.abc import Callable, Generator, Mapping, Set
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -123,11 +123,7 @@ _REVISION_PATTERN = re.compile(r"[1-9][0-9]*")
 
 
 class DurabilityStep(StrEnum):
-    """受支持的耐久 I/O 故障注入步骤（Task 11）。
-
-    这是测试和生产耐久边界共享的唯一步骤集合。默认没有作用域时，checkpoint
-    不改变实际 I/O；测试只能在一次调用作用域内选择具体步骤和 occurrence。
-    """
+    """受支持的耐久 I/O 协作者步骤。"""
 
     STAGING_WRITE = "staging_write"
     STAGING_FSYNC = "staging_fsync"
@@ -141,49 +137,32 @@ class DurabilityStep(StrEnum):
     FLAG_DIRECTORY_FSYNC = "flag_directory_fsync"
 
 
-@dataclass
-class _DurabilityScope:
-    failures: dict[DurabilityStep, frozenset[int]]
-    occurrences: dict[DurabilityStep, int]
+class DurabilityObserver(Protocol):
+    """可选的耐久边界观察者；默认没有观察者。"""
+
+    def checkpoint(self, step: DurabilityStep) -> None: ...
 
 
-_DURABILITY_SCOPE: ContextVar[_DurabilityScope | None] = ContextVar(
-    "draft_durability_scope", default=None
+_DURABILITY_OBSERVER: ContextVar[DurabilityObserver | None] = ContextVar(
+    "draft_durability_observer", default=None
 )
 
 
 @contextmanager
-def durability_scope(
-    failures: Mapping[DurabilityStep, int | Iterable[int]],
-) -> Generator[None, None, None]:
-    """在一次调用作用域内注入指定耐久步骤的 ``OSError``。
-
-    ``occurrence`` 从每个 step 的第一次生产调用开始计数，因此同一协议中有多个
-    目录同步时可精确选择失败位置。作用域使用 ``ContextVar``，嵌套或并行测试不会
-    共享计数；生产调用方无需传递任何测试参数。
-    """
-    normalized: dict[DurabilityStep, frozenset[int]] = {}
-    for step, occurrences in failures.items():
-        values = (occurrences,) if isinstance(occurrences, int) else tuple(occurrences)
-        if not values or any(value < 1 for value in values):
-            raise ValueError("durability failure occurrences must be positive")
-        normalized[step] = frozenset(values)
-    token = _DURABILITY_SCOPE.set(_DurabilityScope(normalized, {}))
+def durability_observer_scope(observer: DurabilityObserver) -> Generator[None, None, None]:
+    """在一次调用树内安装耐久边界观察者，并在退出时恢复外层观察者。"""
+    token = _DURABILITY_OBSERVER.set(observer)
     try:
         yield
     finally:
-        _DURABILITY_SCOPE.reset(token)
+        _DURABILITY_OBSERVER.reset(token)
 
 
 def durability_checkpoint(step: DurabilityStep) -> None:
-    """在真实耐久 I/O 前检查当前作用域；触发时抛出底层 ``OSError``。"""
-    scope = _DURABILITY_SCOPE.get()
-    if scope is None:
-        return
-    occurrence = scope.occurrences.get(step, 0) + 1
-    scope.occurrences[step] = occurrence
-    if occurrence in scope.failures.get(step, frozenset()):
-        raise OSError(errno.EIO, f"injected durability failure: {step.value}#{occurrence}")
+    """在真实耐久 I/O 前通知当前观察者；无观察者时保持真实 I/O。"""
+    observer = _DURABILITY_OBSERVER.get()
+    if observer is not None:
+        observer.checkpoint(step)
 
 
 def validate_link_index_revision(value: object, *, path: Path) -> str:
@@ -200,7 +179,7 @@ def validate_link_index_revision(value: object, *, path: Path) -> str:
 
 
 class MutationDirection(StrEnum):
-    """mutation artifact 恢复方向：正向应用或回滚（第十轮 H3）。"""
+    """mutation artifact 恢复方向：正向应用或回滚。"""
 
     FORWARD = "forward"
     ROLLBACK = "rollback"
@@ -361,10 +340,8 @@ def fsync_directory(
 ) -> None:
     """严格同步目录：打开或 fsync 失败都映射为 operation.durability_failed。
 
-    曾经静默吞掉 OSError（回归 H1）：调用方会把"日志/证据已耐久"的结论建立在未同步
-    的目录项上，崩溃后可能同时失去内容与重建证据。作为提交点前置的同步必须可失败。
-    以 no-follow 打开（回归 M2）：同步的必须是此前验证过的同一目录，不是被链接替换
-    后的其他目录。
+    作为提交点前置的同步必须可失败。以 no-follow 打开，确保同步的是此前验证过的
+    同一目录，而不是被链接替换后的其他目录。
     """
     try:
         if durability_step is not None:
@@ -386,7 +363,7 @@ def _fsync_dir_fd(
     *,
     durability_step: DurabilityStep | None = None,
 ) -> None:
-    """严格同步已打开的目录句柄：失败映射为 operation.durability_failed（回归 H1）。"""
+    """严格同步已打开的目录句柄：失败映射为 operation.durability_failed。"""
     try:
         if durability_step is not None:
             durability_checkpoint(durability_step)
@@ -400,7 +377,7 @@ _QUARANTINE_SUFFIX = ".quarantine"
 
 
 def _pending_name(name: str) -> str:
-    """确定名 pending：目标名 + '.pending'，可由授权源决定的目标路径派生（回归 H2）。
+    """确定名 pending：目标名 + '.pending'，可由授权源决定的目标路径派生。
 
     禁止随机 uuid 临时路径：崩溃遗留的 pending 必须能被恢复按精确名字、类型与摘要
     分类收敛，而不是按文件名形状批量猜测归属。
@@ -409,7 +386,7 @@ def _pending_name(name: str) -> str:
 
 
 def _quarantine_name(name: str) -> str:
-    """确定名 quarantine：目标名 + '.quarantine'，由授权源决定的目标路径派生（回归 H3）。
+    """确定名 quarantine：目标名 + '.quarantine'，由授权源决定的目标路径派生。
 
     删除采用"先原子隔离、后验证、再删除"：授权名字被移动到 quarantine 名后才删除，
     崩溃遗留的 quarantine 必须能被恢复按精确名字、类型与摘要分类收敛，不产生随机
@@ -430,17 +407,17 @@ def _publish_pending(
     file_fsync_step: DurabilityStep | None = None,
     directory_fsync_step: DurabilityStep | None = None,
 ) -> None:
-    """在父目录句柄内把 content 耐久发布为 name（确定名 pending + 严格同步，回归 H1/H2/H3）。
+    """在父目录句柄内把 content 耐久发布为 name（确定名 pending + 严格同步）。
 
     顺序：创建 pending → 写入 → fsync 文件 → 严格 fsync 父目录（pending 目录项耐久，
     崩溃时恢复可按授权源分类）→ 发布 → 严格 fsync 父目录（新名字目录项耐久，至少
     一个授权名字可证明存在）→ 删除 pending → 严格 fsync 父目录（pending 移除耐久）。
 
     - ``pending_mode="create"``：O_EXCL 原子创建，已有 pending 拒绝（绝不截断未知
-      pending，回归 H2 create-only）；``pending_mode="replace"``：journal 更新由 H1
-      转换授权持有该命名临时，半写残留可替换。
+      pending）；``pending_mode="replace"``：journal 更新由已验证的转换授权持有该命名
+      临时，半写残留可替换。
     - ``publish="link"``：no-clobber 发布，发布瞬间目标已出现即外部变化（create-only
-      目标与恢复写不覆盖）；``publish="replace"``：经 H1 验证后的权威 journal 原子替换。
+      目标与恢复写不覆盖）；``publish="replace"``：经转换验证后的权威 journal 原子替换。
 
     任一步失败保留 pending/旧目标现场并抛稳定领域错误；调用方不得把该写入当作已耐久，
     也不得继续删除权威叶或释放锁。
@@ -478,8 +455,7 @@ def _publish_pending(
         except OSError as exc:
             raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
         # 新名字耐久后（至少一个授权名字可证明存在），复核发布内容仍是我们写入的
-        # 授权字节，且 pending 仍指向同一节点（回归 H3）：任一被替换都拒绝消费，
-        # 绝不删除未知节点。
+        # 授权字节，且 pending 仍指向同一节点：任一被替换都拒绝消费，绝不删除未知节点。
         _fsync_dir_fd(parent_fd, code_path, durability_step=directory_fsync_step)
         if _read_name_bytes(parent_fd, name, code_path=code_path) != content or not _same_name_node(
             parent_fd,
@@ -511,7 +487,7 @@ def _create_only_publish(
     file_fsync_step: DurabilityStep | None = None,
     directory_fsync_step: DurabilityStep | None = None,
 ) -> None:
-    """create-only 发布（回归 H2）：目标与 pending 都必须是 missing 的首次创建。
+    """create-only 发布：目标与 pending 都必须是 missing 的首次创建。
 
     绝不截断未知 pending、绝不覆盖既有目标；目标/pending 已占用（file/directory/link/
     other）都保留现场报 operation.external_change，除非调用方已先跑专用恢复决策并证明
@@ -540,7 +516,7 @@ def _replace_publish(
     file_fsync_step: DurabilityStep | None = None,
     directory_fsync_step: DurabilityStep | None = None,
 ) -> None:
-    """权威 journal 更新发布（回归 H2）：调用方必须先经 H1 转换验证授权 old→new。
+    """权威 journal 更新发布：调用方必须先验证授权 old→new 转换。
 
     journal 自身的命名临时可替换半写残留（旧 journal 权威且已同步）；最终 os.replace
     原子替换目标，绝不出现目标缺失窗口。
@@ -567,7 +543,7 @@ def _open_parent_dir(path: Path, *, code: str, code_path: Path) -> int:
 
 
 def ensure_directory_chain(root: Path, relative: Path, *, code: str, code_path: Path) -> int:
-    """从 root no-follow 逐层打开/创建目录链，每创建一层立即 fsync 父目录（回归 M2）。
+    """从 root no-follow 逐层打开/创建目录链，每创建一层立即 fsync 父目录。
 
     返回最终父目录 fd（调用方负责 close）。缺失目录以 mkdirat 创建后立即 fsync 当前
     父目录（新目录项耐久），再打开下一层；中间组件为符号链接/非目录/不可打开时以
@@ -625,7 +601,7 @@ def _pending_decision(
 
     授权源是调用方给出的 expected_digest（日志登记摘要或 T 授权摘要）。目标与 pending
     都必须为普通文件且摘要等于授权才可动作；类型/摘要不符一律保留现场报 external，
-    绝不按文件名形状删除（回归 H2）。
+    绝不按文件名形状删除。
     """
     if pending_kind is EntryKind.MISSING:
         if target_kind is EntryKind.FILE and target_digest == expected_digest:
@@ -650,7 +626,7 @@ def recover_digest_pending(
     code: str,
     code_path: Path,
 ) -> None:
-    """把崩溃遗留的 ``<目标>.pending`` 收敛为已发布/已消费状态（回归 H2）。
+    """把崩溃遗留的 ``<目标>.pending`` 收敛为已发布/已消费状态。
 
     授权源是 expected_digest。只处理精确授权 pending：目标与 pending 在同一锚定父目录
     内分类复核，类型/摘要不符即外部改写，保留现场报错，不按文件名形状批量删除。
@@ -686,7 +662,7 @@ def recover_digest_pending(
                 raise DraftError("operation.external_change", code_path) from exc
             except OSError as exc:
                 raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
-            # 新名字耐久后，复核发布内容仍是授权内容且 pending 未被替换（回归 H3）。
+            # 新名字耐久后，复核发布内容仍是授权内容且 pending 未被替换。
             _fsync_dir_fd(parent_fd, code_path)
             try:
                 published = _read_name_bytes(parent_fd, target.name, code_path=code_path)
@@ -733,7 +709,7 @@ def _quarantine_decision(
     """恢复期 quarantine 收敛决策（纯函数）：complete / restore / delete_stale / external / ignore。
 
     授权源是 expected_digest。quarantine 是删除隔离名（``{name}.quarantine``），由
-    确定名派生（回归 H3）。恢复语义：目标缺失 + quarantine 授权精确 → 隔离已通过
+    确定名派生。恢复语义：目标缺失 + quarantine 授权精确 → 隔离已通过
     验证，删除它完成删除；目标与 quarantine 都是授权精确（同一 inode 中途移动）→
     quarantine 已消费，删除它；目标缺失 + quarantine 摘要不符 → 被隔离的不是授权叶，
     恢复原名并报告外部变化（原名占用时同时保留两者）；其余类型/摘要不符一律保留现场。
@@ -757,7 +733,7 @@ def recover_quarantine(
     code: str,
     code_path: Path,
 ) -> None:
-    """把崩溃遗留的 ``<目标>.quarantine`` 收敛为已删除/已恢复状态（回归 H3）。
+    """把崩溃遗留的 ``<目标>.quarantine`` 收敛为已删除/已恢复状态。
 
     授权源是 expected_digest。目标与 quarantine 在同一锚定父目录内分类复核，只处理
     精确授权 quarantine；类型/摘要不符即外部改写，恢复原名或保留现场报错，不按文件名
@@ -794,7 +770,7 @@ def recover_quarantine(
                 raise DraftError("operation.external_change", code_path) from None
             except OSError as exc:
                 raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
-            # 新名字耐久后，复核恢复内容仍是授权内容且 quarantine 未被替换（回归 H3）。
+            # 新名字耐久后，复核恢复内容仍是授权内容且 quarantine 未被替换。
             _fsync_dir_fd(parent_fd, code_path)
             try:
                 restored = _read_name_bytes(parent_fd, target.name, code_path=code_path)
@@ -843,7 +819,7 @@ def reject_symlink_components(root: Path, relative: Path) -> None:
 
 
 def classify_node_or_error(path: Path, *, code: str, code_path: Path) -> EntryKind:
-    """调用方拥有错误语义的分类边界（回归 M2）。
+    """调用方拥有错误语义的分类边界。
 
     ``classify_node`` 是低层事实函数，只吞 ENOENT；其原始 OSError 语义只允许在本包装
     后的持久协议入口出现。同一入口的 classify/read/decode 共享领域错误码并保留
@@ -866,8 +842,8 @@ def _name_node(
 ) -> tuple[int, int] | None:
     """no-follow stat 返回 (st_ino, st_dev)；仅 ENOENT（名字确实不存在）返回 None。
 
-    其他 OSError（EACCES/EIO 等）按调用者拥有的 code/path 转 DraftError（round-12
-    H4）：ENOENT 与"无法读取节点身份"是会导致不同行为的现实状态，不能共用 None——
+    其他 OSError（EACCES/EIO 等）按调用者拥有的 code/path 转 DraftError。
+    ENOENT 与"无法读取节点身份"是会导致不同行为的现实状态，不能共用 None——
     幂等缺失只允许由 FileNotFoundError 证明，其他 I/O 失败必须阻止成功、清理与解锁。
     """
     try:
@@ -887,11 +863,11 @@ def _same_name_node(
     code: str,
     code_path: Path,
 ) -> bool:
-    """name 当前是否仍指向 node（删除前 inode 复核，回归 H3）。
+    """name 当前是否仍指向 node（删除前 inode 复核）。
 
     命名动作之间名字被外部替换时，绝不能按名字删除未知节点：只有名字仍指向
     我们验证过的同一 inode 才允许消费。身份读取失败（EACCES/EIO）让 DraftError
-    传播，不得把读取失败返回 false 后在调用者处当作幂等完成（round-12 H4）；
+    传播，不得把读取失败返回 false 后在调用者处当作幂等完成；
     node 为 None（名字本就不存在）时返回 False。
     """
     if node is None:
@@ -906,7 +882,7 @@ def _read_name_bytes(
     code_path: Path,
     code: str = CheckCode.OPERATION_DURABILITY_FAILED.value,
 ) -> bytes:
-    """在父目录句柄内 no-follow 读取名字内容；失败映射稳定领域错误（回归 M3）。"""
+    """在父目录句柄内 no-follow 读取名字内容；失败映射稳定领域错误。"""
     try:
         descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
     except OSError as exc:
@@ -929,7 +905,7 @@ class _AnchoredLeaf:
     """锚定到 no-follow 打开的父目录句柄的叶节点访问对象。
 
     验证（stat/read 摘要）与删除（unlink/rmdir）使用同一句柄：中间组件在"检查通过"
-    之后变成符号链接时，句柄仍指向原目录 inode，绝不跟随新链接解析新路径（回归 H1）。
+    之后变成符号链接时，句柄仍指向原目录 inode，绝不跟随新链接解析新路径。
     """
 
     parent_fd: int
@@ -984,7 +960,7 @@ class _AnchoredLeaf:
             raise self._io_error(exc) from exc
 
     def write(self, content: bytes) -> None:
-        """create-only 耐久发布叶文件（restore 恢复缺失叶，回归 H1/H2/H3）。
+        """create-only 耐久发布叶文件（restore 恢复缺失叶）。
 
         目标与 pending 都必须 missing（O_EXCL + link 无覆盖发布）：发布瞬间目标或
         pending 已出现即外部变化，保留现场报错，绝不截断未知 pending、绝不覆盖既有
@@ -994,7 +970,7 @@ class _AnchoredLeaf:
         _create_only_publish(self.parent_fd, self.name, content, code_path=self.code_path)
 
     def quarantine_delete(self, expected_digest: str) -> None:
-        """先隔离、后验证、再删除（回归 H3）。
+        """先隔离、后验证、再删除。
 
         节点事务（每个命名动作后严格 fsync，新名字耐久后才允许删旧名字）：
         1. no-clobber 快照：link 原子捕获当前节点到确定名 quarantine（EEXIST→外部变化）；
@@ -1140,7 +1116,7 @@ def anchored_leaf(
     """
     if not relative.parts:
         raise ValueError("relative must be non-empty")
-    # 根以 no-follow 目录方式打开（回归 H3）：跟根本身是符号链接时稳定领域错误，
+    # 根以 no-follow 目录方式打开：跟根本身是符号链接时稳定领域错误，
     # 不跟随链接解析到其他目录。
     try:
         parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -1164,7 +1140,7 @@ def anchored_leaf(
                 os.close(parent_fd)
                 closed = True
                 raise DraftError(code, code_path) from exc
-            # 每打开下一层立即关闭上一层（回归 M2）：成功、中间缺失与异常分支都保证
+            # 每打开下一层立即关闭上一层：成功、中间缺失与异常分支都保证
             # fd 数量回到调用前，避免大 mutation/深路径耗尽描述符。
             os.close(parent_fd)
             parent_fd = next_fd
@@ -1183,10 +1159,10 @@ def durable_write(
     file_fsync_step: DurabilityStep | None = None,
     directory_fsync_step: DurabilityStep | None = None,
 ) -> None:
-    """create-only 严格耐久写（回归 H1/H2/H3/M2）：journal bootstrap、original/staged、
+    """create-only 严格耐久写：journal bootstrap、original/staged、
     attempt、cleanup evidence 等首次创建目标。
 
-    目录链从 ``root`` no-follow 逐层打开/创建（回归 M2）：缺失目录 mkdirat 创建后立即
+    目录链从 ``root`` no-follow 逐层打开/创建：缺失目录 mkdirat 创建后立即
     fsync 父目录，逐层同步到最终父目录，绝不按绝对路径重新解析祖先。目标与 pending
     都必须是 missing 的瞬时状态：O_EXCL 创建确定名 pending（绝不截断未知 pending）+
     link 无覆盖发布（发布瞬间目标已出现即外部变化），绝不覆盖既有目标。严格同步失败
@@ -1213,7 +1189,7 @@ def durable_write(
 
 
 def acquire_lock(root: Path, operation_id: str) -> None:
-    """排他创建写锁。锁创建的各步失败都在最窄边界映射稳定领域错误（回归 M3）。
+    """排他创建写锁。锁创建的各步失败都在最窄边界映射稳定领域错误。
 
     write/file-fsync/parent-fsync 任一失败都映射 operation.durability_failed：锁文件
     可能已存在但未耐久，下一次命令按实际锁存在分类（存在→recovery_required，丢失→
@@ -1258,7 +1234,7 @@ def read_lock(root: Path) -> str | None:
     reject_symlink_components(root, LOCK_RELATIVE)
     lock = root / LOCK_RELATIVE
     # lstat 分类：缺失→无锁；非普通文件（目录/链接等）→损坏。分类与读取共享稳定
-    # 领域错误（回归 M2/M3）：lstat/read/decode 任一失败都映射 journal_corrupt，
+    # 领域错误：lstat/read/decode 任一失败都映射 journal_corrupt，
     # 绝不泄漏原始 OSError。
     node = classify_node_or_error(
         lock, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value, code_path=lock
@@ -1467,7 +1443,7 @@ def _parse_observations(data: object, journal_path: Path) -> ObservationManifest
 
 
 def _decode_persistent_json(data: bytes, *, code: str, path: Path) -> object:
-    """持久 JSON 严格解码边界（回归 M3）：非法 UTF-8 与 JSON 错误统一映射领域错误。
+    """持久 JSON 严格解码边界：非法 UTF-8 与 JSON 错误统一映射领域错误。
 
     journal 与 lock 共用此 helper；``UnicodeDecodeError`` 绝不泄漏原始异常。
     """
@@ -1478,7 +1454,7 @@ def _decode_persistent_json(data: bytes, *, code: str, path: Path) -> object:
 
 
 def _parse_journal_bytes(data: bytes, journal_path: Path) -> Journal:
-    """持久 JSON bytes 解码 + 形状验证的单一解析边界（回归 M3）。
+    """持久 JSON bytes 解码 + 形状验证的单一解析边界。
 
     严格 UTF-8 解码、JSON 解析与 journal 形状验证在同一处；``UnicodeDecodeError``
     与 JSON 错误统一映射 operation.journal_corrupt，绝不泄漏原始异常。
@@ -1490,7 +1466,7 @@ def _parse_journal_bytes(data: bytes, journal_path: Path) -> Journal:
 
 
 # ---------------------------------------------------------------------------
-# 日志单步后继的权威转换验证器（回归 H1）
+# 日志单步后继的权威转换验证器
 # ---------------------------------------------------------------------------
 # journal pending 或普通 write_journal 发布前都必须证明 new 是 old（或 bootstrap）
 # 的合法后继：identity 不可变、阶段只能走状态图允许的边、mutation 已冻结后不可增删换、
@@ -1535,7 +1511,7 @@ _GENERIC_STRUCTURAL_KINDS = frozenset(
     }
 )
 
-# kind 拥有的 phase 与边的单一权威来源（回归 M1）：解析单条 journal 与验证后继转换
+# kind 拥有的 phase 与边的单一权威来源：解析单条 journal 与验证后继转换
 # 都从这里读取，不允许普通操作借用 adopt/trash 生命周期边。RECOVER 不允许形成持久
 # journal，phase 集为空。
 _BASE_PHASES = frozenset(
@@ -1852,7 +1828,7 @@ def _validate_mutation_transition(old: Journal, new: Journal, *, path: Path) -> 
 
 
 def validate_journal_kind_phase(journal: Journal, *, path: Path) -> None:
-    """kind 是否拥有该 phase 的单一权威检查（回归 M1）。
+    """kind 是否拥有该 phase 的单一权威检查。
 
     解析单条 journal 与验证后继转换共用；RECOVER 不允许形成持久 journal，任何 phase
     都被拒绝。跨 kind 借用 adopt/trash 生命周期状态在此被拒，不进入权威状态。
@@ -1863,11 +1839,11 @@ def validate_journal_kind_phase(journal: Journal, *, path: Path) -> None:
 
 
 def _validate_journal_transition(old: Journal | None, new: Journal, *, path: Path) -> None:
-    """验证 new 是 old（或 bootstrap）的合法单步后继（纯函数，回归 H1）。
+    """验证 new 是 old（或 bootstrap）的合法单步后继（纯函数）。
 
     old=None 为 bootstrap：只允许 allocating、空 mutations、空待删空目录。
     违反任何身份/阶段/内容规则抛 operation.journal_corrupt。阶段合法性由
-    ``(kind, phase)`` 与 ``(kind, old_phase, new_phase)`` 共同决定（回归 M1）。
+    ``(kind, phase)`` 与 ``(kind, old_phase, new_phase)`` 共同决定。
     """
     validate_journal_kind_phase(new, path=path)
     if old is None:
@@ -1924,12 +1900,12 @@ def _validate_journal_transition(old: Journal | None, new: Journal, *, path: Pat
 
 
 def validate_journal_transition(old: Journal | None, new: Journal, *, path: Path) -> None:
-    """公开的转换验证入口：resolve_journal_pending 与 write_journal 共用（回归 H1）。"""
+    """公开的转换验证入口：resolve_journal_pending 与 write_journal 共用。"""
     _validate_journal_transition(old, new, path=path)
 
 
 def _read_persistent_bytes(path: Path, *, code: str) -> bytes:
-    """no-follow 读取持久协议文件 bytes 一次（回归 M3）。
+    """no-follow 读取持久协议文件 bytes 一次。
 
     分类后（is_file 等）与实际读取之间节点被删除/目录化/替换为链接时，原始 OSError
     在最窄边界映射为稳定领域错误，绝不泄漏给 CLI。调用方负责解码与解析。
@@ -1973,7 +1949,7 @@ def read_journal(journal_path: Path) -> Journal:
 
 
 def resolve_journal_pending(journal_path: Path) -> None:
-    """把崩溃遗留的 ``journal.json.pending`` 收敛为已发布日志（回归 H1/H2）。
+    """把崩溃遗留的 ``journal.json.pending`` 收敛为已发布日志。
 
     只有能由当前耐久 journal 通过一次合法状态转换产生的完整新对象才可发布：
     ``validate_journal_transition`` 消费 old/new 两个纯对象判定合法单步后继，不凭文件名
@@ -2034,7 +2010,7 @@ def _parse_journal(data: object, journal_path: Path) -> Journal:
 
     在单一解析边界完成全部形状与协议验证：路径、hash 形状、kind/hash 组合、
     original/staged 协议形状与唯一性。任何 I/O 消费者只接触已验证对象，
-    恢复材料路径不得由字符串拼接决定 I/O 边界（回归 H5）。
+    恢复材料路径不得由字符串拼接决定 I/O 边界。
     """
     if not isinstance(data, dict):
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
@@ -2179,18 +2155,18 @@ def _parse_journal(data: object, journal_path: Path) -> Journal:
         link_index_result=link_index_result,
         link_index_sha256=link_index_sha256,
     )
-    # 磁盘读取验证 kind 拥有该 phase（回归 M1）：跨 kind 借用 adopt/trash 状态的
+    # 磁盘读取验证 kind 拥有该 phase：跨 kind 借用 adopt/trash 状态的
     # journal 即使结构合法也不是权威状态。链接索引字段矩阵在同一边界校验（规格 §4）。
     validate_journal_kind_phase(journal, path=journal_path)
     return journal
 
 
 def write_journal(journal: Journal) -> None:
-    """耐久写入 journal，发布前验证 new 是当前持久 journal 的合法单步后继（回归 H1）。
+    """耐久写入 journal，发布前验证 new 是当前持久 journal 的合法单步后继。
 
     先收敛崩溃遗留 pending（有效后继发布、半写残留保留旧 journal），再从磁盘重读当前
     持久 journal 作为 old，以 ``validate_journal_transition`` 证明 new 是合法后继后才发布。
-    bootstrap（无旧 journal）走 create-only；更新走经 H1 授权后的原子 replace。
+    bootstrap（无旧 journal）走 create-only；更新走经过转换验证的原子 replace。
     """
     path = journal.directory / "journal.json"
     resolve_journal_pending(path)
@@ -2401,7 +2377,7 @@ def _quarantine_before_then_publish(
 ) -> None:
     """改写/回滚的节点事务：先隔离 before 到 quarantine（保留），发布新内容后再消费。
 
-    隔离名保持到新内容耐久发布之后才删除（回归 H4）：崩溃不会出现"目标缺失且无
+    隔离名保持到新内容耐久发布之后才删除：崩溃不会出现"目标缺失且无
     隔离名"的歧义现场——before 节点要么仍在原名、要么可恢复地存在于隔离名，恢复
     据此决定前向补发还是外部变化。每步命名动作后严格 fsync，inode 复核后消费。
     """
@@ -2481,9 +2457,9 @@ def _apply_write(
     expected_current: str | None,
     code_path: Path,
 ) -> None:
-    """摘要绑定受管写（回归 H4）。
+    """摘要绑定受管写。
 
-    先沿锚定链创建/同步目标父目录（回归 M2），再在同一锚定父目录内验证目标当前
+    先沿锚定链创建/同步目标父目录，再在同一锚定父目录内验证目标当前
     授权状态并发布：
     - ``expected_current=None``（新建）：目标必须 missing，create-only no-clobber
       发布，目标瞬时出现即 external_change；
@@ -2498,7 +2474,7 @@ def _apply_write(
         cursor /= part
         if cursor.is_symlink():
             raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, cursor)
-    # 目录链逐层创建/同步（回归 M2）；晚到的组件链接由后续锚定 O_NOFOLLOW 拒绝。
+    # 目录链逐层创建/同步；晚到的组件链接由后续锚定 O_NOFOLLOW 拒绝。
     parent_fd = ensure_directory_chain(
         root,
         target.parent,
@@ -2525,7 +2501,7 @@ def _apply_write(
 
 
 def _apply_delete(root: Path, target: Path, *, expected_digest: str) -> None:
-    """摘要绑定受管删（回归 H4）：目标必须当前为 expected_digest 的精确普通文件，
+    """摘要绑定受管删：目标必须当前为 expected_digest 的精确普通文件，
     经节点事务隔离验证后消费；缺失（提交点后幂等清理）容忍。"""
     with anchored_leaf(
         root, target, code=CheckCode.PATH_SYMLINK_ESCAPE.value, code_path=root / target
@@ -2575,9 +2551,9 @@ def _clean_recovery_copies(journal: Journal) -> None:
     """按日志登记路径精确清理恢复副本（originals/staged）。
 
     全局无副作用预检两个目录的全部成员：任何未登记成员、符号链接、错误类型或
-    摘要不符都在第一次 unlink 前报 operation.inconsistent_state 并保留（回归 M1）。
-    无登记 mutation（allocating 崩溃）时目录必须为空：prepare 已先登记后建文件
-    （回归 H4），任何内容都不可解释为本操作副作用，一律拒绝。预检通过后按锚定
+    摘要不符都在第一次 unlink 前报 operation.inconsistent_state 并保留。
+    无登记 mutation（allocating 崩溃）时目录必须为空：prepare 已先登记后建文件，
+    任何内容都不可解释为本操作副作用，一律拒绝。预检通过后按锚定
     句柄复核并删除登记叶，已知空目录 rmdir；登记叶部分缺失（提交点后幂等清理）
     容忍。journal.json 不属于本函数清理范围，由调用方按"最后处理 journal"的状态
     机决定。
@@ -2611,7 +2587,7 @@ def _clean_recovery_copies(journal: Journal) -> None:
         if directory_node is not EntryKind.DIRECTORY:
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, directory)
         allowed = registered[sub]
-        # 先收敛崩溃遗留的登记文件 pending/quarantine（回归 H2/H3）：发布/消费后才做
+        # 先收敛崩溃遗留的登记文件 pending/quarantine：发布/消费后才做
         # 未知成员检查，否则 .pending/.quarantine 会作为未登记成员被拒绝且锁永久保留。
         for name, digest in sorted(allowed.items()):
             recover_digest_pending(
@@ -2659,7 +2635,7 @@ def _clean_recovery_copies(journal: Journal) -> None:
                     raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, relative)
                 if sha256_bytes(leaf.read()) != registered[sub][relative.name]:
                     raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, relative)
-                # 隔离→验证→删除：验证与删除同一锚定句柄（回归 H3）。
+                # 隔离→验证→删除：验证与删除同一锚定句柄。
                 leaf.quarantine_delete(registered[sub][relative.name])
         directory = journal.directory / sub
         if (
@@ -2699,7 +2675,7 @@ def finalize_operation(
 
     顺序为终态日志耐久 → 安全清理已授权恢复材料 → 释放锁：清理遇到未知成员/类型
     错误时保留锁与现场，CLI 报错后 recover 仍能凭锁定位，不会出现"报错时根内已无锁"
-    （回归 H5）。
+    。
 
     通用业务完成路径（``_validate_and_complete``）在进入索引阶段前已由
     ``settle_planned_empty_directories`` 收敛计划内空目录，因此传入
@@ -2745,7 +2721,7 @@ def _rollback(
         if current not in known:
             raise DraftError("operation.external_change", root / mutation.path)
     # 首次回滚 mutation 前耐久登记方向意图：正向与回滚共用 {目标}.pending/.quarantine
-    # 后缀，恢复器必须凭 phase 区分授权摘要（第十轮 H3）。普通操作不再允许
+    # 后缀，恢复器必须凭 phase 区分授权摘要。普通操作不再允许
     # prepared/applying/validating 直接写 rolled_back。
     rolling = _with_phase(journal, OperationPhase.ROLLING_BACK)
     write_journal(rolling)
@@ -2766,7 +2742,7 @@ def _rollback(
             if original_hash != mutation.before_sha256:
                 raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, original)
             # 回滚改写/DELETE：目标当前为 after（或缺失）授权状态，恢复 original
-            # 的 before 内容（摘要绑定受管写，回归 H4）。
+            # 的 before 内容（摘要绑定受管写）。
             _apply_write(
                 root,
                 mutation.path,
@@ -3204,7 +3180,7 @@ def execute_plan(plan: OperationPlan) -> OperationResult:
         _verify_plan_observations(root, journal)
     except DraftError:
         # 首次业务变更前的复核失败：本次准备日志尚未授权任何根变更，安全终态化
-        # 并释放锁，不遗留锁或中段日志（计划 Task 7 Step 4）。
+        # 并释放锁，不遗留锁或中段日志。
         write_journal(with_phase(journal, OperationPhase.ROLLED_BACK))
         _clean_recovery_copies(journal)
         release_lock(root, operation_id)
@@ -3315,7 +3291,7 @@ def _execute_allocated_plan(
         link_index_result=None,
         link_index_sha256=None,
     )
-    # 先在文件创建前耐久登记全部 original/staged 路径与摘要（回归 H4）：allocating
+    # 先在文件创建前耐久登记全部 original/staged 路径与摘要：allocating
     # 阶段永远不会有未登记文件；崩溃 mid-prepare 留下 PREPARED 日志 + 部分缺失文件，
     # 恢复按登记清单容忍缺失并拒绝任何未登记内容。
     write_journal(prepared)
@@ -3423,7 +3399,7 @@ def _classify(root: Path, mutation: JournalMutation) -> str:
 
 
 def _verify_recovery_material(journal: Journal) -> None:
-    """复核现存恢复材料摘要；登记但缺失（prepare 先登记后建文件，回归 H4）容忍。
+    """复核现存恢复材料摘要；登记但缺失（prepare 先登记后建文件）容忍。
 
     缺失的 original 只在目标已进入 after 时才需要回滚，而 prepare 完成前不会应用
     任何 mutation，因此登记即缺失不会阻断回滚；staged 缺失只阻断前向完成。
@@ -3742,7 +3718,7 @@ def _write_recovery_decision(
     temp_kind: EntryKind,
     temp_digest: str | None,
 ) -> Literal["forward", "consume", "external"]:
-    """WRITE 恢复决策表（回归 H3）：输入 target/登记精确临时路径的探针事实，输出动作。
+    """WRITE 恢复决策表：输入 target/登记精确临时路径的探针事实，输出动作。
 
     | target 状态 | 登记 temp 状态 | 结果 |
     | before | missing | forward：从 staged 正常前向完成 |
@@ -3811,7 +3787,7 @@ def _verify_observations_for_recovery(
     # 推导"本操作可能创建的目录闭包"；只把当前确实存在（本操作已 mkdir）的目录
     # 计入可解释创建。不等到目标文件达到 after 才承认目录出现：mkdir 后、目标文件
     # 替换前崩溃时，本操作创建的空目录不得被误判为外部变化。created_dirs 单独保留，
-    # 供合成"成员可为空"的明确观察（回归 H3）。
+    # 供合成"成员可为空"的明确观察。
     is_missing = _plan_time_missing_index(journal.observations)
     plan_created_targets = [
         mutation.path
@@ -3849,7 +3825,7 @@ def _verify_observations_for_recovery(
         created_dirs=frozenset(created_dirs),
     )
 
-    # 每个 WRITE 按 target/登记 temp 状态表一次性分类（回归 H3）：只有
+    # 每个 WRITE 按 target/登记 temp 状态表一次性分类：只有
     # before+owned-temp-exact（可消费的崩溃遗留）被排除出目录成员，target=after 时
     # 任何共存 temp 都是外部变化，未登记的 temp-like 成员一律保留。
     consume_temps: set[Path] = set()
@@ -3987,7 +3963,7 @@ def artifact_plan_time_absent(
     *,
     planned_created_directories: frozenset[Path],
 ) -> bool:
-    """协议节点（pending/quarantine/temp）是否由本操作创建（回归第十轮 H4）。
+    """协议节点（pending/quarantine/temp）是否由本操作创建。
 
     确定性名字与匹配摘要不是所有权证据。只有 plan-time 精确缺失才可拥有：精确路径
     可证明缺失，且其祖先链要么是已观察 DIRECTORY（受管目录内创建），要么整条缺失
@@ -4027,7 +4003,7 @@ def mutation_artifact_actions(
     pending_owned: bool,
     quarantine_owned: bool,
 ) -> tuple[MutationRecoveryAction, ...]:
-    """方向感知的 mutation artifact 恢复决策（纯函数，第十轮 H3）。
+    """方向感知的 mutation artifact 恢复决策（纯函数）。
 
     输入 target/pending/quarantine 的类型与摘要分类、pending/quarantine 的所有权布尔。
     输出有序动作序列；表外组合一律 ``EXTERNAL``（保留现场）。任何存在的 artifact
@@ -4228,7 +4204,7 @@ def _rollback_artifact_actions(
 
 
 def _recover_managed_temp_quarantines(root: Path, journal: Journal) -> None:
-    """恢复前把崩溃遗留的 managed temp quarantine 收敛（回归 H3）。
+    """恢复前把崩溃遗留的 managed temp quarantine 收敛。
 
     在观察复核之前运行：被中断的 consume 删除留下的 ``{temp}.quarantine`` 会被观察
     复核当成无法解释的新文件；先按授权摘要精确分类（精确→删除完成，不符→恢复原名
@@ -4249,7 +4225,7 @@ def _recover_managed_temp_quarantines(root: Path, journal: Journal) -> None:
             is EntryKind.MISSING
         ):
             continue
-        # 所有权证明：managed temp 路径也必须计划时缺失才可消费（回归 H4）。
+        # 所有权证明：managed temp 路径也必须计划时缺失才可消费。
         if not artifact_plan_time_absent(
             journal.observations,
             quarantine_path,
@@ -4283,7 +4259,7 @@ def _artifact_state_of(
 def _consume_named_artifact(
     root: Path, relative: Path, *, name: str, expected_digest: str, code_path: Path
 ) -> None:
-    """inode+内容复核后消费（删除）崩溃遗留 artifact 名（回归 H3/H4）。
+    """inode+内容复核后消费（删除）崩溃遗留 artifact 名。
 
     只删除我们验证过的同一节点；缺失幂等容忍，类型/摘要不符保留现场报外部变化。
     """
@@ -4302,7 +4278,7 @@ def _consume_named_artifact(
             code_path=code_path,
         )
         if verified is None:
-            return  # ENOENT：名字确实不存在，幂等（H4：只允许缺失证明幂等）。
+            return  # ENOENT：名字确实不存在，幂等（只允许缺失证明幂等）。
         kind = artifact.classify()
         if kind is not EntryKind.FILE or sha256_bytes(artifact.read()) != expected_digest:
             raise DraftError("operation.external_change", code_path)
@@ -4324,7 +4300,7 @@ def _consume_named_artifact(
 def _publish_pending_to_target(
     root: Path, relative: Path, *, expected_digest: str, code_path: Path
 ) -> None:
-    """把授权 pending（内容摘要=expected）create-only 发布为目标并消费 pending（回归 H3）。
+    """把授权 pending（内容摘要=expected）create-only 发布为目标并消费 pending。
 
     目标必须缺失（no-clobber link）：发布瞬间目标已出现即外部变化。发布后复核内容
     仍是授权内容且 pending 未被替换，再删除 pending。pending 与目标在同一锚定句柄内。
@@ -4410,7 +4386,7 @@ def _execute_mutation_artifact_actions(
     actions: tuple[MutationRecoveryAction, ...],
     code_path: Path,
 ) -> None:
-    """按纯决策表动作执行 artifact 收敛（I/O 层；回归 H3）。
+    """按纯决策表动作执行 artifact 收敛（I/O 层）。
 
     摘要来源固定：pending=after（正向）/before（回滚）、staged=after、original=before。
     不在此处按 before/after 是否为空猜方向。
@@ -4491,14 +4467,14 @@ def _execute_mutation_artifact_actions(
 def _recover_mutation_artifacts(
     root: Path, journal: Journal, *, direction: MutationDirection
 ) -> None:
-    """方向感知收敛受管写/删应用的崩溃遗留 pending/quarantine（第十轮 H3/H4）。
+    """方向感知收敛受管写/删应用的崩溃遗留 pending/quarantine。
 
     正向与回滚共用 ``{目标}.pending/.quarantine`` 后缀，但代表不同授权摘要：正向
     quarantine 保存 before、pending 保存 after；回滚 quarantine 保存 after、pending
     保存 before。方向由 journal phase（ROLLING_BACK=回滚）决定，纯决策表
     ``mutation_artifact_actions`` 输出按序动作，I/O 层只执行。任何存在的 artifact 必须
     由计划时缺失证明（``artifact_plan_time_absent``）才可消费或发布：计划前既有节点
-    即使字节恰好相同也不移动、不删除、不覆盖（回归 H4）。
+    即使字节恰好相同也不移动、不删除、不覆盖。
     """
     planned_dirs = _planned_created_directory_closure(journal.observations, journal.mutations)
     for mutation in journal.mutations:
@@ -4583,14 +4559,14 @@ def _clean_owned_temp_artifacts(
         if relative not in consume_temps:
             continue
         temporary = root / relative
-        # 所有权证明：managed temp 路径必须计划时缺失才可消费（回归 H4）。
+        # 所有权证明：managed temp 路径必须计划时缺失才可消费。
         if not artifact_plan_time_absent(
             journal.observations,
             relative,
             planned_created_directories=planned_dirs,
         ):
             raise DraftError("operation.external_change", temporary)
-        # 锚定隔离→验证→删除（回归 H3）：不再用普通 Path.unlink 旁路。
+        # 锚定隔离→验证→删除：不再用普通 Path.unlink 旁路。
         with anchored_leaf(
             root,
             relative,
@@ -4610,7 +4586,7 @@ def _recover_locked(
     *,
     retain_terminal_lock: bool = False,
 ) -> OperationResult:
-    # 先把崩溃遗留的 journal pending 发布为最新日志（回归 H2），再从最新日志恢复。
+    # 先把崩溃遗留的 journal pending 发布为最新日志，再从最新日志恢复。
     resolve_journal_pending(operation_journal_path(root, operation_id))
     journal = read_journal(operation_journal_path(root, operation_id))
     if journal.operation_id != operation_id:
@@ -4662,19 +4638,19 @@ def _recover_locked(
             retain_terminal_lock=retain_terminal_lock,
             changed_paths=_recover_changed_paths(journal),
         )
-    # 先把崩溃遗留的 managed temp quarantine 收敛（回归 H3）：被中断的 consume 删除
+    # 先把崩溃遗留的 managed temp quarantine 收敛：被中断的 consume 删除
     # 留下的 ``{temp}.quarantine`` 若不在观察复核前处理，会被当成无法解释的新文件。
     _recover_managed_temp_quarantines(root, journal)
     # 再按方向收敛受管写/删应用的崩溃遗留 pending/quarantine（正向：quarantine 保存
-    # before、pending 保存 after；回归 H4/H3）：在 _classify 与观察复核前收敛，否则
+    # before、pending 保存 after）：在 _classify 与观察复核前收敛，否则
     # 会被误判为无法解释的外部变化。只有计划时证明缺失的 artifact 才可消费/发布。
     _recover_mutation_artifacts(root, journal, direction=MutationDirection.FORWARD)
     for mutation in journal.mutations:
         if _classify(root, mutation) == "unknown":
             raise DraftError("operation.external_change", root / mutation.path)
     # 恢复前向完成必须复核观察清单：mutation 的 before/after 分类是可解释变化，
-    # 其余被观察文件或目录成员的差异是无法解释的外部修改，保留现场（计划 Task 7
-    # Step 4），不能把依赖旧读集语义的结果静默提交。
+    # 其余被观察文件或目录成员的差异是无法解释的外部修改，保留现场，不能把依赖旧
+    # 读集语义的结果静默提交。
     changed, consume_temps = _verify_observations_for_recovery(
         root, journal, explained_mutations=journal.mutations
     )
@@ -4701,7 +4677,7 @@ def recover_locked_operation(
     *,
     retain_terminal_lock: bool = False,
 ) -> OperationResult:
-    """恢复锁内通用 operation 的窄接口（第十一轮 H1）。
+    """恢复锁内通用 operation 的窄接口。
 
     供 restore 生命周期层在 R/T 协调事务内调用：验证锁仍属于 operation_id 后复用
     通用锁内恢复。``retain_terminal_lock=True`` 时终态日志耐久但不清材料、不解锁，
@@ -4728,8 +4704,8 @@ def verify_locked_terminal_operation(
     复用通用锁内终态验证（``_recover_terminal`` ``retain_terminal_lock=True``）证明
     mutation 目标仍处于终态对应的 before/after 摘要，不复制摘要循环。目录等不可读取
     目标被转换为 ``operation.external_change``，不泄漏原始 ``OSError``；符号链接目标
-    保持更精确的 ``path.symlink_escape``（第十二轮 H2：R 终态不能替代"目标仍为 before"
-    的事实证明）。调用方（restore 生命周期 ABANDON/FINISH 动作）验证通过后才允许
+    保持更精确的 ``path.symlink_escape``：R 终态不能替代"目标仍为 before"的事实证明。
+    调用方（restore 生命周期 ABANDON/FINISH 动作）验证通过后才允许
     解关联、清理材料与释放锁。
     """
     journal = read_journal(operation_journal_path(root, operation_id))
@@ -4772,7 +4748,7 @@ def recover(root_path: Path) -> OperationResult:
                 continue
             resolve_journal_pending(journal_path)
         else:
-            # journal 与 pending 并存：pending 是更新的完整日志，先发布（回归 H2）。
+            # journal 与 pending 并存：pending 是更新的完整日志，先发布。
             resolve_journal_pending(journal_path)
         journal = read_journal(journal_path)
         if journal.phase is OperationPhase.ALLOCATING:
@@ -4783,8 +4759,8 @@ def recover(root_path: Path) -> OperationResult:
                 continue
             # 无锁 allocating 碎片：协议明确拥有 journal.json 与 originals/staged
             # 目录；其余未知条目报 inconsistent_state，不得用 rglob 递归删除任意
-            # 内容（回归 H5）。统一状态机：完整预检全部恢复目录 → 删除精确授权叶
-            # → 删除空目录 → journal 最后删除（回归 H4）。
+            # 内容。统一状态机：完整预检全部恢复目录 → 删除精确授权叶 → 删除空目录
+            # → journal 最后删除。
             known_names = {"journal.json", "originals", "staged"}
             extra = [path for path in entry.iterdir() if path.name not in known_names]
             if extra:
