@@ -1255,9 +1255,9 @@ def main(
             _emit_error(error, json_mode)
             return _exit_for_error(error)
 
-    # check/adopt/notify/init 不推进回收生命周期（规格 §8.1/§13）；其余受管命令在任一
+    # check/adopt/notify/recover/init 不推进回收生命周期（规格 §8.1/§13）；其余受管命令在任一
     # 受管根上于业务前推进恰好一次。
-    if command not in ("check", "adopt", "notify") and managed is not None:
+    if command not in ("check", "adopt", "notify", "recover") and managed is not None:
         try:
             _advance_for_command(managed.path, now=captured_now)
         except DraftError as error:

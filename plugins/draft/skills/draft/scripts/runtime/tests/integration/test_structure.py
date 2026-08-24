@@ -1,10 +1,11 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from draft.checker import check_draft
+from draft.cli import main
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import OperationPhase, RootState
@@ -1413,6 +1414,57 @@ def test_restore_does_not_advance_any_package(
     due_journal = json.loads(due_path.read_text(encoding="utf-8"))
     assert due_journal["phase"] == "trash_retained"
     assert (root / ".draft/trash/outgoing" / due.operation_id).is_dir()
+
+
+def test_recover_does_not_advance_due_retained_package(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """公开 recover 只收敛中断现场，不推进到期 retained 包。"""
+    import json
+
+    from draft.operations import TrashDeadlines, acquire_lock
+
+    root = _lazy_root(draft_factory)
+    (root / "pages/c.md").write_text(LAZY_B.replace("乙", "丙"), encoding="utf-8")
+    (root / "index.md").write_text(
+        (root / "index.md").read_text(encoding="utf-8").replace(
+            "- [乙](pages/b.md)", "- [乙](pages/b.md)\n- [丙](pages/c.md)"
+        ),
+        encoding="utf-8",
+    )
+
+    due = trash_page(root, Path("pages/b.md"), now=DUE_NOW)
+    interrupted = trash_page(root, Path("pages/c.md"), now=DUE_NOW)
+    interrupted_journal_path = (
+        root / ".draft/operations" / interrupted.operation_id / "journal.json"
+    )
+    interrupted_journal = json.loads(interrupted_journal_path.read_text(encoding="utf-8"))
+    interrupted_journal["phase"] = OperationPhase.TRASH_HANDOFF_SUCCEEDED.value
+    interrupted_journal_path.write_text(json.dumps(interrupted_journal), encoding="utf-8")
+    acquire_lock(root, interrupted.operation_id)
+
+    due_journal_path = root / ".draft/operations" / due.operation_id / "journal.json"
+    due_journal = json.loads(due_journal_path.read_text(encoding="utf-8"))
+    due_journal["metadata"].update(
+        TrashDeadlines.from_created_at(datetime.now(UTC) - timedelta(days=8)).to_metadata()
+    )
+    due_journal_path.write_text(json.dumps(due_journal), encoding="utf-8")
+    due_package = root / ".draft/trash/outgoing" / due.operation_id
+    due_package_before = snapshot_tree(due_package)
+    calls: list[str] = []
+    monkeypatch.setattr("draft.trash_lifecycle._default_handoff", calls.append)
+    capsys.readouterr()
+
+    code = main(["recover", "--root", str(root), "--json"])
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"result_type": "recover", "fixed_count": 1, "paths": []}
+    assert snapshot_tree(due_package) == due_package_before
+    assert not (root / "pages/b.md").exists()
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------

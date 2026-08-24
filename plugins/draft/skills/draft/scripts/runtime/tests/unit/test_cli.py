@@ -942,6 +942,27 @@ def test_main_notify_does_not_advance_lifecycle(
     assert payload == {"result_type": "files_changed_notification"}
 
 
+def test_main_recover_does_not_advance_lifecycle(
+    mocker: MockerFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stub_root_discovery(mocker)
+    advance = mocker.patch("draft.cli._advance_for_command", autospec=True)
+    recover = mocker.patch(
+        "draft.trash_lifecycle.recover_interrupted_operations",
+        autospec=True,
+        return_value=(),
+    )
+
+    code = cli.main(["recover", "--root", "/draft", "--json"])
+
+    assert code == 0
+    advance.assert_not_called()
+    recover.assert_called_once_with(Path("/draft"))
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"result_type": "recover", "fixed_count": 0, "paths": []}
+
+
 def test_is_expected_link_index_maintenance_error_absorbs_classified_codes() -> None:
     codes = (
         CheckCode.OPERATION_RECOVERY_REQUIRED.value,
