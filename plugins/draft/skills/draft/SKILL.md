@@ -38,12 +38,13 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 - init 初始化新草稿
 - adopt 接管格式完整的未登记目录
 - check 检查草稿一致性
+- notify files-changed 通知根外部批量文件编辑已经稳定
 - move 移动页面或未受管理文件：`TARGET` 以 `.md` 结尾时是文件目标，只允许单个文件 `SOURCE`；否则是前缀目标，来源按基名或目录名落入其下；目录 `SOURCE` 只移动其中的 `.md` 普通文件，其余内容原地留下；未受管理来源提升后由 `check` 报告协议欠账
 - promote 升格页面为枢纽
 - collapse 降级枢纽为普通页面
 - trash 回收页面为保留态
 - restore 恢复被回收的页面
-- recover 修复崩溃或中断留下的未完成写操作（回收生命周期推进由所有已登记命令的前置静默完成）
+- recover 按持久 journal 证据收敛崩溃或中断留下的 recovery pending operation
 - create 创建叶子页面
 - status set 修改页面状态
 - relation add / relation remove 修改正式关系
@@ -56,7 +57,9 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 
 - 除 `init` 外，需要草稿根的命令统一使用可选 `--root ROOT`，缺省回退到绝对 `DRAFT_ROOT`，再回退到物理 `pwd` 祖先发现；`init` 只接受位置 `ROOT`。
 - `SOURCE`、`TARGET`、`PAGE`、`CHILD`、`HUB` 是草稿根内规范相对页面路径（如 `pages/a.md`、`pages/hub/index.md`），不接受目录别名。
-- `check` 对 `candidate` 与 `registered` 使用同一检查协议，始终完整扫描并严格只读；程序不提供来源格式迁移器，旧布局由 Agent 在固定候选根中重写。
+- `check` 对 `candidate` 与 `registered` 使用同一检查协议并始终完整扫描；CLI 可以机会式维护内部 link-index journal、制品和 flag，但不修改 Markdown、marker 或回收生命周期。底层纯 checker 的 `maintain_index=False` 只表示内部只读边界，不是 CLI 契约。
+- `notify files-changed --root ROOT` 适用于 candidate 与 registered 根，是外部批量编辑稳定后的可选后置通知；它不接收路径、变更类型、rename map 或 stdin 清单，也不支持 `--dry-run`。成功退出码为 `0`，JSON 固定为 `{"result_type":"files_changed_notification"}`，不返回 revision、warning、变化文件数或消费者状态；已有锁或已分类的索引维护故障仍表示通知送达。
+- 结构写命令的 `--dry-run` 使用相同事实和计划边界，但不创建 journal、revision、索引制品或 flag。
 
 ## 第一性边界
 
@@ -82,10 +85,10 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 每次用户确认、否定、提出关键反例或打开新分支时，在语义仍然新鲜时执行：
 
 1. 读根索引和当前相关页面，判断受影响的最小页面集合；
-2. 只改普通内容 -> 直接编辑 Markdown（标题、正文、例子都自由）；
+2. 只改普通内容 -> 直接编辑 Markdown（标题、正文、例子都自由）；一次外部批量编辑稳定后可选运行 `draft notify files-changed --root ROOT`，逐文件普通编辑不要求逐次通知；
 3. 改名、移动、升格、降级、回收 -> 调用对应 CLI 命令，一次命令完成，不拆成手工步骤；
 4. 更新受影响的正式关系（父主题、依赖、取代/被取代、质疑/被质疑）和页面状态；
-5. 运行 `draft check`；有客观错误立即修复，有语义歧义立即询问用户。
+5. 运行 `draft check`；有客观错误立即修复，有语义歧义立即询问用户。后续 `check` 或链接查询会严格比较当前根事实，不依赖是否发送过 notification。
 
 `conclusions.md` 是讨论结束时按需生成的机器产物，不实时维护。日常讨论中不手动写入
 或逐条改写结论列表；已确认页面由 `confirmed` 状态标记。只有讨论结束且与用户确认后
@@ -99,9 +102,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 2. 根据这份最新结论页产出设计文档；
 3. 产出完成后运行 `draft status set ROOT conclusions.md confirmed`，表示已据最新结论完成产出。
 
-查询选择：用 `draft query page ROOT PAGE` 做路由，用窄集合命令
-（`query links`/`backlinks`/`relations`/`status`/`recoverable`）获取事实，用
-`rg` 搜索正文。不要要求代理在普通编辑过程中维护结论页。
+查询选择：用 `draft query page ROOT PAGE` 做路由。`query page` 与 `query backlinks` 可以机会式维护全根链接索引；索引不可用时，两者从当前根完整 Markdown 链接事实闭包返回结果。`query links`、`query relations`、`query status` 和 `query recoverable` 不维护全根链接索引。用 `rg` 搜索正文，不要要求代理在普通编辑过程中维护结论页。
 
 ## 拆分时机
 
@@ -112,9 +113,9 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 ## 回收与恢复
 
 - `trash` 把页面和权威删除包落地为 7 天保留态（`trash_retained`），不立即移交系统回收站；有其他入站引用时命令拒绝并列出阻碍，先人工解除或改指再回收。
-- `trash` 后 7 天内可 `draft restore ROOT OPERATION_ID` 恢复页面；到期后的系统回收站移交和最终清理由所有已登记命令的前置静默推进，Agent 不需要维护计时器。`draft recover ROOT` 只修复崩溃或中断留下的未完成写操作，回收到期与移交结果不进入它的公开输出。最终清理（`trash_purge_committed`）只在到达清理期限后最后一次投递明确失败时发生，是永久删除授权。
+- `trash` 后 7 天内可 `draft restore ROOT OPERATION_ID` 恢复页面；到期后的系统回收站移交和最终清理由允许的已登记命令前置推进，Agent 不需要维护计时器。`draft recover ROOT` 只按 journal 证据收敛 recovery pending operation，不推进 retained trash 的到期、移交或清理。索引阶段中，`link_index_updating` 前向进入 `link_index_rebuild_required`；`link_index_published` 验证目标 revision/SHA-256 后补原终态；`link_index_rebuild_required` 尽力补 flag 后补原终态。不分配新 revision，也不因派生缓存故障回滚已验证业务内容。最终清理（`trash_purge_committed`）只在到达清理期限后最后一次投递明确失败时发生，是永久删除授权。
 - `restore` 回滚不是成功：恢复未完成时 `exit 3`、JSON `ok=false`（`result_type=restore`），权威删除包仍保留；JSON 不暴露内部 phase，遇到 `exit 3` 时不要报告"已恢复"。
-- 移交明确失败只产生警告并继续原命令；状态损坏（`operation.inconsistent_state` 等）才停止写入。结构命令提示需要恢复时，先运行 `draft recover ROOT` 做机械恢复，不要删除锁或日志目录；恢复结果无法解释或需要取舍时再停止并询问用户（见硬停止条件）。
+- 移交明确失败只产生警告并继续原命令；状态损坏（`operation.inconsistent_state` 等）才停止写入。索引发布失败但已耐久记录 `link_index.rebuild_required` 时，业务结果仍成功，退出码为 `0`，并返回索引 warning；`link_index.rebuild_flag_update_failed` 同样只是 warning。journal 结果无法耐久写入时返回 operation error，退出码为 `3`，保留锁和现场供 `recover` 处理。结构命令提示需要恢复时，先运行 `draft recover ROOT` 做机械恢复，不要删除锁或日志目录；恢复结果无法解释或需要取舍时再停止并询问用户（见硬停止条件）。
 - `.draft/` 下的操作日志、权威删除包和锁是工具内部状态，绝不手工编辑。
 
 ## 硬停止条件
@@ -132,7 +133,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 检查器输出四档：
 
 - `errors`客观结构损坏
-- `warnings`合法但需注意的运行状态，如投递失败
+- `warnings`合法但需注意的运行状态，如投递失败；`link_index.rebuild_required` 与 `link_index.rebuild_flag_update_failed` 是只含机器 `code`/`severity` 的索引 warning，不表示业务 operation 失败。`adopt` 的完整预检查中，索引性能降级不阻止登记，页面 errors、journal/制品矛盾、耐久失败或 recovery pending 才阻止登记。
 - `infos`合法未结束的生命周期事实，如 `trash_retained`
 - `reviews`待人类审查提醒。
 

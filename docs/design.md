@@ -1,10 +1,10 @@
 # Draft 正式设计
 
-状态：第一版领域核心、Tavern 孵化、2026-07-21 增量整改与独立插件提取均已完成；自包含 skill 运行时与插件增强桥接基线已实现并验证。2026-08-04 全局评审确认的单文件 Python 启动入口、版本环境键和非可编辑 runtime 安装纠正设计已按 [`2026-08-04-draft-single-python-launcher.md`](superpowers/plans/2026-08-04-draft-single-python-launcher.md) 实施，容器内全部门禁通过。2026-08-05 核心与插件适配层同仓库拆分完成：核心命令改由 `uvx --isolated --from` 从当前 skill 的 runtime 包源执行，插件入口（`plugins/draft/scripts/draft.py`）独立承担 bridge/binding/SessionStart，核心不再拥有插件状态。本次发布插件与 runtime 版本均为 `0.3.0`，但二者版本语义此后独立。`draft` 是唯一活跃产品与协议身份。
+状态：Draft 领域核心、独立插件、self-contained skill runtime 与插件增强桥接均按当前协议运行；核心命令通过 `uvx --isolated --from` 从当前 skill 的 runtime 包源执行，插件入口（`plugins/draft/scripts/draft.py`）独立承担 bridge/binding/SessionStart，核心不拥有插件状态。插件与 runtime 版本语义独立，`draft` 是唯一活跃产品与协议身份。
 
 宿主机复验仍待执行：真实 Windows 上的单文件 Python 入口（P1 关闭验证）、Codex 校验器、两个宿主的钩子信任与端到端、沙箱 `data_dir` 写权限和宿主官方文档复核。在真实 Windows 复验完成前不得宣称 P1 已关闭。
 
-本文档定义 `draft`（讨论草稿）第一版的产品边界、文档协议、运行架构和交付方式。它由已经逐项确认的[结论汇总](discussion/2026-07-18-recursive-discussion-notebook-skill/conclusions.md)迁移而来，并根据真实试用、2026-07-20 的后续讨论和 2026-07-21 的对抗性复评修订。本文是当前规范性设计；结论汇总和来源草稿保存推导历史。两者冲突时以本文为准，并应把新的已确认结论同步回草稿，而不能让旧讨论记录覆盖修订设计。
+本文档定义 `draft`（讨论草稿）的产品边界、文档协议、运行架构和交付方式。本文是当前规范性设计；结论汇总和来源草稿仅作为推导资料，两者冲突时以本文为准。
 
 ## 1. 摘要
 
@@ -61,9 +61,9 @@ Agent 判断讨论意味着什么；程序只处理能够从文件事实证明�
 
 ## 4. 孵化与独立交付
 
-### 4.1 Tavern 内孵化（已完成）
+### 4.1 Tavern 内孵化环境
 
-项目在 Tavern 的 `.claude/skills/` 下完成孵化与真实长讨论试用；2026-07-21 增量整改在孵化边界内加固了共享证据，并替换了已废止的迁移、回收编排。孵化产物随后被完整提取到本仓库；孵化期运行状态是 Tavern 项目本地生成物，不迁移、不进入版本控制。孵化位置从未让核心代码依赖 Tavern 的 Python 包、数据库或领域模型。
+Tavern 的 `.claude/skills/` 可提供 skill 试用环境；其项目本地运行状态不进入本仓库，也不属于核心运行依赖。核心代码不依赖 Tavern 的 Python 包、数据库或领域模型。
 
 ### 4.2 独立仓库与目标交付形态
 
@@ -185,6 +185,8 @@ flowchart LR
 
 Codex 与 Claude Code 不得各自实现一份结构规则。宿主差异停在钩子环境变量和清单接线，不进入 binding 或草稿领域模型；适配层不能直接改 Markdown，也不调用核心 CLI。
 
+根内 Markdown 和目录成员/节点类型是链接索引的权威事实。索引只缓存每个覆盖 Markdown 的 SHA-256、出站链接、反向链接表和目录快照；严格扫描每次读取全部覆盖 Markdown 并比较摘要与目录事实，只有路径和摘要均未变化的文件才能复用解析结果。索引不可用或被标记 `rebuild_required` 时，业务操作和链接查询使用当前根的完整链接事实闭包，不把旧索引当作 `fresh`。
+
 ## 7. 草稿目录
 
 一个受管理草稿必须是自包含目录：
@@ -200,10 +202,13 @@ topic/
 │       └── 10-1-child-question.md
 └── .draft/
     ├── draft.json           # 唯一根身份 marker（format_version + root_state + conclusions_state）
+    ├── link-index.json       # 存在时为从根内 Markdown 与目录事实派生的链接查询缓存
+    ├── link-index-rebuild-required.flag  # 存在时以纯存在性表示需要全根重建
     ├── operation.lock
     ├── operations/
     │   └── <operation-id>/
     │       ├── journal.json
+    │       ├── link-index.staged.json
     │       ├── originals/
     │       └── staged/
     └── trash/
@@ -218,9 +223,14 @@ topic/
 - 次级枢纽使用完整页面主干名作为目录名，枢纽本身为目录内 `index.md`；
 - `.draft/` 是工具内部区域，普通页面不得链接或写入其中；
 - `draft.json` 是根身份的唯一权威来源，精确保存 `format_version`、`root_state`（`candidate`/`registered`）与 `conclusions_state`；
+- `.draft/link-index.json` 是从根内全部覆盖 Markdown 和目录事实派生的可重建链接查询缓存，不是页面或链接事实的权威来源；`.draft/link-index-rebuild-required.flag` 只以文件存在性阻止未经 journal 判定的旧索引进入 `fresh` 路径，不承载 revision、原因或其他结构化状态；
 - `operation.lock` 只在结构操作期间存在，使 Codex 与 Claude Code 即使使用不同平台数据目录也能竞争同一把草稿锁；
-- `operations/` 保存未完成结构操作的日志（含根状态与读集观察清单）、恢复副本和暂存内容，任何平台都通过草稿根读取同一份恢复事实；
+- `operations/` 保存未完成结构操作的日志（含根状态与读集观察清单）、恢复副本和暂存内容；链接索引 staging 位于对应 operation 目录下，任何平台都通过草稿根读取同一份恢复事实；
 - `trash/outgoing/` 保存仍由插件负责的权威删除包，包括恢复保留期和系统回收站待移交阶段；成功移交或已提交到期清理后才删除其中内容。
+
+链接索引的权威链只有三层：当前 `journal_version=4` operation journal 中合法的链接索引结果、与最新 `published` 结果绑定的 `.draft/link-index.json` 制品，以及对当前根内 Markdown 和目录事实的严格新鲜度证明。journal 记录索引结果和 `link_index_revision`；制品保存派生快照；flag 只提供快速阻断信号，缺失时仍必须读取 journal。
+
+链接索引制品唯一支持 schema `v2`，不保存绝对根路径或 mtime/size 探针：`files` 覆盖 `.draft/` 之外的全部普通 Markdown 并保存 SHA-256 与出站边，`backlinks` 是出站边的精确反向表，`directories` 保存遍历目录的直接成员名称和节点类型。`link_index_revision` 使用规范十进制正整数；`published` 与 `rebuild_required` 都是 journal 的合法权威结果，分别绑定制品摘要或表示旧制品不可用于 fresh。
 
 第一版不保存永久草稿 ID。会话绑定使用显式根路径；目录被移动后，用户重新选择，不由程序猜测。
 
@@ -336,14 +346,16 @@ topic/
 - 先运行无过滤、无分页的完整候选检查；只有 `errors` 为空才继续；
 - 以 `kind="adopt"` 的普通操作日志承载登记事务，marker 的 `candidate→registered` 替换作为唯一受管根 mutation 原子提交；
 - marker 是最后一项受管根变更；替换后只核对 after 摘要并完成日志，不再运行会以业务校验失败为由回滚的全根检查；
+- 完整候选预检查可以机会式维护链接索引；索引性能降级 warning 不阻止登记，页面 errors、journal/索引制品矛盾、耐久失败或 recovery pending 等内部状态错误阻止登记；
 - 恢复按 `OperationKind.ADOPT` 单向收敛：marker 仍是 before 时可在重新证明观察未变后前向完成，marker 已是 after 时只完成提交与清理，绝不回滚根身份；
 - 不修改页面，不解释旧格式，也不自动改用其他入口。
 
 ### `draft check`
 
 - `candidate` 与 `registered` 共享同一页面、关系、链接、路径与内部状态检查协议；marker 的 `root_state` 决定根前置条件；
-- 始终完整扫描并严格只读，不推进回收生命周期、不恢复、不清理、不修改 marker；
-- 输出支持 `--code`、`--path-prefix` 过滤、`--limit`/`--offset` 分页与 `--count-only`；`ok` 与退出码只由未过滤完整扫描决定。
+- 始终完整扫描；CLI 可以机会式维护链接索引 journal、制品和 flag，但不修改 Markdown、marker，不推进回收生命周期，不执行 recovery；
+- 底层纯 checker 可用 `maintain_index=False` 保持只读，这个内部边界不改变 CLI `check` 的维护契约；
+- 输出支持 `--code`、`--path-prefix` 过滤、`--limit`/`--offset` 分页与 `--count-only`；过滤和分页只影响诊断呈现，完整扫描结果决定检查结论，机会式索引维护的耐久错误仍按 operation error 返回。
 
 ### Agent 主导迁移
 
@@ -369,12 +381,19 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft init ROOT
 uvx --isolated --from "<skill_root>/scripts/runtime" draft init --candidate ROOT
 uvx --isolated --from "<skill_root>/scripts/runtime" draft adopt --root ROOT
 uvx --isolated --from "<skill_root>/scripts/runtime" draft check --root ROOT
+uvx --isolated --from "<skill_root>/scripts/runtime" draft notify files-changed --root ROOT
 uvx --isolated --from "<skill_root>/scripts/runtime" draft move --root ROOT SOURCE TARGET
 uvx --isolated --from "<skill_root>/scripts/runtime" draft promote --root ROOT PAGE CHILD [CHILD ...]
 uvx --isolated --from "<skill_root>/scripts/runtime" draft collapse --root ROOT HUB
 uvx --isolated --from "<skill_root>/scripts/runtime" draft trash --root ROOT PAGE
 uvx --isolated --from "<skill_root>/scripts/runtime" draft restore --root ROOT OPERATION_ID
 uvx --isolated --from "<skill_root>/scripts/runtime" draft recover --root ROOT
+uvx --isolated --from "<skill_root>/scripts/runtime" draft query page --root ROOT PAGE
+uvx --isolated --from "<skill_root>/scripts/runtime" draft query links --root ROOT PAGE
+uvx --isolated --from "<skill_root>/scripts/runtime" draft query backlinks --root ROOT PAGE
+uvx --isolated --from "<skill_root>/scripts/runtime" draft query relations --root ROOT PAGE
+uvx --isolated --from "<skill_root>/scripts/runtime" draft query status --root ROOT
+uvx --isolated --from "<skill_root>/scripts/runtime" draft query recoverable --root ROOT
 ```
 
 共同规则：
@@ -386,6 +405,8 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft recover --root ROOT
 - 人类可读输出是默认形式，`--json` 提供稳定的结果类型、错误编号、涉及路径和严重级别；
 - 结构写命令附带的生命周期警告在 JSON 中使用结构化对象，至少含稳定 `code`、相关 `operation_id` 和 `details`；本地化句子只用于人类输出，不能充当机器协议；
 - 同一结果的人类输出、JSON `ok`、`phase` 和进程退出码必须表达同一事实，不能只在结构化字段中暴露失败却在人类输出中声称成功；
+- 结构写命令的 `--dry-run` 使用与真实执行相同的事实和计划边界，但不创建 operation journal、索引 revision、索引制品或 rebuild flag；
+- `notify files-changed --root ROOT` 只接受根级外部变更通知，candidate 与 registered 均可用；不接收路径、变更类型、rename map 或 stdin 清单，也不支持 `--dry-run`。成功退出码为 `0`，JSON 固定为 `{"result_type":"files_changed_notification"}`，不返回 revision、warning、变化文件数或消费者状态；已有锁或已分类的索引维护故障仍表示通知送达，参数错误、根选择失败、无效 Draft 根和未预期程序缺陷按真实错误返回；
 - 测试断言结构化结果，不断言完整中文诊断句子。
 
 `promote` 把现有叶子 `PAGE.md` 变为 `PAGE/index.md`，并在同一次操作中把至少一个现有受管理 `CHILD` 改挂到新枢纽下。若需要全新子页，Agent 先把它创建为结构合法的同级页，再通过 `promote` 一次完成升格和改挂。命令拒绝生成最终为空的枢纽。
@@ -406,7 +427,13 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft recover --root ROOT
 
 人类输出必须表达同一事实。特别是 `rolled_back` 不能报告“已恢复”，而要明确页面未恢复、权威包仍保留。
 
-`recover ROOT` 是显式的完整恢复与到期推进入口：先处理持锁或中断的结构操作，再推进所有到期删除包。`move`、`promote`、`collapse` 和 `trash` 等既有草稿结构写命令在开始自身操作前也惰性推进到期包。普通系统回收站投递失败只作为机器可读警告返回，不改变原结构命令的成功状态；权威包损坏、摘要不符、日志关联矛盾或锁状态无法解释时阻止继续写入。第一版不新增后台进程、`gc` 或 `maintain` 命令。
+改变根内 Markdown 或索引覆盖目录事实的 operation 在业务结果验证后进入链接索引阶段，并在释放写锁和进入原成功终态前收敛 `published` 或 `rebuild_required`；空操作和只改 `.draft/` 的 operation 不产生 revision。`check`、`query page` 与 `query backlinks` 可以机会式维护全根链接索引；索引不可用时按当前根完整链接事实闭包返回结果。`query links`、relations、status 和 recoverable 不维护全根索引。普通系统回收站投递失败只作为机器可读警告返回，不改变原结构命令的成功状态；权威包损坏、摘要不符、日志关联矛盾或锁状态无法解释时阻止继续写入。
+
+`notify files-changed` 是外部批量编辑稳定后的可选后置通知，不是 fresh 或 recovery 的强制前置，也不是索引错误恢复命令。通知成功只确认根已收到通知，不返回消费者维护结果；通知缺失时，后续允许维护的命令仍严格比较当前根事实。
+
+索引发布失败但已耐久记录 `link_index.rebuild_required` 时保留已验证业务结果，退出码仍为 `0`，并返回 `link_index.rebuild_required` 或 `link_index.rebuild_flag_update_failed` warning；两者均只含机器 `code`/`severity`，旧索引不得进入 `fresh`。journal 结果无法耐久写入时返回 `operation.durability_failed`，退出码为 `3`，保留锁和现场供 recovery 处理。索引性能降级不阻止 candidate `adopt`，但页面 errors、journal/制品不一致、耐久失败和 recovery pending 阻止登记。
+
+`recover ROOT` 只按 journal 证据收敛 recovery pending operation，不推进 retained trash 的到期、系统回收站移交或最终清理。索引阶段按 `link_index_updating → link_index_rebuild_required`、`link_index_published` 验证目标 revision/SHA-256 后补原终态、或 `link_index_rebuild_required` 尽力补 flag 后补原终态前向完成；不分配新 revision，也不因派生缓存故障回滚已验证业务结果。允许的普通受管命令仍可在自身前置阶段推进 retained trash 生命周期。
 
 普通 Agent 不选择宿主平台，也不读取、推导或搜索插件数据目录。Codex 与 Claude Code 只在各自 `SessionStart` 钩子内通过插件入口（`plugins/draft/scripts/draft.py`）读取准确的宿主变量、发布 bridge，并把原始 `session_id` 交给 binding 逻辑；`platform` 不进入核心 CLI 或领域模型。核心命令不读取 bridge、不区分运行模式、不注入 `DRAFT_DATA` 或 `DRAFT_SKILL_PATH`。普通结构命令不需要会话身份。
 
@@ -416,6 +443,29 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft recover --root ROOT
 
 `move`、`promote`、`collapse`、`trash` 和 `restore` 对受管理文件的修改共享同一操作引擎：
 
+改变根内 Markdown 或索引覆盖目录事实的 operation 遵循：
+
+```text
+applying
+→ validating
+→ link_index_updating
+→ link_index_published | link_index_rebuild_required
+→ 原有成功终态
+```
+
+只修改 `.draft/` 或没有实际事实变化的 operation 不进入链接索引阶段，也不产生 revision。
+
+v4 journal 的链接索引字段为 `link_index_revision`、`link_index_result` 和
+`link_index_sha256`。`link_index_updating` 只要求 revision；`link_index_published` 要求
+result=`published` 与制品 SHA-256；`link_index_rebuild_required` 要求
+result=`rebuild_required` 且不带制品 SHA-256。索引阶段前和 rollback 路径不携带这些字段；
+解析时区分字段缺失与显式 `null`，不接受其他 journal 版本。
+
+独立维护使用 `kind="link-index.update"`，只记录实际索引维护而不记录触发入口，阶段为
+`allocating → link_index_updating → link_index_published | link_index_rebuild_required → completed`。
+严格证明无需维护时不创建 maintenance operation；恢复只收敛当前 operation，不分配独立
+revision。
+
 1. 验证显式草稿根路径和登记版本。若已经存在 `operation.lock`，普通写命令在读取可能处于中间态的 Markdown 前就拒绝，并提示运行恢复；
 2. 生成 `operation_id`，惰性创建并同步固定的 `operations/` 父目录后，以排他方式创建 `.draft/operations/<operation-id>/`，同步其父目录项，再耐久写入初始阶段为 `allocating` 的 `journal.json`；已有同名目录一律报告操作标识冲突并保持其字节不变，绝不能复用或覆盖证据。此时尚未修改受管理 Markdown。`restore` 使用第 13 节规定的预分配关联恢复日志，不重新分配日志或丢弃其关联元数据；
 3. 使用排他创建取得草稿内部的 `operation.lock`，锁内容至少记录 `operation_id`；已有锁时普通写命令立即拒绝；
@@ -423,20 +473,27 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft recover --root ROOT
 5. 把日志阶段耐久更新为 `prepared`，再次读取正式文件并核对摘要，拒绝计划生成后的外部修改；
 6. 在目标文件所在文件系统准备临时文件，并逐个执行单文件原子替换；
 7. 每完成一步就在 `journal.json` 中耐久记录；
-8. 运行完整结构检查；
-9. 检查通过后，普通结构操作标记完成并释放锁；`trash` 转为无锁的 `trash_retained`，`restore` 按第 13 节完成关联终态。无需继续支持恢复的副本和暂存内容可以清理，权威删除包则按保留协议继续存在。
+8. 运行完整结构检查并验证业务结果；
+9. 若 operation 改变根内 Markdown 或索引覆盖目录事实，先耐久写入 `link_index_updating`，再写 operation 专属 link-index staging、原子发布 `.draft/link-index.json` 并耐久记录 `link_index_published`，或在无法完整构建/发布时耐久记录 `link_index_rebuild_required`；发布结果未知时不猜测已发布。索引结果收敛后，普通结构操作进入原有成功终态并释放锁；`trash` 转为无锁的 `trash_retained`，`restore` 按第 13 节完成关联终态。已耐久记录 `rebuild_required` 时保留业务成功并返回 warning。无需继续支持恢复的副本和暂存内容可以清理，权威删除包则按保留协议继续存在。
 
 所有日志读取必须在第一次依据其内容行动前绑定身份：`operation.lock.operation_id`、`.draft/operations/<operation-id>/` 的目录名和 `journal.operation_id` 必须一致。引用另一操作的字段还必须验证目标日志类型、目标标识和反向引用；不能把“字段存在”当作可选增强，也不能用日志自己的内部声明绕过路径身份。任一缺失或错配都报告日志损坏或 `operation.inconsistent_state` 并保留现场。
 
-进程重启时，`recover ROOT` 只读取该草稿的锁和 `.draft/operations/`，不需要平台或会话参数：
+进程重启时，`recover ROOT` 只读取该草稿的锁和 `.draft/operations/`，不需要平台或会话参数；它只收敛 recovery pending operation，不推进 retained trash 的到期、移交或清理：
 
 - 能证明当前文件仍符合计划前置条件时继续完成；
 - 不能继续，但能证明没有外部变化时回滚；
 - 无法证明安全或发现人类并发编辑时停止，保留现场并报告冲突。
 
+链接索引阶段使用机械前向规则：`link_index_updating` 进入
+`link_index_rebuild_required`，不猜测索引是否已经发布；`link_index_published` 验证目标
+revision 与 SHA-256，一致则补原成功终态，不一致则停止并保留现场；
+`link_index_rebuild_required` 尽力补建存在性 flag 后补原成功终态。进入
+`link_index_updating` 后不回滚业务结果，不分配新的 revision；恢复只清理当前 operation
+的 staging 文件，不使用通配符触碰其他 operation 或未知内部文件。
+
 锁不因为“时间过去很久”就自动判为陈旧。锁指向合法操作日志时按日志恢复；锁指向缺失或损坏的日志时报告客观损坏并保留现场，不能擅自解锁。没有锁的 `allocating` 操作目录尚未取得写权限，可以作为未开始操作清理；预分配在初始日志落盘前崩溃遗留的空操作目录同样没有授权，只能作为未关联分配残留清理，不能被后续操作复用。没有锁却声称已经进入 `prepared` 或写入阶段的日志属于矛盾状态，必须停止检查。这样 Codex 和 Claude Code 看到的是同一份可恢复事实，不需要访问对方的平台数据目录。
 
-`check` 始终完整扫描并严格只读，对 `candidate` 与 `registered` 使用同一协议；候选写命令按操作级门禁执行，不隐式运行完整检查。`adopt` 以 `kind="adopt"` 的普通操作日志承载登记事务：完整候选检查通过后，marker 的 `candidate→registered` 替换作为唯一受管根 mutation 原子提交；marker 是最后一项受管根变更，替换后只核对 after 摘要并完成日志。恢复按 `OperationKind.ADOPT` 单向收敛：marker 仍是 before 时可在重新证明观察未变后前向完成，marker 已是 after 时只完成提交与清理，绝不回滚根身份。因此 `recover` 对任何受管根都按 marker、锁与操作日志判定，不猜测根状态。
+`check` 对 `candidate` 与 `registered` 使用同一协议并始终完整扫描；CLI 可以机会式维护链接索引，但不修改 Markdown、marker，不推进回收生命周期，也不执行 recovery。底层纯 checker 的 `maintain_index=False` 保持只读。候选写命令按操作级门禁执行，不隐式运行完整检查。`adopt` 以 `kind="adopt"` 的普通操作日志承载登记事务：完整候选预检查可以机会式维护索引，索引性能降级 warning 不阻止登记；页面 errors、journal/制品矛盾、耐久失败或 recovery pending 阻止登记。marker 的 `candidate→registered` 替换作为唯一受管根 mutation 原子提交；marker 是最后一项受管根变更，替换后只核对 after 摘要并完成日志。恢复按 `OperationKind.ADOPT` 单向收敛：marker 仍是 before 时可在重新证明观察未变后前向完成，marker 已是 after 时只完成提交与清理，绝不回滚根身份。因此 `recover` 对任何受管根都按 marker、锁与操作日志判定，不猜测根状态。
 
 工具不覆盖无法解释的新内容，也不以“尽量恢复”为理由猜测合并。
 
@@ -453,8 +510,11 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft recover --root ROOT
 3. 其他入站引用可能表达依赖、产出、质疑或普通语义，CLI 不猜替代目标，列出这些引用并拒绝执行，直到 Agent 明确移除或改指；
 4. 把页面、原路径、内容摘要、相关父文件前后摘要和恢复元数据组成权威删除包；
 5. 将权威删除包原子移动到 `.draft/trash/outgoing/<operation-id>/`，同时从受管理树移除页面和父导航；
-6. 运行完整结构检查；
-7. 检查通过后持久化带时区的 UTC 时间 `created_at`、`restore_expires_at`、`purge_eligible_at` 和 `next_handoff_attempt_at`，把日志转为 `trash_retained` 并释放写锁。
+6. 运行完整结构检查并验证业务结果；
+7. `trash` 的页面/目录事实变化按链接索引阶段收敛为 `link_index_published` 或
+   `link_index_rebuild_required`，然后持久化带时区的 UTC 时间 `created_at`、
+   `restore_expires_at`、`purge_eligible_at` 和 `next_handoff_attempt_at`，把日志转为
+   `trash_retained` 并释放写锁。索引降级保留业务结果并返回 warning。
 
 第一版固定 `restore_expires_at = created_at + 7 天`，`purge_eligible_at = restore_expires_at + 30 天`，初始 `next_handoff_attempt_at = restore_expires_at`。这些绝对时间属于该操作的不可变事实；未来默认值变化不能追溯改变已有删除包。`trash_retained` 是合法的无锁状态，页面已经离开受管理树，权威删除包是唯一由插件负责的内容副本。`trash` 不立即调用系统回收站。
 
@@ -525,15 +585,15 @@ trash
 
 ### 13.5 惰性推进与时钟
 
-`recover ROOT` 推进全部到期删除包。普通结构写命令在自身操作前也推进所有达到条件的包；系统回收站明确失败只产生警告并继续原命令，状态损坏则停止写入。`restore` 是例外：它只处理指定包，不触发该包或其他包的到期推进。`check` 和 `check --candidate` 始终只读。
+到期删除包的推进只由允许的普通受管命令前置执行；`recover ROOT` 只收敛 recovery pending operation，不推进 retained trash 到期、系统回收站移交或最终清理。系统回收站明确失败只产生警告并继续原命令，状态损坏则停止写入。`restore` 只处理指定包，不触发该包或其他包的到期推进。`check` 和 `check --candidate` 可以机会式维护链接索引，但不修改 Markdown、marker 或回收生命周期。
 
-批量推进按 `operation_id` 排序，并返回类型化报告。若 `A` 已成功推进而 `B` 因日志或包损坏停止，则 `A` 的结果保持耐久且必须出现在公开信封中，`B` 作为结构化错误和 `stopped_at_operation_id` 返回，`B` 之后的 `C` 不再读取或触碰。`recover --json` 使用 `ok=false`、`result_type=recover`、`results=[A...]`、`error={code, operation_id, paths, details}` 和 `stopped_at_operation_id=B` 表达部分完成。结构写命令的前置推进使用 `ok=false`、`result_type=error`、`lifecycle_results=[A...]`、同一 `error` 和停止标识；它保留并报告已有结果，但不得加载当前结构图或开始请求的结构写操作。退出码按错误编号分类，`operation.inconsistent_state` 等操作错误退出 `3`。普通适配器明确失败已经被转成生命周期警告和结果，不属于批量失败，仍允许原结构命令继续。
+普通受管命令的生命周期前置推进按 `operation_id` 排序，并返回类型化报告。若 `A` 已成功推进而 `B` 因日志或包损坏停止，则 `A` 的结果保持耐久且必须出现在公开信封中，`B` 作为结构化错误和 `stopped_at_operation_id` 返回，`B` 之后的 `C` 不再读取或触碰。结构写命令的前置推进使用 `ok=false`、`result_type=error`、`lifecycle_results=[A...]`、错误对象和停止标识；它保留并报告已有结果，但不得加载当前结构图或开始请求的结构写操作。`recover --json` 只报告 recovery pending operation 的收敛结果，不包含 retained trash 的到期推进结果。退出码按错误编号分类，`operation.inconsistent_state` 等操作错误退出 `3`。普通适配器明确失败已经被转成生命周期警告和结果，不属于批量失败，仍允许原结构命令继续。
 
 第一版使用可注入、带时区的 UTC 墙上时钟。时钟回拨只会推迟推进；时钟前跳可以触发已经持久化的期限。第一版不引入跨重启单调时钟、时钟仲裁、后台任务、批量上限或单独维护服务。
 
 ## 14. 检查器
 
-检查器是只读共同核心。它输出：
+检查器始终完整扫描当前根事实。底层纯 checker 可以使用 `maintain_index=False` 保持只读；CLI `check` 默认允许在完整扫描后机会式维护链接索引 journal、制品和 flag。任何情况下都不修改 Markdown、marker，也不推进回收生命周期或执行 recovery。它输出：
 
 - **客观错误：** 文件事实已经证明结构损坏；结构操作不能把它当作成功；
 - **警告：** 结构仍可继续使用，但存在需要 Agent 看到的运行状态，例如系统回收站最近一次投递失败；
@@ -555,12 +615,13 @@ trash
 - `已取代` 与 `被取代` 的双向约束；
 - `已确认` 页面的产出完整性、其他状态不得产出、产出目标和产出回链；
 - 未完成操作日志是否可以解释；
+- 链接索引 journal 的唯一 `v4` 版本、`link_index_revision` 与 `published` 制品的一致性、制品 schema/摘要/反向表完整性，以及当前根事实的新鲜度；索引降级时报告 `link_index.rebuild_required` 或 `link_index.rebuild_flag_update_failed` warning；
 - `trash_retained` 的恢复期限、`trash_handoff_pending` 的最近失败，以及回收日志、权威包和锁是否满足第 13 节不变量；
 - 普通页约 600 行或 60 KB 的容量提醒。
 
 回收生命周期诊断的严重级别固定为：恢复窗口内的 `trash_retained` 是 `INFO`；已经过 `restore_expires_at` 但尚未被下一次惰性推进处理的 `trash_retained` 仍是合法的 `INFO`；有有效投递失败记录的无锁 `trash_handoff_pending` 是合法但需要注意的 `WARNING`，`now < next_handoff_attempt_at` 时也不能降为信息，到点后只表示已经具备再次推进条件；没有有效失败记录且没有匹配锁的 pending 无法由协议解释，是 `ERROR`。合法状态不必一律降为信息。
 
-`check` 对 `candidate` 与 `registered` 使用同一页面、关系、链接、路径与内部状态协议；marker 的 `root_state` 决定根前置条件，`conclusions_state` 决定结论产物所有权。`check` 始终完整扫描并严格只读，不推进回收生命周期、不恢复、不清理，也不修改 marker；它不把“有锁”解释为只报告一条错误后停止扫描。检查前后文件状态必须相同。
+`check` 对 `candidate` 与 `registered` 使用同一页面、关系、链接、路径与内部状态协议；marker 的 `root_state` 决定根前置条件，`conclusions_state` 决定结论产物所有权。`check` 始终完整扫描，并可利用扫描结果机会式维护链接索引；它不修改页面或 marker，不推进回收生命周期，不执行 recovery，也不把“有锁”解释为只报告一条错误后停止扫描。底层使用 `maintain_index=False` 时，检查函数只返回事实而不写内部索引状态。检查前后 Markdown、marker 和回收生命周期状态必须相同。
 
 检查器不会把 `已确认 + 被质疑` 本身报告为冲突；它分别验证产出完整性和质疑双向关系。产出页是否清楚提示挑战属于 Agent 与用户的语义评审，不通过固定句子测试。
 
@@ -574,6 +635,24 @@ trash
 - skill 全文和生成文本快照。
 
 检查全绿只表示没有发现机械损坏，不表示讨论语义正确。
+
+链接索引维护入口遵循同一边界：
+
+| 入口 | 内部索引行为 |
+| --- | --- |
+| `notify files-changed` | 外部批量编辑稳定后的可选维护通知；不接收变化清单，不返回消费者状态 |
+| 普通结构写命令 | 业务结果验证后强制收敛索引阶段；只改 `.draft/` 或 no-op 不产生 revision |
+| `check` | 完整扫描后机会式维护；不改页面、marker 或回收生命周期 |
+| `query page`、`query backlinks` | 为 backlink 事实机会式维护；索引不可用时从完整根事实闭包返回结果 |
+| `query links`、relations、status、recoverable | 不维护全根链接索引 |
+| `adopt` 完整预检查 | 可先完成独立索引维护；索引性能 warning 不阻止登记，内部状态错误阻止登记 |
+| 结构写命令 `--dry-run` | 使用同一事实/计划边界，不写 journal、revision、索引制品或 flag |
+| `init` | 不发布首次索引 |
+| `recover` | 只收敛已有 recovery pending operation，不推进 retained trash 生命周期 |
+
+从未建立索引或 stale 本身不是公开 warning。索引发布失败但已耐久记录
+`rebuild_required` 时，当前业务或查询使用完整事实并返回降级 warning；journal 耐久失败
+返回 operation error，退出码为 `3`，并在 `adopt` 中阻止登记。
 
 ## 15. 插件上下文、会话绑定与压缩后恢复
 
@@ -753,8 +832,8 @@ data_dir/
 - 内部日志、权威包和关联字段同样属于不可信的持久化输入；读取后必须验证路径身份、版本、类型、必填字段和跨文件证据，不能以“它由本工具写入”为由跳过收口。
 - 客观结构错误使结构操作失败；审查提醒不会单独阻止普通讨论。
 - 未知或更高 `format_version` 要求升级工具；未来已知旧版本要求显式格式迁移。未登记的旧内容由 Agent 重写为当前候选格式，不能根据缺失版本猜测它属于某个来源适配器。
-- Markdown 结构和 `draft.json` 没有因本次修订改变，因此 `format_version` 保持 `1`；操作日志的阶段、时间和关联字段发生不兼容变化，因此当前日志固定提升为 `journal_version=2`。
-- 第一版不迁移旧操作日志，也不从文件时间或旧阶段猜测 `created_at`、`restore_expires_at` 或 `purge_eligible_at`。遇到旧、未知或更高 `journal_version` 时明确报告版本不兼容并停止写入。
+- Markdown 结构和 `draft.json` 使用 `format_version=1`；操作日志唯一支持 `journal_version=4`。程序不双读、不迁移、不填补其他版本默认值；遇到旧、未知或更高版本时返回 `operation.journal_version_unsupported` 并停止写入。
+- 程序不从文件时间或旧阶段猜测 `created_at`、`restore_expires_at` 或 `purge_eligible_at`；v4 journal 的 phase、链接索引字段和关联证据必须满足当前状态模型，否则返回 `operation.journal_corrupt` 或 `operation.inconsistent_state`。
 - 本地链接解析忽略代码围栏示例，但不靠全文文本替换修复路径。
 - 结构操作日志、恢复副本和暂存材料位于草稿根的 `.draft/operations/`，不调用 Git 命令；插件 `data_dir` 只保存会话绑定和诊断日志。
 - bridge 不存在时 bind/unbind 报告 `plugin.context_unavailable`；bridge 存在但损坏、不安全或冲突时是不同状态，必须保留可诊断证据并停止。
@@ -782,7 +861,7 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff format
 
 - 合法与非法顶部结构块；
 - 五个状态前缀、值内冒号解析、可选说明、状态与产出完整性；
-- 普通检查与候选检查的登记边界，最终登记根的 `candidate.already_registered`、临时登记态的 `adopt.recovery_required`，以及候选检查在两类拒绝下都保持只读；
+- 普通检查与候选检查的登记边界，最终登记根的 `candidate.already_registered`、临时登记态的 `adopt.recovery_required`，以及候选检查可写内部链接索引但始终不改页面、marker 或回收生命周期；
 - 候选检查通过后的完整文件集合或摘要发生结构合法变化时，`adopt` 撤销自己的临时标记并保留并发编辑；临时标记写入后崩溃时，普通命令拒绝使用，再次 `adopt` 能按原清单确定完成或撤销；
 - 断链、路径逃逸、父子不一致、依赖环、产出冲突和同标签重复规范化目标；
 - 纯导航根页或枢纽使用 `已确认` 时同样要求产出，`已确认 + 被质疑` 不被误判为冲突；
@@ -802,6 +881,10 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff format
 - 时钟回拨、前跳、惰性推进和 `check` 不推进生命周期；恢复窗口内与到期未推进的 retained 为信息，节流期内有失败记录的 pending 为警告，无失败记录且无锁的 pending 为错误；
 - 批量推进中前项成功、当前项损坏时公开返回前项结果和停止位置，后续项保持完全未触碰；同一失败发生在结构写前置推进时，请求的结构写不开始；
 - 当前、未知和非法 `format_version` 与 `journal_version`，以及候选检查与临时态复核都通过后 `adopt` 才发布最终 `draft.json`；
+- `journal_version=4` 的链接索引 phase/字段矩阵、`published`/`rebuild_required` authority、revision/SHA-256/flag 一致性、完整 Markdown 摘要新鲜度和目录节点快照；
+- notification 的固定 `files_changed_notification` 信封、candidate/registered 根、无路径清单、已有锁吸收和非预期异常边界；`check`、`query page`、`query backlinks` 的机会式维护及完整事实回退；`query links`、无关 query、dry-run、init 和 recover 的内部无写入边界；
+- 索引发布/flag 降级 warning 保留业务成功、journal durability failure 退出 `3` 并保留现场、adopt 对 warning 与内部状态错误的不同分类；
+- `link_index_updating`、`link_index_published` 和 `link_index_rebuild_required` 各恢复窗口，以及 recover 不推进 retained trash 生命周期；
 - `platform` 从插件 CLI、模型、JSON 和路径中完全删除，文件名为原始 `session_id` 的 SHA-256，payload 错配时拒绝返回 root；binding 不再保存 `skill_name` 或 `skill_digest`；
 - bridge 不存在、合法、损坏、不安全、冲突和 reset 后状态，以及同一安装键的并发发布；
 - Codex 和 Claude Code 的 `SessionStart` 清单、宿主变量选择、无绑定会话事实、已绑定信封与重复调用幂等性；
@@ -823,13 +906,13 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff format
 
 机械问题应进入 CLI 或检查器，不能用更多提示词替代可以确定执行的程序。
 
-## 19. 第一版验收条件
+## 19. 交付验收条件
 
-孵化版本在进入独立仓库之前须满足以下条件（验收已完成）：
+当前交付满足以下条件：
 
 - 用户批准本文档和后续实现计划；
 - Claude Code 能从 Tavern 的 `.claude/skills/` 发现并使用 skill；
-- `init`、`check --candidate` 和 `adopt` 严格区分空根、未登记候选、临时登记态和最终登记草稿，并拒绝越界输入；最终登记根的候选检查稳定返回 `candidate.already_registered`，临时态返回 `adopt.recovery_required`，且两者都保持只读；`adopt` 的临时态可确定恢复，不能因崩溃伪装成已接管；
+- `init`、`check --candidate` 和 `adopt` 严格区分空根、未登记候选、临时登记态和最终登记草稿，并拒绝越界输入；最终登记根的候选检查稳定返回 `candidate.already_registered`，临时态返回 `adopt.recovery_required`；检查可以维护内部链接索引但不改页面、marker 或回收生命周期，`adopt` 的临时态可确定恢复，不能因崩溃伪装成已接管；
 - Agent 能把至少一个真实旧草稿迁移到新的空候选根，来源零改动，程序不包含来源格式适配器；
 - 检查器覆盖已确认的客观结构规则；
 - `move`、`promote`、`collapse`、`trash`、`restore` 和 `recover` 能在故障注入下保护数据；
@@ -838,14 +921,14 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff format
 - 恢复引擎的返回与异常通过同一终态解决器收口；安全回滚会同步解关联并保留包，无法证明的中间态保留锁和现场，普通冲突与证据损坏使用不同错误语义；
 - 7 天恢复、随后 30 天尽力投递、24 小时节流和最终清理的时间边界可通过注入时钟确定验证，普通历史页面永不按年龄自动回收；
 - 批量生命周期推进的部分成功结果不会被后续损坏项的错误信封吞掉，损坏项之后的包不被触碰，结构写前置推进失败时结构写本身不开始；
-- `check` 与 `check --candidate` 在成功、警告和错误情况下都保持只读；
+- `check` 与 `check --candidate` 在成功、警告和错误情况下都完整扫描，允许维护内部索引，但保持 Markdown、marker 和回收生命周期不变；底层 `maintain_index=False` 纯 checker 保持只读；
 - Tavern 项目级 Claude 钩子接线完成后，压缩或恢复能重新绑定 skill，同一事件重复执行无副作用；
 - 新会话不会自动猜测草稿；
 - Python 门禁全绿；
 - 至少用一个真实 Tavern 草稿完成人工试用；
 - 安装产物不依赖 Tavern 项目代码。
 
-独立仓库阶段已经补齐 Codex 与 Claude Code 的 marketplace 与插件基础清单；提取没有改变已经通过试用的草稿格式、CLI 或共同核心。自包含 skill 运行时与插件增强改造完成时还必须满足：
+自包含 skill runtime 与插件增强边界还满足：
 
 - runtime 完整位于 `skills/draft/scripts/runtime/`，插件根不再存在 `runtime/` 或 `bootstrap/`；核心外层 launcher（`skills/draft/scripts/draft.py`）已删除；
 - Agent 核心命令只使用 `uvx --isolated --from "<skill_root>/scripts/runtime" draft`，Windows 与 POSIX 同一命令；插件命令使用 `uv run <plugin_entry>`；
@@ -854,16 +937,14 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff format
 - 核心 runtime 的工具环境由 uv 的 `uvx --isolated --from` 构建，位于 uv 自己的平台缓存目录；Draft 不创建 `envs/<runtime_version>`，不定义 `runtime.cache_unavailable` 或 `runtime.environment_invalid`；
 - 绑定严格三字段（`session_id`、`root`、`last_page_hint`），不再包含 `platform`、`skill_name` 或 `skill_digest`；会话标识按宿主原值哈希并在 payload 中精确复核；
 - Codex 与 Claude Code 的受信任 `SessionStart` 都按八步顺序执行，有合法绑定时恢复活动草稿；
-- 插件 manifest 版本与 runtime 版本独立语义：本次发布均为 `0.3.0`，但此后不要求数值相同；
+- 插件 manifest 版本与 runtime 版本具有独立语义，当前版本均为 `0.3.0`；
 - 清单校验、完整 Python 门禁、复制后 skill 烟雾测试和完整无仓库父目录分发 smoke test 全部通过。
 
-## 20. 后续步骤
-
-初版实现、2026-07-21 增量整改和独立插件提取均已完成。当前演进依据与下一步：
+## 20. 规范参考
 
 1. 插件清单、完整改名与路径契约由 `docs/superpowers/specs/2026-07-30-draft-plugin-manifests-and-path-contract-design.md` 定义；
-2. 自包含 skill 运行时、两字段 bridge、无平台绑定与双宿主 `SessionStart` 基线由 `docs/superpowers/specs/2026-07-30-draft-self-contained-skill-runtime-design.md` 定义，并已按 `docs/superpowers/plans/2026-07-31-draft-self-contained-skill-runtime.md` 实施；
-3. 单文件 Python 启动入口、版本环境键和非可编辑 runtime 安装由 `docs/superpowers/specs/2026-08-04-draft-single-python-launcher-design.md` 定义，已按 `docs/superpowers/plans/2026-08-04-draft-single-python-launcher.md` 实施且容器门禁全绿；真实 Windows 宿主复验（计划 Task 6 Step 6）完成前 P1 不关闭。前一项基线规格保留为已完成历史；
-4. 核心与插件适配层同仓库拆分由 `docs/superpowers/specs/2026-08-05-draft-core-plugin-separation-design.md` 定义，已按 `docs/superpowers/plans/2026-08-05-draft-core-plugin-separation.md` 实施：核心命令改由 `uvx --isolated --from` 从当前 skill 的 runtime 包源执行，插件入口独立承担 bridge/binding/SessionStart，核心不再拥有插件状态，插件与 runtime 版本语义独立；
-5. `docs/discussion/` 保存历史推导资料，与本文冲突时以本文和当前规格为准；
-6. 租约撤销、旧环境回收、转录备份等未经验证的能力只在真实使用证明当前边界不足时重新评审。
+2. 自包含 skill runtime、两字段 bridge、无平台绑定与双宿主 `SessionStart` 的边界由 `docs/superpowers/specs/2026-07-30-draft-self-contained-skill-runtime-design.md` 定义，并以 `docs/superpowers/plans/2026-07-31-draft-self-contained-skill-runtime.md` 为实施参考；
+3. 单文件 Python 启动入口、版本环境键和非可编辑 runtime 安装由 `docs/superpowers/specs/2026-08-04-draft-single-python-launcher-design.md` 定义；真实 Windows 宿主复验仍是 P1 验收条件；
+4. 核心与插件适配层同仓库拆分的边界由 `docs/superpowers/specs/2026-08-05-draft-core-plugin-separation-design.md` 定义：核心命令通过 `uvx --isolated --from` 从当前 skill 的 runtime 包源执行，插件入口独立承担 bridge/binding/SessionStart，核心不拥有插件状态，插件与 runtime 版本语义独立；
+5. `docs/discussion/` 保存推导资料，与本文冲突时以本文和当前规格为准；
+6. 租约撤销、环境回收、转录备份等不在当前能力边界内，只有真实使用证明边界不足时才重新评审。
