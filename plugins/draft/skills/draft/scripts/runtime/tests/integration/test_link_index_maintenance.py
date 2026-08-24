@@ -1456,3 +1456,58 @@ def test_recover_maintenance_completed_releases_lock_and_cleans_staging(
     assert journal.phase is OperationPhase.COMPLETED
     assert not (op_dir / LINK_INDEX_STAGED_FILE_NAME).exists()
     assert read_lock(root) is None
+
+
+# ---------------------------------------------------------------------------
+# 性能基准 smoke（Task 12）：完整规模由显式 benchmark 命令运行，不进入默认门禁。
+# ---------------------------------------------------------------------------
+
+
+def test_benchmark_smoke(tmp_path: Path) -> None:
+    from benchmarks.link_index_maintenance import run_benchmark_scenario
+
+    first = run_benchmark_scenario(
+        "first_build", markdown_files=10, root=tmp_path / "first", seed=20260825
+    )
+    repeat = run_benchmark_scenario(
+        "first_build", markdown_files=10, root=tmp_path / "repeat", seed=20260825
+    )
+    fresh_query = run_benchmark_scenario(
+        "fresh_query_backlinks", markdown_files=10, root=tmp_path / "query", seed=20260825
+    )
+    notification = run_benchmark_scenario(
+        "notification_noop", markdown_files=10, root=tmp_path / "notification", seed=20260825
+    )
+    changed = run_benchmark_scenario(
+        "modify_one", markdown_files=10, root=tmp_path / "changed", seed=20260825
+    )
+
+    assert first.markdown_files == 10
+    assert first.read_files == 10
+    assert first.parsed_files == 10
+    assert first.read_bytes == repeat.read_bytes
+    assert first.index_file_bytes == repeat.index_file_bytes
+    assert fresh_query.read_files == fresh_query.markdown_files == 10
+    assert fresh_query.parsed_files == 0
+    assert notification.read_files == notification.markdown_files == 10
+    assert notification.parsed_files == 0
+    assert notification.journal_write_count == 0
+    assert changed.read_files == 10
+    assert changed.parsed_files == 1
+    assert changed.journal_write_count > 0
+    assert changed.journal_write_bytes > 0
+
+    payload = first.to_dict()
+    assert {
+        "scenario",
+        "files",
+        "width",
+        "read_files",
+        "read_bytes",
+        "parsed_files",
+        "wall_seconds",
+        "peak_index_bytes",
+        "index_file_bytes",
+        "journal_write_count",
+        "journal_write_bytes",
+    } <= payload.keys()
