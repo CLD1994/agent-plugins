@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from draft.conclusions import GenerationPlan, generate_conclusions
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.link_index import (
@@ -21,11 +24,91 @@ from draft.link_index_maintenance import (
     read_link_index_authority,
     scan_link_index,
 )
-from draft.models import LinkIndexResult, OperationKind, OperationPhase, RootState
+from draft.models import LinkIndexResult, OperationKind, OperationPhase, OperationResult, RootState
 from draft.operations import JOURNAL_VERSION, sha256_bytes
+from draft.page_create import create_page
+from draft.page_metadata import add_relation, remove_relation, set_status
 from draft.resources import ResourceIdentity, ResourceKind
-from draft.structure import move_entries
+from draft.structure import collapse_hub, move_entries, promote_page
+from draft.trash import restore_retained_trash, trash_page
+from draft.vocabulary import EditableRelationCode, StatusCode
 from tests.integration.support import DraftFactory
+
+_ENTRY_INDEX = """# Topic
+
+> 状态：`已关闭：纯导航页，不表达独立结论`
+
+## 子主题
+
+- [甲](pages/a.md)
+- [乙](pages/b.md)
+"""
+
+_ENTRY_A = """# 甲
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+
+甲。
+"""
+
+_ENTRY_CONFIRMED_A = _ENTRY_A.replace("待讨论", "已确认")
+
+_ENTRY_B = """# 乙
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+
+乙。
+"""
+
+
+def _entry_root(draft_factory: DraftFactory) -> Path:
+    return draft_factory(
+        {
+            "index.md": _ENTRY_INDEX,
+            "pages/a.md": _ENTRY_A,
+            "pages/b.md": _ENTRY_B,
+        }
+    )
+
+
+def _latest_journal(root: Path, kind: str) -> dict[str, object]:
+    candidates: list[dict[str, object]] = []
+    operations = root / ".draft" / "operations"
+    for path in operations.glob("*/journal.json"):
+        payload = cast("dict[str, object]", json.loads(path.read_text(encoding="utf-8")))
+        if payload.get("kind") == kind and payload.get("link_index_revision") is not None:
+            candidates.append(payload)
+    assert candidates, f"no indexed journal for {kind}"
+    return max(candidates, key=lambda item: int(cast("str", item["link_index_revision"])))
+
+
+def _assert_current_backlink(
+    root: Path,
+    journal: dict[str, object],
+    *,
+    target: str,
+    source: str,
+    terminal_phase: OperationPhase = OperationPhase.COMPLETED,
+    expected_revision: str = "1",
+) -> None:
+    assert journal["phase"] == terminal_phase.value
+    assert journal["link_index_result"] == LinkIndexResult.PUBLISHED.value
+    revision = cast("str", journal["link_index_revision"])
+    assert revision == expected_revision
+    artifact = root / ".draft" / "link-index.json"
+    raw = artifact.read_bytes()
+    assert sha256_bytes(raw) == journal["link_index_sha256"]
+    authority = read_link_index_authority(root)
+    assert authority.revision == revision
+    assert authority.result is LinkIndexResult.PUBLISHED
+    baseline = load_link_index_baseline(root)
+    assert baseline.index is not None
+    identity = ResourceIdentity(ResourceKind.PAGE, target)
+    assert any(edge.source_path == Path(source) for edge in baseline.index.backlinks[identity])
 
 
 def test_index_missing_and_corrupt_are_explicit(tmp_path: Path) -> None:
@@ -460,3 +543,314 @@ def test_second_mutation_converges_incrementally_to_next_revision(
     # 第一次的 journal 未被改写（每个 operation 只记录自己的结果）。
     for path, raw in journals_after_first.items():
         assert path.read_bytes() == raw
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "create",
+        "move",
+        "promote",
+        "collapse",
+        "status set",
+        "relation add",
+        "relation remove",
+        "generate-conclusions",
+        "trash",
+        "restore",
+    ],
+    ids=lambda value: value.replace(" ", "-"),
+)
+def test_every_mutation_entry_publishes_terminal_index_and_current_backlinks(
+    draft_factory: DraftFactory,
+    entry: str,
+) -> None:
+    """十类用户入口都经同一 operation 收敛边界发布当前反向表。"""
+    if entry == "create":
+        root = _entry_root(draft_factory)
+        result = create_page(root, Path("pages/c.md"), title="丙", status=StatusCode.PENDING)
+        journal = _latest_journal(root, OperationKind.CREATE.value)
+        _assert_current_backlink(root, journal, target="pages/c.md", source="index.md")
+        assert result.phase is OperationPhase.COMPLETED
+    elif entry == "move":
+        root = _entry_root(draft_factory)
+        result = move_entries(root, ["pages/a.md"], "pages/c.md")
+        journal = _latest_journal(root, OperationKind.MOVE.value)
+        _assert_current_backlink(root, journal, target="pages/c.md", source="index.md")
+        assert result.phase is OperationPhase.COMPLETED
+    elif entry == "promote":
+        root = draft_factory(
+            {
+                "index.md": _ENTRY_INDEX.replace(
+                    "- [乙](pages/b.md)", "- [乙](pages/b.md)\n- [丙](pages/c.md)"
+                ).replace("- [甲](pages/a.md)", "- [主题](pages/topic.md)"),
+                "pages/topic.md": _ENTRY_A,
+                "pages/b.md": _ENTRY_B,
+                "pages/c.md": _ENTRY_B.replace("乙", "丙"),
+            }
+        )
+        result = promote_page(
+            root, Path("pages/topic.md"), [Path("pages/b.md"), Path("pages/c.md")]
+        )
+        journal = _latest_journal(root, OperationKind.PROMOTE.value)
+        _assert_current_backlink(root, journal, target="pages/topic/index.md", source="index.md")
+        assert result.phase is OperationPhase.COMPLETED
+    elif entry == "collapse":
+        root = draft_factory(
+            {
+                "index.md": _ENTRY_INDEX.replace(
+                    "- [甲](pages/a.md)", "- [枢纽](pages/hub/index.md)"
+                ),
+                "pages/hub/index.md": (
+                    "# 枢纽\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n>\n"
+                    "> 父主题：[根索引](../../index.md)\n"
+                ),
+                "pages/b.md": _ENTRY_B,
+            }
+        )
+        result = collapse_hub(root, Path("pages/hub/index.md"))
+        journal = _latest_journal(root, OperationKind.COLLAPSE.value)
+        _assert_current_backlink(root, journal, target="pages/hub.md", source="index.md")
+        assert result.phase is OperationPhase.COMPLETED
+    elif entry == "status set":
+        root = _entry_root(draft_factory)
+        result = set_status(root, Path("pages/a.md"), StatusCode.CONFIRMED)
+        journal = _latest_journal(root, OperationKind.STATUS_SET.value)
+        _assert_current_backlink(root, journal, target="pages/a.md", source="index.md")
+        assert result.phase is OperationPhase.COMPLETED
+    elif entry == "relation add":
+        root = _entry_root(draft_factory)
+        result = add_relation(
+            root, Path("pages/a.md"), EditableRelationCode.DEPENDS_ON, Path("pages/b.md")
+        )
+        journal = _latest_journal(root, OperationKind.RELATION_ADD.value)
+        _assert_current_backlink(root, journal, target="pages/b.md", source="index.md")
+        assert result.phase is OperationPhase.COMPLETED
+    elif entry == "relation remove":
+        root = _entry_root(draft_factory)
+        add_relation(root, Path("pages/a.md"), EditableRelationCode.DEPENDS_ON, Path("pages/b.md"))
+        result = remove_relation(
+            root, Path("pages/a.md"), EditableRelationCode.DEPENDS_ON, Path("pages/b.md")
+        )
+        journal = _latest_journal(root, OperationKind.RELATION_REMOVE.value)
+        _assert_current_backlink(
+            root,
+            journal,
+            target="pages/b.md",
+            source="index.md",
+            expected_revision="2",
+        )
+        assert result.phase is OperationPhase.COMPLETED
+    elif entry == "generate-conclusions":
+        root = draft_factory(
+            {"index.md": _ENTRY_INDEX, "pages/a.md": _ENTRY_CONFIRMED_A, "pages/b.md": _ENTRY_B}
+        )
+        result = generate_conclusions(root)
+        journal = _latest_journal(root, OperationKind.GENERATE_CONCLUSIONS.value)
+        _assert_current_backlink(root, journal, target="conclusions.md", source="index.md")
+        assert result.operation is not None
+    elif entry == "trash":
+        root = _entry_root(draft_factory)
+        result = trash_page(root, Path("pages/b.md"), now=datetime(2026, 8, 1, tzinfo=UTC))
+        journal = _latest_journal(root, OperationKind.TRASH.value)
+        _assert_current_backlink(
+            root,
+            journal,
+            target="pages/a.md",
+            source="index.md",
+            terminal_phase=OperationPhase.TRASH_RETAINED,
+        )
+        assert result.phase is OperationPhase.TRASH_RETAINED
+    else:
+        root = _entry_root(draft_factory)
+        trashed = trash_page(root, Path("pages/b.md"), now=datetime(2026, 8, 1, tzinfo=UTC))
+        result = restore_retained_trash(
+            root, trashed.operation_id, now=datetime(2026, 8, 2, tzinfo=UTC)
+        )
+        journal = _latest_journal(root, OperationKind.RESTORE.value)
+        _assert_current_backlink(
+            root,
+            journal,
+            target="pages/b.md",
+            source="index.md",
+            expected_revision="2",
+        )
+        assert result.phase is OperationPhase.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["status set", "relation add", "relation remove", "generate-conclusions"],
+    ids=lambda value: value.replace(" ", "-"),
+)
+def test_idempotent_mutation_entries_do_not_advance_revision(
+    draft_factory: DraftFactory,
+    entry: str,
+) -> None:
+    """支持幂等语义的入口 no-op 不分配 operation 或链接索引 revision。"""
+    if entry == "status set":
+        root = _entry_root(draft_factory)
+        set_status(root, Path("pages/a.md"), StatusCode.PENDING)
+        before = read_link_index_authority(root)
+        result = set_status(root, Path("pages/a.md"), StatusCode.PENDING)
+    elif entry == "relation add":
+        root = _entry_root(draft_factory)
+        add_relation(
+            root, Path("pages/a.md"), EditableRelationCode.DEPENDS_ON, Path("pages/b.md")
+        )
+        before = read_link_index_authority(root)
+        result = add_relation(
+            root, Path("pages/a.md"), EditableRelationCode.DEPENDS_ON, Path("pages/b.md")
+        )
+    elif entry == "relation remove":
+        root = _entry_root(draft_factory)
+        before = read_link_index_authority(root)
+        result = remove_relation(
+            root, Path("pages/a.md"), EditableRelationCode.DEPENDS_ON, Path("pages/b.md")
+        )
+    else:
+        root = draft_factory(
+            {"index.md": _ENTRY_INDEX, "pages/a.md": _ENTRY_A, "pages/b.md": _ENTRY_B}
+        )
+        before = read_link_index_authority(root)
+        result = generate_conclusions(root)
+
+    if entry == "generate-conclusions":
+        assert cast(GenerationPlan, result).operation is None
+    else:
+        assert cast(OperationResult, result).changed_paths == ()
+    after = read_link_index_authority(root)
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "create",
+        "move",
+        "promote",
+        "collapse",
+        "status set",
+        "relation add",
+        "relation remove",
+        "generate-conclusions",
+        "trash",
+        "restore",
+    ],
+    ids=lambda value: value.replace(" ", "-"),
+)
+def test_every_mutation_entry_keeps_business_result_when_index_scan_degrades(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    """索引候选失败只形成 rebuild-required，不撤销已验证的业务 mutation。"""
+    import draft.link_index_maintenance as maintenance
+
+    def fail_scan(_root: Path, _baseline: object = None, *, known_documents: object = ()) -> object:
+        del known_documents
+        raise DraftError("operation.index_update_failed", _root)
+
+    if entry == "create":
+        root = _entry_root(draft_factory)
+        monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+        result = create_page(root, Path("pages/c.md"), title="丙", status=StatusCode.PENDING)
+        kind = OperationKind.CREATE.value
+        assert (root / "pages/c.md").is_file()
+    elif entry == "move":
+        root = _entry_root(draft_factory)
+        monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+        result = move_entries(root, ["pages/a.md"], "pages/c.md")
+        kind = OperationKind.MOVE.value
+        assert (root / "pages/c.md").is_file()
+    elif entry == "promote":
+        root = draft_factory(
+            {
+                "index.md": _ENTRY_INDEX.replace(
+                    "- [乙](pages/b.md)", "- [乙](pages/b.md)\n- [丙](pages/c.md)"
+                ).replace("- [甲](pages/a.md)", "- [主题](pages/topic.md)"),
+                "pages/topic.md": _ENTRY_A,
+                "pages/b.md": _ENTRY_B,
+                "pages/c.md": _ENTRY_B.replace("乙", "丙"),
+            }
+        )
+        monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+        result = promote_page(
+            root, Path("pages/topic.md"), [Path("pages/b.md"), Path("pages/c.md")]
+        )
+        kind = OperationKind.PROMOTE.value
+        assert (root / "pages/topic/index.md").is_file()
+    elif entry == "collapse":
+        root = draft_factory(
+            {
+                "index.md": _ENTRY_INDEX.replace(
+                    "- [甲](pages/a.md)", "- [枢纽](pages/hub/index.md)"
+                ),
+                "pages/hub/index.md": (
+                    "# 枢纽\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n>\n"
+                    "> 父主题：[根索引](../../index.md)\n"
+                ),
+                "pages/b.md": _ENTRY_B,
+            }
+        )
+        monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+        result = collapse_hub(root, Path("pages/hub/index.md"))
+        kind = OperationKind.COLLAPSE.value
+        assert (root / "pages/hub.md").is_file()
+    elif entry == "status set":
+        root = _entry_root(draft_factory)
+        monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+        result = set_status(root, Path("pages/a.md"), StatusCode.CONFIRMED)
+        kind = OperationKind.STATUS_SET.value
+        assert "已确认" in (root / "pages/a.md").read_text(encoding="utf-8")
+    elif entry == "relation add":
+        root = _entry_root(draft_factory)
+        monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+        result = add_relation(
+            root, Path("pages/a.md"), EditableRelationCode.DEPENDS_ON, Path("pages/b.md")
+        )
+        kind = OperationKind.RELATION_ADD.value
+        assert "依赖" in (root / "pages/a.md").read_text(encoding="utf-8")
+    elif entry == "relation remove":
+        root = _entry_root(draft_factory)
+        add_relation(
+            root, Path("pages/a.md"), EditableRelationCode.DEPENDS_ON, Path("pages/b.md")
+        )
+        monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+        result = remove_relation(
+            root, Path("pages/a.md"), EditableRelationCode.DEPENDS_ON, Path("pages/b.md")
+        )
+        kind = OperationKind.RELATION_REMOVE.value
+        assert "依赖" not in (root / "pages/a.md").read_text(encoding="utf-8")
+    elif entry == "generate-conclusions":
+        root = draft_factory(
+            {"index.md": _ENTRY_INDEX, "pages/a.md": _ENTRY_CONFIRMED_A, "pages/b.md": _ENTRY_B}
+        )
+        monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+        result = generate_conclusions(root)
+        kind = OperationKind.GENERATE_CONCLUSIONS.value
+        assert (root / "conclusions.md").is_file()
+    elif entry == "trash":
+        root = _entry_root(draft_factory)
+        monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+        result = trash_page(root, Path("pages/b.md"), now=datetime(2026, 8, 1, tzinfo=UTC))
+        kind = OperationKind.TRASH.value
+        assert not (root / "pages/b.md").exists()
+        assert (root / ".draft/trash/outgoing" / result.operation_id).is_dir()
+    else:
+        root = _entry_root(draft_factory)
+        trashed = trash_page(root, Path("pages/b.md"), now=datetime(2026, 8, 1, tzinfo=UTC))
+        monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+        result = restore_retained_trash(
+            root, trashed.operation_id, now=datetime(2026, 8, 2, tzinfo=UTC)
+        )
+        kind = OperationKind.RESTORE.value
+        assert (root / "pages/b.md").is_file()
+
+    journal = _latest_journal(root, kind)
+    assert journal["link_index_result"] == LinkIndexResult.REBUILD_REQUIRED.value
+    assert (root / ".draft/link-index-rebuild-required.flag").is_file()
+    assert cast("str", journal["phase"]) in {
+        OperationPhase.COMPLETED.value,
+        OperationPhase.TRASH_RETAINED.value,
+    }

@@ -196,6 +196,86 @@ def test_managed_roots_share_internal_namespace_rules(
 
 
 @pytest.mark.parametrize("root_state", tuple(RootState))
+def test_checker_rejects_legacy_link_index_invalid_entry(
+    draft_factory: DraftFactory,
+    root_state: RootState,
+) -> None:
+    """内部根只接受规格登记的索引目标与 flag，不接受旧 invalid 制品。"""
+    root = draft_factory(healthy(), root_state=root_state, precreate_internal=True)
+    invalid = root / ".draft" / "link-index.invalid"
+    invalid.write_text("stale\n", encoding="utf-8")
+
+    report = check_draft(root)
+
+    assert Path(".draft/link-index.invalid") in {
+        issue.path
+        for issue in report.errors
+        if issue.code == CheckCode.INTERNAL_UNEXPECTED_ENTRY.value
+    }
+
+
+def _link_index_updating_journal(root: Path) -> Path:
+    """Create a valid active journal shape for operation-directory namespace checks."""
+    operation_id = "c" * 32
+    journal_path = write_raw_journal(root, operation_id=operation_id)
+    payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    payload["phase"] = OperationPhase.LINK_INDEX_UPDATING.value
+    payload["link_index_revision"] = "1"
+    journal_path.write_text(json.dumps(payload), encoding="utf-8")
+    acquire_lock(root, operation_id)
+    return journal_path
+
+
+def test_checker_accepts_exact_link_index_staging_in_active_operation(
+    draft_factory: DraftFactory,
+) -> None:
+    """索引更新 phase 可保留其 operation 专属精确 staging 文件。"""
+    root = draft_factory(healthy(), precreate_internal=True)
+    journal_path = _link_index_updating_journal(root)
+    staging = journal_path.parent / "link-index.staged.json"
+    staging.write_text("{}", encoding="utf-8")
+
+    report = check_draft(root)
+
+    unexpected = {
+        issue.path
+        for issue in report.errors
+        if issue.code == CheckCode.INTERNAL_UNEXPECTED_ENTRY.value
+    }
+    assert staging.relative_to(root) not in unexpected
+
+
+@pytest.mark.parametrize("shape", ["directory", "symlink"])
+def test_checker_rejects_non_file_link_index_staging(
+    draft_factory: DraftFactory,
+    shape: str,
+) -> None:
+    """staging 名称合法不等于节点类型合法；symlink 必须保留路径错误分类。"""
+    import shutil
+
+    root = draft_factory(healthy(), precreate_internal=True)
+    journal_path = _link_index_updating_journal(root)
+    staging = journal_path.parent / "link-index.staged.json"
+    if shape == "directory":
+        staging.mkdir()
+    else:
+        staging.symlink_to("journal.json")
+
+    report = check_draft(root)
+
+    expected_code = (
+        CheckCode.PATH_SYMLINK_ESCAPE.value
+        if shape == "symlink"
+        else CheckCode.INTERNAL_UNEXPECTED_ENTRY.value
+    )
+    assert staging.relative_to(root) in {
+        issue.path for issue in report.errors if issue.code == expected_code
+    }
+    if shape == "directory":
+        shutil.rmtree(staging)
+
+
+@pytest.mark.parametrize("root_state", tuple(RootState))
 def test_non_directory_entry_in_operations_is_reported(
     draft_factory: DraftFactory,
     root_state: RootState,
