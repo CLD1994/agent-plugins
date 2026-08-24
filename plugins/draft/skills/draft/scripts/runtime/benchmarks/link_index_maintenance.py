@@ -108,7 +108,9 @@ class BenchmarkResult:
 
 @dataclass
 class _Observation:
-    scan_stats: list[LinkIndexScanStats] = field(default_factory=list)
+    scan_stats: list[LinkIndexScanStats] = field(
+        default_factory=list[LinkIndexScanStats]
+    )
     journal_write_count: int = 0
     journal_write_bytes: int = 0
 
@@ -167,7 +169,7 @@ def _lstat(path: Path) -> os.stat_result:
         raise BenchmarkFilesystemError(f"lstat failed at {path}: {exc}") from exc
 
 
-def _count_markdown_files(root: Path) -> int:
+def count_markdown_files(root: Path) -> int:
     count = 0
     for current, dirnames, filenames in os.walk(root, onerror=_walk_error):
         current_path = Path(current)
@@ -266,7 +268,7 @@ def _measure(root: Path, requested_files: int, action: Callable[[], object]) -> 
         operations_module.write_journal = original_operations_write
 
     stats = _aggregate_stats(observation)
-    markdown_files = _count_markdown_files(root)
+    markdown_files = count_markdown_files(root)
     if stats.read_files != markdown_files:
         raise RuntimeError(
             f"strict scan coverage mismatch: read {stats.read_files}, files {markdown_files}"
@@ -302,11 +304,12 @@ def _query_backlinks(root: Path) -> None:
     if exit_code != 0:
         raise RuntimeError(f"query backlinks exited with {exit_code}: {output.getvalue()}")
     try:
-        payload = json.loads(output.getvalue())
+        payload_value: object = json.loads(output.getvalue())
     except json.JSONDecodeError as exc:
         raise RuntimeError("query backlinks did not produce JSON") from exc
-    if not isinstance(payload, dict):
+    if not isinstance(payload_value, dict):
         raise RuntimeError("query backlinks result is not an object")
+    payload = cast("dict[str, object]", payload_value)
     if payload.get("result_type") != "query.backlinks":
         raise RuntimeError("query backlinks returned the wrong result type")
     items = payload.get("items")

@@ -11,6 +11,7 @@ import errno
 import json
 import os
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -1568,8 +1569,11 @@ def test_benchmark_smoke_suite_and_unknown_scenario(tmp_path: Path) -> None:
     assert by_scenario[Scenario.DELETE_MARKDOWN].markdown_files == 9
     assert by_scenario[Scenario.RENAME_MARKDOWN].parsed_files == 1
 
-    payload = json.loads(output.read_text(encoding="utf-8"))
-    assert isinstance(payload, list)
+    payload_value: object = json.loads(output.read_text(encoding="utf-8"))
+    assert isinstance(payload_value, list)
+    payload_items = cast("list[object]", payload_value)
+    assert all(isinstance(item, dict) for item in payload_items)
+    payload = cast("list[dict[str, object]]", payload_value)
     assert len(payload) == 13
     expected_fields = {
         "scenario",
@@ -1611,7 +1615,7 @@ def test_benchmark_lstat_failure_keeps_path_and_stops_counting(tmp_path: Path) -
     monkeypatch.setattr(benchmark.os, "lstat", fail_lstat)
     try:
         with pytest.raises(benchmark.BenchmarkFilesystemError, match="doc-00001.md"):
-            benchmark._count_markdown_files(root)
+            benchmark.count_markdown_files(root)
     finally:
         monkeypatch.undo()
 
@@ -1636,4 +1640,4 @@ def test_benchmark_walk_failure_keeps_path(
 
     monkeypatch.setattr(benchmark.os, "walk", fail_walk)
     with pytest.raises(benchmark.BenchmarkFilesystemError, match="benchmark-unreadable"):
-        benchmark._count_markdown_files(tmp_path)
+        benchmark.count_markdown_files(tmp_path)
