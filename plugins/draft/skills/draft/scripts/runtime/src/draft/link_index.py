@@ -20,6 +20,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from draft.diagnostic_codes import OPERATION_INDEX_UPDATE_FAILED
 from draft.errors import DraftError
 from draft.markdown import extract_body_links
 from draft.operations import sha256_bytes, validate_link_index_revision
@@ -754,7 +755,7 @@ def write_index_atomic(root: Path, index: LegacyLinkIndex) -> None:
     except OSError as exc:
         with contextlib.suppress(OSError):
             os.unlink(temp_name)
-        raise DraftError("operation.index_update_failed", target) from exc
+        raise DraftError(OPERATION_INDEX_UPDATE_FAILED, target) from exc
 
 
 def invalidate_index(root: Path, *, reason: str = "invalid") -> None:
@@ -763,7 +764,7 @@ def invalidate_index(root: Path, *, reason: str = "invalid") -> None:
     try:
         marker.write_text(reason + "\n", encoding="utf-8")
     except OSError as exc:
-        raise DraftError("operation.index_update_failed", marker) from exc
+        raise DraftError(OPERATION_INDEX_UPDATE_FAILED, marker) from exc
 
 
 def build_index(root: Path, *, generation: int = 0) -> LegacyLinkIndex:
@@ -797,7 +798,7 @@ def build_index(root: Path, *, generation: int = 0) -> LegacyLinkIndex:
                 raw = path.read_bytes()
                 stat_result = path.stat()
             except OSError as exc:
-                raise DraftError("operation.index_update_failed", relative) from exc
+                raise DraftError(OPERATION_INDEX_UPDATE_FAILED, relative) from exc
             outbound: list[OutboundEdge] = []
             parse_status = "parsed"
             try:
@@ -870,7 +871,7 @@ def _index_file(root: Path, relative: Path, raw: bytes) -> LegacyIndexedFile:
     try:
         stat_result = (root / relative).stat()
     except OSError as exc:
-        raise DraftError("operation.index_update_failed", relative) from exc
+        raise DraftError(OPERATION_INDEX_UPDATE_FAILED, relative) from exc
     outbound: list[OutboundEdge] = []
     parse_status = "parsed"
     try:
@@ -921,7 +922,7 @@ def _directory_snapshot(root: Path) -> dict[Path, tuple[DirectoryMember, ...]]:
                 members.append(DirectoryMember(name, kind))
             directories[relative] = tuple(members)
     except OSError as exc:
-        raise DraftError("operation.index_update_failed", root) from exc
+        raise DraftError(OPERATION_INDEX_UPDATE_FAILED, root) from exc
     return directories
 
 

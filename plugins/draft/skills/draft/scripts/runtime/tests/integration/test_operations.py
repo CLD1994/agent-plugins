@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from draft.models import (
 from draft.observations import EMPTY_OBSERVATIONS, graph_observations
 from draft.operations import (
     JOURNAL_VERSION,
+    acquire_lock,
     execute_plan,
     operation_journal_path,
     preallocate_journal,
@@ -166,7 +168,13 @@ def crash_after_nth_apply(ops_module: Any, nth: int) -> object:
     return crash
 
 
-def write_journal(root: Path, operation_id: str, phase: str) -> Path:
+def write_journal(
+    root: Path,
+    operation_id: str,
+    phase: str,
+    *,
+    remove_empty_directories: Sequence[str] = (),
+) -> Path:
     journal_dir = root / ".draft/operations" / operation_id
     journal_dir.mkdir(parents=True, exist_ok=True)
     journal: dict[str, object] = {
@@ -177,7 +185,7 @@ def write_journal(root: Path, operation_id: str, phase: str) -> Path:
         "root_state": "registered",
         "observations": [],
         "mutations": [],
-        "remove_empty_directories": [],
+        "remove_empty_directories": list(remove_empty_directories),
         "metadata": {},
     }
     (journal_dir / "journal.json").write_text(json.dumps(journal), encoding="utf-8")
@@ -1028,6 +1036,81 @@ def test_mutation_without_link_index_facts_skips_index_phase(
     assert journal.link_index_result is None
     assert journal.link_index_revision is None
     assert not (root / ".draft/link-index.json").exists()
+
+
+def test_recover_after_published_terminal_does_not_delete_retained_directory(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """携带索引结果的终态：恢复不得再执行计划内空目录清理（spec §6）。
+
+    复合场景（每步单独合法）：普通 I/O 失败保留目录 → 索引按实际状态发布 →
+    completed 写完后崩溃于 release_lock 前 → 公开 recover 进入终态恢复。目录此时
+    已是已发布索引的事实，再删除即产生索引发布后的未记录目录成员变化。
+    """
+    root = operation_draft
+    (root / "pages/old").mkdir()
+    plan, _old_a, _old_b, _new_a, _new_b = two_write_plan(root)
+    plan = dataclasses.replace(plan, remove_empty_directories=(Path("pages/old"),))
+    target = root / "pages/old"
+    original_rmdir = Path.rmdir
+
+    def fail_target_rmdir(self: Path) -> None:
+        if self == target:
+            raise PermissionError(13, "injected io failure", str(self))
+        original_rmdir(self)
+
+    monkeypatch.setattr(Path, "rmdir", fail_target_rmdir)
+    result = execute_plan(plan)
+    monkeypatch.undo()
+
+    # 普通 I/O 失败保留目录；索引按实际状态发布并携带该目录事实。
+    assert result.phase is OperationPhase.COMPLETED
+    assert target.exists()
+    journal = read_journal(operation_journal_path(root, result.operation_id))
+    assert journal.link_index_result is LinkIndexResult.PUBLISHED
+    artifact_before = sha256_bytes((root / ".draft/link-index.json").read_bytes())
+
+    # 崩溃窗口：终态日志已耐久但锁未释放，公开 recover 走终态恢复。
+    acquire_lock(root, result.operation_id)
+    recover(root)
+
+    # 恢复不删已进入索引事实的目录；索引制品不变且对严格扫描仍然 fresh。
+    assert target.exists()
+    assert sha256_bytes((root / ".draft/link-index.json").read_bytes()) == artifact_before
+    from draft.link_index_maintenance import load_link_index_baseline, scan_link_index
+
+    baseline = load_link_index_baseline(root)
+    assert baseline.index is not None
+    assert scan_link_index(root, baseline).changed is False
+    assert read_lock(root) is None
+
+
+def test_recover_without_link_index_result_still_cleans_planned_directories(
+    operation_draft: Path,
+) -> None:
+    """无索引字段的终态保持既有恢复行为：恢复时清理残留计划内空目录。
+
+    该状态无法经 execute_plan 构造（只要 remove_empty_directories 非空，
+    operation_changes_link_index 必为 True，会进入索引阶段）；用遗留样式手写
+    journal（不写 link_index 字段，解析为 None）直接驱动 `_recover_terminal`。
+    """
+    root = operation_draft
+    (root / "pages/old").mkdir()
+    op_id = "9" * 32
+    write_journal(
+        root,
+        op_id,
+        "completed",
+        remove_empty_directories=("pages/old",),
+    )
+    target = root / "pages/old"
+
+    acquire_lock(root, op_id)
+    recover(root)
+
+    # 无链接索引结果：恢复侧既有清理行为不变。
+    assert not target.exists()
+    assert read_lock(root) is None
 
 
 def test_mutation_path_escape_rejected_before_allocation(operation_draft: Path) -> None:

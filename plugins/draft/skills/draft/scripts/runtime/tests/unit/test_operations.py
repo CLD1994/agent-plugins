@@ -973,6 +973,25 @@ def test_adopt_marker_only_does_not_require_link_index() -> None:
     assert operation_changes_link_index(journal) is False
 
 
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (Path("pages/a.md"), True),
+        (Path(".draft/draft.json"), False),
+        # `.draft/` 内部 .md 路径不进索引阶段：必须先跳过内部命名空间再看后缀，
+        # 检查顺序换序会让该用例误判为需要索引。
+        (Path(".draft/trash/o/payload/pages/a.md"), False),
+    ],
+)
+def test_internal_markdown_never_requires_link_index(path: Path, expected: bool) -> None:
+    journal = dataclasses.replace(
+        _journal(),
+        mutations=(_link_write_mutation(path),),
+        remove_empty_directories=(),
+    )
+    assert operation_changes_link_index(journal) is expected
+
+
 def test_no_mutation_or_directory_change_does_not_require_link_index() -> None:
     journal = dataclasses.replace(_journal(), mutations=(), remove_empty_directories=())
     assert operation_changes_link_index(journal) is False

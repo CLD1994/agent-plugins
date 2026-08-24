@@ -6,7 +6,11 @@ from dataclasses import replace
 from pathlib import Path
 from urllib.parse import quote
 
-from draft.diagnostic_codes import CheckCode
+from draft.diagnostic_codes import (
+    OPERATION_EXTERNAL_CHANGE,
+    OPERATION_INDEX_UPDATE_FAILED,
+    CheckCode,
+)
 from draft.errors import DraftError
 from draft.graph import (
     CONCLUSIONS_PAGE,
@@ -715,11 +719,12 @@ def _indexed_closure_for_plan(root: Path, closure: MoveClosure) -> MoveClosure:
         return closure
     internal = root / INTERNAL_DIR
     try:
+        # 与 scan_move_closure._record_directory 同一分类顺序（is_dir 起、跟随符号链接）。
         kind = (
             "directory"
-            if internal.is_dir() and not internal.is_symlink()
+            if internal.is_dir()
             else "file"
-            if internal.is_file() and not internal.is_symlink()
+            if internal.is_file()
             else "symlink"
             if internal.is_symlink()
             else "other"
@@ -756,7 +761,7 @@ def plan_move_from_arguments(
         try:
             scan = scan_link_index(root, baseline)
         except DraftError as exc:
-            if exc.code in ("operation.index_update_failed", "operation.external_change"):
+            if exc.code in (OPERATION_INDEX_UPDATE_FAILED, OPERATION_EXTERNAL_CHANGE):
                 # 扫描失败或根不稳定：无法证明 fresh，回退到严格全根扫描。
                 closure = scan_move_closure(root, facts.graph)
             else:

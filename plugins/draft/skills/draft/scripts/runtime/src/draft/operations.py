@@ -18,7 +18,12 @@ from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, cast
 if TYPE_CHECKING:
     from draft.link_index_maintenance import PreparedLinkIndexUpdate
 
-from draft.diagnostic_codes import CheckCode
+from draft.diagnostic_codes import (
+    LINK_INDEX_REBUILD_REQUIRED,
+    OPERATION_EXTERNAL_CHANGE,
+    OPERATION_INDEX_UPDATE_FAILED,
+    CheckCode,
+)
 from draft.errors import DraftError
 from draft.graph import INTERNAL_DIR, MARKER_PATH
 from draft.models import (
@@ -50,11 +55,6 @@ class _MutationLike(Protocol):
 JOURNAL_VERSION = 4
 LOCK_RELATIVE = Path(INTERNAL_DIR) / "operation.lock"
 OPERATIONS_RELATIVE = Path(INTERNAL_DIR) / "operations"
-
-# 通用业务 operation 索引阶段使用的稳定领域码（spec §10/§11）。
-_INDEX_UPDATE_FAILED = "operation.index_update_failed"
-_EXTERNAL_CHANGE = "operation.external_change"
-_REBUILD_REQUIRED_WARNING = "link_index.rebuild_required"
 
 # 第一版固定的生命周期时间常量：恢复窗口 7 天、清理期限再延 30 天、
 # 普通投递失败后节流 24 小时。这些是绝对事实，不随默认值变化追溯改变已有删除包。
@@ -2777,7 +2777,7 @@ def settle_link_index_for_operation(root: Path, journal: Journal) -> _OperationI
     try:
         return _finish_operation_published(root, updating, prepared, next_revision)
     except DraftError as exc:
-        if exc.code in (_INDEX_UPDATE_FAILED, _EXTERNAL_CHANGE):
+        if exc.code in (OPERATION_INDEX_UPDATE_FAILED, OPERATION_EXTERNAL_CHANGE):
             # 发布失败但可耐久记录：降级到 rebuild_required（spec §10/§11）。
             return _finish_operation_rebuild_required(root, updating, next_revision)
         raise
@@ -2833,7 +2833,7 @@ def _finish_operation_rebuild_required(
         sha256=None,
     )
     write_journal(rebuild)
-    warnings: list[ResultWarning] = [ResultWarning(_REBUILD_REQUIRED_WARNING)]
+    warnings: list[ResultWarning] = [ResultWarning(LINK_INDEX_REBUILD_REQUIRED)]
     flag_warning = maintenance.ensure_rebuild_flag(root)
     if flag_warning is not None:
         warnings.append(flag_warning)
@@ -3301,9 +3301,12 @@ def _recover_terminal(
             raise DraftError("operation.external_change", root / mutation.path)
     if not retain_terminal_lock:
         _clean_recovery_copies(journal)
-        for relative in journal.remove_empty_directories:
-            with suppress(OSError):
-                (root / relative).rmdir()
+        if journal.link_index_revision is None:
+            # 携带索引结果的 completed 终态：计划内目录已在发布前收敛（spec §6），
+            # 残留即已发布索引事实，不得再删；无索引字段的终态保持旧清理行为。
+            for relative in journal.remove_empty_directories:
+                with suppress(OSError):
+                    (root / relative).rmdir()
         release_lock(root, operation_id)
     return OperationResult(
         operation_id=operation_id,

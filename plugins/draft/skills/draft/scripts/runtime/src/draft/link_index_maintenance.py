@@ -18,7 +18,13 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from draft.diagnostic_codes import CheckCode
+from draft.diagnostic_codes import (
+    LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED,
+    LINK_INDEX_REBUILD_REQUIRED,
+    OPERATION_EXTERNAL_CHANGE,
+    OPERATION_INDEX_UPDATE_FAILED,
+    CheckCode,
+)
 from draft.errors import DraftError
 from draft.link_index import (
     INDEX_RELATIVE_PATH,
@@ -59,18 +65,15 @@ from draft.operations import (
     write_journal,
 )
 
-_INDEX_UPDATE_FAILED = "operation.index_update_failed"
-_SCAN_READ_FAILED = _INDEX_UPDATE_FAILED
-_EXTERNAL_CHANGE = "operation.external_change"
-_SCAN_UNSTABLE = _EXTERNAL_CHANGE
+# 扫描失败语义别名：值引用 diagnostic_codes 的稳定协议码单一权威。
+_SCAN_READ_FAILED = OPERATION_INDEX_UPDATE_FAILED
+_SCAN_UNSTABLE = OPERATION_EXTERNAL_CHANGE
 _INCONSISTENT = CheckCode.OPERATION_INCONSISTENT_STATE.value
 
 # 候选制品精确文件名（operation 目录内，spec §2）：operation ID 唯一推导。
 LINK_INDEX_STAGED_FILE_NAME = "link-index.staged.json"
 # rebuild-required 纯存在性 flag 精确相对路径（spec §2/§10）。
 REBUILD_FLAG_RELATIVE_PATH = Path(".draft") / "link-index-rebuild-required.flag"
-# flag 普通 I/O 失败的稳定 warning code（spec §11）。
-_REBUILD_FLAG_UPDATE_FAILED = "link_index.rebuild_flag_update_failed"
 
 
 @dataclass(frozen=True)
@@ -415,7 +418,7 @@ def _ensure_dot_draft(root: Path) -> None:
     parent_fd = ensure_directory_chain(
         root,
         INDEX_RELATIVE_PATH.parent,
-        code=_INDEX_UPDATE_FAILED,
+        code=OPERATION_INDEX_UPDATE_FAILED,
         code_path=root / INDEX_RELATIVE_PATH.parent,
     )
     os.close(parent_fd)
@@ -433,7 +436,7 @@ def _read_artifact_bytes(path: Path) -> bytes:
     except OSError as exc:
         if exc.errno in (errno.ENOENT, errno.ELOOP):
             raise DraftError(_INCONSISTENT, path) from exc
-        raise DraftError(_INDEX_UPDATE_FAILED, path) from exc
+        raise DraftError(OPERATION_INDEX_UPDATE_FAILED, path) from exc
     try:
         chunks: list[bytes] = []
         while True:
@@ -442,7 +445,7 @@ def _read_artifact_bytes(path: Path) -> bytes:
                 return b"".join(chunks)
             chunks.append(chunk)
     except OSError as exc:
-        raise DraftError(_INDEX_UPDATE_FAILED, path) from exc
+        raise DraftError(OPERATION_INDEX_UPDATE_FAILED, path) from exc
     finally:
         os.close(descriptor)
 
@@ -492,9 +495,9 @@ def stage_link_index(journal: Journal, index: LinkIndex) -> str:
     try:
         durable_write(journal.directory, Path(LINK_INDEX_STAGED_FILE_NAME), raw)
     except DraftError as exc:
-        if exc.code == _EXTERNAL_CHANGE:
+        if exc.code == OPERATION_EXTERNAL_CHANGE:
             raise
-        error = DraftError(_INDEX_UPDATE_FAILED, staging)
+        error = DraftError(OPERATION_INDEX_UPDATE_FAILED, staging)
         error.__cause__ = exc
         raise error from exc
     return digest
@@ -559,7 +562,7 @@ def publish_staged_link_index(root: Path, journal: Journal, expected_sha256: str
     try:
         os.replace(staging, target)
     except OSError as exc:
-        raise DraftError(_INDEX_UPDATE_FAILED, target) from exc
+        raise DraftError(OPERATION_INDEX_UPDATE_FAILED, target) from exc
 
     # 发布后复核：目标必须是我们的精确 staging 内容，不覆盖未知节点。
     if (
@@ -572,7 +575,7 @@ def publish_staged_link_index(root: Path, journal: Journal, expected_sha256: str
         fsync_directory(target.parent)
         fsync_directory(journal.directory)
     except DraftError as exc:
-        error = DraftError(_INDEX_UPDATE_FAILED, target)
+        error = DraftError(OPERATION_INDEX_UPDATE_FAILED, target)
         error.__cause__ = exc
         raise error from exc
 
@@ -601,7 +604,7 @@ def ensure_rebuild_flag(root: Path) -> ResultWarning | None:
             code_path=flag.parent,
         )
     except DraftError:
-        return ResultWarning(_REBUILD_FLAG_UPDATE_FAILED)
+        return ResultWarning(LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED)
     try:
         try:
             descriptor = os.open(
@@ -621,9 +624,9 @@ def ensure_rebuild_flag(root: Path) -> ResultWarning | None:
     except DraftError as exc:
         if exc.code == _INCONSISTENT:
             raise
-        return ResultWarning(_REBUILD_FLAG_UPDATE_FAILED)
+        return ResultWarning(LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED)
     except OSError:
-        return ResultWarning(_REBUILD_FLAG_UPDATE_FAILED)
+        return ResultWarning(LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED)
     finally:
         os.close(parent_fd)
     return None
@@ -655,7 +658,7 @@ def remove_rebuild_flag(root: Path) -> ResultWarning | None:
             code_path=flag.parent,
         )
     except DraftError:
-        return ResultWarning(_REBUILD_FLAG_UPDATE_FAILED)
+        return ResultWarning(LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED)
     try:
         # 删除前 inode 复核：叶仍是刚分类的同一普通文件（no-follow dir_fd）。
         identity = _regular_flag_identity(parent_fd, REBUILD_FLAG_RELATIVE_PATH.name, flag)
@@ -670,9 +673,9 @@ def remove_rebuild_flag(root: Path) -> ResultWarning | None:
     except DraftError as exc:
         if exc.code == _INCONSISTENT:
             raise
-        return ResultWarning(_REBUILD_FLAG_UPDATE_FAILED)
+        return ResultWarning(LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED)
     except OSError:
-        return ResultWarning(_REBUILD_FLAG_UPDATE_FAILED)
+        return ResultWarning(LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED)
     finally:
         os.close(parent_fd)
     return None
@@ -700,8 +703,6 @@ def cleanup_link_index_staging(journal: Journal) -> None:
 # ---------------------------------------------------------------------------
 # 独立 link-index.update maintenance operation（spec §5/§14/§15，Task 5）
 # ---------------------------------------------------------------------------
-
-_REBUILD_REQUIRED_WARNING = "link_index.rebuild_required"
 
 
 @dataclass(frozen=True)
@@ -822,7 +823,7 @@ def commit_link_index_update(
         try:
             return _finish_published(root, updating, prepared, next_revision, operation_id)
         except DraftError as exc:
-            if exc.code in (_INDEX_UPDATE_FAILED, _EXTERNAL_CHANGE):
+            if exc.code in (OPERATION_INDEX_UPDATE_FAILED, OPERATION_EXTERNAL_CHANGE):
                 # 发布失败但可耐久记录：降级到 rebuild_required（spec §10/§14）。
                 return _finish_rebuild_required(root, updating, next_revision, operation_id)
             raise
@@ -860,7 +861,7 @@ def _finish_rebuild_required(
         sha256=None,
     )
     write_journal(rebuild)
-    warnings: list[ResultWarning] = [ResultWarning(_REBUILD_REQUIRED_WARNING)]
+    warnings: list[ResultWarning] = [ResultWarning(LINK_INDEX_REBUILD_REQUIRED)]
     flag_warning = ensure_rebuild_flag(root)
     if flag_warning is not None:
         warnings.append(flag_warning)
