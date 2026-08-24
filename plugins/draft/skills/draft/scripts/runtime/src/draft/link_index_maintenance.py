@@ -18,6 +18,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+import draft.operations as operation_io
 from draft.diagnostic_codes import (
     LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED,
     LINK_INDEX_REBUILD_REQUIRED,
@@ -494,7 +495,14 @@ def stage_link_index(journal: Journal, index: LinkIndex) -> str:
     if node is not EntryKind.MISSING:
         raise DraftError(_INCONSISTENT, staging)
     try:
-        durable_write(journal.directory, Path(LINK_INDEX_STAGED_FILE_NAME), raw)
+        durable_write(
+            journal.directory,
+            Path(LINK_INDEX_STAGED_FILE_NAME),
+            raw,
+            write_step=operation_io.DurabilityStep.STAGING_WRITE,
+            file_fsync_step=operation_io.DurabilityStep.STAGING_FSYNC,
+            directory_fsync_step=operation_io.DurabilityStep.STAGING_DIRECTORY_FSYNC,
+        )
     except DraftError as exc:
         if exc.code == OPERATION_EXTERNAL_CHANGE:
             raise
@@ -561,6 +569,7 @@ def publish_staged_link_index(root: Path, journal: Journal, expected_sha256: str
 
     _ensure_dot_draft(root)
     try:
+        operation_io.durability_checkpoint(operation_io.DurabilityStep.INDEX_REPLACE)
         os.replace(staging, target)
     except OSError as exc:
         raise DraftError(OPERATION_INDEX_UPDATE_FAILED, target) from exc
@@ -573,12 +582,16 @@ def publish_staged_link_index(root: Path, journal: Journal, expected_sha256: str
         raise DraftError(_INCONSISTENT, target)
 
     try:
+        operation_io.durability_checkpoint(operation_io.DurabilityStep.INDEX_DIRECTORY_FSYNC)
         fsync_directory(target.parent)
+        operation_io.durability_checkpoint(operation_io.DurabilityStep.INDEX_DIRECTORY_FSYNC)
         fsync_directory(journal.directory)
     except DraftError as exc:
         error = DraftError(OPERATION_INDEX_UPDATE_FAILED, target)
         error.__cause__ = exc
         raise error from exc
+    except OSError as exc:
+        raise DraftError(OPERATION_INDEX_UPDATE_FAILED, target) from exc
 
 
 def ensure_rebuild_flag(root: Path) -> ResultWarning | None:
@@ -608,6 +621,7 @@ def ensure_rebuild_flag(root: Path) -> ResultWarning | None:
         return ResultWarning(LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED)
     try:
         try:
+            operation_io.durability_checkpoint(operation_io.DurabilityStep.FLAG_CREATE)
             descriptor = os.open(
                 REBUILD_FLAG_RELATIVE_PATH.name,
                 os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
@@ -621,6 +635,7 @@ def ensure_rebuild_flag(root: Path) -> ResultWarning | None:
                 return None
             raise DraftError(_INCONSISTENT, flag) from None
         os.close(descriptor)
+        operation_io.durability_checkpoint(operation_io.DurabilityStep.FLAG_DIRECTORY_FSYNC)
         fsync_directory(flag.parent)
     except DraftError as exc:
         if exc.code == _INCONSISTENT:
@@ -667,7 +682,9 @@ def remove_rebuild_flag(root: Path) -> ResultWarning | None:
             return None
         if _regular_flag_identity(parent_fd, REBUILD_FLAG_RELATIVE_PATH.name, flag) != identity:
             raise DraftError(_INCONSISTENT, flag)
+        operation_io.durability_checkpoint(operation_io.DurabilityStep.FLAG_DELETE)
         os.unlink(REBUILD_FLAG_RELATIVE_PATH.name, dir_fd=parent_fd)
+        operation_io.durability_checkpoint(operation_io.DurabilityStep.FLAG_DIRECTORY_FSYNC)
         fsync_directory(flag.parent)
     except FileNotFoundError:
         return None
@@ -682,7 +699,11 @@ def remove_rebuild_flag(root: Path) -> ResultWarning | None:
     return None
 
 
-def _unlink_protocol_file(path: Path) -> None:
+def _unlink_protocol_file(
+    path: Path,
+    *,
+    durability_step: operation_io.DurabilityStep | None = None,
+) -> None:
     """删除 operation 目录内的协议命名普通文件；缺失幂等，异常节点报不一致。
 
     ``link-index.staged.json`` 及其 ``.pending`` 都位于 operation 专属目录（mkdir
@@ -696,6 +717,8 @@ def _unlink_protocol_file(path: Path) -> None:
         raise DraftError(_INCONSISTENT, path)
     try:
         path.unlink()
+        if durability_step is not None:
+            operation_io.durability_checkpoint(durability_step)
         fsync_directory(path.parent)
     except OSError as exc:
         raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, path) from exc
@@ -708,8 +731,14 @@ def cleanup_link_index_staging(journal: Journal) -> None:
     收敛。符号链接、目录或其他异常节点是内部状态错误，保留现场不按文件名删除未知
     节点。
     """
-    _unlink_protocol_file(journal.directory / LINK_INDEX_STAGED_FILE_NAME)
-    _unlink_protocol_file(journal.directory / Path(_pending_name(LINK_INDEX_STAGED_FILE_NAME)))
+    _unlink_protocol_file(
+        journal.directory / LINK_INDEX_STAGED_FILE_NAME,
+        durability_step=operation_io.DurabilityStep.STAGING_DIRECTORY_FSYNC,
+    )
+    _unlink_protocol_file(
+        journal.directory / Path(_pending_name(LINK_INDEX_STAGED_FILE_NAME)),
+        durability_step=operation_io.DurabilityStep.STAGING_DIRECTORY_FSYNC,
+    )
 
 
 def verify_published_link_index(root: Path, journal: Journal) -> None:

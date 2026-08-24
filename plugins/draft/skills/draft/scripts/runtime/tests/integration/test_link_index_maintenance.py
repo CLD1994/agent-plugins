@@ -10,8 +10,9 @@ import dataclasses
 import errno
 import json
 import os
+from multiprocessing import get_context
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -45,7 +46,15 @@ from draft.models import (
     RootState,
 )
 from draft.observations import EMPTY_OBSERVATIONS
-from draft.operations import JOURNAL_VERSION, Journal, read_lock, sha256_bytes
+from draft.operations import (
+    JOURNAL_VERSION,
+    DurabilityStep,
+    Journal,
+    durability_checkpoint,
+    durability_scope,
+    read_lock,
+    sha256_bytes,
+)
 
 _STAGED_NAME = LINK_INDEX_STAGED_FILE_NAME
 
@@ -159,6 +168,31 @@ def _fail_fsync_at(monkeypatch: pytest.MonkeyPatch, fail_at: frozenset[int]) -> 
     monkeypatch.setattr(os, "fsync", flaky_fsync)
 
 
+def test_durability_steps_are_the_complete_protocol_boundary() -> None:
+    assert tuple(step.value for step in DurabilityStep) == (
+        "staging_write",
+        "staging_fsync",
+        "staging_directory_fsync",
+        "index_replace",
+        "index_directory_fsync",
+        "journal_write",
+        "journal_directory_fsync",
+        "flag_create",
+        "flag_delete",
+        "flag_directory_fsync",
+    )
+
+
+def test_durability_scope_isolated_between_calls() -> None:
+    with durability_scope({DurabilityStep.STAGING_WRITE: 1}), pytest.raises(OSError):
+        durability_checkpoint(DurabilityStep.STAGING_WRITE)
+
+    # 作用域退出后默认真实 I/O 边界不注入；下一次作用域从 occurrence 1 重新计数。
+    durability_checkpoint(DurabilityStep.STAGING_WRITE)
+    with durability_scope({DurabilityStep.STAGING_WRITE: 1}), pytest.raises(OSError):
+        durability_checkpoint(DurabilityStep.STAGING_WRITE)
+
+
 # ---------------------------------------------------------------------------
 # staging（spec §10）
 # ---------------------------------------------------------------------------
@@ -217,6 +251,27 @@ def test_stage_link_index_rejects_symlink_staging(tmp_path: Path) -> None:
     with pytest.raises(DraftError) as caught:
         stage_link_index(journal, _index("1"))
     assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+
+
+@pytest.mark.parametrize("kind", ["directory", "other"])
+def test_stage_link_index_rejects_non_file_staging_nodes(
+    tmp_path: Path, kind: str
+) -> None:
+    root = _init_root(tmp_path)
+    directory = root / ".draft" / "operations" / ("a" * 32)
+    journal = _journal(directory, revision="1")
+    _persist_journal(journal)
+    staging = directory / _STAGED_NAME
+    if kind == "directory":
+        staging.mkdir()
+    else:
+        os.mkfifo(staging)
+
+    with pytest.raises(DraftError) as caught:
+        stage_link_index(journal, _index("1"))
+
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    assert staging.is_dir() if kind == "directory" else staging.is_fifo()
 
 
 def test_stage_link_index_write_failure(
@@ -490,6 +545,23 @@ def test_publish_rejects_directory_target(tmp_path: Path) -> None:
     assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
 
 
+def test_publish_rejects_other_target(tmp_path: Path) -> None:
+    root = _init_root(tmp_path)
+    directory = root / ".draft" / "operations" / ("a" * 32)
+    journal = _journal(directory, revision="1")
+    _persist_journal(journal)
+    digest = stage_link_index(journal, _index("1"))
+    target = root / INDEX_RELATIVE_PATH
+    os.mkfifo(target)
+
+    with pytest.raises(DraftError) as caught:
+        publish_staged_link_index(root, journal, digest)
+
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    assert target.is_fifo()
+    assert (directory / _STAGED_NAME).is_file()
+
+
 def test_publish_rejects_staging_sha256_mismatch(tmp_path: Path) -> None:
     root = _init_root(tmp_path)
     directory = root / ".draft" / "operations" / ("a" * 32)
@@ -734,6 +806,18 @@ def test_ensure_rebuild_flag_rejects_directory(tmp_path: Path) -> None:
     assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
 
 
+def test_ensure_rebuild_flag_rejects_other_node(tmp_path: Path) -> None:
+    root = _init_root(tmp_path)
+    flag = root / REBUILD_FLAG_RELATIVE_PATH
+    os.mkfifo(flag)
+
+    with pytest.raises(DraftError) as caught:
+        ensure_rebuild_flag(root)
+
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    assert flag.is_fifo()
+
+
 def test_ensure_rebuild_flag_create_failure_returns_warning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -809,6 +893,18 @@ def test_remove_rebuild_flag_rejects_directory(tmp_path: Path) -> None:
     with pytest.raises(DraftError) as caught:
         remove_rebuild_flag(root)
     assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+
+
+def test_remove_rebuild_flag_rejects_other_node(tmp_path: Path) -> None:
+    root = _init_root(tmp_path)
+    flag = root / REBUILD_FLAG_RELATIVE_PATH
+    os.mkfifo(flag)
+
+    with pytest.raises(DraftError) as caught:
+        remove_rebuild_flag(root)
+
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    assert flag.is_fifo()
 
 
 def test_remove_rebuild_flag_rejects_symlink_ancestor(tmp_path: Path) -> None:
@@ -931,6 +1027,22 @@ def _operation_dirs(root: Path) -> list[Path]:
         (operations / entry.name for entry in operations.iterdir()),
         key=lambda path: path.name,
     )
+
+
+def _revision_competitor(
+    root_text: str,
+    role: str,
+    ready: Any,
+    proceed: Any,
+    results: Any,
+) -> None:
+    """两个独立进程共享真实 prepare/commit 协议；父进程控制提交先后。"""
+    prepared = prepare_link_index_update(Path(root_text))
+    ready.put((role, prepared.observed_revision))
+    if not proceed.wait(15):
+        raise RuntimeError(f"{role} was not released to commit")
+    result = commit_link_index_update(Path(root_text), prepared)
+    results.put((role, result.published, tuple(warning.code for warning in result.warnings)))
 
 
 def _journal_payload(root: Path) -> dict[str, object]:
@@ -1070,6 +1182,79 @@ def test_maintain_publish_failure_degrades_to_rebuild_required(
     assert read_lock(root) is None
 
 
+@pytest.mark.parametrize(
+    ("step", "artifact_present_after_failure"),
+    [
+        (DurabilityStep.STAGING_WRITE, False),
+        (DurabilityStep.STAGING_FSYNC, False),
+        (DurabilityStep.STAGING_DIRECTORY_FSYNC, False),
+        (DurabilityStep.INDEX_REPLACE, False),
+        (DurabilityStep.INDEX_DIRECTORY_FSYNC, True),
+    ],
+    ids=lambda value: value.value if isinstance(value, DurabilityStep) else str(value),
+)
+def test_index_durability_steps_preserve_business_and_record_rebuild(
+    tmp_path: Path, step: DurabilityStep, artifact_present_after_failure: bool
+) -> None:
+    """每个 staging/index 耐久点失败都保留根事实并耐久降级。"""
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+    before = (root / "pages/a.md").read_bytes()
+
+    with durability_scope({step: 1}):
+        result = maintain_link_index(root)
+
+    assert result.published is False
+    assert result.warnings == (ResultWarning("link_index.rebuild_required"),)
+    assert (root / "pages/a.md").read_bytes() == before
+    payload = _journal_payload(root)
+    assert payload["phase"] == OperationPhase.COMPLETED.value
+    assert payload["link_index_revision"] == "1"
+    assert payload["link_index_result"] == LinkIndexResult.REBUILD_REQUIRED.value
+    assert "link_index_sha256" not in payload
+    artifact = root / INDEX_RELATIVE_PATH
+    assert artifact.is_file() is artifact_present_after_failure
+    assert (root / REBUILD_FLAG_RELATIVE_PATH).is_file()
+    operation_dirs = _operation_dirs(root)
+    assert len(operation_dirs) == 1
+    assert not (operation_dirs[0] / LINK_INDEX_STAGED_FILE_NAME).exists()
+    assert not (operation_dirs[0] / f"{LINK_INDEX_STAGED_FILE_NAME}.pending").exists()
+    assert read_lock(root) is None
+
+    next_result = maintain_link_index(root)
+    assert next_result.published is True
+    assert next_result.index is not None
+    assert next_result.index.revision == "2"
+    assert _journal_payload(root)["link_index_result"] == LinkIndexResult.PUBLISHED.value
+
+
+@pytest.mark.parametrize(
+    ("step", "action", "expected_flag"),
+    [
+        (DurabilityStep.FLAG_CREATE, "create", False),
+        (DurabilityStep.FLAG_DIRECTORY_FSYNC, "create", True),
+        (DurabilityStep.FLAG_DELETE, "delete", True),
+        (DurabilityStep.FLAG_DIRECTORY_FSYNC, "delete", False),
+    ],
+    ids=["flag-create", "flag-create-directory", "flag-delete", "flag-delete-directory"],
+)
+def test_flag_durability_steps_are_warnings_without_changing_journal_result(
+    tmp_path: Path,
+    step: DurabilityStep,
+    action: str,
+    expected_flag: bool,
+) -> None:
+    root = _init_root(tmp_path)
+    flag = root / REBUILD_FLAG_RELATIVE_PATH
+    if action == "delete":
+        assert ensure_rebuild_flag(root) is None
+
+    with durability_scope({step: 1}):
+        warning = ensure_rebuild_flag(root) if action == "create" else remove_rebuild_flag(root)
+
+    assert warning == ResultWarning("link_index.rebuild_flag_update_failed")
+    assert flag.exists() is expected_flag
+
+
 def test_revision_advance_race_abandons_candidate(tmp_path: Path) -> None:
     """spec §15 并发令牌：取锁后 authority 已推进，放弃旧候选，不发布/不降级。
 
@@ -1098,6 +1283,63 @@ def test_revision_advance_race_abandons_candidate(tmp_path: Path) -> None:
     assert len(_operation_dirs(root)) == 2
     assert read_link_index_authority(root).revision == "2"
     assert not (root / REBUILD_FLAG_RELATIVE_PATH).exists()
+
+
+def test_two_process_revision_seven_to_eight_drops_late_candidate(tmp_path: Path) -> None:
+    """真实文件锁下两个 revision 7 候选只允许一个发布 revision 8。"""
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A 1\n"})
+    assert maintain_link_index(root).published is True
+    for revision in range(2, 8):
+        (root / "pages/a.md").write_text(f"# A {revision}\n", encoding="utf-8")
+        result = maintain_link_index(root)
+        assert result.published is True
+        assert result.index is not None
+        assert result.index.revision == str(revision)
+    (root / "pages/a.md").write_text("# A pending\n", encoding="utf-8")
+
+    context = get_context("fork")
+    ready = context.Queue()
+    first_go = context.Event()
+    second_go = context.Event()
+    results = context.Queue()
+    first = context.Process(
+        target=_revision_competitor,
+        args=(str(root), "first", ready, first_go, results),
+    )
+    second = context.Process(
+        target=_revision_competitor,
+        args=(str(root), "second", ready, second_go, results),
+    )
+    processes = (first, second)
+    try:
+        first.start()
+        second.start()
+        observed = {ready.get(timeout=15), ready.get(timeout=15)}
+        assert observed == {("first", "7"), ("second", "7")}
+
+        first_go.set()
+        first_result = results.get(timeout=15)
+        first.join(timeout=15)
+        assert first.exitcode == 0
+        assert first_result == ("first", True, ())
+
+        second_go.set()
+        second_result = results.get(timeout=15)
+        second.join(timeout=15)
+        assert second.exitcode == 0
+        assert second_result == ("second", False, ())
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=15)
+        ready.close()
+        results.close()
+
+    assert read_link_index_authority(root).revision == "8"
+    assert len(_operation_dirs(root)) == 8
+    assert not (root / REBUILD_FLAG_RELATIVE_PATH).exists()
+    assert read_lock(root) is None
 
 
 def test_maintain_scan_external_change_records_rebuild_required(

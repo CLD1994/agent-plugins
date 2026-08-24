@@ -23,8 +23,10 @@ from draft.models import (
 from draft.observations import EMPTY_OBSERVATIONS, graph_observations
 from draft.operations import (
     JOURNAL_VERSION,
+    DurabilityStep,
     Journal,
     acquire_lock,
+    durability_scope,
     execute_plan,
     operation_journal_path,
     preallocate_journal,
@@ -247,6 +249,84 @@ def test_non_current_journal_version_is_rejected(
     path = write_raw_journal(operation_draft, version=version)
     with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_VERSION_UNSUPPORTED.value):
         read_journal(path)
+
+
+@pytest.mark.parametrize(
+    ("step", "pending_expected"),
+    [
+        (DurabilityStep.JOURNAL_WRITE, False),
+        (DurabilityStep.JOURNAL_DIRECTORY_FSYNC, True),
+    ],
+    ids=["journal-write", "journal-directory-fsync"],
+)
+def test_journal_durability_steps_keep_last_durable_successor(
+    operation_draft: Path,
+    step: DurabilityStep,
+    pending_expected: bool,
+) -> None:
+    root = operation_draft
+    operation_id = "a" * 32
+    journal = preallocate_journal(
+        root,
+        kind=OperationKind.CREATE,
+        operation_id=operation_id,
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
+        metadata={},
+    )
+    successor = dataclasses.replace(journal, phase=OperationPhase.PREPARED)
+
+    with durability_scope({step: 1}), pytest.raises(DraftError) as caught:
+        write_journal_durable(successor)
+
+    assert caught.value.code == CheckCode.OPERATION_DURABILITY_FAILED.value
+    current = read_journal(operation_journal_path(root, operation_id))
+    assert current.phase is OperationPhase.ALLOCATING
+    assert (journal.directory / "journal.json.pending").exists() is pending_expected
+
+
+@pytest.mark.parametrize(
+    ("step", "occurrence", "phase"),
+    [
+        (DurabilityStep.JOURNAL_WRITE, 8, OperationPhase.LINK_INDEX_UPDATING),
+        (DurabilityStep.JOURNAL_DIRECTORY_FSYNC, 19, OperationPhase.COMPLETED),
+    ],
+    ids=["journal-write-after-business", "journal-directory-after-business"],
+)
+def test_business_after_state_survives_journal_durability_failure(
+    operation_draft: Path,
+    step: DurabilityStep,
+    occurrence: int,
+    phase: OperationPhase,
+) -> None:
+    """日志耐久失败不回滚已验证内容，recover 后同 revision 幂等收敛。"""
+    root = operation_draft
+    plan, _old_a, _old_b, new_a, new_b = two_write_plan(root)
+
+    with durability_scope({step: occurrence}), pytest.raises(DraftError) as caught:
+        execute_plan(plan)
+
+    assert caught.value.code == CheckCode.OPERATION_DURABILITY_FAILED.value
+    assert (root / "pages/a.md").read_bytes() == new_a
+    assert (root / "pages/b.md").read_bytes() == new_b
+    operation_id = read_lock(root)
+    assert operation_id is not None
+    journal_before = read_journal(operation_journal_path(root, operation_id))
+    assert journal_before.phase is phase
+    revision_before = journal_before.link_index_revision
+
+    recover(root)
+    journal_after = read_journal(operation_journal_path(root, operation_id))
+    assert journal_after.phase is OperationPhase.COMPLETED
+    assert journal_after.link_index_revision == revision_before
+    assert read_lock(root) is None
+
+    recover(root)
+    journal_repeat = read_journal(operation_journal_path(root, operation_id))
+    assert journal_repeat.phase is OperationPhase.COMPLETED
+    assert journal_repeat.link_index_revision == revision_before
+    assert (root / "pages/a.md").read_bytes() == new_a
+    assert (root / "pages/b.md").read_bytes() == new_b
 
 
 def test_journal_operation_id_must_match_directory(operation_draft: Path) -> None:
@@ -1210,6 +1290,8 @@ def test_recover_link_index_phase(
     assert journal.link_index_result is expected
     assert journal.link_index_revision == revision
     assert read_lock(root) is None
+    assert b"forward-a" in (root / "pages/a.md").read_bytes()
+    assert b"forward-b" in (root / "pages/b.md").read_bytes()
 
     # 幂等：再次 recover 不改变结果、revision、flag 和制品。
     flag_before = (root / ".draft/link-index-rebuild-required.flag").exists()
@@ -1300,6 +1382,16 @@ def test_recover_link_index_updating_does_not_guess_published_from_replaced_targ
     assert journal.link_index_result is LinkIndexResult.REBUILD_REQUIRED
     assert journal.link_index_revision == revision
     assert target.is_file()  # 恢复只清理 staging，不猜测也不删除已替换目标。
+    target_after = target.read_bytes()
+    recover(root)
+    repeated = read_journal(operation_journal_path(root, operation_id))
+    assert repeated.phase is OperationPhase.COMPLETED
+    assert repeated.link_index_result is LinkIndexResult.REBUILD_REQUIRED
+    assert repeated.link_index_revision == revision
+    assert target.read_bytes() == target_after
+    assert read_lock(root) is None
+    assert b"forward-a" in (root / "pages/a.md").read_bytes()
+    assert b"forward-b" in (root / "pages/b.md").read_bytes()
 
 
 def test_recover_link_index_published_verifies_target_before_terminal(

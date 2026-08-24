@@ -7,8 +7,9 @@ import os
 import re
 import stat
 import uuid
-from collections.abc import Callable, Mapping, Set
+from collections.abc import Callable, Generator, Iterable, Mapping, Set
 from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -119,6 +120,70 @@ _PRESERVED_LINK_INDEX_PHASES = frozenset(
 )
 
 _REVISION_PATTERN = re.compile(r"[1-9][0-9]*")
+
+
+class DurabilityStep(StrEnum):
+    """受支持的耐久 I/O 故障注入步骤（Task 11）。
+
+    这是测试和生产耐久边界共享的唯一步骤集合。默认没有作用域时，checkpoint
+    不改变实际 I/O；测试只能在一次调用作用域内选择具体步骤和 occurrence。
+    """
+
+    STAGING_WRITE = "staging_write"
+    STAGING_FSYNC = "staging_fsync"
+    STAGING_DIRECTORY_FSYNC = "staging_directory_fsync"
+    INDEX_REPLACE = "index_replace"
+    INDEX_DIRECTORY_FSYNC = "index_directory_fsync"
+    JOURNAL_WRITE = "journal_write"
+    JOURNAL_DIRECTORY_FSYNC = "journal_directory_fsync"
+    FLAG_CREATE = "flag_create"
+    FLAG_DELETE = "flag_delete"
+    FLAG_DIRECTORY_FSYNC = "flag_directory_fsync"
+
+
+@dataclass
+class _DurabilityScope:
+    failures: dict[DurabilityStep, frozenset[int]]
+    occurrences: dict[DurabilityStep, int]
+
+
+_DURABILITY_SCOPE: ContextVar[_DurabilityScope | None] = ContextVar(
+    "draft_durability_scope", default=None
+)
+
+
+@contextmanager
+def durability_scope(
+    failures: Mapping[DurabilityStep, int | Iterable[int]],
+) -> Generator[None, None, None]:
+    """在一次调用作用域内注入指定耐久步骤的 ``OSError``。
+
+    ``occurrence`` 从每个 step 的第一次生产调用开始计数，因此同一协议中有多个
+    目录同步时可精确选择失败位置。作用域使用 ``ContextVar``，嵌套或并行测试不会
+    共享计数；生产调用方无需传递任何测试参数。
+    """
+    normalized: dict[DurabilityStep, frozenset[int]] = {}
+    for step, occurrences in failures.items():
+        values = (occurrences,) if isinstance(occurrences, int) else tuple(occurrences)
+        if not values or any(value < 1 for value in values):
+            raise ValueError("durability failure occurrences must be positive")
+        normalized[step] = frozenset(values)
+    token = _DURABILITY_SCOPE.set(_DurabilityScope(normalized, {}))
+    try:
+        yield
+    finally:
+        _DURABILITY_SCOPE.reset(token)
+
+
+def durability_checkpoint(step: DurabilityStep) -> None:
+    """在真实耐久 I/O 前检查当前作用域；触发时抛出底层 ``OSError``。"""
+    scope = _DURABILITY_SCOPE.get()
+    if scope is None:
+        return
+    occurrence = scope.occurrences.get(step, 0) + 1
+    scope.occurrences[step] = occurrence
+    if occurrence in scope.failures.get(step, frozenset()):
+        raise OSError(errno.EIO, f"injected durability failure: {step.value}#{occurrence}")
 
 
 def validate_link_index_revision(value: object, *, path: Path) -> str:
@@ -289,7 +354,11 @@ def replace_file(source: Path, target: Path) -> None:
     source.replace(target)
 
 
-def fsync_directory(path: Path) -> None:
+def fsync_directory(
+    path: Path,
+    *,
+    durability_step: DurabilityStep | None = None,
+) -> None:
     """严格同步目录：打开或 fsync 失败都映射为 operation.durability_failed。
 
     曾经静默吞掉 OSError（回归 H1）：调用方会把"日志/证据已耐久"的结论建立在未同步
@@ -298,6 +367,8 @@ def fsync_directory(path: Path) -> None:
     后的其他目录。
     """
     try:
+        if durability_step is not None:
+            durability_checkpoint(durability_step)
         descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as exc:
         raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, path) from exc
@@ -309,9 +380,16 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _fsync_dir_fd(parent_fd: int, code_path: Path) -> None:
+def _fsync_dir_fd(
+    parent_fd: int,
+    code_path: Path,
+    *,
+    durability_step: DurabilityStep | None = None,
+) -> None:
     """严格同步已打开的目录句柄：失败映射为 operation.durability_failed（回归 H1）。"""
     try:
+        if durability_step is not None:
+            durability_checkpoint(durability_step)
         os.fsync(parent_fd)
     except OSError as exc:
         raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
@@ -348,6 +426,9 @@ def _publish_pending(
     pending_mode: Literal["create", "replace"],
     publish: Literal["link", "replace"],
     code_path: Path,
+    write_step: DurabilityStep | None = None,
+    file_fsync_step: DurabilityStep | None = None,
+    directory_fsync_step: DurabilityStep | None = None,
 ) -> None:
     """在父目录句柄内把 content 耐久发布为 name（确定名 pending + 严格同步，回归 H1/H2/H3）。
 
@@ -372,6 +453,8 @@ def _publish_pending(
         | (os.O_EXCL if pending_mode == "create" else os.O_TRUNC)
     )
     try:
+        if write_step is not None:
+            durability_checkpoint(write_step)
         descriptor = os.open(pending, flags, 0o644, dir_fd=parent_fd)
     except FileExistsError as exc:
         raise DraftError("operation.external_change", code_path) from exc
@@ -381,10 +464,12 @@ def _publish_pending(
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(content)
             handle.flush()
+            if file_fsync_step is not None:
+                durability_checkpoint(file_fsync_step)
             os.fsync(handle.fileno())
     except OSError as exc:
         raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
-    _fsync_dir_fd(parent_fd, code_path)
+    _fsync_dir_fd(parent_fd, code_path, durability_step=directory_fsync_step)
     if publish == "link":
         try:
             os.link(pending, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
@@ -395,7 +480,7 @@ def _publish_pending(
         # 新名字耐久后（至少一个授权名字可证明存在），复核发布内容仍是我们写入的
         # 授权字节，且 pending 仍指向同一节点（回归 H3）：任一被替换都拒绝消费，
         # 绝不删除未知节点。
-        _fsync_dir_fd(parent_fd, code_path)
+        _fsync_dir_fd(parent_fd, code_path, durability_step=directory_fsync_step)
         if _read_name_bytes(parent_fd, name, code_path=code_path) != content or not _same_name_node(
             parent_fd,
             pending,
@@ -413,10 +498,19 @@ def _publish_pending(
             os.replace(pending, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         except OSError as exc:
             raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
-    _fsync_dir_fd(parent_fd, code_path)
+    _fsync_dir_fd(parent_fd, code_path, durability_step=directory_fsync_step)
 
 
-def _create_only_publish(parent_fd: int, name: str, content: bytes, *, code_path: Path) -> None:
+def _create_only_publish(
+    parent_fd: int,
+    name: str,
+    content: bytes,
+    *,
+    code_path: Path,
+    write_step: DurabilityStep | None = None,
+    file_fsync_step: DurabilityStep | None = None,
+    directory_fsync_step: DurabilityStep | None = None,
+) -> None:
     """create-only 发布（回归 H2）：目标与 pending 都必须是 missing 的首次创建。
 
     绝不截断未知 pending、绝不覆盖既有目标；目标/pending 已占用（file/directory/link/
@@ -424,18 +518,43 @@ def _create_only_publish(parent_fd: int, name: str, content: bytes, *, code_path
     exact。用于 journal bootstrap、original/staged、attempt、cleanup evidence。
     """
     _publish_pending(
-        parent_fd, name, content, pending_mode="create", publish="link", code_path=code_path
+        parent_fd,
+        name,
+        content,
+        pending_mode="create",
+        publish="link",
+        code_path=code_path,
+        write_step=write_step,
+        file_fsync_step=file_fsync_step,
+        directory_fsync_step=directory_fsync_step,
     )
 
 
-def _replace_publish(parent_fd: int, name: str, content: bytes, *, code_path: Path) -> None:
+def _replace_publish(
+    parent_fd: int,
+    name: str,
+    content: bytes,
+    *,
+    code_path: Path,
+    write_step: DurabilityStep | None = None,
+    file_fsync_step: DurabilityStep | None = None,
+    directory_fsync_step: DurabilityStep | None = None,
+) -> None:
     """权威 journal 更新发布（回归 H2）：调用方必须先经 H1 转换验证授权 old→new。
 
     journal 自身的命名临时可替换半写残留（旧 journal 权威且已同步）；最终 os.replace
     原子替换目标，绝不出现目标缺失窗口。
     """
     _publish_pending(
-        parent_fd, name, content, pending_mode="replace", publish="replace", code_path=code_path
+        parent_fd,
+        name,
+        content,
+        pending_mode="replace",
+        publish="replace",
+        code_path=code_path,
+        write_step=write_step,
+        file_fsync_step=file_fsync_step,
+        directory_fsync_step=directory_fsync_step,
     )
 
 
@@ -1055,7 +1174,15 @@ def anchored_leaf(
             os.close(parent_fd)
 
 
-def durable_write(root: Path, relative: Path, value: bytes) -> None:
+def durable_write(
+    root: Path,
+    relative: Path,
+    value: bytes,
+    *,
+    write_step: DurabilityStep | None = None,
+    file_fsync_step: DurabilityStep | None = None,
+    directory_fsync_step: DurabilityStep | None = None,
+) -> None:
     """create-only 严格耐久写（回归 H1/H2/H3/M2）：journal bootstrap、original/staged、
     attempt、cleanup evidence 等首次创建目标。
 
@@ -1072,7 +1199,15 @@ def durable_write(root: Path, relative: Path, value: bytes) -> None:
         code_path=relative.parent,
     )
     try:
-        _create_only_publish(parent_fd, relative.name, value, code_path=relative)
+        _create_only_publish(
+            parent_fd,
+            relative.name,
+            value,
+            code_path=relative,
+            write_step=write_step,
+            file_fsync_step=file_fsync_step,
+            directory_fsync_step=directory_fsync_step,
+        )
     finally:
         os.close(parent_fd)
 
@@ -1876,6 +2011,7 @@ def resolve_journal_pending(journal_path: Path) -> None:
     )
     try:
         try:
+            durability_checkpoint(DurabilityStep.JOURNAL_WRITE)
             os.replace(
                 pending_path.name,
                 journal_path.name,
@@ -1884,7 +2020,11 @@ def resolve_journal_pending(journal_path: Path) -> None:
             )
         except OSError as exc:
             raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, pending_path) from exc
-        _fsync_dir_fd(parent_fd, journal_path.parent)
+        _fsync_dir_fd(
+            parent_fd,
+            journal_path.parent,
+            durability_step=DurabilityStep.JOURNAL_DIRECTORY_FSYNC,
+        )
     finally:
         os.close(parent_fd)
 
@@ -2064,9 +2204,23 @@ def write_journal(journal: Journal) -> None:
     )
     try:
         if old is None:
-            _create_only_publish(parent_fd, path.name, _journal_to_json(journal), code_path=path)
+            _create_only_publish(
+                parent_fd,
+                path.name,
+                _journal_to_json(journal),
+                code_path=path,
+                write_step=DurabilityStep.JOURNAL_WRITE,
+                directory_fsync_step=DurabilityStep.JOURNAL_DIRECTORY_FSYNC,
+            )
         else:
-            _replace_publish(parent_fd, path.name, _journal_to_json(journal), code_path=path)
+            _replace_publish(
+                parent_fd,
+                path.name,
+                _journal_to_json(journal),
+                code_path=path,
+                write_step=DurabilityStep.JOURNAL_WRITE,
+                directory_fsync_step=DurabilityStep.JOURNAL_DIRECTORY_FSYNC,
+            )
     finally:
         os.close(parent_fd)
 

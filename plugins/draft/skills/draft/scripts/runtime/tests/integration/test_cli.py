@@ -13,6 +13,7 @@ from draft.cli import main
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import ResultWarning, RootState
+from draft.operations import DurabilityStep, durability_scope
 from draft.vocabulary import ConclusionsState
 from tests.integration.support import (
     DraftFactory,
@@ -321,6 +322,84 @@ def test_check_maintains_index_on_candidate_root(
     journal = _journal_payload(root)
     assert journal["link_index_result"] == "published"
     assert journal["root_state"] == "candidate"
+
+
+def test_check_journal_durability_failure_uses_error_envelope(
+    registered_draft: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = registered_draft
+
+    with durability_scope({DurabilityStep.JOURNAL_WRITE: 1}):
+        code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
+
+    assert code == 1
+    assert payload["result_type"] == "check"
+    assert CheckCode.OPERATION_DURABILITY_FAILED.value in {
+        str(issue["code"]) for issue in as_dicts(payload["errors"])
+    }
+
+
+def test_query_journal_durability_failure_returns_exit_three(
+    registered_draft: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with durability_scope({DurabilityStep.JOURNAL_WRITE: 1}):
+        code, payload = run_json(
+            ["query", "backlinks", "--root", str(registered_draft), "index.md", "--json"],
+            capsys,
+        )
+
+    assert code == 3
+    assert payload["result_type"] == "error"
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == CheckCode.OPERATION_DURABILITY_FAILED.value
+
+
+def test_query_backlinks_rejects_old_sha_when_probe_metadata_is_unchanged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], draft_factory: DraftFactory
+) -> None:
+    root = draft_factory(
+        {
+            "index.md": "# Index\n\n[A](pages/a.md)\n",
+            "pages/a.md": "# A\n",
+        },
+        root_state=RootState.CANDIDATE,
+    )
+    code, before_payload = run_json(
+        ["query", "backlinks", "--root", str(root), "pages/a.md", "--json"], capsys
+    )
+    assert code == 0
+    assert [item["page"] for item in as_dicts(before_payload["items"])] == ["index.md"]
+
+    source = root / "index.md"
+    previous = source.stat()
+    # 两个正文保持相同长度；只切换链接目标，预期事实直接由测试常量给出。
+    new_body = b"# Index\n\n[A](pages/b.md)\n"
+    assert len(new_body) == previous.st_size
+    with source.open("r+b") as handle:
+        handle.write(new_body)
+        handle.flush()
+    os.utime(source, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+    current = source.stat()
+    assert (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) == (
+        previous.st_dev,
+        previous.st_ino,
+        previous.st_size,
+        previous.st_mtime_ns,
+    )
+
+    code, old_target_payload = run_json(
+        ["query", "backlinks", "--root", str(root), "pages/a.md", "--json"], capsys
+    )
+    assert code == 0
+    assert old_target_payload["items"] == []
+    assert _journal_payload(root)["link_index_revision"] == "2"
+
+    code, new_target_payload = run_json(
+        ["query", "backlinks", "--root", str(root), "pages/b.md", "--json"], capsys
+    )
+    assert code == 0
+    assert [item["page"] for item in as_dicts(new_target_payload["items"])] == ["index.md"]
 
 
 def test_check_reports_retired_provisional_entry_as_unexpected(
@@ -1581,6 +1660,106 @@ def test_notify_scan_failure_is_delivered_and_records_rebuild_required(
     monkeypatch.undo()
     assert code == 0
     assert payload == {"result_type": "files_changed_notification"}
+    assert _journal_payload(root)["link_index_result"] == "rebuild_required"
+
+
+def test_notification_scanning_change_is_absorbed_by_fixed_envelope(
+    capsys: pytest.CaptureFixture[str],
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = draft_factory({"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def unstable_scan(
+        _root: Path, _directories: object, _identities: object
+    ) -> None:
+        raise DraftError("operation.external_change", root)
+
+    monkeypatch.setattr(maintenance, "_verify_root_stable", unstable_scan)
+
+    code, payload = _notify(root, capsys)
+
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+    assert _journal_payload(root)["link_index_result"] == "rebuild_required"
+
+
+def test_notification_flag_durability_warning_is_absorbed(
+    capsys: pytest.CaptureFixture[str],
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = draft_factory({"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def fail_scan(_root: Path, _baseline: object, *, known_documents: object = ()) -> object:
+        del known_documents
+        raise DraftError("operation.index_update_failed", root)
+
+    monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+    with durability_scope({DurabilityStep.FLAG_CREATE: 1}):
+        code, payload = _notify(root, capsys)
+
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+    assert not (root / ".draft/link-index-rebuild-required.flag").exists()
+    assert _journal_payload(root)["link_index_result"] == "rebuild_required"
+
+
+def test_check_scanning_change_keeps_check_projection(
+    capsys: pytest.CaptureFixture[str],
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = draft_factory({"index.md": "# Index\n", "pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def unstable_scan(
+        _root: Path, _directories: object, _identities: object
+    ) -> None:
+        raise DraftError("operation.external_change", root)
+
+    monkeypatch.setattr(maintenance, "_verify_root_stable", unstable_scan)
+
+    code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
+
+    assert code == 1
+    assert payload["result_type"] == "check"
+    assert _journal_payload(root)["link_index_result"] == "rebuild_required"
+    assert all(issue["severity"] == "error" for issue in as_dicts(payload["errors"]))
+
+
+def test_query_scanning_change_uses_current_full_facts(
+    capsys: pytest.CaptureFixture[str],
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = draft_factory(
+        {
+            "index.md": "# Index\n\n[A](pages/a.md)\n",
+            "pages/a.md": "# A\n",
+        },
+        root_state=RootState.CANDIDATE,
+    )
+    import draft.link_index_maintenance as maintenance
+
+    def unstable_scan(
+        _root: Path, _directories: object, _identities: object
+    ) -> None:
+        raise DraftError("operation.external_change", root)
+
+    monkeypatch.setattr(maintenance, "_verify_root_stable", unstable_scan)
+
+    code, payload = run_json(
+        ["query", "backlinks", "--root", str(root), "pages/a.md", "--json"], capsys
+    )
+
+    assert code == 0
+    assert [item["page"] for item in as_dicts(payload["items"])] == ["index.md"]
+    assert [warning["code"] for warning in as_dicts(payload["warnings"])] == [
+        "link_index.rebuild_required"
+    ]
     assert _journal_payload(root)["link_index_result"] == "rebuild_required"
 
 
