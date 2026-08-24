@@ -66,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[shared],
         description="递归讨论草稿维护工具：以页面网络为单一事实源，提供登记、检查、结构维护与回收生命周期推进命令。",
     )
+    parser.set_defaults(advance_lifecycle=True)
     parser.add_argument("--version", action="store_true", help="显示版本号后退出")
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
 
@@ -75,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="初始化新草稿",
         description="在 ROOT 创建草稿结构并登记；--candidate 创建未登记候选根。",
     )
+    init.set_defaults(advance_lifecycle=False)
     init.add_argument("root", metavar="ROOT", help="草稿根目录（将在此创建草稿结构）")
     init.add_argument(
         "--candidate",
@@ -88,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="接管格式完整的候选根",
         description="把 root_state=candidate 的受管根原子推进为 registered。",
     )
+    _adopt.set_defaults(advance_lifecycle=False)
 
     _check = subparsers.add_parser(
         "check",
@@ -95,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="检查草稿一致性",
         description="按已登记布局检查草稿；candidate 与 registered 共享同一检查协议。",
     )
+    _check.set_defaults(advance_lifecycle=False)
     _check.add_argument(
         "--code",
         action="append",
@@ -185,6 +189,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="修复中断的写操作",
         description="修复崩溃或中断留下的未完成写操作；回收生命周期推进由所有已登记命令的前置静默完成。",
     )
+    _recover.set_defaults(advance_lifecycle=False)
 
     notify = subparsers.add_parser(
         "notify",
@@ -195,6 +200,7 @@ def build_parser() -> argparse.ArgumentParser:
             "命令不接收路径、变化清单或 --dry-run，不推进回收生命周期。"
         ),
     )
+    notify.set_defaults(advance_lifecycle=False)
     notify_sub = notify.add_subparsers(dest="notify_command", metavar="SUB", required=True)
     notify_sub.add_parser(
         "files-changed",
@@ -1255,9 +1261,8 @@ def main(
             _emit_error(error, json_mode)
             return _exit_for_error(error)
 
-    # check/adopt/notify/recover/init 不推进回收生命周期（规格 §8.1/§13）；其余受管命令在任一
-    # 受管根上于业务前推进恰好一次。
-    if command not in ("check", "adopt", "notify", "recover") and managed is not None:
+    # 顶层命令通过 argparse 分派属性声明是否推进回收生命周期；受管命令在业务前恰好一次。
+    if args.advance_lifecycle and managed is not None:
         try:
             _advance_for_command(managed.path, now=captured_now)
         except DraftError as error:

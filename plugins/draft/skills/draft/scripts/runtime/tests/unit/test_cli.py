@@ -144,6 +144,28 @@ def test_build_parser_json_flag_after_subcommand() -> None:
     assert args.json is True
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["init", "/draft"],
+        ["check", "--root", "/draft"],
+        ["adopt", "--root", "/draft"],
+        ["notify", "files-changed", "--root", "/draft"],
+        ["recover", "--root", "/draft"],
+    ),
+)
+def test_lifecycle_exempt_commands_disable_advancement(arguments: list[str]) -> None:
+    args = cli.build_parser().parse_args(arguments)
+
+    assert args.advance_lifecycle is False
+
+
+def test_managed_command_defaults_to_lifecycle_advancement() -> None:
+    args = cli.build_parser().parse_args(["move", "--root", "/draft", "pages/a.md", "pages/b.md"])
+
+    assert args.advance_lifecycle is True
+
+
 # ---------------------------------------------------------------------------
 # _dispatch: init / adopt
 # ---------------------------------------------------------------------------
