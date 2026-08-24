@@ -549,6 +549,7 @@ def _dispatch_query(
         from draft.query import (
             PAGE_NOT_FOUND,
             backlinks_from_index,
+            backlinks_from_root,
             load_tolerant_view,
             maintain_link_index_for_query,
             page_summary,
@@ -567,12 +568,14 @@ def _dispatch_query(
                 page,
                 details=(str(len(paths)), *paths[:20]),
             )
-        # 机会式维护（spec §14）：为 backlink count 尝试维护，索引可用时用完整反向表。
+        # 机会式维护（spec §14）：为 backlink count 尝试维护；索引可用时用完整反向
+        # 表，否则降级回退到全根 .md 完整闭包（spec §8）。
         maintained = maintain_link_index_for_query(root, view.graph, root_state)
-        backlink_count: int | None = None
+        identity = ResourceIdentity(ResourceKind.PAGE, page.as_posix())
         if maintained.index is not None:
-            identity = ResourceIdentity(ResourceKind.PAGE, page.as_posix())
             backlink_count = len(backlinks_from_index(maintained.index, identity))
+        else:
+            backlink_count = len(backlinks_from_root(root, identity))
         summary = page_summary(view.graph, page, backlink_count=backlink_count)
         payload: dict[str, object] = {
             "result_type": ResultType.QUERY_PAGE.value,
@@ -624,8 +627,8 @@ def _dispatch_query(
         )
     if q == "backlinks":
         from draft.query import (
-            backlinks,
             backlinks_from_index,
+            backlinks_from_root,
             load_tolerant_view,
             maintain_link_index_for_query,
         )
@@ -635,12 +638,12 @@ def _dispatch_query(
         view = load_tolerant_view(root)
         _raise_for_blocking(root, view, root_state)
         # 机会式维护（spec §14）：利用完整链接事实尝试维护；索引可用时读反向表，
-        # 否则使用图内完整事实。
+        # 否则降级回退到全根 .md 完整闭包（受管 + 未受管，spec §8）。
         maintained = maintain_link_index_for_query(root, view.graph, root_state)
         if maintained.index is not None:
             sources = backlinks_from_index(maintained.index, target)
         else:
-            sources = backlinks(view.graph, target)
+            sources = backlinks_from_root(root, target)
         items = [{"page": path.as_posix()} for path in sources]
         payload = _collection_payload(
             items,

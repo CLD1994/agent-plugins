@@ -286,7 +286,7 @@ def test_query_backlinks_calls_opportunistic_maintenance(mocker: MockerFixture) 
     )
     view = _empty_view()
     mocker.patch("draft.query.load_tolerant_view", return_value=view)
-    mocker.patch("draft.query.backlinks", return_value=())
+    mocker.patch("draft.query.backlinks_from_root", return_value=())
     maintain = mocker.patch(
         "draft.query.maintain_link_index_for_query",
         return_value=OpportunisticIndexResult(None, ()),
@@ -297,6 +297,61 @@ def test_query_backlinks_calls_opportunistic_maintenance(mocker: MockerFixture) 
     assert exit_code == 0
     assert payload["result_type"] == "query.backlinks"
     assert "warnings" not in payload
+
+
+def test_query_backlinks_uses_index_when_available(mocker: MockerFixture) -> None:
+    """索引可用时从已验证反向表读取（spec §14）。"""
+    mocker.patch("draft.cli._query_root_state", return_value=RootState.REGISTERED)
+    mocker.patch(
+        "draft.resources.resource_identity_from_operand",
+        return_value=ResourceIdentity(ResourceKind.PAGE, "pages/a.md"),
+    )
+    view = _empty_view()
+    mocker.patch("draft.query.load_tolerant_view", return_value=view)
+    index = LinkIndexContent(files={}, backlinks={}, directories={})
+    mocker.patch(
+        "draft.query.maintain_link_index_for_query",
+        return_value=OpportunisticIndexResult(index, ()),
+    )
+    from_index = mocker.patch(
+        "draft.query.backlinks_from_index", return_value=(Path("pages/b.md"),)
+    )
+    from_root = mocker.patch("draft.query.backlinks_from_root")
+    args = _query_args("backlinks", "pages/a.md")
+    payload, _human, exit_code = cli._dispatch(args, root=Path("/draft"))  # pyright: ignore[reportPrivateUsage]
+    from_index.assert_called_once()
+    from_root.assert_not_called()
+    assert payload["items"] == [{"page": "pages/b.md"}]
+    assert "warnings" not in payload
+    assert exit_code == 0
+
+
+def test_query_backlinks_uses_full_closure_when_degraded(mocker: MockerFixture) -> None:
+    """索引不可用（降级）时回退到全根 .md 完整闭包（spec §8/§14）。"""
+    mocker.patch("draft.cli._query_root_state", return_value=RootState.REGISTERED)
+    mocker.patch(
+        "draft.resources.resource_identity_from_operand",
+        return_value=ResourceIdentity(ResourceKind.PAGE, "pages/a.md"),
+    )
+    view = _empty_view()
+    mocker.patch("draft.query.load_tolerant_view", return_value=view)
+    mocker.patch(
+        "draft.query.maintain_link_index_for_query",
+        return_value=OpportunisticIndexResult(
+            None, (ResultWarning("link_index.rebuild_required"),)
+        ),
+    )
+    from_index = mocker.patch("draft.query.backlinks_from_index")
+    from_root = mocker.patch("draft.query.backlinks_from_root", return_value=(Path("notes.md"),))
+    args = _query_args("backlinks", "pages/a.md")
+    payload, _human, exit_code = cli._dispatch(args, root=Path("/draft"))  # pyright: ignore[reportPrivateUsage]
+    from_index.assert_not_called()
+    from_root.assert_called_once()
+    assert payload["items"] == [{"page": "notes.md"}]
+    assert payload["warnings"] == [
+        {"code": "link_index.rebuild_required", "severity": "warning"}
+    ]
+    assert exit_code == 0
 
 
 def test_query_page_calls_opportunistic_maintenance(mocker: MockerFixture) -> None:
@@ -318,6 +373,7 @@ def test_query_page_calls_opportunistic_maintenance(mocker: MockerFixture) -> No
         incoming_relation_count=0,
     )
     page_summary_mock = mocker.patch("draft.query.page_summary", return_value=summary)
+    mocker.patch("draft.query.backlinks_from_root", return_value=())
     maintain = mocker.patch(
         "draft.query.maintain_link_index_for_query",
         return_value=OpportunisticIndexResult(None, ()),

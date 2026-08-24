@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +24,7 @@ from draft.link_index import (
     LinkSpan,
     OutboundEdge,
 )
+from draft.markdown import extract_body_links
 from draft.models import (
     CheckIssue,
     PageDocument,
@@ -310,6 +313,56 @@ def backlinks_from_index(
     文件与关系位置），是查询可用的完整反向表事实。
     """
     sources = {edge.source_path for edge in index.backlinks.get(target, ())}
+    return tuple(sorted(sources))
+
+
+def _markdown_files(root: Path) -> tuple[Path, ...]:
+    """全根普通 ``.md`` 根内相对路径：排除整个 ``.draft/``，no-follow 不读符号链接。
+
+    与严格扫描同一覆盖边界（spec §8），供降级回退计算完整闭包。
+    """
+    files: list[Path] = []
+    for directory, dirnames, filenames in os.walk(root):
+        relative_dir = Path(directory).relative_to(root)
+        if relative_dir == Path(".draft") or relative_dir.parts[:1] == (".draft",):
+            dirnames[:] = []
+            continue
+        for name in filenames:
+            if not name.endswith(".md"):
+                continue
+            path = Path(directory) / name
+            try:
+                mode = os.lstat(path).st_mode
+            except OSError:
+                continue
+            if not stat.S_ISREG(mode):
+                continue
+            files.append(path.relative_to(root))
+    return tuple(sorted(files))
+
+
+def backlinks_from_root(root: Path, target: ResourceIdentity) -> tuple[Path, ...]:
+    """降级回退的完整闭包：全根 ``.md``（受管 + 未受管，排除 ``.draft/``）来源。
+
+    复用与索引 ``_index_v2_file`` 同一套提取机制（``extract_body_links`` +
+    ``resolve_body_resource``），与索引路径闭包一致（spec §8 完整反向表）。个别
+    文件不可读、非 UTF-8 或链接提取失败时跳过该文件，仍返回可读部分的闭包——
+    降级 warning 已标识降级，不吞掉整个查询。
+    """
+    sources: set[Path] = set()
+    for relative in _markdown_files(root):
+        try:
+            text = (root / relative).read_text(encoding="utf-8")
+            links = extract_body_links(text)
+        except (OSError, UnicodeDecodeError, DraftError):
+            continue
+        for link in links:
+            resource = resolve_body_resource(
+                root, relative, link.destination, target_probe=_no_probe
+            )
+            if resource.identity == target:
+                sources.add(relative)
+                break
     return tuple(sorted(sources))
 
 

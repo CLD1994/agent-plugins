@@ -496,22 +496,141 @@ def test_query_backlinks_equivalence_across_index_states(
     assert recovered == absent
 
 
-def test_query_page_backlink_count_equivalence_across_index_states(
-    draft_factory: DraftFactory, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """query page 的 backlink count 与 query backlinks 使用同一严格事实（spec §20）。"""
+def _unmanaged_closure_root(draft_factory: DraftFactory) -> Path:
+    """带未受管根级 notes.md 的根：它与导航页共同引用 pages/c.md。"""
     root = build_query_draft(draft_factory)
-    capsys.readouterr()
-    args = ["query", "page", "--root", str(root), "pages/a.md", "--json"]
+    (root / "pages" / "c.md").write_text(
+        "# 丙\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n\n正文。\n",
+        encoding="utf-8",
+    )
+    (root / "notes.md").write_text("见 [丙](pages/c.md)。\n", encoding="utf-8")
+    (root / "index.md").write_text(
+        (root / "index.md")
+        .read_text(encoding="utf-8")
+        .replace(
+            "- [乙](pages/b.md)\n",
+            "- [乙](pages/b.md)\n- [丙](pages/c.md)\n",
+        ),
+        encoding="utf-8",
+    )
+    return root
 
+
+def test_query_backlinks_full_closure_equivalence_across_index_states(
+    draft_factory: DraftFactory,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """四状态结果恒等，且都包含未受管 .md 来源（spec §8 完整闭包）。"""
+    root = _unmanaged_closure_root(draft_factory)
+    capsys.readouterr()
+    args = ["query", "backlinks", "--root", str(root), "pages/c.md", "--json"]
+
+    # absent：首次查询发布索引，结果同时包含导航页和未受管 notes.md。
     code, absent = run_json(args, capsys)
     assert code == 0
-    assert absent["backlink_count"] == 2  # index.md 导航 + b.md 正文
+    items = cast("list[dict[str, object]]", absent["items"])
+    assert [item["page"] for item in items] == ["index.md", "notes.md"]
     assert "warnings" not in absent
 
     code, fresh = run_json(args, capsys)
     assert code == 0
     assert fresh == absent
+
+    # stale：受管页新增指向目标的链接 → 结果集真正变化（证伪误服旧索引）。
+    (root / "pages" / "b.md").write_text(
+        (root / "pages" / "b.md").read_text(encoding="utf-8") + "也见 [丙](c.md)。\n",
+        encoding="utf-8",
+    )
+    code, stale = run_json(args, capsys)
+    assert code == 0
+    items = cast("list[dict[str, object]]", stale["items"])
+    assert [item["page"] for item in items] == ["index.md", "notes.md", "pages/b.md"]
+
+    # rebuild-required：降级回退仍为全根完整闭包（含未受管来源）。
+    import draft.link_index_maintenance as maintenance
+
+    def fail_scan(root: Path, baseline: object, *, known_documents: object = ()) -> object:
+        raise DraftError("operation.index_update_failed", root)
+
+    monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+    code, rebuild = run_json(args, capsys)
+    monkeypatch.undo()
+    assert code == 0
+    items = cast("list[dict[str, object]]", rebuild["items"])
+    assert [item["page"] for item in items] == ["index.md", "notes.md", "pages/b.md"]
+    assert rebuild["warnings"] == [
+        {"code": "link_index.rebuild_required", "severity": "warning"}
+    ]
+
+    # 恢复扫描后发布并返回相同结果。
+    code, recovered = run_json(args, capsys)
+    assert code == 0
+    assert recovered == stale
+
+
+def test_query_page_backlink_count_full_closure_across_index_states(
+    draft_factory: DraftFactory,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """query page 的 backlink count 在四状态使用与 query backlinks 同一完整闭包（spec §20）。"""
+    root = _unmanaged_closure_root(draft_factory)
+    capsys.readouterr()
+    args = ["query", "page", "--root", str(root), "pages/c.md", "--json"]
+
+    code, absent = run_json(args, capsys)
+    assert code == 0
+    assert absent["backlink_count"] == 2  # 导航页 + 未受管 notes.md
+    assert "warnings" not in absent
+
+    code, fresh = run_json(args, capsys)
+    assert code == 0
+    assert fresh == absent
+
+    (root / "pages" / "b.md").write_text(
+        (root / "pages" / "b.md").read_text(encoding="utf-8") + "也见 [丙](c.md)。\n",
+        encoding="utf-8",
+    )
+    code, stale = run_json(args, capsys)
+    assert code == 0
+    assert stale["backlink_count"] == 3
+
+    import draft.link_index_maintenance as maintenance
+
+    def fail_scan(root: Path, baseline: object, *, known_documents: object = ()) -> object:
+        raise DraftError("operation.index_update_failed", root)
+
+    monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+    code, rebuild = run_json(args, capsys)
+    monkeypatch.undo()
+    assert code == 0
+    assert rebuild["backlink_count"] == 3
+    assert rebuild["warnings"] == [
+        {"code": "link_index.rebuild_required", "severity": "warning"}
+    ]
+
+
+def test_query_backlinks_degraded_fallback_skips_undecodable_markdown(
+    draft_factory: DraftFactory,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """严格扫描失败后，降级闭包跳过不可解码文件并保留其余当前事实。"""
+    root = build_query_draft(draft_factory)
+    (root / "broken.md").write_bytes(b"\xff")
+    capsys.readouterr()
+
+    code, payload = run_json(
+        ["query", "backlinks", "--root", str(root), "pages/a.md", "--json"],
+        capsys,
+    )
+
+    assert code == 0
+    items = cast("list[dict[str, object]]", payload["items"])
+    assert [item["page"] for item in items] == ["index.md", "pages/b.md"]
+    assert payload["warnings"] == [
+        {"code": "link_index.rebuild_required", "severity": "warning"}
+    ]
 
 
 def test_query_backlinks_journal_durability_failure_is_nonzero(
