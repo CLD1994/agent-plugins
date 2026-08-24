@@ -29,8 +29,10 @@ from draft.models import (
     MutationKind,
     OperationKind,
     OperationPlan,
+    OperationResult,
     PageDocument,
     RelationCode,
+    ResultWarning,
     RootState,
     StatusCode,
 )
@@ -60,6 +62,7 @@ CONCLUSIONS_HEADING = "## 已确认结论"
 # 所有权状态由 vocabulary 权威定义；此处再导出方便生成器消费者统一导入。
 __all__ = [
     "ConclusionsState",
+    "GenerationResult",
     "GenerationPlan",
     "GenerationReason",
     "is_conclusions_document",
@@ -367,6 +370,16 @@ class GenerationPlan:
     operation: OperationPlan | None
 
 
+@dataclass(frozen=True)
+class GenerationResult:
+    """结论生成的执行结果：计划与实际 operation 结果保持分离。"""
+
+    generated: bool
+    reason: GenerationReason | None
+    operation: OperationResult | None
+    warnings: tuple[ResultWarning, ...] = ()
+
+
 def plan_generation(
     graph: ConclusionsView,
     *,
@@ -487,7 +500,7 @@ def plan_generation(
     return GenerationPlan(generated=True, reason=None, operation=plan)
 
 
-def generate_conclusions(root: Path) -> GenerationPlan:
+def generate_conclusions(root: Path) -> GenerationResult:
     """按需生成结论页并原子更新根导航与登记标记；返回生成结果。
 
     门禁是生成器的可判定性而非一般健康：全部受管页面路径/标题/状态/导航可判定才
@@ -513,9 +526,15 @@ def generate_conclusions(root: Path) -> GenerationPlan:
         raise DraftError("conclusions.incomplete", resolved, details=details)
     graph = _load_graph_with_conclusions(resolved, marker.state)
     plan = plan_generation(graph, marker=marker)
-    if plan.operation is not None:
-        execute_plan(plan.operation)
-    return plan
+    if plan.operation is None:
+        return GenerationResult(generated=plan.generated, reason=plan.reason, operation=None)
+    operation = execute_plan(plan.operation)
+    return GenerationResult(
+        generated=plan.generated,
+        reason=plan.reason,
+        operation=operation,
+        warnings=operation.warnings,
+    )
 
 
 def load_generation_graph(root: Path, *, marker_state: MarkerState | None = None) -> DraftGraph:

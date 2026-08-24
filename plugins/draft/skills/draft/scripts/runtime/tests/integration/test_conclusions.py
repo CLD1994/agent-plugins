@@ -1,13 +1,15 @@
 import json
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
 
 import pytest
 
 from draft.checker import check_draft
 from draft.cli import main
 from draft.diagnostic_codes import CheckCode
+from draft.errors import DraftError
 from draft.graph import read_marker
+from draft.operations import Journal
 from draft.vocabulary import ConclusionsState
 from tests.integration.support import DraftFactory
 
@@ -67,6 +69,7 @@ def test_generate_conclusions_creates_page_and_advances_owner(
     assert code == 0
     assert payload["result_type"] == "generate-conclusions"
     assert payload["generated"] is True
+    assert "warnings" not in payload
     changed = cast("list[str]", payload["changed_paths"])
     assert "conclusions.md" in changed
     assert "index.md" in changed
@@ -94,6 +97,7 @@ def test_generate_conclusions_idempotent_second_run(
     assert code == 0
     assert payload["generated"] is True
     assert cast("list[str]", payload["changed_paths"]) == []
+    assert "warnings" not in payload
 
 
 def test_generate_conclusions_no_confirmed_is_no_op(
@@ -112,8 +116,42 @@ def test_generate_conclusions_no_confirmed_is_no_op(
     assert payload["generated"] is False
     assert payload["reason"] == "no_confirmed_pages"
     assert cast("list[str]", payload["changed_paths"]) == []
+    assert "warnings" not in payload
     assert not (root / "conclusions.md").exists()
     assert read_marker(root).conclusions_state is ConclusionsState.NOT_GENERATED
+
+
+def test_generate_conclusions_cli_projects_publish_failure_warning(
+    draft_factory: DraftFactory,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 CLI 入口在索引发布降级时保留业务结果并投影统一 warning。"""
+    import draft.link_index_maintenance as maintenance
+
+    def fail_publish(root: Path, journal: Journal, expected_sha256: str) -> NoReturn:
+        del journal, expected_sha256
+        raise DraftError("operation.index_update_failed", root)
+
+    root = build_conc_draft(draft_factory)
+    monkeypatch.setattr(maintenance, "publish_staged_link_index", fail_publish)
+    capsys.readouterr()
+
+    code, payload = run_json(["generate-conclusions", "--root", str(root), "--json"], capsys)
+
+    assert code == 0
+    assert payload["generated"] is True
+    assert payload["warnings"] == [
+        {"code": "link_index.rebuild_required", "severity": "warning"}
+    ]
+    assert (root / "conclusions.md").is_file()
+    assert (root / ".draft/link-index-rebuild-required.flag").is_file()
+    journal_paths = tuple((root / ".draft/operations").glob("*/journal.json"))
+    assert len(journal_paths) == 1
+    journal_payload = json.loads(journal_paths[0].read_text(encoding="utf-8"))
+    assert journal_payload["phase"] == "completed"
+    assert journal_payload["link_index_result"] == "rebuild_required"
+    assert "link_index_sha256" not in journal_payload
 
 
 def test_generate_conclusions_dry_run_does_not_write(

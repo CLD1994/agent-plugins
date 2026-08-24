@@ -214,6 +214,39 @@ def test_checker_rejects_legacy_link_index_invalid_entry(
     }
 
 
+@pytest.mark.parametrize("shape", ["missing", "regular", "directory", "symlink", "other"])
+def test_checker_enforces_link_index_target_node_kind(
+    draft_factory: DraftFactory,
+    shape: str,
+) -> None:
+    """索引目标只允许缺失或普通文件，其他节点按共享分类边界报告。"""
+    import os
+
+    root = draft_factory(healthy(), precreate_internal=True)
+    target = root / ".draft/link-index.json"
+    if shape == "regular":
+        target.write_bytes(b"{}\n")
+    elif shape == "directory":
+        target.mkdir()
+    elif shape == "symlink":
+        target.symlink_to("draft.json")
+    elif shape == "other":
+        os.mkfifo(target)
+
+    report = check_draft(root)
+    target_issues = {
+        issue.code
+        for issue in report.errors
+        if issue.path == Path(".draft/link-index.json")
+    }
+    if shape in {"missing", "regular"}:
+        assert target_issues == set()
+    elif shape == "symlink":
+        assert target_issues == {CheckCode.PATH_SYMLINK_ESCAPE.value}
+    else:
+        assert target_issues == {CheckCode.INTERNAL_UNEXPECTED_ENTRY.value}
+
+
 def _link_index_updating_journal(root: Path) -> Path:
     """Create a valid active journal shape for operation-directory namespace checks."""
     operation_id = "c" * 32

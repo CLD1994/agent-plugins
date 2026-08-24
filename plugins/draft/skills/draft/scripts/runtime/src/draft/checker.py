@@ -1201,6 +1201,7 @@ _ALLOWED_INTERNAL_DIRECTORIES = frozenset(
 # 内部协议普通文件：只允许普通文件，目录/其他异常节点是非法形状（spec §10 flag 语义）。
 _ALLOWED_INTERNAL_FILES = frozenset(
     {
+        Path(INTERNAL_DIR) / "link-index.json",
         Path(INTERNAL_DIR) / "link-index-rebuild-required.flag",
     }
 )

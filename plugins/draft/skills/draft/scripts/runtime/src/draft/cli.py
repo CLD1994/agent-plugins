@@ -1151,13 +1151,13 @@ def _dispatch(
         if result.reason is not None:
             payload["reason"] = result.reason.value
         if result.operation is not None:
-            from draft.plan_effects import public_changed_paths
-
             payload["changed_paths"] = [
-                path.as_posix() for path in public_changed_paths(result.operation.effects)
+                path.as_posix() for path in result.operation.changed_paths
             ]
         else:
             payload["changed_paths"] = []
+        if result.warnings:
+            payload["warnings"] = result_warnings_payload(result.warnings)
         human = f"结论生成：{'已生成' if result.generated else '无已确认页面'}"
         return payload, human, 0
     if command == "restore":
