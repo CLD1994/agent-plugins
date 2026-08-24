@@ -1127,12 +1127,12 @@ def test_check_json_separates_errors_warnings_infos_and_reviews(
             assert set(issue) == {"code", "severity", "path", "line", "details"}
 
 
-def test_recover_preflight_corruption_is_standard_error_envelope(
+def test_recover_ignores_due_retained_package_corruption_and_reports_pending_only(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = _trashable_cli_root(tmp_path)
     capsys.readouterr()
-    # 造两个到期包：第二个破坏证据，使前置推进整体失败。
+    # 造两个到期 retained 包：第二个破坏恢复认领字段，但 recover 不推进生命周期。
     import json as json_module
 
     from draft.operations import TrashDeadlines
@@ -1152,7 +1152,7 @@ def test_recover_preflight_corruption_is_standard_error_envelope(
         encoding="utf-8",
     )
     second = trash_page(root, Path("pages/b.md"), now=datetime(2026, 7, 21, tzinfo=UTC))
-    # 把两个包都改到已过期、清理期限之前，并破坏排序在后者的证据。
+    # 把两个包都改到已过期、清理期限之前，并破坏排序在后者的恢复认领字段。
     for op_id in (first.operation_id, second.operation_id):
         path = root / ".draft/operations" / op_id / "journal.json"
         data = json_module.loads(path.read_text(encoding="utf-8"))
@@ -1166,19 +1166,16 @@ def test_recover_preflight_corruption_is_standard_error_envelope(
     broken_data = json_module.loads(broken_path.read_text(encoding="utf-8"))
     broken_data["metadata"]["restore_operation_id"] = "0" * 32
     broken_path.write_text(json_module.dumps(broken_data), encoding="utf-8")
+    before = snapshot_tree(root)
     capsys.readouterr()
 
     code, payload = run_json(["recover", "--root", str(root), "--json"], capsys)
 
-    # 前置推进损坏：recover 不进入自身逻辑，只返回标准错误信封，退出码 3。
-    assert code == 3
-    assert payload["ok"] is False
-    assert payload["result_type"] == "error"
-    error = payload["error"]
-    assert isinstance(error, dict)
-    assert error["code"] == CheckCode.OPERATION_INCONSISTENT_STATE.value
-    assert "results" not in payload
-    assert "stopped_at_operation_id" not in payload
+    assert code == 0
+    assert payload == {"result_type": "recover", "fixed_count": 0, "paths": []}
+    assert snapshot_tree(root) == before
+    broken_after = json_module.loads(broken_path.read_text(encoding="utf-8"))
+    assert broken_after["metadata"]["restore_operation_id"] == "0" * 32
 
 
 def test_structure_preflight_corruption_never_starts_write(
