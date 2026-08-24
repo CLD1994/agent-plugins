@@ -16,11 +16,15 @@ import tempfile
 import time
 import tracemalloc
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from contextlib import redirect_stdout
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
+from io import StringIO
 from pathlib import Path
-from typing import cast
+from typing import Never, cast
 
 from draft.checker import check_draft
+from draft.cli import main as cli_main
 from draft.cli import notify_files_changed
 from draft.diagnostic_codes import OPERATION_INDEX_UPDATE_FAILED
 from draft.errors import DraftError
@@ -30,42 +34,49 @@ from draft.link_index_maintenance import (
     maintain_link_index,
     read_link_index_authority,
 )
-from draft.models import RootState
 from draft.operations import Journal
-from draft.query import (
-    backlinks_from_index,
-    load_tolerant_view,
-    maintain_link_index_for_query,
-)
-from draft.resources import ResourceIdentity, ResourceKind
 
 DEFAULT_SEED = 20260825
-SCENARIOS: tuple[str, ...] = (
-    "first_build",
-    "fresh_query_backlinks",
-    "fresh_check",
-    "notification_noop",
-    "modify_one",
-    "modify_one_percent",
-    "add_markdown",
-    "delete_markdown",
-    "rename_markdown",
-    "directory_nodes",
-    "rebuild_required_recovery",
-    "check_maintenance",
-    "journal_growth",
-)
+
+
+class Scenario(StrEnum):
+    FIRST_BUILD = "first_build"
+    FRESH_QUERY_BACKLINKS = "fresh_query_backlinks"
+    FRESH_CHECK = "fresh_check"
+    NOTIFICATION_NOOP = "notification_noop"
+    MODIFY_ONE = "modify_one"
+    MODIFY_ONE_PERCENT = "modify_one_percent"
+    ADD_MARKDOWN = "add_markdown"
+    DELETE_MARKDOWN = "delete_markdown"
+    RENAME_MARKDOWN = "rename_markdown"
+    DIRECTORY_NODES = "directory_nodes"
+    REBUILD_REQUIRED_RECOVERY = "rebuild_required_recovery"
+    CHECK_ABSENT_MAINTENANCE = "check_absent_maintenance"
+    JOURNAL_GROWTH = "journal_growth"
+
+
+class BenchmarkFilesystemError(RuntimeError):
+    """基准测量边界无法证明文件事实时携带路径停止。"""
+
+
+def _parse_scenario(value: str | Scenario) -> Scenario:
+    if isinstance(value, Scenario):
+        return value
+    try:
+        return Scenario(value)
+    except ValueError as exc:
+        raise ValueError(f"unknown benchmark scenario: {value}") from exc
 
 
 @dataclass(frozen=True)
 class BenchmarkResult:
     """一个场景的一次测量结果。
 
-    ``markdown_files`` 是规范字段；JSON 同时提供 ``files`` 这一面向报告的短名称，
-    两者由同一字段派生，避免 benchmark 消费方维护两套计数。
+    ``requested_files`` 是命令请求的规模，``markdown_files`` 是动作后实际覆盖数。
     """
 
-    scenario: str
+    scenario: Scenario
+    requested_files: int
     markdown_files: int
     width: int
     read_files: int
@@ -79,8 +90,8 @@ class BenchmarkResult:
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
-            "scenario": self.scenario,
-            "files": self.markdown_files,
+            "scenario": self.scenario.value,
+            "requested_files": self.requested_files,
             "markdown_files": self.markdown_files,
             "width": self.width,
             "read_files": self.read_files,
@@ -143,9 +154,22 @@ def _append_change(path: Path, marker: str) -> None:
     path.write_text(path.read_text(encoding="utf-8") + f"\nchange={marker}\n", encoding="utf-8")
 
 
+def _walk_error(error: OSError) -> Never:
+    filename = error.filename or "."
+    path = Path(filename)
+    raise BenchmarkFilesystemError(f"walk failed at {path}: {error}") from error
+
+
+def _lstat(path: Path) -> os.stat_result:
+    try:
+        return os.lstat(path)
+    except OSError as exc:
+        raise BenchmarkFilesystemError(f"lstat failed at {path}: {exc}") from exc
+
+
 def _count_markdown_files(root: Path) -> int:
     count = 0
-    for current, dirnames, filenames in os.walk(root):
+    for current, dirnames, filenames in os.walk(root, onerror=_walk_error):
         current_path = Path(current)
         relative = current_path.relative_to(root)
         if relative == Path(".draft") or relative.parts[:1] == (".draft",):
@@ -153,10 +177,7 @@ def _count_markdown_files(root: Path) -> int:
             continue
         for name in filenames:
             path = current_path / name
-            try:
-                node = os.lstat(path)
-            except OSError:
-                continue
+            node = _lstat(path)
             if name.endswith(".md") and stat.S_ISREG(node.st_mode):
                 count += 1
     return count
@@ -164,7 +185,7 @@ def _count_markdown_files(root: Path) -> int:
 
 def _markdown_width(root: Path) -> int:
     width = 0
-    for current, dirnames, filenames in os.walk(root):
+    for current, dirnames, filenames in os.walk(root, onerror=_walk_error):
         current_path = Path(current)
         relative = current_path.relative_to(root)
         if relative == Path(".draft") or relative.parts[:1] == (".draft",):
@@ -174,10 +195,7 @@ def _markdown_width(root: Path) -> int:
         for name in filenames:
             if not name.endswith(".md"):
                 continue
-            try:
-                node = os.lstat(current_path / name)
-            except OSError:
-                continue
+            node = _lstat(current_path / name)
             if stat.S_ISREG(node.st_mode):
                 count += 1
         width = max(width, count)
@@ -190,6 +208,8 @@ def _index_file_bytes(root: Path) -> int:
         node = os.lstat(path)
     except FileNotFoundError:
         return 0
+    except OSError as exc:
+        raise BenchmarkFilesystemError(f"lstat failed at {path}: {exc}") from exc
     if not stat.S_ISREG(node.st_mode):
         return 0
     return node.st_size
@@ -205,7 +225,7 @@ def _aggregate_stats(observation: _Observation) -> LinkIndexScanStats:
     )
 
 
-def _measure(root: Path, action: Callable[[], object]) -> BenchmarkResult:
+def _measure(root: Path, requested_files: int, action: Callable[[], object]) -> BenchmarkResult:
     """在 scanner/journal 两个稳定边界观察一次公开入口。"""
     import draft.link_index_maintenance as maintenance_module
     import draft.operations as operations_module
@@ -252,7 +272,8 @@ def _measure(root: Path, action: Callable[[], object]) -> BenchmarkResult:
             f"strict scan coverage mismatch: read {stats.read_files}, files {markdown_files}"
         )
     return BenchmarkResult(
-        scenario="",
+        scenario=Scenario.FIRST_BUILD,
+        requested_files=requested_files,
         markdown_files=markdown_files,
         width=_markdown_width(root),
         read_files=stats.read_files,
@@ -273,13 +294,24 @@ def _build_initial(root: Path) -> None:
 
 
 def _query_backlinks(root: Path) -> None:
-    view = load_tolerant_view(root)
-    result = maintain_link_index_for_query(root, view.graph, RootState.REGISTERED)
-    if result.index is None:
-        raise RuntimeError("fresh query did not expose an index")
-    target = ResourceIdentity(ResourceKind.LOCAL, "doc-00001.md")
-    if not backlinks_from_index(result.index, target):
-        raise RuntimeError("benchmark target has no backlinks")
+    output = StringIO()
+    with redirect_stdout(output):
+        exit_code = cli_main(
+            ["query", "backlinks", "--root", str(root), "doc-00001.md", "--json"]
+        )
+    if exit_code != 0:
+        raise RuntimeError(f"query backlinks exited with {exit_code}: {output.getvalue()}")
+    try:
+        payload = json.loads(output.getvalue())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("query backlinks did not produce JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("query backlinks result is not an object")
+    if payload.get("result_type") != "query.backlinks":
+        raise RuntimeError("query backlinks returned the wrong result type")
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        raise RuntimeError("query backlinks returned no items")
 
 
 def _rebuild_then_recover(root: Path) -> None:
@@ -302,38 +334,50 @@ def _rebuild_then_recover(root: Path) -> None:
         maintenance_module.scan_link_index = original_scan
 
 
-def _scenario_action(root: Path, scenario: str, markdown_files: int) -> Callable[[], object]:
-    if scenario == "first_build":
+def _scenario_action(
+    root: Path, scenario: Scenario, markdown_files: int
+) -> Callable[[], object]:
+    if scenario is Scenario.FIRST_BUILD:
         return lambda: maintain_link_index(root)
-    if scenario == "fresh_query_backlinks":
+    if scenario is Scenario.FRESH_QUERY_BACKLINKS:
+        _build_initial(root)
         return lambda: _query_backlinks(root)
-    if scenario == "fresh_check":
+    if scenario is Scenario.FRESH_CHECK:
+        _build_initial(root)
         return lambda: check_draft(root, maintain_index=True)
-    if scenario == "notification_noop":
+    if scenario is Scenario.NOTIFICATION_NOOP:
+        _build_initial(root)
         return lambda: notify_files_changed(root)
-    if scenario == "modify_one":
+    if scenario is Scenario.MODIFY_ONE:
+        _build_initial(root)
         _append_change(_document_path(root, 1), "one")
         return lambda: maintain_link_index(root)
-    if scenario == "modify_one_percent":
+    if scenario is Scenario.MODIFY_ONE_PERCENT:
+        _build_initial(root)
         changed = min(markdown_files - 1, max(1, markdown_files // 100))
         for number in range(1, changed + 1):
             _append_change(_document_path(root, number), f"percent-{number}")
         return lambda: maintain_link_index(root)
-    if scenario == "add_markdown":
+    if scenario is Scenario.ADD_MARKDOWN:
+        _build_initial(root)
         (root / "doc-added.md").write_text(
             "# Added\n\nSee [target](doc-00001.md).\n", encoding="utf-8"
         )
         return lambda: maintain_link_index(root)
-    if scenario == "delete_markdown":
+    if scenario is Scenario.DELETE_MARKDOWN:
+        _build_initial(root)
         _document_path(root, 1).unlink()
         return lambda: maintain_link_index(root)
-    if scenario == "rename_markdown":
+    if scenario is Scenario.RENAME_MARKDOWN:
+        _build_initial(root)
         _document_path(root, 1).rename(root / "doc-renamed.md")
         return lambda: maintain_link_index(root)
-    if scenario == "directory_nodes":
+    if scenario is Scenario.DIRECTORY_NODES:
+        _build_initial(root)
         (root / "empty-directory").mkdir()
         return lambda: maintain_link_index(root)
-    if scenario == "rebuild_required_recovery":
+    if scenario is Scenario.REBUILD_REQUIRED_RECOVERY:
+        _build_initial(root)
         _rebuild_then_recover(root)
 
         def recover_index() -> object:
@@ -343,9 +387,10 @@ def _scenario_action(root: Path, scenario: str, markdown_files: int) -> Callable
             return result
 
         return recover_index
-    if scenario == "check_maintenance":
+    if scenario is Scenario.CHECK_ABSENT_MAINTENANCE:
         return lambda: check_draft(root, maintain_index=True)
-    if scenario == "journal_growth":
+    if scenario is Scenario.JOURNAL_GROWTH:
+        _build_initial(root)
         growth = min(8, markdown_files - 1)
         for number in range(1, growth + 1):
             _append_change(_document_path(root, number), f"journal-{number}")
@@ -359,49 +404,22 @@ def _scenario_action(root: Path, scenario: str, markdown_files: int) -> Callable
             return result
 
         return maintain_after_journal_growth
-    raise ValueError(f"unknown benchmark scenario: {scenario}")
+    raise AssertionError(f"unhandled benchmark scenario: {scenario}")
 
 
 def run_benchmark_scenario(
-    scenario: str,
+    scenario: str | Scenario,
     *,
     markdown_files: int,
     root: Path,
     seed: int = DEFAULT_SEED,
 ) -> BenchmarkResult:
     """生成固定数据集并运行一个可观测场景。``root`` 必须是新的临时目录路径。"""
-    if scenario not in SCENARIOS:
-        raise ValueError(f"unknown benchmark scenario: {scenario}")
+    scenario_value = _parse_scenario(scenario)
     _write_dataset(root, markdown_files, seed)
-    if scenario in {
-        "fresh_query_backlinks",
-        "fresh_check",
-        "notification_noop",
-        "modify_one",
-        "modify_one_percent",
-        "add_markdown",
-        "delete_markdown",
-        "rename_markdown",
-        "directory_nodes",
-        "rebuild_required_recovery",
-        "journal_growth",
-    }:
-        _build_initial(root)
-    action = _scenario_action(root, scenario, markdown_files)
-    measured = _measure(root, action)
-    return BenchmarkResult(
-        scenario=scenario,
-        markdown_files=measured.markdown_files,
-        width=measured.width,
-        read_files=measured.read_files,
-        read_bytes=measured.read_bytes,
-        parsed_files=measured.parsed_files,
-        wall_seconds=measured.wall_seconds,
-        peak_index_bytes=measured.peak_index_bytes,
-        index_file_bytes=measured.index_file_bytes,
-        journal_write_count=measured.journal_write_count,
-        journal_write_bytes=measured.journal_write_bytes,
-    )
+    action = _scenario_action(root, scenario_value, markdown_files)
+    measured = _measure(root, markdown_files, action)
+    return replace(measured, scenario=scenario_value)
 
 
 def run_benchmark_suite(
@@ -416,7 +434,7 @@ def run_benchmark_suite(
         for count in file_counts:
             if count < 2:
                 raise ValueError("file counts must be at least 2")
-            for scenario in SCENARIOS:
+            for scenario in Scenario:
                 root = workspace / f"files-{count}" / scenario
                 results.append(
                     run_benchmark_scenario(

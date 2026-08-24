@@ -1464,7 +1464,10 @@ def test_recover_maintenance_completed_releases_lock_and_cleans_staging(
 
 
 def test_benchmark_smoke(tmp_path: Path) -> None:
-    from benchmarks.link_index_maintenance import run_benchmark_scenario
+    from benchmarks.link_index_maintenance import (
+        Scenario,
+        run_benchmark_scenario,
+    )
 
     first = run_benchmark_scenario(
         "first_build", markdown_files=10, root=tmp_path / "first", seed=20260825
@@ -1475,6 +1478,15 @@ def test_benchmark_smoke(tmp_path: Path) -> None:
     fresh_query = run_benchmark_scenario(
         "fresh_query_backlinks", markdown_files=10, root=tmp_path / "query", seed=20260825
     )
+    fresh_check = run_benchmark_scenario(
+        "fresh_check", markdown_files=10, root=tmp_path / "fresh-check", seed=20260825
+    )
+    absent_check = run_benchmark_scenario(
+        "check_absent_maintenance",
+        markdown_files=10,
+        root=tmp_path / "absent-check",
+        seed=20260825,
+    )
     notification = run_benchmark_scenario(
         "notification_noop", markdown_files=10, root=tmp_path / "notification", seed=20260825
     )
@@ -1482,11 +1494,26 @@ def test_benchmark_smoke(tmp_path: Path) -> None:
         "modify_one", markdown_files=10, root=tmp_path / "changed", seed=20260825
     )
 
+    assert first.scenario is Scenario.FIRST_BUILD
+    assert first.requested_files == 10
     assert first.markdown_files == 10
+    assert first.width == first.markdown_files
     assert first.read_files == 10
     assert first.parsed_files == 10
     assert first.read_bytes == repeat.read_bytes
     assert first.index_file_bytes == repeat.index_file_bytes
+    assert fresh_check.requested_files == 10
+    assert fresh_check.markdown_files == 10
+    assert fresh_check.width == fresh_check.markdown_files
+    assert fresh_check.read_files == fresh_check.markdown_files
+    assert fresh_check.parsed_files == 0
+    assert fresh_check.journal_write_count == 0
+    assert absent_check.requested_files == 10
+    assert absent_check.markdown_files == 10
+    assert absent_check.width == absent_check.markdown_files
+    assert absent_check.read_files == absent_check.markdown_files
+    assert absent_check.parsed_files > 0
+    assert absent_check.journal_write_count > 0
     assert fresh_query.read_files == fresh_query.markdown_files == 10
     assert fresh_query.parsed_files == 0
     assert notification.read_files == notification.markdown_files == 10
@@ -1500,7 +1527,8 @@ def test_benchmark_smoke(tmp_path: Path) -> None:
     payload = first.to_dict()
     assert {
         "scenario",
-        "files",
+        "requested_files",
+        "markdown_files",
         "width",
         "read_files",
         "read_bytes",
@@ -1511,3 +1539,101 @@ def test_benchmark_smoke(tmp_path: Path) -> None:
         "journal_write_count",
         "journal_write_bytes",
     } <= payload.keys()
+
+
+def test_benchmark_smoke_suite_and_unknown_scenario(tmp_path: Path) -> None:
+    from benchmarks.link_index_maintenance import (
+        Scenario,
+        run_benchmark_scenario,
+        run_benchmark_suite,
+    )
+
+    output = tmp_path / "benchmark.json"
+    results = run_benchmark_suite([10], output=output, seed=20260825)
+    assert len(results) == len(Scenario) == 13
+    assert tuple(result.scenario for result in results) == tuple(Scenario)
+    assert all(result.requested_files == 10 for result in results)
+    assert all(result.read_files == result.markdown_files for result in results)
+    assert all(result.width == result.markdown_files for result in results)
+
+    by_scenario = {result.scenario: result for result in results}
+    assert by_scenario[Scenario.FRESH_QUERY_BACKLINKS].parsed_files == 0
+    assert by_scenario[Scenario.FRESH_CHECK].parsed_files == 0
+    assert by_scenario[Scenario.NOTIFICATION_NOOP].journal_write_count == 0
+    assert by_scenario[Scenario.CHECK_ABSENT_MAINTENANCE].parsed_files > 0
+    assert by_scenario[Scenario.CHECK_ABSENT_MAINTENANCE].journal_write_count > 0
+    assert by_scenario[Scenario.MODIFY_ONE].parsed_files == 1
+    assert by_scenario[Scenario.MODIFY_ONE_PERCENT].parsed_files == 1
+    assert by_scenario[Scenario.ADD_MARKDOWN].markdown_files == 11
+    assert by_scenario[Scenario.DELETE_MARKDOWN].markdown_files == 9
+    assert by_scenario[Scenario.RENAME_MARKDOWN].parsed_files == 1
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert isinstance(payload, list)
+    assert len(payload) == 13
+    expected_fields = {
+        "scenario",
+        "requested_files",
+        "markdown_files",
+        "width",
+        "read_files",
+        "read_bytes",
+        "parsed_files",
+        "wall_seconds",
+        "peak_index_bytes",
+        "index_file_bytes",
+        "journal_write_count",
+        "journal_write_bytes",
+    }
+    assert all(set(item) == expected_fields for item in payload)
+
+    with pytest.raises(ValueError, match="unknown benchmark scenario"):
+        run_benchmark_scenario(
+            "unknown", markdown_files=10, root=tmp_path / "unknown", seed=20260825
+        )
+
+
+def test_benchmark_lstat_failure_keeps_path_and_stops_counting(tmp_path: Path) -> None:
+    import benchmarks.link_index_maintenance as benchmark
+
+    root = tmp_path / "root"
+    root.mkdir()
+    target = root / "doc-00001.md"
+    target.write_text("body\n", encoding="utf-8")
+    real_lstat = benchmark.os.lstat
+
+    def fail_lstat(path: os.PathLike[str] | str) -> os.stat_result:
+        if Path(path).name == target.name:
+            raise OSError(errno.EIO, "injected lstat failure")
+        return real_lstat(path)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(benchmark.os, "lstat", fail_lstat)
+    try:
+        with pytest.raises(benchmark.BenchmarkFilesystemError, match="doc-00001.md"):
+            benchmark._count_markdown_files(root)
+    finally:
+        monkeypatch.undo()
+
+
+def test_benchmark_walk_failure_keeps_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Callable, Iterator
+
+    import benchmarks.link_index_maintenance as benchmark
+
+    def fail_walk(
+        top: str | os.PathLike[str],
+        *,
+        onerror: Callable[[OSError], object] | None = None,
+    ) -> Iterator[tuple[str, list[str], list[str]]]:
+        assert onerror is not None
+        error = OSError(errno.EIO, "injected walk failure")
+        error.filename = str(Path(top) / "benchmark-unreadable")
+        onerror(error)
+        yield (str(top), [], [])
+
+    monkeypatch.setattr(benchmark.os, "walk", fail_walk)
+    with pytest.raises(benchmark.BenchmarkFilesystemError, match="benchmark-unreadable"):
+        benchmark._count_markdown_files(tmp_path)
