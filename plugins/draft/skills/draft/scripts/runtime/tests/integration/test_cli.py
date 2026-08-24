@@ -11,7 +11,8 @@ import pytest
 from draft import __version__
 from draft.cli import main
 from draft.diagnostic_codes import CheckCode
-from draft.models import RootState
+from draft.errors import DraftError
+from draft.models import ResultWarning, RootState
 from draft.vocabulary import ConclusionsState
 from tests.integration.support import (
     DraftFactory,
@@ -1452,3 +1453,281 @@ def test_dry_run_with_existing_lock_fails_recovery_required(
     # 未产生业务写入。
     assert (root / "pages/a.md").is_file()
     assert not (root / "pages/b.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# notify files-changed：notification 结果矩阵（spec §13）
+# ---------------------------------------------------------------------------
+
+
+def _operation_dirs(root: Path) -> list[Path]:
+    operations = root / ".draft" / "operations"
+    if not operations.is_dir():
+        return []
+    return sorted(
+        (operations / entry.name for entry in operations.iterdir()),
+        key=lambda path: path.name,
+    )
+
+
+def _journal_payload(root: Path) -> dict[str, object]:
+    """返回最新权威（数值最大 revision）operation 的 journal 负载。"""
+    best: tuple[int, dict[str, object]] | None = None
+    for directory in _operation_dirs(root):
+        payload = json.loads((directory / "journal.json").read_text(encoding="utf-8"))
+        revision = payload.get("link_index_revision")
+        if revision is None:
+            continue
+        numeric = int(revision)
+        if best is None or numeric > best[0]:
+            best = (numeric, payload)
+    assert best is not None, "no journal with a link_index_revision found"
+    return best[1]
+
+
+def _notify(root: Path, capsys: pytest.CaptureFixture[str]) -> tuple[int, dict[str, object]]:
+    return run_json(["notify", "files-changed", "--root", str(root), "--json"], capsys)
+
+
+def test_notify_registered_absent_delivers_and_publishes_first_index(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], draft_factory: DraftFactory
+) -> None:
+    root = draft_factory({"pages/a.md": "# A\n"})
+
+    code, payload = _notify(root, capsys)
+
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+    journal = _journal_payload(root)
+    assert journal["phase"] == "completed"
+    assert journal["link_index_revision"] == "1"
+    assert journal["link_index_result"] == "published"
+    assert journal["root_state"] == "registered"
+
+
+def test_notify_candidate_delivers_and_records_candidate_root_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], draft_factory: DraftFactory
+) -> None:
+    root = draft_factory({"pages/a.md": "# A\n"}, root_state=RootState.CANDIDATE)
+
+    code, payload = _notify(root, capsys)
+
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+    journal = _journal_payload(root)
+    assert journal["root_state"] == "candidate"
+    assert journal["link_index_result"] == "published"
+
+
+def test_notify_fresh_no_change_is_delivered_without_new_operation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], draft_factory: DraftFactory
+) -> None:
+    root = draft_factory({"pages/a.md": "# A\n"})
+    assert _notify(root, capsys)[0] == 0
+    before = _operation_dirs(root)
+
+    code, payload = _notify(root, capsys)
+
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+    assert _operation_dirs(root) == before
+
+
+def test_notify_stale_publishes_next_revision(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], draft_factory: DraftFactory
+) -> None:
+    root = draft_factory({"pages/a.md": "# A\n"})
+    assert _notify(root, capsys)[0] == 0
+    (root / "pages" / "a.md").write_text("# A changed\n", encoding="utf-8")
+
+    code, payload = _notify(root, capsys)
+
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+    assert _journal_payload(root)["link_index_revision"] == "2"
+
+
+def test_notify_lock_held_is_delivered_without_maintenance(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], draft_factory: DraftFactory
+) -> None:
+    root = draft_factory({"pages/a.md": "# A\n"})
+    lock = root / ".draft" / "operation.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(json.dumps({"operation_id": "f" * 32}) + "\n", encoding="utf-8")
+
+    code, payload = _notify(root, capsys)
+
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+    assert _operation_dirs(root) == []
+
+
+def test_notify_scan_failure_is_delivered_and_records_rebuild_required(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = draft_factory({"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def fail_scan(root: Path, baseline: object, *, known_documents: object = ()) -> object:
+        raise DraftError("operation.index_update_failed", root)
+
+    monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+
+    code, payload = _notify(root, capsys)
+
+    monkeypatch.undo()
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+    assert _journal_payload(root)["link_index_result"] == "rebuild_required"
+
+
+def test_notify_rebuild_required_state_rebuilds_and_delivers(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = draft_factory({"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def fail_scan(root: Path, baseline: object, *, known_documents: object = ()) -> object:
+        raise DraftError("operation.index_update_failed", root)
+
+    monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+    assert _notify(root, capsys)[0] == 0
+    monkeypatch.undo()
+    assert _journal_payload(root)["link_index_result"] == "rebuild_required"
+
+    code, payload = _notify(root, capsys)
+
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+    assert _journal_payload(root)["link_index_result"] == "published"
+
+
+def test_notify_rebuild_flag_failure_is_delivered_without_warning(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = draft_factory({"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def fail_scan(root: Path, baseline: object, *, known_documents: object = ()) -> object:
+        raise DraftError("operation.index_update_failed", root)
+
+    monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+
+    def flag_failed(root: Path) -> ResultWarning:
+        return ResultWarning("link_index.rebuild_flag_update_failed")
+
+    monkeypatch.setattr(maintenance, "ensure_rebuild_flag", flag_failed)
+
+    code, payload = _notify(root, capsys)
+
+    monkeypatch.undo()
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+
+
+def test_notify_artifact_inconsistency_is_delivered(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = draft_factory({"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def fail_baseline(root: Path) -> object:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, root)
+
+    monkeypatch.setattr(maintenance, "load_link_index_baseline", fail_baseline)
+
+    code, payload = _notify(root, capsys)
+
+    monkeypatch.undo()
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+
+
+def test_notify_journal_durability_failure_is_delivered(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = draft_factory({"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def fail_first_write(journal: object) -> None:
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, root / ".draft")
+
+    monkeypatch.setattr(maintenance, "write_journal", fail_first_write)
+
+    code, payload = _notify(root, capsys)
+
+    monkeypatch.undo()
+    assert code == 0
+    assert payload == {"result_type": "files_changed_notification"}
+
+
+def test_notify_program_contract_error_is_not_absorbed(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = draft_factory({"pages/a.md": "# A\n"})
+    import draft.link_index_maintenance as maintenance
+
+    def fail_prepare(root: Path, *, known_documents: object = ()) -> object:
+        raise DraftError("operation.plan_invalid", root)
+
+    monkeypatch.setattr(maintenance, "prepare_link_index_update", fail_prepare)
+
+    code, payload = _notify(root, capsys)
+
+    monkeypatch.undo()
+    assert code == 3  # operation.* 程序契约错误映射操作退出码，不被吸收。
+    assert payload["ok"] is False
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "operation.plan_invalid"
+
+
+def test_notify_missing_root_is_domain_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from draft.diagnostic_codes import RootCode
+
+    code, payload = run_json(
+        ["notify", "files-changed", "--root", str(tmp_path / "nope"), "--json"], capsys
+    )
+    assert code == 2
+    assert payload["ok"] is False
+    assert payload["result_type"] == "error"
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == RootCode.NOT_FOUND.value
+
+
+def test_notify_corrupt_marker_is_domain_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], draft_factory: DraftFactory
+) -> None:
+    root = draft_factory({})
+    (root / ".draft" / "draft.json").write_text("{corrupt", encoding="utf-8")
+
+    code, payload = run_json(
+        ["notify", "files-changed", "--root", str(root), "--json"], capsys
+    )
+    assert code == 2
+    assert payload["ok"] is False
+    assert payload["result_type"] == "error"
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == CheckCode.FORMAT_INVALID.value

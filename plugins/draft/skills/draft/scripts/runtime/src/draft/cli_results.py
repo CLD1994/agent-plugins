@@ -28,6 +28,7 @@ class ResultType(StrEnum):
     TRASH = "trash"
     RESTORE = "restore"
     RECOVER = "recover"
+    FILES_CHANGED_NOTIFICATION = "files_changed_notification"
     QUERY_PAGE = "query.page"
     QUERY_LINKS = "query.links"
     QUERY_BACKLINKS = "query.backlinks"

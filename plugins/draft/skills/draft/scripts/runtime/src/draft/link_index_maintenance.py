@@ -802,6 +802,7 @@ def prepare_link_index_update(
 def commit_link_index_update(
     root: Path,
     prepared: PreparedLinkIndexUpdate,
+    root_state: RootState = RootState.REGISTERED,
 ) -> LinkIndexMaintenanceResult:
     """取锁、核对并发令牌并耐久收敛维护结果（spec §15/§10/§11）。
 
@@ -813,6 +814,9 @@ def commit_link_index_update(
     并发令牌（spec §15）：revision/absent 已推进时不预分配、放弃候选、不记录降级；
     锁已由另一 operation 持有时保留进程内扫描事实而不发布。发布失败但可耐久记录时
     降级到 ``rebuild_required``（spec §10/§14）。
+
+    ``root_state`` 是调用方已解析的真实根状态（spec §13：candidate/registered 都允许），
+    写入预分配 journal；默认 registered 保持既有调用向后兼容。
     """
     if prepared.scan is None and not prepared.requires_rebuild:
         return LinkIndexMaintenanceResult(index=None, warnings=(), published=False)
@@ -841,7 +845,7 @@ def commit_link_index_update(
             root,
             kind=OperationKind.LINK_INDEX_UPDATE,
             operation_id=operation_id,
-            root_state=RootState.REGISTERED,
+            root_state=root_state,
             observations=EMPTY_OBSERVATIONS,
             metadata={},
         )
@@ -870,12 +874,17 @@ def commit_link_index_update(
 def maintain_link_index(
     root: Path,
     known_documents: tuple[IndexedFile, ...] = (),
+    root_state: RootState = RootState.REGISTERED,
 ) -> LinkIndexMaintenanceResult:
-    """独立 maintenance 入口：扫描前读锁，已有锁直接返回未发布结果（spec §13/§14）。"""
+    """独立 maintenance 入口：扫描前读锁，已有锁直接返回未发布结果（spec §13/§14）。
+
+    ``root_state`` 由调用方解析（notification 等触达 candidate 根的消费者穿通真实状态），
+    经 ``commit_link_index_update`` 写入预分配 journal；默认 registered 保持向后兼容。
+    """
     if read_lock(root) is not None:
         return LinkIndexMaintenanceResult(index=None, warnings=(), published=False)
     prepared = prepare_link_index_update(root, known_documents=known_documents)
-    return commit_link_index_update(root, prepared)
+    return commit_link_index_update(root, prepared, root_state=root_state)
 
 
 def _finish_rebuild_required(

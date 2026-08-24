@@ -11,7 +11,11 @@ from typing import cast
 
 from draft import __version__
 from draft.cli_results import CheckSlice, DryRunOperation, ResultType, project_check
-from draft.diagnostic_codes import CheckCode
+from draft.diagnostic_codes import (
+    OPERATION_EXTERNAL_CHANGE,
+    OPERATION_INDEX_UPDATE_FAILED,
+    CheckCode,
+)
 from draft.diagnostics import issue_payload, render_issue
 from draft.errors import DraftError
 from draft.models import (
@@ -174,6 +178,23 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[rooted],
         help="修复中断的写操作",
         description="修复崩溃或中断留下的未完成写操作；回收生命周期推进由所有已登记命令的前置静默完成。",
+    )
+
+    notify = subparsers.add_parser(
+        "notify",
+        parents=[rooted],
+        help="通知草稿根发生外部文件变化",
+        description=(
+            "声明草稿根内文件已在 Draft 写命令之外发生变化，触发机会式索引维护；"
+            "命令不接收路径、变化清单或 --dry-run，不推进回收生命周期。"
+        ),
+    )
+    notify_sub = notify.add_subparsers(dest="notify_command", metavar="SUB", required=True)
+    notify_sub.add_parser(
+        "files-changed",
+        parents=[rooted],
+        help="外部文件变更通知",
+        description="通知草稿根已发生外部文件变化；已有维护持锁或已分类维护失败仍视为送达。",
     )
 
     create = subparsers.add_parser(
@@ -451,6 +472,47 @@ def _query_root_state(root: Path) -> RootState:
     from draft.graph import read_marker
 
     return read_marker(root).root_state
+
+
+# notification 用例（spec §13）：已分类的索引维护消费者失败由单一集合吸收，程序契约
+# 错误与根/marker 验证失败不得吸收。集合是本文件唯一权威，禁止在 CLI 另建第二份清单。
+_NOTIFICATION_ABSORBED_CODES = frozenset(
+    {
+        CheckCode.OPERATION_RECOVERY_REQUIRED.value,
+        CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+        CheckCode.OPERATION_INCONSISTENT_STATE.value,
+        CheckCode.OPERATION_DURABILITY_FAILED.value,
+        CheckCode.PATH_SYMLINK_ESCAPE.value,
+        CheckCode.OPERATION_JOURNAL_VERSION_UNSUPPORTED.value,
+        OPERATION_EXTERNAL_CHANGE,
+        OPERATION_INDEX_UPDATE_FAILED,
+    }
+)
+
+
+def is_expected_link_index_maintenance_error(error: DraftError) -> bool:
+    """已分类的索引维护消费者失败（spec §13）：notification 用例视为送达。"""
+    return error.code in _NOTIFICATION_ABSORBED_CODES
+
+
+def notify_files_changed(root: Path) -> None:
+    """外部文件变更通知用例：已有锁或已分类维护失败都视为送达（spec §13）。
+
+    真实根状态（candidate/registered 都允许）在调用维护前解析并穿通到预分配 journal；
+    根与 marker 验证在本函数之前完成，此处失败按真实错误传播，不被吸收。
+    """
+    root_state = _query_root_state(root)
+    from draft.link_index_maintenance import maintain_link_index
+    from draft.operations import read_lock
+
+    try:
+        if read_lock(root) is not None:
+            return
+        maintain_link_index(root, root_state=root_state)
+    except DraftError as error:
+        if not is_expected_link_index_maintenance_error(error):
+            raise
+        return
 
 
 def _raise_for_blocking(root: Path, view: TolerantView, root_state: RootState) -> None:
@@ -1070,6 +1132,13 @@ def _dispatch(
             "paths": [path.as_posix() for path in paths],
         }
         return payload, f"恢复完成：{len(results)} 项结果", 0
+    if command == "notify":
+        notify_files_changed(root)
+        return (
+            {"result_type": ResultType.FILES_CHANGED_NOTIFICATION.value},
+            "已通知 Draft 根发生外部文件变化",
+            0,
+        )
     raise DraftError("cli.unknown_command")
 
 
@@ -1127,9 +1196,9 @@ def main(
             _emit_error(error, json_mode)
             return _exit_for_error(error)
 
-    # check/adopt/init 不推进回收生命周期（规格 §8.1）；其余受管命令在任一受管根上
-    # 于业务前推进恰好一次。
-    if command not in ("check", "adopt") and managed is not None:
+    # check/adopt/notify/init 不推进回收生命周期（规格 §8.1/§13）；其余受管命令在任一
+    # 受管根上于业务前推进恰好一次。
+    if command not in ("check", "adopt", "notify") and managed is not None:
         try:
             _advance_for_command(managed.path, now=captured_now)
         except DraftError as error:

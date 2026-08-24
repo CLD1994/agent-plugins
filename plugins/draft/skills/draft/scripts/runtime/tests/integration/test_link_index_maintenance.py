@@ -973,6 +973,22 @@ def test_maintain_first_publish_creates_revision_one(tmp_path: Path) -> None:
     assert read_lock(root) is None
 
 
+def test_maintain_candidate_root_records_candidate_root_state(tmp_path: Path) -> None:
+    """T5 review P3-3：candidate 根的维护 journal root_state 必须记录 candidate。
+
+    通知是首个触达 candidate 根的维护消费者；真实根状态必须经 maintain_link_index
+    穿通到 preallocate_journal，而不是硬编码 registered。
+    """
+    root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
+
+    result = maintain_link_index(root, root_state=RootState.CANDIDATE)
+
+    assert result.published is True
+    payload = _journal_payload(root)
+    assert payload["root_state"] == "candidate"
+    assert payload["link_index_result"] == "published"
+
+
 def test_maintain_no_change_does_not_allocate_operation(tmp_path: Path) -> None:
     root = _maintenance_root(tmp_path, {"pages/a.md": "# A\n"})
     assert maintain_link_index(root).published is True

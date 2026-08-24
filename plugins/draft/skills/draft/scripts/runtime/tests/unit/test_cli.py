@@ -11,7 +11,12 @@ from pytest_mock import MockerFixture
 import draft.cli as cli
 from draft import __version__
 from draft.cli_results import CheckSlice, project_check
-from draft.diagnostic_codes import CheckCode
+from draft.diagnostic_codes import (
+    OPERATION_EXTERNAL_CHANGE,
+    OPERATION_INDEX_UPDATE_FAILED,
+    CheckCode,
+    RootCode,
+)
 from draft.errors import DraftError
 from draft.graph import MarkerState
 from draft.models import (
@@ -882,3 +887,81 @@ def test_main_dispatch_os_error_returns_runtime_exit_code(
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
     assert payload["error"]["code"] == "runtime.os_error"
+
+
+# ---------------------------------------------------------------------------
+# notify files-changed：parser / dispatch / 吸收集合（spec §13）
+# ---------------------------------------------------------------------------
+
+
+def test_notify_files_changed_parser_has_no_path_operands() -> None:
+    args = cli.build_parser().parse_args(
+        ["notify", "files-changed", "--root", "/draft", "--json"]
+    )
+    assert args.command == "notify"
+    assert args.notify_command == "files-changed"
+    assert not hasattr(args, "paths")
+
+
+def test_notify_parser_rejects_path_operands() -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            ["notify", "files-changed", "--root", "/draft", "pages/a.md"]
+        )
+
+
+def test_notify_parser_requires_subcommand() -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["notify", "--root", "/draft"])
+
+
+def test_dispatch_notify_calls_use_case_and_returns_minimal_payload(
+    mocker: MockerFixture,
+) -> None:
+    args = cli.build_parser().parse_args(["notify", "files-changed", "--root", "/draft"])
+    notify = mocker.patch("draft.cli.notify_files_changed", autospec=True)
+    payload, human, exit_code = cli._dispatch(args, root=Path("/draft"))  # pyright: ignore[reportPrivateUsage]  # 验证 notify 分派到用例函数并返回最小载荷
+    notify.assert_called_once_with(Path("/draft"))
+    assert payload == {"result_type": "files_changed_notification"}
+    assert "已通知 Draft 根发生外部文件变化" in human
+    assert exit_code == 0
+
+
+def test_main_notify_does_not_advance_lifecycle(
+    mocker: MockerFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stub_root_discovery(mocker)
+    advance = mocker.patch("draft.cli._advance_for_command", autospec=True)
+    notify = mocker.patch("draft.cli.notify_files_changed", autospec=True)
+    code = cli.main(["notify", "files-changed", "--root", "/draft", "--json"])
+    assert code == 0
+    advance.assert_not_called()
+    notify.assert_called_once_with(Path("/draft"))
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"result_type": "files_changed_notification"}
+
+
+def test_is_expected_link_index_maintenance_error_absorbs_classified_codes() -> None:
+    codes = (
+        CheckCode.OPERATION_RECOVERY_REQUIRED.value,
+        CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+        CheckCode.OPERATION_INCONSISTENT_STATE.value,
+        CheckCode.OPERATION_DURABILITY_FAILED.value,
+        CheckCode.PATH_SYMLINK_ESCAPE.value,
+        CheckCode.OPERATION_JOURNAL_VERSION_UNSUPPORTED.value,
+        OPERATION_EXTERNAL_CHANGE,
+        OPERATION_INDEX_UPDATE_FAILED,
+    )
+    for code in codes:
+        assert cli.is_expected_link_index_maintenance_error(DraftError(code))
+    # 集合与 _NOTIFICATION_ABSORBED_CODES 同源：单元测试不复制第二份清单。
+    assert frozenset(codes) == cli._NOTIFICATION_ABSORBED_CODES  # pyright: ignore[reportPrivateUsage]
+
+
+def test_is_expected_link_index_maintenance_error_rejects_program_contract_errors() -> None:
+    assert not cli.is_expected_link_index_maintenance_error(DraftError("operation.plan_invalid"))
+    assert not cli.is_expected_link_index_maintenance_error(DraftError("cli.unknown_command"))
+    assert not cli.is_expected_link_index_maintenance_error(
+        DraftError(RootCode.NOT_FOUND.value)
+    )
