@@ -1145,7 +1145,7 @@ def _fail_write_at(monkeypatch: pytest.MonkeyPatch, fail_at: frozenset[int]) -> 
     real_write = maintenance.write_journal
     calls = {"n": 0}
 
-    def flaky_write(journal: object) -> None:
+    def flaky_write(journal: Journal) -> None:
         calls["n"] += 1
         if calls["n"] in fail_at:
             raise DraftError(

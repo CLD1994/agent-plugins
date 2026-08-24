@@ -8,6 +8,8 @@ import draft.link_index_maintenance as _maintenance
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.link_index import (
+    IndexedFile,
+    LinkIndex,
     LinkIndexContent,
     LinkIndexScan,
     LinkIndexScanStats,
@@ -228,17 +230,39 @@ def _scan(changed: bool) -> LinkIndexScan:
     )
 
 
+def _baseline_index() -> LinkIndex:
+    return LinkIndex(revision="1", files={}, backlinks={}, directories={})
+
+
+def _stub_scan(monkeypatch: pytest.MonkeyPatch, *, changed: bool) -> None:
+    def scan(
+        root: Path,
+        baseline: LinkIndexBaseline | None,
+        known_documents: tuple[IndexedFile, ...] = (),
+    ) -> LinkIndexScan:
+        return _scan(changed=changed)
+
+    monkeypatch.setattr(_maintenance, "scan_link_index", scan)
+
+
 def _stub_authority_and_baseline(
     monkeypatch: pytest.MonkeyPatch,
     *,
     revision: str | None,
     result: LinkIndexResult | None,
-    baseline_index: object | None,
+    baseline_index: LinkIndex | None,
 ) -> None:
     authority = LinkIndexAuthority(revision, result, None)
     baseline = LinkIndexBaseline(authority=authority, index=baseline_index)
-    monkeypatch.setattr(_maintenance, "read_link_index_authority", lambda root: authority)
-    monkeypatch.setattr(_maintenance, "load_link_index_baseline", lambda root: baseline)
+
+    def read_authority(root: Path) -> LinkIndexAuthority:
+        return authority
+
+    def load_baseline(root: Path) -> LinkIndexBaseline:
+        return baseline
+
+    monkeypatch.setattr(_maintenance, "read_link_index_authority", read_authority)
+    monkeypatch.setattr(_maintenance, "load_link_index_baseline", load_baseline)
 
 
 def test_prepare_absent_returns_full_build_candidate(
@@ -247,11 +271,7 @@ def test_prepare_absent_returns_full_build_candidate(
     _stub_authority_and_baseline(
         monkeypatch, revision=None, result=None, baseline_index=None
     )
-    monkeypatch.setattr(
-        _maintenance,
-        "scan_link_index",
-        lambda root, baseline, known_documents=(): _scan(changed=True),
-    )
+    _stub_scan(monkeypatch, changed=True)
 
     prepared = prepare_link_index_update(Path("/draft"))
 
@@ -264,13 +284,12 @@ def test_prepare_fresh_returns_no_write_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _stub_authority_and_baseline(
-        monkeypatch, revision="5", result=LinkIndexResult.PUBLISHED, baseline_index=object()
+        monkeypatch,
+        revision="5",
+        result=LinkIndexResult.PUBLISHED,
+        baseline_index=_baseline_index(),
     )
-    monkeypatch.setattr(
-        _maintenance,
-        "scan_link_index",
-        lambda root, baseline, known_documents=(): _scan(changed=False),
-    )
+    _stub_scan(monkeypatch, changed=False)
 
     prepared = prepare_link_index_update(Path("/draft"))
 
@@ -283,13 +302,12 @@ def test_prepare_stale_returns_incremental_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _stub_authority_and_baseline(
-        monkeypatch, revision="5", result=LinkIndexResult.PUBLISHED, baseline_index=object()
+        monkeypatch,
+        revision="5",
+        result=LinkIndexResult.PUBLISHED,
+        baseline_index=_baseline_index(),
     )
-    monkeypatch.setattr(
-        _maintenance,
-        "scan_link_index",
-        lambda root, baseline, known_documents=(): _scan(changed=True),
-    )
+    _stub_scan(monkeypatch, changed=True)
 
     prepared = prepare_link_index_update(Path("/draft"))
 
@@ -302,13 +320,12 @@ def test_prepare_rebuild_required_returns_full_build_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _stub_authority_and_baseline(
-        monkeypatch, revision="5", result=LinkIndexResult.REBUILD_REQUIRED, baseline_index=None
+        monkeypatch,
+        revision="5",
+        result=LinkIndexResult.REBUILD_REQUIRED,
+        baseline_index=None,
     )
-    monkeypatch.setattr(
-        _maintenance,
-        "scan_link_index",
-        lambda root, baseline, known_documents=(): _scan(changed=True),
-    )
+    _stub_scan(monkeypatch, changed=True)
 
     prepared = prepare_link_index_update(Path("/draft"))
 
@@ -321,11 +338,16 @@ def test_prepare_scan_failure_degrades_to_rebuild_required(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _stub_authority_and_baseline(
-        monkeypatch, revision="5", result=LinkIndexResult.PUBLISHED, baseline_index=object()
+        monkeypatch,
+        revision="5",
+        result=LinkIndexResult.PUBLISHED,
+        baseline_index=_baseline_index(),
     )
 
     def fail_scan(
-        root: Path, baseline: LinkIndexBaseline, *, known_documents: object = ()
+        root: Path,
+        baseline: LinkIndexBaseline | None,
+        known_documents: tuple[IndexedFile, ...] = (),
     ) -> LinkIndexScan:
         raise DraftError("operation.index_update_failed", root)
 
@@ -342,11 +364,16 @@ def test_prepare_unstable_scan_degrades_to_rebuild_required(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _stub_authority_and_baseline(
-        monkeypatch, revision="5", result=LinkIndexResult.PUBLISHED, baseline_index=object()
+        monkeypatch,
+        revision="5",
+        result=LinkIndexResult.PUBLISHED,
+        baseline_index=_baseline_index(),
     )
 
     def fail_scan(
-        root: Path, baseline: LinkIndexBaseline, *, known_documents: object = ()
+        root: Path,
+        baseline: LinkIndexBaseline | None,
+        known_documents: tuple[IndexedFile, ...] = (),
     ) -> LinkIndexScan:
         raise DraftError("operation.external_change", root)
 
@@ -361,7 +388,11 @@ def test_prepare_journal_artifact_contradiction_propagates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     authority = LinkIndexAuthority("5", LinkIndexResult.PUBLISHED, "a" * 64)
-    monkeypatch.setattr(_maintenance, "read_link_index_authority", lambda root: authority)
+
+    def read_authority(root: Path) -> LinkIndexAuthority:
+        return authority
+
+    monkeypatch.setattr(_maintenance, "read_link_index_authority", read_authority)
 
     def fail_baseline(root: Path) -> LinkIndexBaseline:
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, root)
@@ -400,13 +431,41 @@ def _commit_stubs(
     *,
     authority: LinkIndexAuthority,
 ) -> None:
-    monkeypatch.setattr(_maintenance, "acquire_lock", lambda root, operation_id: None)
-    monkeypatch.setattr(_maintenance, "release_lock", lambda root, operation_id: None)
-    monkeypatch.setattr(_maintenance, "read_link_index_authority", lambda root: authority)
-    monkeypatch.setattr(
-        _maintenance, "preallocate_journal", lambda root, **kwargs: _allocating_journal()
-    )
-    monkeypatch.setattr(_maintenance, "write_journal", lambda journal: None)
+    def acquire(root: Path, operation_id: str) -> None:
+        return None
+
+    def release(root: Path, operation_id: str) -> None:
+        return None
+
+    def read_authority(root: Path) -> LinkIndexAuthority:
+        return authority
+
+    def preallocate(root: Path, **kwargs: object) -> Journal:
+        return _allocating_journal()
+
+    def write(journal: Journal) -> None:
+        return None
+
+    monkeypatch.setattr(_maintenance, "acquire_lock", acquire)
+    monkeypatch.setattr(_maintenance, "release_lock", release)
+    monkeypatch.setattr(_maintenance, "read_link_index_authority", read_authority)
+    monkeypatch.setattr(_maintenance, "preallocate_journal", preallocate)
+    monkeypatch.setattr(_maintenance, "write_journal", write)
+
+
+def _stub_publish_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    def stage(journal: Journal, index: LinkIndex) -> str:
+        return "d" * 64
+
+    def publish(root: Path, journal: Journal, expected_sha256: str) -> None:
+        return None
+
+    def remove_flag(root: Path) -> ResultWarning | None:
+        return None
+
+    monkeypatch.setattr(_maintenance, "stage_link_index", stage)
+    monkeypatch.setattr(_maintenance, "publish_staged_link_index", publish)
+    monkeypatch.setattr(_maintenance, "remove_rebuild_flag", remove_flag)
 
 
 def test_commit_no_change_does_not_allocate_operation(
@@ -439,11 +498,7 @@ def test_commit_absent_publishes_first_revision(
         observed_revision=None, scan=_scan(changed=True), requires_rebuild=False
     )
     _commit_stubs(monkeypatch, authority=LinkIndexAuthority(None, None, None))
-    monkeypatch.setattr(_maintenance, "stage_link_index", lambda journal, index: "d" * 64)
-    monkeypatch.setattr(
-        _maintenance, "publish_staged_link_index", lambda root, journal, expected_sha256: None
-    )
-    monkeypatch.setattr(_maintenance, "remove_rebuild_flag", lambda root: None)
+    _stub_publish_success(monkeypatch)
 
     result = commit_link_index_update(Path("/draft"), prepared)
 
@@ -463,11 +518,7 @@ def test_commit_stale_publishes_numeric_next_revision(
         monkeypatch,
         authority=LinkIndexAuthority("5", LinkIndexResult.PUBLISHED, "a" * 64),
     )
-    monkeypatch.setattr(_maintenance, "stage_link_index", lambda journal, index: "d" * 64)
-    monkeypatch.setattr(
-        _maintenance, "publish_staged_link_index", lambda root, journal, expected_sha256: None
-    )
-    monkeypatch.setattr(_maintenance, "remove_rebuild_flag", lambda root: None)
+    _stub_publish_success(monkeypatch)
 
     result = commit_link_index_update(Path("/draft"), prepared)
 
@@ -484,13 +535,19 @@ def test_commit_revision_advanced_abandons_candidate(
     )
     preallocated: dict[str, bool] = {"called": False}
     writes: list[Journal] = []
-    monkeypatch.setattr(_maintenance, "acquire_lock", lambda root, operation_id: None)
-    monkeypatch.setattr(_maintenance, "release_lock", lambda root, operation_id: None)
-    monkeypatch.setattr(
-        _maintenance,
-        "read_link_index_authority",
-        lambda root: LinkIndexAuthority("6", LinkIndexResult.PUBLISHED, "b" * 64),
-    )
+
+    def acquire(root: Path, operation_id: str) -> None:
+        return None
+
+    def release(root: Path, operation_id: str) -> None:
+        return None
+
+    def read_authority(root: Path) -> LinkIndexAuthority:
+        return LinkIndexAuthority("6", LinkIndexResult.PUBLISHED, "b" * 64)
+
+    monkeypatch.setattr(_maintenance, "acquire_lock", acquire)
+    monkeypatch.setattr(_maintenance, "release_lock", release)
+    monkeypatch.setattr(_maintenance, "read_link_index_authority", read_authority)
 
     def preallocate(root: Path, **kwargs: object) -> Journal:
         preallocated["called"] = True
@@ -520,12 +577,14 @@ def test_commit_rebuild_required_records_degradation_warning(
         monkeypatch,
         authority=LinkIndexAuthority("5", LinkIndexResult.PUBLISHED, "a" * 64),
     )
-    monkeypatch.setattr(_maintenance, "ensure_rebuild_flag", lambda root: None)
-    monkeypatch.setattr(
-        _maintenance, "stage_link_index", lambda journal, index: (_ for _ in ()).throw(
-            AssertionError("stage must not be called on rebuild path")
-        )
-    )
+    def no_flag(root: Path) -> ResultWarning | None:
+        return None
+
+    def fail_stage(journal: Journal, index: LinkIndex) -> str:
+        raise AssertionError("stage must not be called on rebuild path")
+
+    monkeypatch.setattr(_maintenance, "ensure_rebuild_flag", no_flag)
+    monkeypatch.setattr(_maintenance, "stage_link_index", fail_stage)
 
     result = commit_link_index_update(Path("/draft"), prepared)
 
@@ -543,11 +602,10 @@ def test_commit_rebuild_required_flag_failure_warning_order(
         monkeypatch,
         authority=LinkIndexAuthority("5", LinkIndexResult.PUBLISHED, "a" * 64),
     )
-    monkeypatch.setattr(
-        _maintenance,
-        "ensure_rebuild_flag",
-        lambda root: ResultWarning("link_index.rebuild_flag_update_failed"),
-    )
+    def failing_flag(root: Path) -> ResultWarning | None:
+        return ResultWarning("link_index.rebuild_flag_update_failed")
+
+    monkeypatch.setattr(_maintenance, "ensure_rebuild_flag", failing_flag)
 
     result = commit_link_index_update(Path("/draft"), prepared)
 
@@ -586,11 +644,16 @@ def test_commit_lock_held_keeps_in_process_index(
 def test_maintain_lock_held_returns_unpublished_without_scan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(_maintenance, "read_lock", lambda root: "f" * 32)
+    def read_lock_held(root: Path) -> str | None:
+        return "f" * 32
+
+    monkeypatch.setattr(_maintenance, "read_lock", read_lock_held)
     scanned: dict[str, bool] = {"called": False}
 
     def scan_spy(
-        root: Path, baseline: LinkIndexBaseline, *, known_documents: object = ()
+        root: Path,
+        baseline: LinkIndexBaseline | None,
+        known_documents: tuple[IndexedFile, ...] = (),
     ) -> LinkIndexScan:
         scanned["called"] = True
         return _scan(changed=True)
