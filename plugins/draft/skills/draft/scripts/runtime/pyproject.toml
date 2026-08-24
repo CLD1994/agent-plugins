@@ -42,7 +42,7 @@ markers = [
 ]
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "benchmarks"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
 
