@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -12,7 +13,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Literal, NoReturn, Protocol, cast
+from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, cast
+
+if TYPE_CHECKING:
+    from draft.link_index_maintenance import PreparedLinkIndexUpdate
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
@@ -24,6 +28,7 @@ from draft.models import (
     OperationPhase,
     OperationPlan,
     OperationResult,
+    ResultWarning,
     RootState,
 )
 from draft.observations import (
@@ -45,6 +50,11 @@ class _MutationLike(Protocol):
 JOURNAL_VERSION = 4
 LOCK_RELATIVE = Path(INTERNAL_DIR) / "operation.lock"
 OPERATIONS_RELATIVE = Path(INTERNAL_DIR) / "operations"
+
+# 通用业务 operation 索引阶段使用的稳定领域码（spec §10/§11）。
+_INDEX_UPDATE_FAILED = "operation.index_update_failed"
+_EXTERNAL_CHANGE = "operation.external_change"
+_REBUILD_REQUIRED_WARNING = "link_index.rebuild_required"
 
 # 第一版固定的生命周期时间常量：恢复窗口 7 天、清理期限再延 30 天、
 # 普通投递失败后节流 24 小时。这些是绝对事实，不随默认值变化追溯改变已有删除包。
@@ -1657,6 +1667,14 @@ def _validate_link_index_transition(old: Journal, new: Journal, *, path: Path) -
         if new_state != (old.link_index_revision, LinkIndexResult.REBUILD_REQUIRED, None):
             _raise_journal_invalid(path)
         return
+    if new.phase in _ROLLBACK_PHASES:
+        # 进入 rollback：链接索引字段必须清空（spec §4/§5 rollback 禁止）。既有索引
+        # 结果随业务回滚作废（如 restore 把 trash 从 trash_retained 提交为 rolled_back），
+        # 不再作为 authority 结果。``link_index_updating`` 之后不允许进入 rollback，
+        # 因此此处只会清空终态保留阶段携带的既有结果。
+        if new_state != (None, None, None):
+            _raise_journal_invalid(path)
+        return
     # 其余边（pre-index 保持空、终态保留索引结果）字段必须原样保留。
     if old_state != new_state:
         _raise_journal_invalid(path)
@@ -2516,6 +2534,8 @@ def finalize_operation(
     *,
     retain_terminal_lock: bool = False,
     changed_paths: tuple[Path, ...] | None = None,
+    settle_empty_directories: bool = True,
+    warnings: tuple[ResultWarning, ...] = (),
 ) -> OperationResult:
     """Mark a terminal phase; by default clean recovery copies then release the lock.
 
@@ -2526,15 +2546,21 @@ def finalize_operation(
     顺序为终态日志耐久 → 安全清理已授权恢复材料 → 释放锁：清理遇到未知成员/类型
     错误时保留锁与现场，CLI 报错后 recover 仍能凭锁定位，不会出现"报错时根内已无锁"
     （回归 H5）。
+
+    通用业务完成路径（``_validate_and_complete``）在进入索引阶段前已由
+    ``settle_planned_empty_directories`` 收敛计划内空目录，因此传入
+    ``settle_empty_directories=False`` 避免索引发布后再执行目录清理（spec §6）；回滚
+    路径保留默认清理。``warnings`` 是索引阶段产生的稳定公开 warning，随成功结果返回。
     """
     terminal = _with_phase(journal, phase)
     write_journal(terminal)
     if not retain_terminal_lock:
         _clean_recovery_copies(journal)
         release_lock(root, journal.operation_id)
-    for relative in journal.remove_empty_directories:
-        with suppress(OSError):
-            (root / relative).rmdir()
+    if settle_empty_directories:
+        for relative in journal.remove_empty_directories:
+            with suppress(OSError):
+                (root / relative).rmdir()
     if changed_paths is None:
         changed_paths = tuple(mutation.path for mutation in journal.mutations)
     return OperationResult(
@@ -2542,6 +2568,7 @@ def finalize_operation(
         kind=plan_kind.value,
         phase=phase,
         changed_paths=changed_paths,
+        warnings=warnings,
     )
 
 
@@ -2655,6 +2682,166 @@ def _apply_one(root: Path, journal: Journal, mutation: JournalMutation) -> Journ
     return updated
 
 
+def operation_changes_link_index(journal: Journal) -> bool:
+    """按 mutation/目录事实判定本 operation 是否需要链接索引阶段（spec §6）。
+
+    凡改变以下任一事实都进入索引阶段，不按命令白名单：
+    - ``.draft/`` 之外的普通 Markdown 内容或路径；
+    - 索引覆盖目录的成员名称或节点类型（新建/删除/改名，或计划内空目录清理）。
+
+    重写既有非 Markdown 普通文件正文不改变索引（spec §8）；``.draft/`` 内部 marker
+    变化（如 adopt）不进入索引阶段。未来 kind 只要产生相同事实，就自动受同一规则约束。
+    """
+    for mutation in journal.mutations:
+        if mutation.path.parts and mutation.path.parts[0] == INTERNAL_DIR:
+            continue  # `.draft/` 内部状态变化不进入索引阶段（spec §5 adopt）。
+        if mutation.path.suffix == ".md":
+            return True
+        if mutation.kind is MutationKind.DELETE:
+            return True  # 删除任何 `.draft/` 外节点改变目录成员事实。
+        if mutation.before_sha256 is None:
+            return True  # 新建 `.draft/` 外节点改变目录成员事实。
+        # 重写既有非 Markdown 普通文件正文：不改变索引（spec §8）。
+    # 计划内空目录清理改变父目录成员事实。
+    return bool(journal.remove_empty_directories)
+
+
+def settle_planned_empty_directories(root: Path, journal: Journal) -> Journal:
+    """在验证完成后、进入链接索引阶段前按深到浅收敛计划内空目录（spec §6）。
+
+    只处理 ``journal.remove_empty_directories`` 精确路径，非递归 ``rmdir``。缺失视为
+    已经收敛；成功同步父目录。成员/符号链接/节点类型发生未解释变化返回
+    ``operation.external_change`` 并保留锁。普通 I/O 原因导致目录不能删除时可以保留，
+    索引按实际目录状态构建；实际状态无法读取时由后续严格扫描映射为
+    ``rebuild_required``。
+    """
+    for relative in journal.remove_empty_directories:
+        try:
+            node = classify_node(root / relative)
+        except OSError:
+            # 实际状态不可读：保留目录并让索引读取实际状态；不可读时索引阶段
+            # 会进入 rebuild_required（spec §6）。
+            continue
+        if node is EntryKind.MISSING:
+            continue  # 缺失视为已经收敛。
+        if node is not EntryKind.DIRECTORY:
+            # 符号链接/普通文件/其他节点：未解释节点类型变化，保留锁。
+            raise DraftError("operation.external_change", root / relative)
+        try:
+            (root / relative).rmdir()
+        except FileNotFoundError:
+            continue  # 分类与删除之间目录消失：缺失视为收敛。
+        except OSError as exc:
+            if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                # 目录仍有未计划成员：未解释变化，保留锁。
+                raise DraftError("operation.external_change", root / relative) from exc
+            # 普通 I/O 失败：保留目录，索引按实际状态构建。
+            continue
+        fsync_directory((root / relative).parent)
+    return journal
+
+
+@dataclass(frozen=True)
+class _OperationIndexSettlement:
+    """通用业务 operation 索引阶段的返回：已写入索引结果的 Journal 与公开 warning。"""
+
+    journal: Journal
+    warnings: tuple[ResultWarning, ...]
+
+
+def settle_link_index_for_operation(root: Path, journal: Journal) -> _OperationIndexSettlement:
+    """在业务结果验证后、终态前收敛链接索引结果（spec §5/§10/§11）。
+
+    在产生任何索引 staging、目标替换或 flag 副作用前先耐久写 ``link_index_updating``；
+    ``link_index_updating`` 之后只允许前向收敛，不进入 ``rolling_back``。索引构建或发布
+    失败只记录 ``rebuild_required``，不回滚已经验证的业务 mutation。严格证明根和索引
+    事实没有变化时不产生 revision（spec §3）。
+    """
+    from draft import link_index_maintenance as maintenance
+
+    authority = maintenance.read_link_index_authority(root)
+    next_revision = maintenance.next_link_index_revision(authority)
+    prepared = maintenance.prepare_link_index_update(root)
+    if prepared.scan is None and not prepared.requires_rebuild:
+        # 严格证明根和索引事实没有变化：不产生 revision、不写索引阶段（spec §3）。
+        return _OperationIndexSettlement(journal=journal, warnings=())
+    updating = with_link_index_state(
+        with_phase(journal, OperationPhase.LINK_INDEX_UPDATING),
+        revision=next_revision,
+        result=None,
+        sha256=None,
+    )
+    write_journal(updating)
+    if prepared.requires_rebuild:
+        return _finish_operation_rebuild_required(root, updating, next_revision)
+    try:
+        return _finish_operation_published(root, updating, prepared, next_revision)
+    except DraftError as exc:
+        if exc.code in (_INDEX_UPDATE_FAILED, _EXTERNAL_CHANGE):
+            # 发布失败但可耐久记录：降级到 rebuild_required（spec §10/§11）。
+            return _finish_operation_rebuild_required(root, updating, next_revision)
+        raise
+
+
+def _finish_operation_published(
+    root: Path,
+    updating: Journal,
+    prepared: PreparedLinkIndexUpdate,
+    next_revision: str,
+) -> _OperationIndexSettlement:
+    """staging 写入、原子发布并耐久写 ``link_index_published``（spec §10）。
+
+    staging 位于当前业务 operation 目录；``link_index_updating`` 已由调用方耐久写入。
+    成功后尽力删除 rebuild flag（普通 I/O 失败形成稳定 warning，不改变结果）。
+    """
+    from draft import link_index_maintenance as maintenance
+
+    assert prepared.scan is not None
+    index = maintenance.materialize_index(next_revision, prepared.scan.content)
+    digest = maintenance.stage_link_index(updating, index)
+    maintenance.publish_staged_link_index(root, updating, digest)
+    published = with_link_index_state(
+        with_phase(updating, OperationPhase.LINK_INDEX_PUBLISHED),
+        revision=next_revision,
+        result=LinkIndexResult.PUBLISHED,
+        sha256=digest,
+    )
+    write_journal(published)
+    warnings: list[ResultWarning] = []
+    flag_warning = maintenance.remove_rebuild_flag(root)
+    if flag_warning is not None:
+        warnings.append(flag_warning)
+    return _OperationIndexSettlement(journal=published, warnings=tuple(warnings))
+
+
+def _finish_operation_rebuild_required(
+    root: Path,
+    updating: Journal,
+    next_revision: str,
+) -> _OperationIndexSettlement:
+    """耐久记录 ``rebuild_required`` 并补建 flag（spec §10/§11）。
+
+    ``published=False`` 语义由调用方消费：业务 operation 保留已经验证的结果，退出码
+    仍为 0，只是没有发布索引制品。warning 按规格去重排序。
+    """
+    from draft import link_index_maintenance as maintenance
+
+    rebuild = with_link_index_state(
+        with_phase(updating, OperationPhase.LINK_INDEX_REBUILD_REQUIRED),
+        revision=next_revision,
+        result=LinkIndexResult.REBUILD_REQUIRED,
+        sha256=None,
+    )
+    write_journal(rebuild)
+    warnings: list[ResultWarning] = [ResultWarning(_REBUILD_REQUIRED_WARNING)]
+    flag_warning = maintenance.ensure_rebuild_flag(root)
+    if flag_warning is not None:
+        warnings.append(flag_warning)
+    # 发布失败降级路径可能残留 staging：幂等清理当前 operation 的 staging。
+    maintenance.cleanup_link_index_staging(updating)
+    return _OperationIndexSettlement(journal=rebuild, warnings=tuple(warnings))
+
+
 def _validate_and_complete(
     root: Path,
     journal: Journal,
@@ -2685,6 +2872,13 @@ def _validate_and_complete(
         for mutation in current.mutations:
             if sha256_file(root / mutation.path) != mutation.after_sha256:
                 raise DraftError("operation.external_change", root / mutation.path)
+    # 空目录清理在验证完成后、进入链接索引阶段前收敛（spec §6）。
+    current = settle_planned_empty_directories(root, current)
+    warnings: tuple[ResultWarning, ...] = ()
+    if operation_changes_link_index(current):
+        settlement = settle_link_index_for_operation(root, current)
+        current = settlement.journal
+        warnings = settlement.warnings
     if current.kind is OperationKind.TRASH:
         # 回收以待恢复为耐久终态：写 trash_retained、释放写锁、清理恢复副本；
         # 权威删除包原样保留，到期推进与系统回收站移交由 trash_lifecycle 子系统驱动。
@@ -2693,7 +2887,10 @@ def _validate_and_complete(
             current,
             OperationPhase.TRASH_RETAINED,
             current.kind,
+            retain_terminal_lock=retain_terminal_lock,
             changed_paths=changed_paths,
+            settle_empty_directories=False,
+            warnings=warnings,
         )
     return finalize_operation(
         root,
@@ -2702,6 +2899,8 @@ def _validate_and_complete(
         current.kind,
         retain_terminal_lock=retain_terminal_lock,
         changed_paths=changed_paths,
+        settle_empty_directories=False,
+        warnings=warnings,
     )
 
 

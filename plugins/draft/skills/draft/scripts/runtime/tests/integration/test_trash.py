@@ -1891,6 +1891,11 @@ def _craft_restore_pair_scene(
     restore_id = "c" * 32
     t_data = _read_journal(root, trash_id)
     t_data["phase"] = trash_phase.value
+    # rollback 路径禁止链接索引字段（journal v4 字段矩阵）：手写 rolled_back 现场
+    # 必须是合法 journal，否则用例只测到解析拒绝而非恢复决策。
+    if trash_phase in (OperationPhase.ROLLING_BACK, OperationPhase.ROLLED_BACK):
+        for key in ("link_index_revision", "link_index_result", "link_index_sha256"):
+            t_data.pop(key, None)
     t_data["metadata"]["restore_operation_id"] = restore_id
     r_data: dict[str, object] = {
         "journal_version": JOURNAL_VERSION,

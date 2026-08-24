@@ -125,16 +125,9 @@ def test_programmatic_move_page_refreshes_index_from_merged_plan(
         captured.append(plan)
         return OperationResult("id", "move", OperationPhase.COMPLETED, ())
 
-    def skip_refresh(_root: Path, _plan: OperationPlan) -> None:
-        return None
-
     monkeypatch.setattr(
         "draft.structure.execute_plan",
         capture_plan,
-    )
-    monkeypatch.setattr(
-        "draft.structure._refresh_move_index",
-        skip_refresh,
     )
     move_page(root, Path("pages/a.md"), Path("pages/b.md"))
     assert captured
@@ -180,9 +173,10 @@ def test_move_plan_rejects_index_generation_change_before_write(
     move_entries(root, ["pages/a.md"], "pages/b.md")
     facts = load_operation_facts(root)
     plan = plan_move_from_arguments(root, facts, ["pages/b.md"], "pages/c.md")
+    # 篡改已发布的 v2 索引制品字节：规划读集观察覆盖制品，执行前必须拒绝。
     index_path = root / ".draft" / "link-index.json"
     payload = json.loads(index_path.read_text(encoding="utf-8"))
-    payload["generation"] = int(payload["generation"]) + 1
+    payload["revision"] = str(int(payload["revision"]) + 1)
     index_path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(DraftError) as caught:
         execute_plan(plan)

@@ -564,12 +564,19 @@ def test_cleanup_evidence_dir_fsync_failure_does_not_delete_leaves(
 
 
 def _commit_phase(root: Path, operation_id: str, phase: str) -> None:
-    """把 T 日志 phase 直接重写为给定阶段（测试用；不涉及锁）。"""
+    """把 T 日志 phase 直接重写为给定阶段（测试用；不涉及锁）。
+
+    rollback 阶段禁止链接索引字段（journal v4 字段矩阵）：手写现场必须是合法
+    journal，否则用例只测到解析拒绝而非授权决策。
+    """
     import json as json_module
 
     journal_path = root / OPERATIONS_RELATIVE / operation_id / "journal.json"
     raw = json_module.loads(journal_path.read_text(encoding="utf-8"))
     raw["phase"] = phase
+    if phase in ("rolling_back", "rolled_back"):
+        for key in ("link_index_revision", "link_index_result", "link_index_sha256"):
+            raw.pop(key, None)
     journal_path.write_text(json_module.dumps(raw, ensure_ascii=False), encoding="utf-8")
 
 

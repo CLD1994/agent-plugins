@@ -11,10 +11,12 @@ from draft.errors import DraftError
 from draft.graph import load_graph, read_marker_snapshot
 from draft.models import (
     FileMutation,
+    LinkIndexResult,
     MutationKind,
     OperationKind,
     OperationPhase,
     OperationPlan,
+    ResultWarning,
     RootState,
 )
 from draft.observations import EMPTY_OBSERVATIONS, graph_observations
@@ -27,6 +29,9 @@ from draft.operations import (
     read_lock,
     recover,
     sha256_bytes,
+)
+from draft.operations import (
+    write_journal as write_journal_durable,
 )
 from draft.vocabulary import ConclusionsState
 from tests.integration.support import managed_marker_text, write_raw_journal
@@ -886,6 +891,143 @@ def test_completed_operation_releases_lock_and_cleans_copies(operation_draft: Pa
     assert (operation_dir / "journal.json").is_file()
     assert not (operation_dir / "originals").exists()
     assert not (operation_dir / "staged").exists()
+
+
+# ---------------------------------------------------------------------------
+# 通用业务 operation 的链接索引阶段（spec §5/§10/§11）
+# ---------------------------------------------------------------------------
+
+_LINK_INDEX_PHASES = frozenset(
+    {
+        OperationPhase.LINK_INDEX_UPDATING,
+        OperationPhase.LINK_INDEX_PUBLISHED,
+        OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
+    }
+)
+
+
+def test_write_operation_publishes_link_index_before_completed(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = operation_draft
+    plan, _old_a, _old_b, new_a, new_b = two_write_plan(root)
+    phases: list[OperationPhase] = []
+    original_write = write_journal_durable
+    from draft.operations import Journal as OperationsJournal
+
+    def spy(journal: OperationsJournal) -> object:
+        if journal.phase in _LINK_INDEX_PHASES:
+            # 索引阶段期间锁与恢复材料仍存在，终态前不释放。
+            assert read_lock(root) == journal.operation_id
+            op_dir = journal.directory
+            assert (op_dir / "originals/0000.bin").exists()
+            assert (op_dir / "staged/0000.bin").exists()
+        phases.append(journal.phase)
+        return original_write(journal)
+
+    monkeypatch.setattr("draft.operations.write_journal", spy)
+    result = execute_plan(plan)
+
+    assert result.phase is OperationPhase.COMPLETED
+    assert phases[-1] is OperationPhase.COMPLETED
+    index_phases = [phase for phase in phases if phase in _LINK_INDEX_PHASES]
+    assert index_phases == [
+        OperationPhase.LINK_INDEX_UPDATING,
+        OperationPhase.LINK_INDEX_PUBLISHED,
+    ]
+    journal = read_journal(operation_journal_path(root, result.operation_id))
+    assert journal.link_index_result is LinkIndexResult.PUBLISHED
+    assert journal.link_index_revision == "1"
+    assert journal.link_index_sha256 is not None
+    artifact = root / ".draft/link-index.json"
+    assert artifact.is_file()
+    assert sha256_bytes(artifact.read_bytes()) == journal.link_index_sha256
+    assert result.warnings == ()
+    # 业务内容保留且索引已发布。
+    assert (root / "pages/a.md").read_bytes() == new_a
+    assert (root / "pages/b.md").read_bytes() == new_b
+
+
+def test_index_build_failure_records_rebuild_required_and_completes(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = operation_draft
+    plan, _old_a, _old_b, new_a, new_b = two_write_plan(root)
+    import draft.link_index_maintenance as maintenance
+
+    def fail_scan(_root: Path, baseline: object = None, known_documents: object = ()) -> object:
+        raise DraftError("operation.index_update_failed", _root)
+
+    monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+    result = execute_plan(plan)
+
+    assert result.phase is OperationPhase.COMPLETED
+    journal = read_journal(operation_journal_path(root, result.operation_id))
+    assert journal.link_index_result is LinkIndexResult.REBUILD_REQUIRED
+    assert journal.link_index_revision == "1"
+    assert journal.link_index_sha256 is None
+    assert (root / ".draft/link-index-rebuild-required.flag").exists()
+    assert result.warnings == (ResultWarning("link_index.rebuild_required"),)
+    # 业务内容保留：索引失败不得触发业务 rollback（spec §11）。
+    assert (root / "pages/a.md").read_bytes() == new_a
+    assert (root / "pages/b.md").read_bytes() == new_b
+    assert not (root / ".draft/operation.lock").exists()
+    # 索引失败不会进入 rolling_back。
+    rolled_back = [
+        path
+        for path in (root / ".draft/operations").glob("*/journal.json")
+        if json.loads(path.read_text(encoding="utf-8"))["phase"] == "rolled_back"
+    ]
+    assert rolled_back == []
+
+
+def test_index_journal_write_failure_leaves_recovery_pending(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = operation_draft
+    plan, _old_a, _old_b, new_a, new_b = two_write_plan(root)
+    original_write = write_journal_durable
+    from draft.operations import Journal as OperationsJournal
+
+    def fail_index_result_write(journal: OperationsJournal) -> object:
+        if journal.phase is OperationPhase.LINK_INDEX_PUBLISHED:
+            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, journal.directory)
+        return original_write(journal)
+
+    monkeypatch.setattr("draft.operations.write_journal", fail_index_result_write)
+    with pytest.raises(DraftError) as caught:
+        execute_plan(plan)
+
+    assert caught.value.code == CheckCode.OPERATION_DURABILITY_FAILED.value
+    # 停在 recovery pending：锁保留，journal 停在 link_index_updating。
+    operation_id = read_lock(root)
+    assert operation_id is not None
+    journal = read_journal(operation_journal_path(root, operation_id))
+    assert journal.phase is OperationPhase.LINK_INDEX_UPDATING
+    # 业务 after 内容保留。
+    assert (root / "pages/a.md").read_bytes() == new_a
+    assert (root / "pages/b.md").read_bytes() == new_b
+
+
+def test_mutation_without_link_index_facts_skips_index_phase(
+    operation_draft: Path,
+) -> None:
+    """没有 mutation/目录事实变化的 operation 不进入索引阶段（spec §6）。"""
+    root = operation_draft
+    plan, _old_a, _old_b, _new_a, _new_b = two_write_plan(root)
+    adopt_plan = dataclasses.replace(
+        plan,
+        kind=OperationKind.ADOPT,
+        mutations=(),
+        remove_empty_directories=(),
+    )
+    result = execute_plan(adopt_plan)
+
+    assert result.phase is OperationPhase.COMPLETED
+    journal = read_journal(operation_journal_path(root, result.operation_id))
+    assert journal.link_index_result is None
+    assert journal.link_index_revision is None
+    assert not (root / ".draft/link-index.json").exists()
 
 
 def test_mutation_path_escape_rejected_before_allocation(operation_draft: Path) -> None:

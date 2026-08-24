@@ -7,7 +7,7 @@ import pytest
 from draft.checker import check_draft
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
-from draft.models import RootState
+from draft.models import OperationPhase, RootState
 from draft.operations import recover
 from draft.query import load_tolerant_view
 from draft.structure import collapse_hub, move_page, promote_page
@@ -1324,6 +1324,35 @@ def test_domain_move_does_not_preflight_due_package(
     assert calls == []
     assert (root / "pages/a2.md").is_file()
     assert result.warnings == ()
+
+
+def test_trash_projects_operation_index_warnings_to_index_warnings(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """trash_page 把底层 OperationResult 的稳定索引 warning 投影到 index_warnings。
+
+    trash 生命周期自己的 warnings 保持独立；索引降级不改变 trash_retained 终态
+    （spec §11）。
+    """
+    import draft.link_index_maintenance as maintenance
+
+    root = _lazy_root(draft_factory)
+
+    def fail_scan(_root: Path, baseline: object = None, known_documents: object = ()) -> object:
+        raise DraftError("operation.index_update_failed", _root)
+
+    monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)
+    result = trash_page(root, Path("pages/b.md"), now=DUE_NOW)
+
+    assert result.phase is OperationPhase.TRASH_RETAINED
+    assert [warning.code for warning in result.index_warnings] == [
+        "link_index.rebuild_required"
+    ]
+    # trash 生命周期自己的 warning 与索引 warning 分离。
+    assert result.warnings == ()
+    assert (root / ".draft/link-index-rebuild-required.flag").exists()
+    # 已验证的业务结果保留：权威删除包存在。
+    assert (root / ".draft/trash/outgoing" / result.operation_id).is_dir()
 
 
 def test_domain_move_corrupt_package_blocks_via_clean_graph(

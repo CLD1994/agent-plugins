@@ -61,6 +61,7 @@ from draft.operations import (
     validate_operation_id,
     validate_restore_link,
     verify_locked_terminal_operation,
+    with_link_index_state,
     with_metadata,
     with_observations,
     with_phase,
@@ -973,6 +974,9 @@ def trash_page(root: Path, page: Path, *, now: datetime | None = None) -> TrashR
         restore_expires_at=deadlines.restore_expires_at,
         purge_eligible_at=deadlines.purge_eligible_at,
         changed_paths=result.changed_paths,
+        # 底层 operation 的稳定索引 warning 投影到 index_warnings；trash 生命周期
+        # 自己的 warnings 保持独立，不混入 handoff operation ID 或细节（spec §11）。
+        index_warnings=result.warnings,
     )
 
 
@@ -1101,10 +1105,19 @@ def resolve_restore_execution(
                 CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory
             )
         # 提交前：必须证明 restore 内容完整后才把 T 提交为 rolled_back。
+        # rollback 路径禁止链接索引字段（规格 §4）：T 携带的既有索引结果随业务回滚
+        # 作废，不再作为 authority 结果；下一次维护按根事实重新收敛。
         if package is None:
             package = load_verified_package(root, current_trash)
         verify_restore_after_state(root, current_trash, terminal_restore, package)
-        write_journal(with_phase(current_trash, OperationPhase.ROLLED_BACK))
+        write_journal(
+            with_link_index_state(
+                with_phase(current_trash, OperationPhase.ROLLED_BACK),
+                revision=None,
+                result=None,
+                sha256=None,
+            )
+        )
         _commit_restore_cleanup(root, current_trash, restore_id, terminal_restore)
         return OperationResult(
             operation_id=restore_id,

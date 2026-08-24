@@ -44,6 +44,7 @@ from draft.operations import (
     handoff_failure_metadata,
     has_handoff_failure,
     normalize_utc,
+    operation_changes_link_index,
     sha256_bytes,
     validate_journal_kind_phase,
     validate_journal_transition,
@@ -802,6 +803,35 @@ def test_rollback_phase_with_link_index_fields_rejected(phase: OperationPhase) -
     assert caught.value.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
 
 
+def test_indexed_terminal_to_rolled_back_requires_cleared_fields() -> None:
+    """终态携带索引结果进入 rolled_back 时必须清空三个字段（规格 §4 rollback 行）。
+
+    restore 把 trash_retained（含 published 结果）提交为 rolled_back 是唯一既有入口：
+    字段随业务回滚作废，不再作为 authority 结果。
+    """
+    old = dataclasses.replace(
+        _journal(),
+        kind=OperationKind.TRASH,
+        phase=OperationPhase.TRASH_RETAINED,
+        link_index_revision="3",
+        link_index_result=LinkIndexResult.PUBLISHED,
+        link_index_sha256="a" * 64,
+    )
+    cleared = dataclasses.replace(
+        _journal(),
+        kind=OperationKind.TRASH,
+        phase=OperationPhase.ROLLED_BACK,
+    )
+    validate_journal_transition(old, cleared, path=Path("journal.json"))
+    with pytest.raises(DraftError) as caught:
+        validate_journal_transition(
+            old,
+            dataclasses.replace(cleared, link_index_revision="3"),
+            path=Path("journal.json"),
+        )
+    assert caught.value.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
+
+
 def test_link_index_published_fields_preserved_to_completed() -> None:
     journal = dataclasses.replace(
         _journal(),
@@ -897,6 +927,110 @@ def test_journal_to_json_omits_forbidden_index_fields_before_index_phase() -> No
     assert "link_index_revision" not in payload
     assert "link_index_result" not in payload
     assert "link_index_sha256" not in payload
+
+
+# ---------------------------------------------------------------------------
+# operation_changes_link_index：由 mutation/目录事实判定（spec §6）
+# ---------------------------------------------------------------------------
+
+# 当前已知会改变链接索引事实的 10 类业务 kind；判定本身不按 kind 白名单。
+INDEX_AFFECTING_KINDS = (
+    OperationKind.CREATE,
+    OperationKind.MOVE,
+    OperationKind.PROMOTE,
+    OperationKind.COLLAPSE,
+    OperationKind.STATUS_SET,
+    OperationKind.RELATION_ADD,
+    OperationKind.RELATION_REMOVE,
+    OperationKind.GENERATE_CONCLUSIONS,
+    OperationKind.TRASH,
+    OperationKind.RESTORE,
+)
+
+
+def _link_write_mutation(path: Path) -> JournalMutation:
+    return _journal_mutation(path, MutationKind.WRITE, None, "after-hash")
+
+
+@pytest.mark.parametrize("kind", INDEX_AFFECTING_KINDS)
+def test_markdown_mutation_requires_link_index(kind: OperationKind) -> None:
+    journal = dataclasses.replace(
+        _journal(),
+        kind=kind,
+        mutations=(_link_write_mutation(Path("pages/a.md")),),
+        remove_empty_directories=(),
+    )
+    assert operation_changes_link_index(journal) is True
+
+
+def test_adopt_marker_only_does_not_require_link_index() -> None:
+    journal = dataclasses.replace(
+        _journal(),
+        kind=OperationKind.ADOPT,
+        mutations=(_link_write_mutation(Path(".draft/draft.json")),),
+        remove_empty_directories=(),
+    )
+    assert operation_changes_link_index(journal) is False
+
+
+def test_no_mutation_or_directory_change_does_not_require_link_index() -> None:
+    journal = dataclasses.replace(_journal(), mutations=(), remove_empty_directories=())
+    assert operation_changes_link_index(journal) is False
+
+
+def test_future_kind_with_markdown_mutation_requires_link_index() -> None:
+    """判定只消费 mutation/目录事实，不按命令白名单：未来 kind 自动受同一规则约束。"""
+    journal = dataclasses.replace(
+        _journal(),
+        kind=OperationKind.ADOPT,
+        mutations=(_link_write_mutation(Path("pages/a.md")),),
+        remove_empty_directories=(),
+    )
+    assert operation_changes_link_index(journal) is True
+
+
+def test_delete_of_non_markdown_node_requires_link_index() -> None:
+    """删除 `.draft/` 外任何节点都改变索引覆盖目录的成员名称/节点类型。"""
+    journal = dataclasses.replace(
+        _journal(),
+        mutations=(
+            _journal_mutation(Path("assets/data.bin"), MutationKind.DELETE, "before", None),
+        ),
+        remove_empty_directories=(),
+    )
+    assert operation_changes_link_index(journal) is True
+
+
+def test_new_non_markdown_node_requires_link_index() -> None:
+    """新建 `.draft/` 外节点改变目录成员事实。"""
+    journal = dataclasses.replace(
+        _journal(),
+        mutations=(_journal_mutation(Path("assets/data.bin"), MutationKind.WRITE, None, "after"),),
+        remove_empty_directories=(),
+    )
+    assert operation_changes_link_index(journal) is True
+
+
+def test_rewrite_existing_non_markdown_content_does_not_require_link_index() -> None:
+    """修改既有非 Markdown 普通文件正文不改变索引（spec §8）。"""
+    journal = dataclasses.replace(
+        _journal(),
+        mutations=(
+            _journal_mutation(Path("assets/data.bin"), MutationKind.WRITE, "before", "after"),
+        ),
+        remove_empty_directories=(),
+    )
+    assert operation_changes_link_index(journal) is False
+
+
+def test_planned_empty_directory_cleanup_requires_link_index() -> None:
+    """计划内空目录清理改变父目录成员事实，进入索引阶段。"""
+    journal = dataclasses.replace(
+        _journal(),
+        mutations=(),
+        remove_empty_directories=(Path("pages/old"),),
+    )
+    assert operation_changes_link_index(journal) is True
 
 
 def test_journal_to_json_serializes_published_index_fields() -> None:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import posixpath
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -11,21 +10,14 @@ from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.graph import (
     CONCLUSIONS_PAGE,
+    INTERNAL_DIR,
     ROOT_PAGE,
     DraftGraph,
     MarkerSnapshot,
     resolve_local_destination,
 )
-from draft.link_index import (
-    Freshness,
-    build_index,
-    check_index_freshness,
-    invalidate_index,
-    read_index,
-    read_index_snapshot,
-    update_index_from_mutations,
-    write_index_atomic,
-)
+from draft.link_index import LinkIndex
+from draft.link_index_maintenance import load_link_index_baseline, scan_link_index
 from draft.markdown import (
     append_parent_navigation,
     canonical_parent_navigation,
@@ -711,6 +703,34 @@ def _load_clean_graph(root: Path, *, allow_empty_hub: Path | None = None) -> Ope
     return facts
 
 
+def _indexed_closure_for_plan(root: Path, closure: MoveClosure) -> MoveClosure:
+    """让索引闭包的根目录观察与严格扫描惯例一致（规格 §7/§8 组合边界）。
+
+    v2 索引目录快照排除整个 ``.draft``（spec §7），而严格扫描闭包和
+    ``graph_observations`` 的根目录成员都包含 ``.draft``；不补齐则读集合并按同路径
+    冲突拒绝。按 ``scan_move_closure._record_directory`` 同一分类惯例补充该成员。
+    """
+    members = closure.directories.get(Path("."))
+    if members is None or any(name == INTERNAL_DIR for name, _kind in members):
+        return closure
+    internal = root / INTERNAL_DIR
+    try:
+        kind = (
+            "directory"
+            if internal.is_dir() and not internal.is_symlink()
+            else "file"
+            if internal.is_file() and not internal.is_symlink()
+            else "symlink"
+            if internal.is_symlink()
+            else "other"
+        )
+    except OSError:
+        return closure  # 无法分类时不补充：执行前读集复核按实际状态判定。
+    patched = dict(closure.directories)
+    patched[Path(".")] = tuple(sorted((*members, (INTERNAL_DIR, kind))))
+    return replace(closure, directories=patched)
+
+
 def plan_move_from_arguments(
     root: Path,
     facts: OperationFacts,
@@ -727,13 +747,33 @@ def plan_move_from_arguments(
             moved_identities.add(
                 resolve_body_resource(root, ROOT_PAGE, member.as_posix()).identity
             )
-    index_status, index, _, index_raw = read_index_snapshot(root)
-    if index is not None and index_status is not Freshness.CORRUPT:
-        index_status = check_index_freshness(root, index)
-    if index is not None and index_status is Freshness.FRESH:
-        closure = scan_indexed_move_closure(
-            root, facts.graph, index, moved_identities, moved_paths
-        )
+    # 闭包只消费 v2 索引事实：先验证发布制品的可信任基线，再严格扫描证明 fresh；
+    # 无法证明 fresh 时使用严格全根扫描事实（spec §8/§9，用户故事 8/9）。不再依赖
+    # v1 维护层（Task 6 迁移）。
+    baseline = load_link_index_baseline(root)
+    index: LinkIndex | None = None
+    if baseline.index is not None:
+        try:
+            scan = scan_link_index(root, baseline)
+        except DraftError as exc:
+            if exc.code in ("operation.index_update_failed", "operation.external_change"):
+                # 扫描失败或根不稳定：无法证明 fresh，回退到严格全根扫描。
+                closure = scan_move_closure(root, facts.graph)
+            else:
+                raise
+        else:
+            if scan.changed:
+                # 根事实已相对发布制品变化：本次规划按严格全根扫描事实执行；
+                # 索引收敛由通用 operation 索引阶段完成（spec §9 增量维护）。
+                closure = scan_move_closure(root, facts.graph)
+            else:
+                index = baseline.index
+                closure = _indexed_closure_for_plan(
+                    root,
+                    scan_indexed_move_closure(
+                        root, facts.graph, index, moved_identities, moved_paths
+                    ),
+                )
     else:
         closure = scan_move_closure(root, facts.graph)
     blocking = merged_blocking(facts.blocking_paths, closure)
@@ -742,13 +782,14 @@ def plan_move_from_arguments(
     plan = plan_move_request(
         facts.graph, closure, request, marker=facts.marker, observations=facts.observations
     )
-    if index is not None and index_status is Freshness.FRESH and index_raw is not None:
+    if index is not None:
+        # 读集观察覆盖本次规划读取的索引制品：规划与执行之间制品变化即外部变化。
         return replace(
             plan,
             observations=merge_observations(
                 plan.observations,
                 ObservationManifest(
-                    entries=(file_observation(Path(".draft/link-index.json"), index_raw),)
+                    entries=(file_observation(Path(".draft/link-index.json"), index.to_json()),)
                 ),
             ),
         )
@@ -760,9 +801,7 @@ def move_entries(root: Path, source_values: Sequence[str], target_value: str) ->
     precheck_move_shape(resolved, source_values, target_value)
     facts = _load_structure_facts(resolved)
     plan = plan_move_from_arguments(resolved, facts, source_values, target_value)
-    result = execute_plan(plan)
-    _refresh_move_index(resolved, plan)
-    return result
+    return execute_plan(plan)
 
 
 def move_page(root: Path, source: Path, target: Path) -> OperationResult:
@@ -811,25 +850,9 @@ def move_page(root: Path, source: Path, target: Path) -> OperationResult:
             observations=merge_observations(plan.observations, closure_observations),
             effects=tuple([*plan.effects, *unmanaged_effects]),
     )
-    result = execute_plan(final_plan)
-    _refresh_move_index(resolved, final_plan)
-    return result
-
-
-def _refresh_move_index(root: Path, plan: OperationPlan) -> None:
-    """提交后增量发布索引；未变 Markdown 的记录不读取、不解析。"""
-    _status, existing, _ = read_index(root)
-    try:
-        updated = (
-            update_index_from_mutations(root, existing, plan.mutations)
-            if existing is not None
-            else build_index(root)
-        )
-        write_index_atomic(root, updated)
-    except DraftError:
-        with contextlib.suppress(DraftError):
-            invalidate_index(root, reason="update_failed")
-        raise
+    # move 的正式执行以 execute_plan() 返回为边界：索引发布由通用 operation 索引阶段
+    # 在锁内完成，返回后不再另行发布（spec §5/§6，Task 6 停用 _refresh_move_index）。
+    return execute_plan(final_plan)
 
 
 def promote_page(root: Path, page: Path, children: list[Path]) -> OperationResult:

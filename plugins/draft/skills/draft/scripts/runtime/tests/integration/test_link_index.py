@@ -21,9 +21,11 @@ from draft.link_index_maintenance import (
     read_link_index_authority,
     scan_link_index,
 )
-from draft.models import LinkIndexResult, OperationKind, OperationPhase
+from draft.models import LinkIndexResult, OperationKind, OperationPhase, RootState
 from draft.operations import JOURNAL_VERSION, sha256_bytes
 from draft.resources import ResourceIdentity, ResourceKind
+from draft.structure import move_entries
+from tests.integration.support import DraftFactory
 
 
 def test_index_missing_and_corrupt_are_explicit(tmp_path: Path) -> None:
@@ -380,3 +382,81 @@ def test_baseline_rejects_missing_artifact_for_published(tmp_path: Path) -> None
     with pytest.raises(DraftError) as caught:
         load_link_index_baseline(root)
     assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+
+
+# ---------------------------------------------------------------------------
+# Task 6：业务 operation 索引阶段与 maintenance authority 的端到端组合
+# ---------------------------------------------------------------------------
+
+_MOVE_INDEX = """# Topic
+
+> 状态：`已关闭：纯导航页，不表达独立结论`
+
+## 子主题
+
+- [甲](pages/a.md)
+"""
+
+_MOVE_PAGE = """# 甲
+
+> 状态：`已确认`
+>
+> 父主题：[根索引](../index.md)
+
+甲。
+"""
+
+
+def test_business_operation_publishes_authoritative_v2_index(
+    draft_factory: DraftFactory,
+) -> None:
+    """move 经通用索引阶段发布 revision "1" 制品；authority 按其验证为可信基线。"""
+    root = draft_factory(
+        {"index.md": _MOVE_INDEX, "pages/a.md": _MOVE_PAGE},
+        root_state=RootState.CANDIDATE,
+    )
+
+    move_entries(root, ["pages/a.md"], "pages/b.md")
+
+    authority = read_link_index_authority(root)
+    assert authority.result is LinkIndexResult.PUBLISHED
+    assert authority.revision == "1"
+    baseline = load_link_index_baseline(root)
+    assert baseline.index is not None
+    artifact = root / ".draft" / "link-index.json"
+    assert sha256_bytes(artifact.read_bytes()) == authority.sha256
+    # 已发布索引覆盖移动后的页面事实：files 反映新路径。
+    assert Path("pages/b.md") in baseline.index.files
+
+
+def test_second_mutation_converges_incrementally_to_next_revision(
+    draft_factory: DraftFactory,
+) -> None:
+    """第一次发布 revision "1" 后，第二次 mutation 增量收敛到 revision "2"。"""
+    root = draft_factory(
+        {"index.md": _MOVE_INDEX, "pages/a.md": _MOVE_PAGE},
+        root_state=RootState.CANDIDATE,
+    )
+    move_entries(root, ["pages/a.md"], "pages/b.md")
+    journals_after_first = {
+        path: path.read_bytes()
+        for path in (root / ".draft/operations").glob("*/journal.json")
+    }
+
+    move_entries(root, ["pages/b.md"], "pages/c.md")
+
+    revisions = sorted(
+        json.loads(path.read_text(encoding="utf-8"))["link_index_revision"]
+        for path in journals_after_first
+        if json.loads(path.read_text(encoding="utf-8")).get("link_index_revision")
+    )
+    assert revisions == ["1"]
+    authority = read_link_index_authority(root)
+    assert authority.revision == "2"
+    assert authority.result is LinkIndexResult.PUBLISHED
+    baseline = load_link_index_baseline(root)
+    assert baseline.index is not None
+    assert Path("pages/c.md") in baseline.index.files
+    # 第一次的 journal 未被改写（每个 operation 只记录自己的结果）。
+    for path, raw in journals_after_first.items():
+        assert path.read_bytes() == raw
