@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import NoReturn, cast
 
 import pytest
 
-from draft.diagnostic_codes import CheckCode
+from draft.conclusions import GenerationResult, generate_conclusions
+from draft.diagnostic_codes import OPERATION_INDEX_UPDATE_FAILED, CheckCode
 from draft.errors import DraftError
 from draft.link_index import (
     Freshness,
+    LinkIndex,
     LinkSpan,
     build_index,
     check_index_freshness,
@@ -17,15 +23,71 @@ from draft.link_index import (
     write_index_atomic,
 )
 from draft.link_index_maintenance import (
+    LINK_INDEX_STAGED_FILE_NAME,
     load_link_index_baseline,
     read_link_index_authority,
     scan_link_index,
 )
-from draft.models import LinkIndexResult, OperationKind, OperationPhase, RootState
-from draft.operations import JOURNAL_VERSION, sha256_bytes
+from draft.models import LinkIndexResult, OperationKind, OperationPhase, OperationResult, RootState
+from draft.operations import JOURNAL_VERSION, Journal, read_lock, sha256_bytes
+from draft.page_create import create_page
+from draft.page_metadata import add_relation, remove_relation, set_status
 from draft.resources import ResourceIdentity, ResourceKind
-from draft.structure import move_entries
+from draft.structure import collapse_hub, move_entries, promote_page
+from draft.trash import restore_retained_trash, trash_page
+from draft.vocabulary import EditableRelationCode, StatusCode
 from tests.integration.support import DraftFactory
+
+_ENTRY_INDEX = """# Topic
+
+> 状态：`已关闭：纯导航页，不表达独立结论`
+
+## 子主题
+
+- [甲](pages/a.md)
+- [乙](pages/b.md)
+"""
+
+_ENTRY_A = """# 甲
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+
+甲。
+"""
+
+_ENTRY_CONFIRMED_A = _ENTRY_A.replace("待讨论", "已确认")
+
+_ENTRY_B = """# 乙
+
+> 状态：`待讨论`
+>
+> 父主题：[根索引](../index.md)
+
+乙。
+"""
+
+
+def _entry_root(draft_factory: DraftFactory) -> Path:
+    return draft_factory(
+        {
+            "index.md": _ENTRY_INDEX,
+            "pages/a.md": _ENTRY_A,
+            "pages/b.md": _ENTRY_B,
+        }
+    )
+
+
+def _latest_journal(root: Path, kind: str) -> dict[str, object]:
+    candidates: list[dict[str, object]] = []
+    operations = root / ".draft" / "operations"
+    for path in operations.glob("*/journal.json"):
+        payload = cast("dict[str, object]", json.loads(path.read_text(encoding="utf-8")))
+        if payload.get("kind") == kind and payload.get("link_index_revision") is not None:
+            candidates.append(payload)
+    assert candidates, f"no indexed journal for {kind}"
+    return max(candidates, key=lambda item: int(cast("str", item["link_index_revision"])))
 
 
 def test_index_missing_and_corrupt_are_explicit(tmp_path: Path) -> None:
@@ -460,3 +522,499 @@ def test_second_mutation_converges_incrementally_to_next_revision(
     # 第一次的 journal 未被改写（每个 operation 只记录自己的结果）。
     for path, raw in journals_after_first.items():
         assert path.read_bytes() == raw
+
+
+_ENTRY_NAMES = (
+    "create",
+    "move",
+    "promote",
+    "collapse",
+    "status set",
+    "relation add",
+    "relation remove",
+    "generate-conclusions",
+    "trash",
+    "restore",
+)
+
+
+@dataclass(frozen=True)
+class _EntryCase:
+    """一个用户入口的独立夹具、业务观察和索引事实预期。"""
+
+    root: Path
+    invoke: Callable[[], object]
+    assert_business: Callable[[], None]
+    kind: str
+    terminal_phase: OperationPhase
+    revision: str
+    files: frozenset[Path]
+    backlink_sources: Mapping[ResourceIdentity, frozenset[Path]]
+    forbidden_files: frozenset[Path] = frozenset()
+    forbidden_edges: tuple[tuple[ResourceIdentity, Path], ...] = ()
+
+
+def _assert_all(*conditions: bool) -> None:
+    assert all(conditions)
+
+
+def _page_identity(path: str) -> ResourceIdentity:
+    return ResourceIdentity(ResourceKind.PAGE, path)
+
+
+def _build_entry_case(draft_factory: DraftFactory, entry: str) -> _EntryCase:
+    """按独立用户入口构造 case；不从生产 operation kind 集合派生预期。"""
+    if entry == "create":
+        root = _entry_root(draft_factory)
+        return _EntryCase(
+            root=root,
+            invoke=lambda: create_page(
+                root, Path("pages/c.md"), title="丙", status=StatusCode.PENDING
+            ),
+            assert_business=lambda: _assert_all((root / "pages/c.md").is_file()),
+            kind=OperationKind.CREATE.value,
+            terminal_phase=OperationPhase.COMPLETED,
+            revision="1",
+            files=frozenset(
+                {Path("index.md"), Path("pages/a.md"), Path("pages/b.md"), Path("pages/c.md")}
+            ),
+            backlink_sources={
+                _page_identity("pages/a.md"): frozenset({Path("index.md")}),
+                _page_identity("pages/b.md"): frozenset({Path("index.md")}),
+                _page_identity("pages/c.md"): frozenset({Path("index.md")}),
+                _page_identity("index.md"): frozenset(
+                    {Path("pages/a.md"), Path("pages/b.md"), Path("pages/c.md")}
+                ),
+            },
+        )
+    if entry == "move":
+        root = _entry_root(draft_factory)
+        return _EntryCase(
+            root=root,
+            invoke=lambda: move_entries(root, ["pages/a.md"], "pages/c.md"),
+            assert_business=lambda: _assert_all(
+                (root / "pages/c.md").is_file(), not (root / "pages/a.md").exists()
+            ),
+            kind=OperationKind.MOVE.value,
+            terminal_phase=OperationPhase.COMPLETED,
+            revision="1",
+            files=frozenset({Path("index.md"), Path("pages/b.md"), Path("pages/c.md")}),
+            backlink_sources={
+                _page_identity("pages/b.md"): frozenset({Path("index.md")}),
+                _page_identity("pages/c.md"): frozenset({Path("index.md")}),
+                _page_identity("index.md"): frozenset({Path("pages/b.md"), Path("pages/c.md")}),
+            },
+            forbidden_files=frozenset({Path("pages/a.md")}),
+            forbidden_edges=((_page_identity("pages/a.md"), Path("index.md")),),
+        )
+    if entry == "promote":
+        root = draft_factory(
+            {
+                "index.md": _ENTRY_INDEX.replace(
+                    "- [乙](pages/b.md)", "- [乙](pages/b.md)\n- [丙](pages/c.md)"
+                ).replace("- [甲](pages/a.md)", "- [主题](pages/topic.md)"),
+                "pages/topic.md": _ENTRY_A,
+                "pages/b.md": _ENTRY_B,
+                "pages/c.md": _ENTRY_B.replace("乙", "丙"),
+            }
+        )
+        return _EntryCase(
+            root=root,
+            invoke=lambda: promote_page(
+                root, Path("pages/topic.md"), [Path("pages/b.md"), Path("pages/c.md")]
+            ),
+            assert_business=lambda: _assert_all(
+                (root / "pages/topic/index.md").is_file(),
+                (root / "pages/topic/b.md").is_file(),
+                (root / "pages/topic/c.md").is_file(),
+                not (root / "pages/topic.md").exists(),
+            ),
+            kind=OperationKind.PROMOTE.value,
+            terminal_phase=OperationPhase.COMPLETED,
+            revision="1",
+            files=frozenset(
+                {
+                    Path("index.md"),
+                    Path("pages/topic/index.md"),
+                    Path("pages/topic/b.md"),
+                    Path("pages/topic/c.md"),
+                }
+            ),
+            backlink_sources={
+                _page_identity("index.md"): frozenset({Path("pages/topic/index.md")}),
+                _page_identity("pages/topic/index.md"): frozenset(
+                    {Path("index.md"), Path("pages/topic/b.md"), Path("pages/topic/c.md")}
+                ),
+                _page_identity("pages/topic/b.md"): frozenset({Path("pages/topic/index.md")}),
+                _page_identity("pages/topic/c.md"): frozenset({Path("pages/topic/index.md")}),
+            },
+            forbidden_files=frozenset(
+                {Path("pages/topic.md"), Path("pages/b.md"), Path("pages/c.md")}
+            ),
+        )
+    if entry == "collapse":
+        root = draft_factory(
+            {
+                "index.md": _ENTRY_INDEX.replace(
+                    "- [甲](pages/a.md)", "- [枢纽](pages/hub/index.md)"
+                ),
+                "pages/hub/index.md": (
+                    "# 枢纽\n\n> 状态：`已关闭：纯导航页，不表达独立结论`\n>\n"
+                    "> 父主题：[根索引](../../index.md)\n"
+                ),
+                "pages/b.md": _ENTRY_B,
+            }
+        )
+        return _EntryCase(
+            root=root,
+            invoke=lambda: collapse_hub(root, Path("pages/hub/index.md")),
+            assert_business=lambda: _assert_all(
+                (root / "pages/hub.md").is_file(), not (root / "pages/hub/index.md").exists()
+            ),
+            kind=OperationKind.COLLAPSE.value,
+            terminal_phase=OperationPhase.COMPLETED,
+            revision="1",
+            files=frozenset({Path("index.md"), Path("pages/hub.md"), Path("pages/b.md")}),
+            backlink_sources={
+                _page_identity("pages/hub.md"): frozenset({Path("index.md")}),
+                _page_identity("pages/b.md"): frozenset({Path("index.md")}),
+                _page_identity("index.md"): frozenset({Path("pages/hub.md"), Path("pages/b.md")}),
+            },
+            forbidden_files=frozenset({Path("pages/hub/index.md")}),
+        )
+    if entry == "status set":
+        root = _entry_root(draft_factory)
+        return _EntryCase(
+            root=root,
+            invoke=lambda: set_status(root, Path("pages/a.md"), StatusCode.CONFIRMED),
+            assert_business=lambda: _assert_all(
+                "已确认" in (root / "pages/a.md").read_text(encoding="utf-8")
+            ),
+            kind=OperationKind.STATUS_SET.value,
+            terminal_phase=OperationPhase.COMPLETED,
+            revision="1",
+            files=frozenset({Path("index.md"), Path("pages/a.md"), Path("pages/b.md")}),
+            backlink_sources={
+                _page_identity("pages/a.md"): frozenset({Path("index.md")}),
+                _page_identity("pages/b.md"): frozenset({Path("index.md")}),
+                _page_identity("index.md"): frozenset({Path("pages/a.md"), Path("pages/b.md")}),
+            },
+        )
+    if entry == "relation add":
+        root = _entry_root(draft_factory)
+        return _EntryCase(
+            root=root,
+            invoke=lambda: add_relation(
+                root, Path("pages/a.md"), EditableRelationCode.DEPENDS_ON, Path("pages/b.md")
+            ),
+            assert_business=lambda: _assert_all(
+                "依赖" in (root / "pages/a.md").read_text(encoding="utf-8")
+            ),
+            kind=OperationKind.RELATION_ADD.value,
+            terminal_phase=OperationPhase.COMPLETED,
+            revision="1",
+            files=frozenset({Path("index.md"), Path("pages/a.md"), Path("pages/b.md")}),
+            backlink_sources={
+                _page_identity("pages/a.md"): frozenset({Path("index.md")}),
+                _page_identity("pages/b.md"): frozenset({Path("index.md"), Path("pages/a.md")}),
+                _page_identity("index.md"): frozenset({Path("pages/a.md"), Path("pages/b.md")}),
+            },
+        )
+    if entry == "relation remove":
+        root = _entry_root(draft_factory)
+        add_relation(root, Path("pages/a.md"), EditableRelationCode.DEPENDS_ON, Path("pages/b.md"))
+        return _EntryCase(
+            root=root,
+            invoke=lambda: remove_relation(
+                root, Path("pages/a.md"), EditableRelationCode.DEPENDS_ON, Path("pages/b.md")
+            ),
+            assert_business=lambda: _assert_all(
+                "依赖" not in (root / "pages/a.md").read_text(encoding="utf-8")
+            ),
+            kind=OperationKind.RELATION_REMOVE.value,
+            terminal_phase=OperationPhase.COMPLETED,
+            revision="2",
+            files=frozenset({Path("index.md"), Path("pages/a.md"), Path("pages/b.md")}),
+            backlink_sources={
+                _page_identity("pages/a.md"): frozenset({Path("index.md")}),
+                _page_identity("pages/b.md"): frozenset({Path("index.md")}),
+                _page_identity("index.md"): frozenset({Path("pages/a.md"), Path("pages/b.md")}),
+            },
+            forbidden_edges=((_page_identity("pages/b.md"), Path("pages/a.md")),),
+        )
+    if entry == "generate-conclusions":
+        root = draft_factory(
+            {"index.md": _ENTRY_INDEX, "pages/a.md": _ENTRY_CONFIRMED_A, "pages/b.md": _ENTRY_B}
+        )
+        return _EntryCase(
+            root=root,
+            invoke=lambda: generate_conclusions(root),
+            assert_business=lambda: _assert_all((root / "conclusions.md").is_file()),
+            kind=OperationKind.GENERATE_CONCLUSIONS.value,
+            terminal_phase=OperationPhase.COMPLETED,
+            revision="1",
+            files=frozenset(
+                {Path("index.md"), Path("conclusions.md"), Path("pages/a.md"), Path("pages/b.md")}
+            ),
+            backlink_sources={
+                _page_identity("pages/a.md"): frozenset({Path("index.md"), Path("conclusions.md")}),
+                _page_identity("pages/b.md"): frozenset({Path("index.md")}),
+                _page_identity("conclusions.md"): frozenset({Path("index.md")}),
+                _page_identity("index.md"): frozenset(
+                    {Path("pages/a.md"), Path("pages/b.md"), Path("conclusions.md")}
+                ),
+            },
+        )
+    if entry == "trash":
+        root = _entry_root(draft_factory)
+        return _EntryCase(
+            root=root,
+            invoke=lambda: trash_page(
+                root, Path("pages/b.md"), now=datetime(2026, 8, 1, tzinfo=UTC)
+            ),
+            assert_business=lambda: _assert_all(
+                not (root / "pages/b.md").exists(),
+                any((root / ".draft/trash/outgoing").glob("*/package.json")),
+            ),
+            kind=OperationKind.TRASH.value,
+            terminal_phase=OperationPhase.TRASH_RETAINED,
+            revision="1",
+            files=frozenset({Path("index.md"), Path("pages/a.md")}),
+            backlink_sources={
+                _page_identity("pages/a.md"): frozenset({Path("index.md")}),
+                _page_identity("index.md"): frozenset({Path("pages/a.md")}),
+            },
+            forbidden_files=frozenset({Path("pages/b.md")}),
+            forbidden_edges=((_page_identity("pages/b.md"), Path("index.md")),),
+        )
+    if entry == "restore":
+        root = _entry_root(draft_factory)
+        trashed = trash_page(root, Path("pages/b.md"), now=datetime(2026, 8, 1, tzinfo=UTC))
+        return _EntryCase(
+            root=root,
+            invoke=lambda: restore_retained_trash(
+                root, trashed.operation_id, now=datetime(2026, 8, 2, tzinfo=UTC)
+            ),
+            assert_business=lambda: _assert_all((root / "pages/b.md").is_file()),
+            kind=OperationKind.RESTORE.value,
+            terminal_phase=OperationPhase.COMPLETED,
+            revision="2",
+            files=frozenset({Path("index.md"), Path("pages/a.md"), Path("pages/b.md")}),
+            backlink_sources={
+                _page_identity("pages/a.md"): frozenset({Path("index.md")}),
+                _page_identity("pages/b.md"): frozenset({Path("index.md")}),
+                _page_identity("index.md"): frozenset({Path("pages/a.md"), Path("pages/b.md")}),
+            },
+        )
+    raise AssertionError(f"unknown entry case: {entry}")
+
+
+def _backlink_sources(index: LinkIndex) -> dict[ResourceIdentity, frozenset[Path]]:
+    return {
+        identity: frozenset(edge.source_path for edge in edges)
+        for identity, edges in index.backlinks.items()
+    }
+
+
+def _assert_entry_index(case: _EntryCase, journal: dict[str, object]) -> None:
+    assert journal["phase"] == case.terminal_phase.value
+    assert journal["link_index_result"] == LinkIndexResult.PUBLISHED.value
+    revision = cast("str", journal["link_index_revision"])
+    assert revision == case.revision
+    raw = (case.root / ".draft/link-index.json").read_bytes()
+    assert sha256_bytes(raw) == journal["link_index_sha256"]
+    authority = read_link_index_authority(case.root)
+    assert authority.revision == case.revision
+    assert authority.result is LinkIndexResult.PUBLISHED
+    baseline = load_link_index_baseline(case.root)
+    assert baseline.index is not None
+    assert frozenset(baseline.index.files) == case.files
+    assert _backlink_sources(baseline.index) == dict(case.backlink_sources)
+    for path in case.forbidden_files:
+        assert path not in baseline.index.files
+    for identity, source in case.forbidden_edges:
+        assert source not in {
+            edge.source_path for edge in baseline.index.backlinks.get(identity, ())
+        }
+
+
+def _result_phase(result: object) -> OperationPhase:
+    if isinstance(result, GenerationResult):
+        assert result.operation is not None
+        assert result.warnings == ()
+        return result.operation.phase
+    if isinstance(result, OperationResult):
+        assert result.warnings == ()
+        return result.phase
+    phase = getattr(result, "phase", None)
+    assert isinstance(phase, OperationPhase)
+    assert getattr(result, "index_warnings", ()) == ()
+    return phase
+
+
+def _journal_paths(root: Path) -> tuple[Path, ...]:
+    return tuple(sorted((root / ".draft/operations").glob("*/journal.json")))
+
+
+@pytest.mark.parametrize("entry", _ENTRY_NAMES, ids=lambda value: value.replace(" ", "-"))
+def test_every_mutation_entry_publishes_terminal_index_and_current_backlinks(
+    draft_factory: DraftFactory,
+    entry: str,
+) -> None:
+    case = _build_entry_case(draft_factory, entry)
+    result = case.invoke()
+    case.assert_business()
+    assert _result_phase(result) is case.terminal_phase
+    _assert_entry_index(case, _latest_journal(case.root, case.kind))
+
+
+@dataclass(frozen=True)
+class _NoOpCase:
+    root: Path
+    invoke: Callable[[], object]
+    expected_code: str | None
+
+
+def _build_noop_case(draft_factory: DraftFactory, entry: str) -> _NoOpCase:
+    if entry == "create":
+        root = _entry_root(draft_factory)
+        return _NoOpCase(
+            root,
+            lambda: create_page(root, Path("pages/a.md"), title="甲", status=StatusCode.PENDING),
+            "structure.target_exists",
+        )
+    if entry == "move":
+        root = _entry_root(draft_factory)
+        return _NoOpCase(
+            root,
+            lambda: move_entries(root, ["pages/a.md"], "pages/b.md"),
+            "structure.target_exists",
+        )
+    if entry == "promote":
+        root = _entry_root(draft_factory)
+        return _NoOpCase(
+            root,
+            lambda: promote_page(root, Path("pages/a.md"), []),
+            "structure.missing_child",
+        )
+    if entry == "collapse":
+        root = _entry_root(draft_factory)
+        return _NoOpCase(root, lambda: collapse_hub(root, Path("pages/a.md")), "structure.not_hub")
+    if entry == "status set":
+        root = _entry_root(draft_factory)
+        return _NoOpCase(
+            root, lambda: set_status(root, Path("pages/a.md"), StatusCode.PENDING), None
+        )
+    if entry == "relation add":
+        root = _entry_root(draft_factory)
+        add_relation(root, Path("pages/a.md"), EditableRelationCode.DEPENDS_ON, Path("pages/b.md"))
+        return _NoOpCase(
+            root,
+            lambda: add_relation(
+                root, Path("pages/a.md"), EditableRelationCode.DEPENDS_ON, Path("pages/b.md")
+            ),
+            None,
+        )
+    if entry == "relation remove":
+        root = _entry_root(draft_factory)
+        return _NoOpCase(
+            root,
+            lambda: remove_relation(
+                root, Path("pages/a.md"), EditableRelationCode.DEPENDS_ON, Path("pages/b.md")
+            ),
+            None,
+        )
+    if entry == "generate-conclusions":
+        root = _entry_root(draft_factory)
+        return _NoOpCase(root, lambda: generate_conclusions(root), None)
+    if entry == "trash":
+        root = _entry_root(draft_factory)
+        return _NoOpCase(root, lambda: trash_page(root, Path("index.md")), "trash.protected")
+    if entry == "restore":
+        root = _entry_root(draft_factory)
+        return _NoOpCase(
+            root,
+            lambda: restore_retained_trash(root, "not-an-operation-id"),
+            "operation.invalid_id",
+        )
+    raise AssertionError(f"unknown no-op case: {entry}")
+
+
+def _business_snapshot(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and ".draft" not in path.relative_to(root).parts
+    }
+
+
+@pytest.mark.parametrize("entry", _ENTRY_NAMES, ids=lambda value: value.replace(" ", "-"))
+def test_every_mutation_entry_noop_keeps_business_journals_and_authority_unchanged(
+    draft_factory: DraftFactory,
+    entry: str,
+) -> None:
+    case = _build_noop_case(draft_factory, entry)
+    before_business = _business_snapshot(case.root)
+    before_journals = _journal_paths(case.root)
+    before_authority = read_link_index_authority(case.root)
+    if case.expected_code is None:
+        result = case.invoke()
+        if isinstance(result, GenerationResult):
+            assert result.operation is None
+            assert result.warnings == ()
+        else:
+            assert isinstance(result, OperationResult)
+            assert result.changed_paths == ()
+            assert result.warnings == ()
+    else:
+        with pytest.raises(DraftError) as caught:
+            case.invoke()
+        assert caught.value.code == case.expected_code
+    assert _business_snapshot(case.root) == before_business
+    assert _journal_paths(case.root) == before_journals
+    assert read_link_index_authority(case.root) == before_authority
+
+
+def _assert_degraded_result(result: object, case: _EntryCase) -> None:
+    if isinstance(result, GenerationResult):
+        assert result.operation is not None
+        phase = result.operation.phase
+    elif isinstance(result, OperationResult):
+        phase = result.phase
+    else:
+        phase = getattr(result, "phase", None)
+    assert phase is case.terminal_phase
+
+
+@pytest.mark.parametrize("entry", _ENTRY_NAMES, ids=lambda value: value.replace(" ", "-"))
+def test_every_mutation_entry_keeps_business_result_when_index_publish_degrades(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    """公共 publish 边界失败时十类入口都保留业务结果并耐久降级。"""
+    import draft.link_index_maintenance as maintenance
+
+    case = _build_entry_case(draft_factory, entry)
+
+    def fail_publish(root: Path, journal: Journal, expected_sha256: str) -> NoReturn:
+        del journal, expected_sha256
+        raise DraftError(OPERATION_INDEX_UPDATE_FAILED, root)
+
+    monkeypatch.setattr(maintenance, "publish_staged_link_index", fail_publish)
+    result = case.invoke()
+    case.assert_business()
+    _assert_degraded_result(result, case)
+    journal = _latest_journal(case.root, case.kind)
+    assert journal["phase"] == case.terminal_phase.value
+    assert journal["link_index_revision"] == case.revision
+    assert journal["link_index_result"] == LinkIndexResult.REBUILD_REQUIRED.value
+    assert "link_index_sha256" not in journal
+    authority = read_link_index_authority(case.root)
+    assert authority.revision == case.revision
+    assert authority.result is LinkIndexResult.REBUILD_REQUIRED
+    assert (case.root / ".draft/link-index-rebuild-required.flag").is_file()
+    assert read_lock(case.root) is None
+    operation_id = cast("str", journal["operation_id"])
+    staging = case.root / ".draft/operations" / operation_id / LINK_INDEX_STAGED_FILE_NAME
+    assert not staging.exists()

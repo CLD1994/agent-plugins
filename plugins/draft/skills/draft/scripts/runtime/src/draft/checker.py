@@ -24,6 +24,7 @@ from draft.graph import (
     load_graph_tolerant,
     resolve_local_destination,
 )
+from draft.link_index_maintenance import LINK_INDEX_STAGED_FILE_NAME
 from draft.models import (
     CheckIssue,
     CheckReport,
@@ -465,6 +466,7 @@ _OPERATION_ENTRY_KINDS: Mapping[str, EntryKind] = MappingProxyType(
         "originals": EntryKind.DIRECTORY,
         "staged": EntryKind.DIRECTORY,
         "attempt": EntryKind.DIRECTORY,
+        LINK_INDEX_STAGED_FILE_NAME: EntryKind.FILE,
         "cleanup-evidence.json": EntryKind.FILE,
         "cleanup-evidence.json.pending": EntryKind.FILE,
         "cleanup-evidence.json.quarantine": EntryKind.FILE,
@@ -1184,7 +1186,6 @@ _ALLOWED_INTERNAL_ENTRIES = frozenset(
         Path(INTERNAL_DIR) / "operations",
         Path(INTERNAL_DIR) / "trash",
         Path(INTERNAL_DIR) / "link-index.json",
-        Path(INTERNAL_DIR) / "link-index.invalid",
         Path(INTERNAL_DIR) / "link-index-rebuild-required.flag",
     }
 )
@@ -1200,6 +1201,7 @@ _ALLOWED_INTERNAL_DIRECTORIES = frozenset(
 # 内部协议普通文件：只允许普通文件，目录/其他异常节点是非法形状（spec §10 flag 语义）。
 _ALLOWED_INTERNAL_FILES = frozenset(
     {
+        Path(INTERNAL_DIR) / "link-index.json",
         Path(INTERNAL_DIR) / "link-index-rebuild-required.flag",
     }
 )
