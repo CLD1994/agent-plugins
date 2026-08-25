@@ -41,6 +41,7 @@ from draft.operations import (
     recover_digest_pending,
     recover_locked_operation,
     recover_quarantine,
+    recover_unlocked_operation,
     reject_symlink_components,
     release_lock,
     resolve_journal_pending,
@@ -588,9 +589,7 @@ def _recover_locked_trash(
     )
 
 
-def _handle_no_lock_dir(
-    root: Path, entry: Path, *, now: datetime, handoff: Handoff
-) -> LifecycleResult | None:
+def _handle_no_lock_dir(root: Path, entry: Path) -> LifecycleResult | None:
     """无锁操作目录分类：放弃孤儿分配碎片、保留损坏现场、忽略终态审计。"""
     reject_symlink_components(root, OPERATIONS_RELATIVE)
     if entry.is_symlink():
@@ -631,24 +630,8 @@ def _handle_no_lock_dir(
             )
         # 其余无锁 restore（被 T 关联或处于中间阶段）一律保留现场。
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-    if journal.kind is OperationKind.TRASH:
-        if journal.phase in (
-            OperationPhase.TRASH_HANDOFF_SUCCEEDED,
-            OperationPhase.TRASH_PURGE_COMMITTED,
-            # 索引 phase 必须持锁（锁在 trash_retained 才释放）：无锁出现即锁已丢失
-            # 的损坏现场，保留证据报 inconsistent，不得静默跳过。
-            OperationPhase.LINK_INDEX_UPDATING,
-            OperationPhase.LINK_INDEX_PUBLISHED,
-            OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
-        ):
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-        # 无锁 retained/pending 不是 recovery-pending 现场：公开 recover 跳过；允许的
-        # 普通受管命令会在独立的生命周期前置入口扫描它们。
-        return None
-    # 普通操作终态：保留审计；中间阶段由 operations.recover 处理（无锁视为 inconsistent）。
-    if journal.phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
-        return None
-    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+    recover_unlocked_operation(root, journal)
+    return None
 
 
 def _restore_linked_back(root: Path, restore_journal: Journal) -> bool:
@@ -845,9 +828,7 @@ def recover_interrupted_operations(
         for entry in sorted(operations.iterdir()):
             if not entry.is_dir() or entry.name == locked:
                 continue
-            result = _handle_no_lock_dir(
-                resolved, entry, now=normalized_now, handoff=active_handoff
-            )
+            result = _handle_no_lock_dir(resolved, entry)
             if result is not None:
                 results.append(result)
 

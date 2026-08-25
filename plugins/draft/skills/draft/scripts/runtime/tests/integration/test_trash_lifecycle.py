@@ -346,7 +346,7 @@ def test_purge_deadline_forces_final_attempt_despite_throttle(
 
 
 def test_crash_during_final_attempt_never_commits_purge(
-    draft_factory: DraftFactory,
+    draft_factory: DraftFactory, tmp_path: Path
 ) -> None:
     root = build_trashable_draft(draft_factory)
     pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
@@ -365,6 +365,120 @@ def test_crash_during_final_attempt_never_commits_purge(
     # 非 OSError 中断不转为明确失败：阶段与权威包保持可重试。
     assert _phase(root, pending.operation_id) == "trash_handoff_pending"
     assert _package_exists(root, pending.operation_id)
+    assert (root / ".draft/operation.lock").is_file()
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    accepted: list[str] = []
+    results = recover_interrupted_operations(
+        root, now=PURGE, handoff=_accept_into(bin_dir, accepted)
+    )
+
+    assert len(results) == 1
+    assert len(accepted) == 1
+    assert _phase(root, pending.operation_id) == "completed"
+    assert not _package_exists(root, pending.operation_id)
+    assert not (root / ".draft/operation.lock").exists()
+
+    assert recover_interrupted_operations(root, now=PURGE, handoff=accepted.append) == ()
+    assert len(accepted) == 1
+
+
+def test_no_lock_trash_allocating_orphan_is_cleaned(
+    draft_factory: DraftFactory,
+) -> None:
+    """无锁 trash allocating 只清理本 operation 已授权的预分配材料。"""
+    from draft.models import RootState
+    from draft.observations import EMPTY_OBSERVATIONS
+    from draft.operations import preallocate_journal
+
+    root = build_trashable_draft(draft_factory)
+    journal = preallocate_journal(
+        root,
+        kind=OperationKind.TRASH,
+        operation_id="a" * 32,
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
+        metadata={},
+    )
+    (journal.directory / "originals").mkdir()
+    (journal.directory / "staged").mkdir()
+
+    recover_interrupted_operations(root, now=CREATED)
+
+    assert not journal.directory.exists()
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        OperationPhase.PREPARED,
+        OperationPhase.APPLYING,
+        OperationPhase.VALIDATING,
+        OperationPhase.ROLLING_BACK,
+    ],
+)
+def test_no_lock_trash_mid_write_phase_is_inconsistent(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: OperationPhase,
+) -> None:
+    """无锁 trash 中间阶段保留所有现场并报告 operation.inconsistent_state。"""
+
+    class ProcessExit(BaseException):
+        pass
+
+    import draft.operations as operations_module
+    from draft.operations import Journal, read_journal, read_lock
+
+    root = build_trashable_draft(draft_factory)
+    real_write = operations_module.write_journal
+    fired = False
+
+    def write_then_crash(journal: Journal) -> None:
+        nonlocal fired
+        real_write(journal)
+        if not fired and journal.kind is OperationKind.TRASH and journal.phase is phase:
+            fired = True
+            raise ProcessExit
+
+    monkeypatch.setattr(operations_module, "write_journal", write_then_crash)
+    if phase is OperationPhase.ROLLING_BACK:
+
+        def fail_check(_root: Path) -> None:
+            raise DraftError("operation.validation_failed", root)
+
+        monkeypatch.setattr(
+            operations_module,
+            "_check",
+            fail_check,
+        )
+
+    with pytest.raises(ProcessExit):
+        trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+
+    operation_id = read_lock(root)
+    assert operation_id is not None
+    journal_path = _journal_path(root, operation_id)
+    assert read_journal(journal_path).phase is phase
+    before_recovery = {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and path != root / ".draft/operation.lock"
+    }
+    (root / ".draft/operation.lock").unlink()
+    monkeypatch.undo()
+
+    with pytest.raises(DraftError) as caught:
+        recover_interrupted_operations(root, now=CREATED)
+
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    after_recovery = {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and path != root / ".draft/operation.lock"
+    }
+    assert after_recovery == before_recovery
 
 
 def test_handoff_success_marker_prevents_resubmission_after_crash(

@@ -4715,6 +4715,31 @@ def verify_locked_terminal_operation(
         raise DraftError("operation.external_change", root) from exc
 
 
+def recover_unlocked_operation(root: Path, journal: Journal) -> None:
+    """按单份 journal 分类无锁 operation，不扫描其他 operation。"""
+    if journal.phase is OperationPhase.ALLOCATING:
+        # allocating 只拥有日志登记的恢复材料；先精确校验并清理材料，再删除日志，
+        # 最后移除已为空的 operation 目录。未知成员或类型会在第一次删除前拒绝。
+        known_names = {"journal.json", "originals", "staged"}
+        extra = [path for path in journal.directory.iterdir() if path.name not in known_names]
+        if extra:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, extra[0])
+        _clean_recovery_copies(journal)
+        operation_journal_path(root, journal.operation_id).unlink()
+        journal.directory.rmdir()
+        return
+    if (
+        journal.phase in _MID_WRITE_PHASES
+        or journal.phase in _LINK_INDEX_PHASES
+        or journal.phase is OperationPhase.TRASH_HANDOFF_SUCCEEDED
+        or journal.phase is OperationPhase.TRASH_PURGE_COMMITTED
+    ):
+        # 无锁中间/索引/已提交 trash phase 表示锁在不应释放的阶段丢失，必须保留证据。
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+    # completed / rolled_back / trash_retained / trash_handoff_pending：终态或等待态，
+    # 只保留审计，不在无锁入口推进生命周期。
+
+
 def recover(root_path: Path) -> OperationResult:
     root = resolve_draft_root(root_path)
     operation_id = read_lock(root)
@@ -4749,34 +4774,16 @@ def recover(root_path: Path) -> OperationResult:
             # journal 与 pending 并存：pending 是更新的完整日志，先发布。
             resolve_journal_pending(journal_path)
         journal = read_journal(journal_path)
-        if journal.phase is OperationPhase.ALLOCATING:
+        if journal.kind is OperationKind.RESTORE and journal.phase is OperationPhase.ALLOCATING:
             if "restores_trash_operation" in journal.metadata:
                 # 关联恢复日志必须继续存在：无锁放弃为 rolled_back，保留审计事实。
                 _clean_recovery_copies(journal)
                 write_journal(_with_phase(journal, OperationPhase.ROLLED_BACK))
                 continue
-            # 无锁 allocating 碎片：协议明确拥有 journal.json 与 originals/staged
-            # 目录；其余未知条目报 inconsistent_state，不得用 rglob 递归删除任意
-            # 内容。统一状态机：完整预检全部恢复目录 → 删除精确授权叶 → 删除空目录
-            # → journal 最后删除。
-            known_names = {"journal.json", "originals", "staged"}
-            extra = [path for path in entry.iterdir() if path.name not in known_names]
-            if extra:
-                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
-            _clean_recovery_copies(journal)
-            (entry / "journal.json").unlink()
-            entry.rmdir()
-        elif (
-            journal.phase in _MID_WRITE_PHASES
-            or journal.phase in _LINK_INDEX_PHASES
-            or journal.phase is OperationPhase.TRASH_HANDOFF_SUCCEEDED
-            or journal.phase is OperationPhase.TRASH_PURGE_COMMITTED
-        ):
-            # 索引 phase 的 operation 必须持锁（锁在终态才释放）：无锁出现即锁已丢失
-            # 的损坏现场，保留证据报 inconsistent（spec §12）。
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal_path)
-        # completed / rolled_back / trash_retained / trash_handoff_pending：终态或非写入状态，
-        # trash 子系统负责推进 trash_retained 与 trash_handoff_pending。
+        elif journal.kind is not OperationKind.RESTORE:
+            recover_unlocked_operation(root, journal)
+        # restore 的其他 phase 由 trash_lifecycle 读取 R/T 关联后分类；普通 terminal/pending
+        # phase 在这里仅保留审计。
     return OperationResult(
         operation_id="", kind="recover", phase=OperationPhase.COMPLETED, changed_paths=()
     )
