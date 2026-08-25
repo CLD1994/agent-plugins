@@ -29,7 +29,8 @@ def test_root_domain_exports_use_draft() -> None:
     assert hasattr(errors, "DraftError")
     assert hasattr(graph, "DraftGraph")
     assert hasattr(checker, "check_draft")
-    assert hasattr(trash_lifecycle, "recover_draft")
+    assert hasattr(trash_lifecycle, "advance_trash_lifecycle")
+    assert hasattr(trash_lifecycle, "recover_interrupted_operations")
     assert hasattr(paths, "resolve_draft_root")
     assert hasattr(lifecycle, "initialize")
 

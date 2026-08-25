@@ -12,7 +12,6 @@ from draft.operations import JOURNAL_VERSION, TrashDeadlines
 from draft.trash import trash_page
 from draft.trash_lifecycle import (
     advance_trash_lifecycle,
-    recover_draft,
     recover_interrupted_operations,
 )
 from tests.integration.support import DraftFactory
@@ -381,7 +380,7 @@ def test_handoff_success_marker_prevents_resubmission_after_crash(
     acquire_lock(root, pending.operation_id)
 
     calls: list[str] = []
-    recover_draft(root, now=PURGE, handoff=calls.append)
+    recover_interrupted_operations(root, now=PURGE, handoff=calls.append)
 
     assert calls == []  # succeeded 已耐久：恢复只清理，不再调用适配器。
     assert _phase(root, pending.operation_id) == "completed"
@@ -402,7 +401,7 @@ def test_purge_committed_recovery_only_finishes_cleanup(
     assert _package_exists(root, pending.operation_id)
 
     calls: list[str] = []
-    recover_draft(root, now=PURGE, handoff=calls.append)
+    recover_interrupted_operations(root, now=PURGE, handoff=calls.append)
 
     assert calls == []
     assert _phase(root, pending.operation_id) == "completed"
@@ -447,7 +446,7 @@ def test_terminal_recovery_preserves_unknown_package_entry(
 
     calls: list[str] = []
     with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
-        recover_draft(root, now=PURGE, handoff=calls.append)
+        recover_interrupted_operations(root, now=PURGE, handoff=calls.append)
 
     assert unknown.is_symlink() or unknown.exists()
     assert calls == []
@@ -469,7 +468,7 @@ def test_terminal_recovery_idempotent_when_payload_missing(
     payload.unlink()
 
     calls: list[str] = []
-    recover_draft(root, now=PURGE, handoff=calls.append)
+    recover_interrupted_operations(root, now=PURGE, handoff=calls.append)
 
     assert calls == []
     assert _phase(root, pending.operation_id) == "completed"
@@ -497,7 +496,7 @@ def test_terminal_recovery_rejects_empty_mutation_log(
 
     calls: list[str] = []
     with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
-        recover_draft(root, now=PURGE, handoff=calls.append)
+        recover_interrupted_operations(root, now=PURGE, handoff=calls.append)
 
     assert calls == []
     assert (root / ".draft/operation.lock").exists()
@@ -529,7 +528,7 @@ def test_terminal_recovery_converges_after_mid_delete_extra(
     monkeypatch.setattr(trash_package_module, "_precheck_package_tree", precheck_then_inject)
     calls: list[str] = []
     with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
-        recover_draft(root, now=PURGE, handoff=calls.append)
+        recover_interrupted_operations(root, now=PURGE, handoff=calls.append)
 
     assert calls == []
     assert _phase(root, pending.operation_id) == "trash_handoff_succeeded"
@@ -539,7 +538,7 @@ def test_terminal_recovery_converges_after_mid_delete_extra(
 
     monkeypatch.undo()
     (package / "late.txt").unlink()
-    recover_draft(root, now=PURGE, handoff=calls.append)
+    recover_interrupted_operations(root, now=PURGE, handoff=calls.append)
     assert _phase(root, pending.operation_id) == "completed"
     assert not _package_exists(root, pending.operation_id)
     assert not (journal.directory / "cleanup-evidence.json").exists()
@@ -688,7 +687,7 @@ def test_locked_retained_before_expiry_recovery_releases_lock(
     acquire_lock(root, pending.operation_id)
     calls: list[str] = []
 
-    recover_draft(root, now=EXPIRY - timedelta(days=1), handoff=calls.append)
+    recover_interrupted_operations(root, now=EXPIRY - timedelta(days=1), handoff=calls.append)
 
     assert calls == []
     assert not (root / ".draft/operation.lock").exists()
@@ -755,7 +754,7 @@ def test_recovery_scan_rejects_symlinked_operations_dir(
     before = (external / "journal.json").read_bytes()
 
     with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     # 外部目录内容不得被读取或改动。
     assert (external / "journal.json").read_bytes() == before
@@ -785,10 +784,10 @@ def test_sub_operation_dir_symlink_is_reported_not_skipped(
     with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
         advance_trash_lifecycle(root, now=EXPIRY, handoff=lambda p: None)
     # 恢复扫描（_handle_no_lock_dir）必须把链接条目报为批量错误，而非静默跳过。
-    report = recover_draft(root)
-    assert report.error is not None
-    assert report.error.code == CheckCode.PATH_SYMLINK_ESCAPE.value
-    assert report.error.operation_id == pending.operation_id
+    with pytest.raises(DraftError) as caught:
+        recover_interrupted_operations(root)
+    assert caught.value.code == CheckCode.PATH_SYMLINK_ESCAPE.value
+    assert caught.value.paths == (operations / pending.operation_id,)
     # 检查器必须报告 path.symlink_escape 问题，而非静默跳过。
     report = check_draft(root)
     assert any(issue.code == CheckCode.PATH_SYMLINK_ESCAPE.value for issue in report.errors)
@@ -820,7 +819,7 @@ def test_terminal_cleanup_rejects_symlinked_outgoing(
     external_payload = (external / pending.operation_id / "package.json").read_bytes()
 
     with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     # 外部目录绝不被清理：外部包内容保持完整。
     assert (external / pending.operation_id / "package.json").read_bytes() == external_payload
@@ -894,12 +893,11 @@ def test_orphan_restore_scan_stops_on_unreadable_sibling_journal(
     (c_dir / "journal.json").write_text("not json\n", encoding="utf-8")
     r_bytes_before = (r_dir / "journal.json").read_bytes()
 
-    report = recover_draft(root)
+    with pytest.raises(DraftError) as caught:
+        recover_interrupted_operations(root)
 
     # 停止并报错；R 保持 allocating，绝不写 rolled_back；T 保持 trash_retained。
-    assert report.error is not None
-    assert report.error.operation_id == r_id
-    assert report.error.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
+    assert caught.value.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
     assert (r_dir / "journal.json").read_bytes() == r_bytes_before
     assert _phase(root, pending.operation_id) == "trash_retained"
 
@@ -1056,9 +1054,9 @@ def test_no_lock_trash_at_index_phase_is_inconsistent(
     assert read_journal(_journal_path(root, trash_id)).phase is OperationPhase.LINK_INDEX_UPDATING
     (root / ".draft/operation.lock").unlink()  # 模拟锁丢失。
 
-    report = recover_draft(root, now=CREATED)
+    with pytest.raises(DraftError) as caught:
+        recover_interrupted_operations(root, now=CREATED)
 
-    assert report.error is not None
-    assert report.error.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
     journal = read_journal(_journal_path(root, trash_id))
     assert journal.phase is OperationPhase.LINK_INDEX_UPDATING

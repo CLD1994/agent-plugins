@@ -11,7 +11,7 @@ from draft.errors import DraftError
 from draft.models import OperationKind, OperationPhase, RootState
 from draft.operations import JOURNAL_VERSION, Journal, operation_journal_path, read_journal
 from draft.trash import restore_retained_trash, trash_page
-from draft.trash_lifecycle import recover_draft
+from draft.trash_lifecycle import recover_interrupted_operations
 from draft.trash_package import VerifiedTrashPackage
 from tests.integration.support import DraftFactory, snapshot_tree
 
@@ -826,8 +826,8 @@ def test_crash_between_r_completed_and_t_rolled_back_recovers(
     assert _package_snapshot(root, pending.operation_id)
 
     # 恢复器用同一终态解决器解释现场：证明证据、转 T、清理包、释放锁。
-    report = recover_draft(root)
-    assert any(result.phase is OperationPhase.COMPLETED for result in report.results)
+    report = recover_interrupted_operations(root)
+    assert any(result.phase is OperationPhase.COMPLETED for result in report)
     assert _read_journal(root, pending.operation_id)["phase"] == "rolled_back"
     assert not (root / ".draft/trash/outgoing" / pending.operation_id).exists()
     assert not (root / ".draft/operation.lock").exists()
@@ -912,7 +912,7 @@ def test_committed_cleanup_recovers_from_crash_point(
     """R=completed、T=rolled_back 后任意清理点崩溃：recover 凭提交状态收敛，不要求完整包。
 
     已提交清理现场包可能 exact/partial/missing，恢复不得因缺失 package.json 报
-    trash.package_corrupt，也不得重新验证完整包（第十轮 H2）。两个公开恢复入口都要
+    trash.package_corrupt，也不得重新验证完整包（第十轮 H2）。公开 recovery 必须
     幂等收敛。
     """
     from draft.trash_lifecycle import recover_interrupted_operations
@@ -928,14 +928,14 @@ def test_committed_cleanup_recovers_from_crash_point(
     assert _read_journal(root, pending.operation_id)["phase"] == "rolled_back"
     assert (root / ".draft/operation.lock").exists()
 
-    report = recover_draft(root)
-    assert any(result.phase is OperationPhase.COMPLETED for result in report.results)
+    report = recover_interrupted_operations(root)
+    assert any(result.phase is OperationPhase.COMPLETED for result in report)
     assert not (root / ".draft/trash/outgoing" / pending.operation_id).exists()
     assert not (root / ".draft/operation.lock").exists()
     assert (root / "pages/obsolete.md").read_text(encoding="utf-8") == OBSOLETE
 
-    # recover_interrupted_operations 必须同样幂等收敛（第二个公开入口，返回元组）：
-    # 首次恢复已清理全部现场，第二次调用无事可做但绝不因缺失 package.json 报损坏。
+    # 首次恢复已清理全部现场，第二次公开 recovery 无事可做但绝不因缺失 package.json
+    # 报损坏。
     report2 = recover_interrupted_operations(root)
     assert report2 == ()
     assert not (root / ".draft/operation.lock").exists()
@@ -1001,26 +1001,18 @@ def _apply_restore_mid_phase_crash(
     return root, restore_id, pending.operation_id
 
 
-def _recover_through_public_entry(root: Path, entry_name: str) -> None:
-    from draft.trash_lifecycle import recover_interrupted_operations
-
-    # now=NOW 保持 T 仍在恢复窗口内：本测试聚焦回滚/前向恢复的协调收敛，不让
-    # recover_draft 的批量到期推进（真实 send2trash）把 T 推过生命周期。
-    if entry_name == "recover_draft":
-        recover_draft(root, now=NOW)
-    else:
-        recover_interrupted_operations(root, now=NOW)
+def _recover_through_public_entry(root: Path) -> None:
+    """经唯一公开恢复边界收敛中断现场，保持 T 仍处于恢复窗口内。"""
+    recover_interrupted_operations(root, now=NOW)
 
 
 @pytest.mark.parametrize("phase", [OperationPhase.APPLYING, OperationPhase.VALIDATING])
-@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 def test_restore_forward_mid_phase_crash_recovers_through_public_entry(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
     phase: OperationPhase,
-    entry_name: str,
 ) -> None:
-    """真实 restore 在 R 耐久进入 applying/validating 后中断：两个公开入口前向收敛。
+    """真实 restore 在 R 耐久进入 applying/validating 后中断：公开 recovery 前向收敛。
 
     正向恢复最终 R=completed、T=rolled_back、包按 cleanup evidence 安全清理、锁释放
     （第十一轮 H1/Q1：生产者写出相位，消费者经公开入口恢复）。
@@ -1036,7 +1028,7 @@ def test_restore_forward_mid_phase_crash_recovers_through_public_entry(
     assert _read_journal(root, restore_id)["phase"] == phase.value
     assert _read_journal(root, pending.operation_id)["phase"] == "trash_retained"
 
-    _recover_through_public_entry(root, entry_name)
+    _recover_through_public_entry(root)
 
     assert _read_journal(root, restore_id)["phase"] == "completed"
     assert _read_journal(root, pending.operation_id)["phase"] == "rolled_back"
@@ -1044,11 +1036,9 @@ def test_restore_forward_mid_phase_crash_recovers_through_public_entry(
     assert not (root / ".draft/operation.lock").exists()
 
 
-@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 def test_trash_link_index_phase_crash_recovers_to_retained_with_index_result(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
-    entry_name: str,
 ) -> None:
     """trash 在索引 phase 中断：索引结果先于 trash_retained 耐久（spec §5/§12）。
 
@@ -1085,7 +1075,7 @@ def test_trash_link_index_phase_crash_recovers_to_retained_with_index_result(
     assert journal["phase"] == "link_index_updating"
     assert journal["link_index_revision"] == "1"
 
-    _recover_through_public_entry(root, entry_name)
+    _recover_through_public_entry(root)
 
     journal = _read_journal(root, trash_id)
     assert journal["phase"] == "trash_retained"
@@ -1139,11 +1129,9 @@ def test_trash_applying_phase_crash_recovers_mutation_through_public_entry(
     assert _package_snapshot(root, trash_id)
 
 
-@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 def test_restore_link_index_phase_crash_recovers_through_public_entry(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
-    entry_name: str,
 ) -> None:
     """restore 在索引 phase 中断：R 先收敛 completed（索引结果耐久、锁保留），再解关联 T。
 
@@ -1160,7 +1148,7 @@ def test_restore_link_index_phase_crash_recovers_through_public_entry(
     assert _read_journal(root, restore_id)["phase"] == "link_index_updating"
     assert _read_journal(root, restore_id)["link_index_revision"] == "2"
 
-    _recover_through_public_entry(root, entry_name)
+    _recover_through_public_entry(root)
 
     assert _read_journal(root, restore_id)["phase"] == "completed"
     assert _read_journal(root, restore_id)["link_index_result"] == "rebuild_required"
@@ -1201,16 +1189,14 @@ def test_restore_link_index_phase_recovery_retains_lock_and_materials(
     assert (r_dir / "originals/0000.bin").exists()
 
     # 公开恢复入口接手协调：验证、解关联、清材料、释放锁。
-    _recover_through_public_entry(root, "recover_draft")
+    _recover_through_public_entry(root)
     assert _read_journal(root, pending.operation_id)["phase"] == "rolled_back"
     assert not (root / ".draft/operation.lock").exists()
 
 
-@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 def test_restore_rollback_mid_phase_crash_recovers_through_public_entry(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
-    entry_name: str,
 ) -> None:
     """真实 restore 在 R 耐久进入 rolling_back 后中断：回滚收敛为 rolled_back + 解关联。
 
@@ -1228,7 +1214,7 @@ def test_restore_rollback_mid_phase_crash_recovers_through_public_entry(
     restore_id = _read_journal(root, pending.operation_id)["metadata"]["restore_operation_id"]
     assert _read_journal(root, restore_id)["phase"] == "rolling_back"
 
-    _recover_through_public_entry(root, entry_name)
+    _recover_through_public_entry(root)
 
     assert _read_journal(root, restore_id)["phase"] == "rolled_back"
     t = _read_journal(root, pending.operation_id)
@@ -1257,7 +1243,7 @@ def test_restore_mid_phase_broken_link_preserves_scene(
     before_package = _package_snapshot(root, trash_id)
 
     with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     assert (root / ".draft/operation.lock").exists()
     assert _read_journal(root, restore_id)["phase"] == "applying"
@@ -1275,7 +1261,7 @@ def test_restore_mid_phase_external_change_preserves_scene(
     before_package = _package_snapshot(root, trash_id)
 
     with pytest.raises(DraftError, match="operation.external_change"):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     assert (root / ".draft/operation.lock").exists()
     assert _read_journal(root, restore_id)["phase"] == "applying"
@@ -1295,7 +1281,7 @@ def test_restore_rolling_back_corrupt_original_preserves_scene(
     before_package = _package_snapshot(root, trash_id)
 
     with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     assert (root / ".draft/operation.lock").exists()
     assert _read_journal(root, restore_id)["phase"] == "rolling_back"
@@ -1316,7 +1302,7 @@ def test_restore_mid_phase_observed_unrelated_change_preserves_scene(
     before_package = _package_snapshot(root, trash_id)
 
     with pytest.raises(DraftError, match="operation.external_change"):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     assert (root / ".draft/operation.lock").exists()
     assert _read_journal(root, restore_id)["phase"] == "applying"
@@ -1379,7 +1365,7 @@ def _abandon_unclaimed_crash_scene(
     )
     crash_after_restore_unclaim(monkeypatch)
     with pytest.raises(SimulatedProcessExit):
-        _recover_through_public_entry(root, "recover_draft")
+        _recover_through_public_entry(root)
     monkeypatch.undo()
     assert _read_journal(root, restore_id)["phase"] == "rolled_back"
     t = _read_journal(root, trash_id)
@@ -1389,12 +1375,10 @@ def _abandon_unclaimed_crash_scene(
     return root, restore_id, trash_id
 
 
-@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 @pytest.mark.parametrize("cleanup_state", ["intact", "partial", "complete"])
 def test_abandon_unclaimed_intermediate_state_converges(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
-    entry_name: str,
     cleanup_state: str,
 ) -> None:
     """ABANDON 已耐久删除 T claim 后在不同清理进度中断：公开恢复入口幂等收敛（H1）。
@@ -1418,7 +1402,7 @@ def test_abandon_unclaimed_intermediate_state_converges(
         # 清理已完成但锁未释放：目录整体已删除。
         shutil.rmtree(staged)
 
-    _recover_through_public_entry(root, entry_name)
+    _recover_through_public_entry(root)
 
     assert read_lock(root) is None
     assert _read_journal(root, restore_id)["phase"] == "rolled_back"
@@ -1430,7 +1414,7 @@ def test_abandon_unclaimed_intermediate_state_converges(
     assert (root / ".draft/trash/outgoing" / trash_id).is_dir()
 
     # 重复调用仍幂等：不重写 T、不删除权威包、锁保持释放。
-    _recover_through_public_entry(root, entry_name)
+    _recover_through_public_entry(root)
     assert read_lock(root) is None
     assert (root / ".draft/trash/outgoing" / trash_id).is_dir()
     t_after = _read_journal(root, trash_id)
@@ -1465,20 +1449,18 @@ def _rollback_converged_scene(
         ("symlink", CheckCode.PATH_SYMLINK_ESCAPE.value),
     ],
 )
-@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 def test_abandon_requires_terminal_target_proof(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
     target_setup: str,
     expected_code: str | None,
-    entry_name: str,
 ) -> None:
     """R=rolled_back 消费 ABANDON 前必须证明 target 仍为 before（H2）。
 
     before 分区完成放弃；after/wrong bytes 报 external_change；目录化目标报
     external_change（不可读取目标不是 before）；链接目标报更精确的
     path.symlink_escape。非 before 分区必须保留 T journal bytes、锁与权威包。
-    两个公开恢复入口都覆盖（H2 验证要求）。
+    公开恢复入口必须覆盖该状态分区。
     """
     from draft.operations import read_lock
 
@@ -1498,7 +1480,7 @@ def test_abandon_requires_terminal_target_proof(
         target.symlink_to(root / "pages" / "other.md")
 
     if expected_code is None:
-        _recover_through_public_entry(root, entry_name)
+        _recover_through_public_entry(root)
         assert read_lock(root) is None
         t = _read_journal(root, trash_id)
         assert t["phase"] == "trash_retained"
@@ -1507,7 +1489,7 @@ def test_abandon_requires_terminal_target_proof(
         return
 
     with pytest.raises(DraftError) as caught:
-        _recover_through_public_entry(root, entry_name)
+        _recover_through_public_entry(root)
     assert caught.value.code == expected_code
     # 验证失败不得先写 T、清副本或解锁：场景必须原样保留。
     assert _journal_path(root, trash_id).read_bytes() == before_t
@@ -1523,17 +1505,15 @@ def test_abandon_requires_terminal_target_proof(
         ("directory", "operation.external_change"),
     ],
 )
-@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 def test_abandon_unclaimed_finish_requires_terminal_target_proof(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
     target_setup: str,
     expected_code: str,
-    entry_name: str,
 ) -> None:
     """FINISH_ABANDON_CLEANUP 同样不得因 T 已解关联就跳过 R 终态证明（H2）。
 
-    两个公开恢复入口都覆盖。
+    公开恢复入口必须覆盖该状态分区。
     """
     root, restore_id, trash_id = _abandon_unclaimed_crash_scene(draft_factory, monkeypatch)
     target = root / "pages/obsolete.md"
@@ -1545,7 +1525,7 @@ def test_abandon_unclaimed_finish_requires_terminal_target_proof(
         target.mkdir(parents=True)
 
     with pytest.raises(DraftError) as caught:
-        _recover_through_public_entry(root, entry_name)
+        _recover_through_public_entry(root)
     assert caught.value.code == expected_code
     assert _journal_path(root, trash_id).read_bytes() == before_t
     assert (root / ".draft/operation.lock").exists()
@@ -1633,13 +1613,11 @@ def crash_after_restore_rolled_back(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(trash_module, "write_journal", write_then_crash)
 
 
-@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 def test_restore_preclaim_crash_converges(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
-    entry_name: str,
 ) -> None:
-    """真实 producer 在写 T claim 前中断：两个公开入口幂等收敛（round-13 H1）。
+    """真实 producer 在写 T claim 前中断：公开 recovery 幂等收敛（round-13 H1）。
 
     收敛：R 耐久转为 rolled_back、R 登记材料清理、锁释放；T journal bytes 与权威包
     字节完全不变、T 无 claim。重复调用无副作用。修复前公开入口报
@@ -1651,7 +1629,7 @@ def test_restore_preclaim_crash_converges(
     before_t = _journal_path(root, trash_id).read_bytes()
     before_package = _package_snapshot(root, trash_id)
 
-    _recover_through_public_entry(root, entry_name)
+    _recover_through_public_entry(root)
 
     assert read_lock(root) is None
     assert _read_journal(root, restore_id)["phase"] == "rolled_back"
@@ -1664,17 +1642,15 @@ def test_restore_preclaim_crash_converges(
     assert t["phase"] == "trash_retained"
     assert "restore_operation_id" not in t["metadata"]
 
-    _recover_through_public_entry(root, entry_name)
+    _recover_through_public_entry(root)
     assert read_lock(root) is None
     assert _journal_path(root, trash_id).read_bytes() == before_t
     assert _package_snapshot(root, trash_id) == before_package
 
 
-@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 def test_restore_preclaim_rolled_back_second_crash_converges_via_finish(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
-    entry_name: str,
 ) -> None:
     """新动作把 R=rolled_back 耐久后再次中断：下一次 recover 走既有 FINISH（H1）。
 
@@ -1686,7 +1662,7 @@ def test_restore_preclaim_rolled_back_second_crash_converges_via_finish(
     root, restore_id, trash_id = _restore_preclaim_crash_scene(draft_factory, monkeypatch)
     crash_after_restore_rolled_back(monkeypatch)
     with pytest.raises(SimulatedProcessExit):
-        _recover_through_public_entry(root, entry_name)
+        _recover_through_public_entry(root)
     monkeypatch.undo()
     assert _read_journal(root, restore_id)["phase"] == "rolled_back"
     t = _read_journal(root, trash_id)
@@ -1695,7 +1671,7 @@ def test_restore_preclaim_rolled_back_second_crash_converges_via_finish(
 
     before_t = _journal_path(root, trash_id).read_bytes()
     before_package = _package_snapshot(root, trash_id)
-    _recover_through_public_entry(root, entry_name)
+    _recover_through_public_entry(root)
     assert read_lock(root) is None
     assert _journal_path(root, trash_id).read_bytes() == before_t
     assert _package_snapshot(root, trash_id) == before_package
@@ -1704,7 +1680,7 @@ def test_restore_preclaim_rolled_back_second_crash_converges_via_finish(
     assert not (r_dir / "staged").exists()
     assert _read_journal(root, restore_id)["phase"] == "rolled_back"
 
-    _recover_through_public_entry(root, entry_name)
+    _recover_through_public_entry(root)
     assert read_lock(root) is None
     assert _journal_path(root, trash_id).read_bytes() == before_t
 
@@ -1713,17 +1689,15 @@ _NON_BOOTSTRAP_DEVIATIONS = ("observation", "mutation", "remove_dir", "extra_met
 
 
 @pytest.mark.parametrize("deviation", _NON_BOOTSTRAP_DEVIATIONS)
-@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 def test_restore_preclaim_non_bootstrap_is_inconsistent(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
     deviation: str,
-    entry_name: str,
 ) -> None:
     """allocating+unclaimed 但任一维度偏离 bootstrap：零写入保留现场（round-13 H1）。
 
     非法状态可以手工构造，但每个只改变一个维度：observation/mutation/remove_dir/
-    额外 metadata。两个公开入口都必须一致拒绝，不得把无法证明 bootstrap 的状态
+    额外 metadata。公开 recovery 必须拒绝，不得把无法证明 bootstrap 的状态
     解释为放弃、成功或无关。
     """
     import json
@@ -1762,7 +1736,7 @@ def test_restore_preclaim_non_bootstrap_is_inconsistent(
     before = snapshot_tree(root)
 
     with pytest.raises(DraftError) as caught:
-        _recover_through_public_entry(root, entry_name)
+        _recover_through_public_entry(root)
     assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
     assert snapshot_tree(root) == before
     assert read_lock(root) == restore_id
@@ -1795,7 +1769,7 @@ def test_restore_non_allocating_phases_do_not_collect_unapplied_proof(
     """非 allocating/prepared 相位不得采集 unapplied proof（spy 一旦被调用即失败）。
 
     _proven_unapplied_restore 只对 ALLOCATING/PREPARED 有意义；其他相位读取目标会
-    引入本来不存在的失败路径并绕过通用恢复器（round-12 M1）。两个决策入口共享同一
+    引入本来不存在的失败路径并绕过通用恢复器（round-12 M1）。公开恢复入口共享同一
     _recover_locked_restore，故以公开入口恢复真实现场并断言收敛。
     """
     root, restore_id, trash_id = _apply_restore_mid_phase_crash(draft_factory, monkeypatch, phase)
@@ -1808,7 +1782,7 @@ def test_restore_non_allocating_phases_do_not_collect_unapplied_proof(
 
     monkeypatch.setattr(trash_module, "_proven_unapplied_restore", forbidden)
 
-    _recover_through_public_entry(root, "recover_draft")
+    _recover_through_public_entry(root)
 
     from draft.operations import read_lock
 
@@ -1840,7 +1814,7 @@ def test_restore_prepared_collects_unapplied_proof_once(
 
     monkeypatch.setattr(trash_module, "_proven_unapplied_restore", spy)
 
-    _recover_through_public_entry(root, "recover_draft")
+    _recover_through_public_entry(root)
 
     assert len(calls) == 1
     from draft.operations import read_lock
@@ -1852,11 +1826,9 @@ def test_restore_prepared_collects_unapplied_proof_once(
     assert "restore_operation_id" not in t["metadata"]
 
 
-@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 def test_restore_applying_directory_target_stable_error(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
-    entry_name: str,
 ) -> None:
     """R=applying 且目标被目录化：进入通用恢复器返回 external_change，不泄漏 OSError（M1）。
 
@@ -1871,7 +1843,7 @@ def test_restore_applying_directory_target_stable_error(
     before_package = _package_snapshot(root, trash_id)
 
     with pytest.raises(DraftError) as caught:
-        _recover_through_public_entry(root, entry_name)
+        _recover_through_public_entry(root)
     assert caught.value.code == "operation.external_change"
     assert (root / ".draft/operation.lock").exists()
     assert _read_journal(root, restore_id)["phase"] == "applying"
@@ -1879,11 +1851,9 @@ def test_restore_applying_directory_target_stable_error(
     assert _package_snapshot(root, trash_id) == before_package
 
 
-@pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 def test_restore_applying_symlink_target_stable_error(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
-    entry_name: str,
 ) -> None:
     """R=applying 且目标被替换为链接：稳定领域错误，不泄漏 OSError（M1）。"""
     root, restore_id, trash_id = _apply_restore_mid_phase_crash(
@@ -1893,7 +1863,7 @@ def test_restore_applying_symlink_target_stable_error(
     before_package = _package_snapshot(root, trash_id)
 
     with pytest.raises(DraftError) as caught:
-        _recover_through_public_entry(root, entry_name)
+        _recover_through_public_entry(root)
     assert caught.value.code in (
         "operation.external_change",
         CheckCode.PATH_SYMLINK_ESCAPE.value,
@@ -1919,7 +1889,7 @@ def test_restore_prepared_unreadable_target_not_abandoned(
     before_package = _package_snapshot(root, trash_id)
 
     with pytest.raises(DraftError) as caught:
-        recover_draft(root, now=NOW)
+        recover_interrupted_operations(root, now=NOW)
     assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
     assert (root / ".draft/operation.lock").read_bytes() == before_lock
     assert _read_journal(root, restore_id)["phase"] == "prepared"
@@ -2014,7 +1984,7 @@ def test_evidence_consume_identity_stat_failure_preserves_scene(
     """evidence 消费前身份复核 EACCES：recover 报 trash.package_corrupt，不错误完成（H4）。
 
     修复前 _name_node 把 EACCES 折叠为 None，消费点当作"evidence 已消失、幂等"，
-    recover_draft 返回 completed 并释放锁，但 evidence 仍残留（错误成功）。修复后身份
+    旧恢复路径返回 completed 并释放锁，但 evidence 仍残留（错误成功）。修复后身份
     读取失败按 evidence code/path 抛稳定错误，锁与包/材料保留；移除故障后收敛。
     """
     from draft.operations import read_lock
@@ -2027,7 +1997,7 @@ def test_evidence_consume_identity_stat_failure_preserves_scene(
     # 注入点位于 evidence 消费前：此刻授权包叶已按清理流程合法删除，失败不得再错误
     # 完成/解锁；evidence 与锁必须保留，T journal 字节不变。
     with pytest.raises(DraftError) as caught:
-        recover_draft(root, now=NOW)
+        recover_interrupted_operations(root, now=NOW)
     assert caught.value.code == CheckCode.TRASH_PACKAGE_CORRUPT.value
     assert read_lock(root) == restore_id  # 锁仍属 R，未错误完成/解锁。
     assert _journal_path(root, trash_id).read_bytes() == before_t
@@ -2035,7 +2005,7 @@ def test_evidence_consume_identity_stat_failure_preserves_scene(
 
     # 移除故障后再次 recover 收敛：包叶删除、evidence 消费、锁释放。
     monkeypatch.undo()
-    recover_draft(root, now=NOW)
+    recover_interrupted_operations(root, now=NOW)
     assert read_lock(root) is None
     assert not (t_dir / "cleanup-evidence.json").exists()
     assert _read_journal(root, restore_id)["phase"] == "completed"
@@ -2098,7 +2068,7 @@ def test_restore_impossible_pair_reports_inconsistent_without_writes(
     before_package = _package_snapshot(root, pending.operation_id)
 
     with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     assert _read_journal(root, restore_id) == before_r
     assert _read_journal(root, pending.operation_id) == before_t
@@ -2134,7 +2104,7 @@ def test_verify_commit_branch_still_requires_complete_package(
     manifest.write_text("{corrupted", encoding="utf-8")
 
     with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
-        recover_draft(root)
+        recover_interrupted_operations(root)
     with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
         recover_interrupted_operations(root)
     # 保留 R/T 关联、锁与包现场，等待人工处理。
@@ -2176,7 +2146,7 @@ def test_completed_restore_with_extra_mutation_is_rejected(
     before_package = _package_snapshot(root, pending.operation_id)
 
     with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     # 权威包、锁、T 全部保留：绝不因伪造 completed 删除权威包。
     assert _package_snapshot(root, pending.operation_id) == before_package
@@ -2216,7 +2186,7 @@ def test_completed_restore_with_wrong_parent_content_is_rejected(
     before_package = _package_snapshot(root, pending.operation_id)
 
     with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     assert _package_snapshot(root, pending.operation_id) == before_package
     assert (root / ".draft/operation.lock").exists()
@@ -2259,7 +2229,7 @@ def test_completed_restore_with_forged_extra_empty_section_is_rejected(
     before_package = _package_snapshot(root, pending.operation_id)
 
     with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     assert _package_snapshot(root, pending.operation_id) == before_package
     assert (root / ".draft/operation.lock").exists()
@@ -2367,7 +2337,7 @@ def test_completed_restore_with_trailing_content_on_nav_line_is_rejected(
     before_package = _package_snapshot(root, pending.operation_id)
 
     with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     assert _package_snapshot(root, pending.operation_id) == before_package
     assert (root / ".draft/operation.lock").exists()
@@ -2429,7 +2399,7 @@ def test_collapsed_restore_forged_rebase_page_is_rejected(
     before_package = _package_snapshot(root, pending.operation_id)
 
     with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     assert _package_snapshot(root, pending.operation_id) == before_package
     assert (root / ".draft/operation.lock").exists()
@@ -2472,7 +2442,7 @@ def test_completed_restore_without_matching_mutations_preserves_package(
     before_package = _package_snapshot(root, pending.operation_id)
 
     with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     # 认领、锁、权威包全部保留。
     assert (root / ".draft/operation.lock").exists()
@@ -2509,7 +2479,7 @@ def test_completed_restore_with_mismatched_journal_identity_preserves_package(
     before_package = _package_snapshot(root, pending.operation_id)
 
     with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_CORRUPT.value):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     assert (root / ".draft/operation.lock").exists()
     assert _package_snapshot(root, pending.operation_id) == before_package

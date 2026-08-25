@@ -562,7 +562,7 @@ def test_adopt_crash_before_marker_is_forwarded_by_recover(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """marker 仍是 before 时崩溃：recover 复核观察未变后前向完成登记。"""
-    from draft.trash_lifecycle import recover_draft
+    from draft.trash_lifecycle import recover_interrupted_operations
 
     root = tmp_path / "candidate"
     build_valid_candidate(root)
@@ -576,7 +576,7 @@ def test_adopt_crash_before_marker_is_forwarded_by_recover(
         root_state=RootState.CANDIDATE
     )
 
-    recover_draft(root)
+    recover_interrupted_operations(root)
 
     assert (root / ".draft/draft.json").read_bytes() == FINAL_MARKER_BYTES
     assert check_draft(root).errors == ()
@@ -588,7 +588,7 @@ def test_adopt_recover_with_observation_change_raises_external_change(
     """adopt 在 marker 写入前崩溃、恢复时观察已变：安全回滚后必须抛 external_change，
     不能把"已放弃 adopt"报告为恢复成功（规格 §12.2 外部变化分区）。"""
     from draft.operations import operation_journal_path, read_journal, read_lock
-    from draft.trash_lifecycle import recover_draft
+    from draft.trash_lifecycle import recover_interrupted_operations
 
     root = tmp_path / "candidate"
     build_valid_candidate(root)
@@ -600,7 +600,7 @@ def test_adopt_recover_with_observation_change_raises_external_change(
     index.write_text(index.read_text(encoding="utf-8") + "\n并发修改。\n", encoding="utf-8")
 
     with pytest.raises(DraftError, match="operation.external_change"):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     # 已安全放弃：marker 仍 candidate、外部修改保留、日志终态化、锁释放。
     assert (root / ".draft/draft.json").read_text(encoding="utf-8") == managed_marker_text(
@@ -621,7 +621,7 @@ def test_adopt_recover_rejects_intruder_in_created_operations_directory(
     目录内部，外部文件会被静默吸收并前向完成登记（规格 §12.2 外部变化分区）。
     """
     from draft.operations import operation_journal_path, read_journal, read_lock
-    from draft.trash_lifecycle import recover_draft
+    from draft.trash_lifecycle import recover_interrupted_operations
 
     root = tmp_path / "candidate"
     # 默认最小根：.draft/operations 由本次 adopt 首次创建。
@@ -635,7 +635,7 @@ def test_adopt_recover_rejects_intruder_in_created_operations_directory(
     (root / ".draft/operations/intruder.json").write_text("x", encoding="utf-8")
 
     with pytest.raises(DraftError, match="operation.external_change"):
-        recover_draft(root)
+        recover_interrupted_operations(root)
 
     # 已安全放弃：外部文件保留、marker 仍 candidate、日志终态化、锁释放。
     assert (root / ".draft/operations/intruder.json").is_file()
@@ -651,7 +651,7 @@ def test_adopt_crash_after_marker_never_rolls_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """marker 已是 after 时崩溃：recover 只完成提交与清理，绝不回滚根身份。"""
-    from draft.trash_lifecycle import recover_draft
+    from draft.trash_lifecycle import recover_interrupted_operations
 
     root = tmp_path / "candidate"
     build_valid_candidate(root)
@@ -663,7 +663,7 @@ def test_adopt_crash_after_marker_never_rolls_back(
     assert read_lock(root) is not None
     assert (root / ".draft/draft.json").read_bytes() == FINAL_MARKER_BYTES
 
-    recover_draft(root)
+    recover_interrupted_operations(root)
 
     assert (root / ".draft/draft.json").read_bytes() == FINAL_MARKER_BYTES
     assert check_draft(root).errors == ()

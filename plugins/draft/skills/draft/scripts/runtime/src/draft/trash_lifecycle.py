@@ -578,15 +578,19 @@ def _recover_locked_trash(
     if journal.phase is OperationPhase.TRASH_HANDOFF_PENDING:
         # pending 已耐久记录移交意图，恢复可以继续同一次生命周期尝试。
         return _advance_one_locked(root, operation_id, now=now, handoff=handoff)
-    if journal.phase in (
-        OperationPhase.ALLOCATING,
-        OperationPhase.PREPARED,
-        OperationPhase.APPLYING,
-        OperationPhase.VALIDATING,
-        OperationPhase.ROLLING_BACK,
-        OperationPhase.COMPLETED,
-        OperationPhase.ROLLED_BACK,
-    ) or journal.phase in _LINK_INDEX_PHASES:
+    if (
+        journal.phase
+        in (
+            OperationPhase.ALLOCATING,
+            OperationPhase.PREPARED,
+            OperationPhase.APPLYING,
+            OperationPhase.VALIDATING,
+            OperationPhase.ROLLING_BACK,
+            OperationPhase.COMPLETED,
+            OperationPhase.ROLLED_BACK,
+        )
+        or journal.phase in _LINK_INDEX_PHASES
+    ):
         # mutation、链接索引和终态 phase 都属于既有 operation recovery；不得按 trash
         # 生命周期推进。终态化后返回 trash 结果形状。
         result = recover(root)
@@ -596,7 +600,7 @@ def _recover_locked_trash(
             package=root / OUTGOING_RELATIVE / operation_id,
             changed_paths=result.changed_paths,
         )
-    raise DraftError(CheckCode.OPERATION_UNSUPPORTED_PHASE.value, journal.directory)
+    raise DraftError("operation.unsupported_phase", journal.directory)
 
 
 def _handle_no_lock_dir(
@@ -769,76 +773,6 @@ def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleRe
     )
 
 
-def recover_draft(
-    root: Path,
-    *,
-    now: datetime | None = None,
-    handoff: Handoff | None = None,
-) -> LifecycleAdvanceReport:
-    """恢复全部崩溃现场并推进到期删除包；首个损坏项停止并保留前项结果。"""
-    resolved = resolve_draft_root(root)
-    normalized_now = normalize_utc(now)
-    active_handoff = handoff if handoff is not None else _default_handoff
-    results: list[LifecycleResult] = []
-
-    locked = read_lock(resolved)
-    if locked is not None:
-        journal = read_journal(operation_journal_path(resolved, locked))
-        if journal.operation_id != locked:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-        if journal.kind is OperationKind.RESTORE:
-            results.append(_recover_locked_restore(resolved, journal))
-        elif journal.kind is OperationKind.TRASH:
-            result = _recover_locked_trash(
-                resolved, journal, now=normalized_now, handoff=active_handoff
-            )
-            if result is not None:
-                results.append(result)
-        else:
-            results.append(recover(resolved))
-
-    reject_symlink_components(resolved, OPERATIONS_RELATIVE)
-    operations = resolved / OPERATIONS_RELATIVE
-    if operations.is_dir():
-        for entry in sorted(operations.iterdir()):
-            if not entry.is_dir() or entry.name == locked:
-                continue
-            try:
-                result = _handle_no_lock_dir(
-                    resolved, entry, now=normalized_now, handoff=active_handoff
-                )
-            except DraftError as error:
-                return LifecycleAdvanceReport(
-                    results=tuple(results), error=_to_failure(entry.name, error)
-                )
-            if result is not None:
-                results.append(result)
-
-    # 无锁 trash_retained/trash_handoff_pending 批量推进。
-    for journal_path in _iter_trash_journals(resolved):
-        if read_lock(resolved) is not None:
-            break
-        operation_id = journal_path.parent.name
-        try:
-            journal = read_journal(journal_path)
-            if journal.kind is not OperationKind.TRASH:
-                continue
-            if journal.phase not in (
-                OperationPhase.TRASH_RETAINED,
-                OperationPhase.TRASH_HANDOFF_PENDING,
-            ):
-                continue
-            result = _advance_one(resolved, journal, now=normalized_now, handoff=active_handoff)
-        except DraftError as error:
-            return LifecycleAdvanceReport(
-                results=tuple(results), error=_to_failure(operation_id, error)
-            )
-        if result is not None:
-            results.append(result)
-
-    return LifecycleAdvanceReport(results=tuple(results), error=None)
-
-
 def prepare_managed_command(
     root: Path,
     *,
@@ -895,8 +829,8 @@ def recover_interrupted_operations(
 ) -> tuple[LifecycleResult, ...]:
     """只修复崩溃或中断留下的未完成写操作；不枚举仍保留或等待移交的回收项。
 
-    当前 ``recover_draft`` 中锁内恢复与无锁操作目录分类属于这里；批量到期推进
-    由 ``prepare_managed_command`` 在命令前置统一完成。
+    锁内恢复与无锁操作目录分类属于这里；批量到期推进由
+    ``prepare_managed_command`` 在命令前置统一完成。
     """
     resolved = resolve_draft_root(root)
     normalized_now = normalize_utc(now)
