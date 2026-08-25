@@ -21,7 +21,6 @@ from draft.models import (
     TrashResult,
 )
 from draft.operations import (
-    _LINK_INDEX_PHASES,  # pyright: ignore[reportPrivateUsage]
     DISPOSITION_KEY,
     HANDOFF_ATTEMPTED_AT_KEY,
     HANDOFF_ERROR_MESSAGE_KEY,
@@ -578,29 +577,15 @@ def _recover_locked_trash(
     if journal.phase is OperationPhase.TRASH_HANDOFF_PENDING:
         # pending 已耐久记录移交意图，恢复可以继续同一次生命周期尝试。
         return _advance_one_locked(root, operation_id, now=now, handoff=handoff)
-    if (
-        journal.phase
-        in (
-            OperationPhase.ALLOCATING,
-            OperationPhase.PREPARED,
-            OperationPhase.APPLYING,
-            OperationPhase.VALIDATING,
-            OperationPhase.ROLLING_BACK,
-            OperationPhase.COMPLETED,
-            OperationPhase.ROLLED_BACK,
-        )
-        or journal.phase in _LINK_INDEX_PHASES
-    ):
-        # mutation、链接索引和终态 phase 都属于既有 operation recovery；不得按 trash
-        # 生命周期推进。终态化后返回 trash 结果形状。
-        result = recover(root)
-        return TrashResult(
-            operation_id=result.operation_id,
-            phase=result.phase,
-            package=root / OUTGOING_RELATIVE / operation_id,
-            changed_paths=result.changed_paths,
-        )
-    raise DraftError("operation.unsupported_phase", journal.directory)
+    # read_journal 已按 OperationKind.TRASH 的权威 phase 表验证输入；其余 mutation、
+    # 链接索引和终态 phase 都委托原 operation recovery，不在这里复制 phase 清单。
+    result = recover(root)
+    return TrashResult(
+        operation_id=result.operation_id,
+        phase=result.phase,
+        package=root / OUTGOING_RELATIVE / operation_id,
+        changed_paths=result.changed_paths,
+    )
 
 
 def _handle_no_lock_dir(
