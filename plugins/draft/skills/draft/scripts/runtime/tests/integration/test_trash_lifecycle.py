@@ -13,6 +13,7 @@ from draft.trash import trash_page
 from draft.trash_lifecycle import (
     advance_trash_lifecycle,
     recover_draft,
+    recover_interrupted_operations,
 )
 from tests.integration.support import DraftFactory
 
@@ -655,10 +656,10 @@ def test_batch_failure_preserves_prior_results_and_never_touches_later_operation
 # ---------------------------------------------------------------------------
 
 
-def test_locked_retained_recovery_advances_and_releases_lock(
+def test_locked_retained_recovery_does_not_advance_lifecycle(
     draft_factory: DraftFactory, tmp_path: Path
 ) -> None:
-    """持锁 trash_retained（到期、推进中崩溃）恢复必须沿持锁推进并释放锁，不再重新加锁。"""
+    """持锁 trash_retained 恢复只释放崩溃残留锁，不推进到期生命周期。"""
     from draft.operations import acquire_lock
 
     root = build_trashable_draft(draft_factory)
@@ -668,11 +669,12 @@ def test_locked_retained_recovery_advances_and_releases_lock(
     bin_dir.mkdir()
     accepted: list[str] = []
 
-    recover_draft(root, now=EXPIRY, handoff=_accept_into(bin_dir, accepted))
+    recover_interrupted_operations(root, now=EXPIRY, handoff=_accept_into(bin_dir, accepted))
 
-    assert len(accepted) == 1
+    assert accepted == []
     assert not (root / ".draft/operation.lock").exists()
-    assert _phase(root, pending.operation_id) == "completed"
+    assert _phase(root, pending.operation_id) == "trash_retained"
+    assert _package_exists(root, pending.operation_id)
 
 
 def test_locked_retained_before_expiry_recovery_releases_lock(

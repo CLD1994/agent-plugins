@@ -1095,6 +1095,50 @@ def test_trash_link_index_phase_crash_recovers_to_retained_with_index_result(
     assert not (root / "pages/obsolete.md").exists()  # 页面已在索引阶段前回收。
 
 
+def test_trash_applying_phase_crash_recovers_mutation_through_public_entry(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """trash 在 applying phase 中断：公开 recovery 必须按 mutation journal 收敛。"""
+    root = build_trashable_draft(draft_factory)
+    import draft.operations as operations_module
+
+    real_write = operations_module.write_journal
+    fired = False
+
+    def write_then_crash(journal: Journal) -> None:
+        nonlocal fired
+        real_write(journal)
+        if (
+            not fired
+            and journal.kind is OperationKind.TRASH
+            and journal.phase is OperationPhase.APPLYING
+        ):
+            fired = True
+            raise SimulatedProcessExit
+
+    monkeypatch.setattr(operations_module, "write_journal", write_then_crash)
+    with pytest.raises(SimulatedProcessExit):
+        trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    monkeypatch.undo()
+
+    from draft.operations import read_journal, read_lock
+    from draft.trash_lifecycle import recover_interrupted_operations
+
+    trash_id = read_lock(root)
+    assert trash_id is not None
+    assert read_journal(_journal_path(root, trash_id)).phase is OperationPhase.APPLYING
+
+    report = recover_interrupted_operations(root, now=NOW)
+
+    assert len(report) == 1
+    assert report[0].phase is OperationPhase.TRASH_RETAINED
+    assert read_journal(_journal_path(root, trash_id)).phase is OperationPhase.TRASH_RETAINED
+    assert not (root / ".draft/operation.lock").exists()
+    assert not (root / "pages/obsolete.md").exists()
+    assert _package_snapshot(root, trash_id)
+
+
 @pytest.mark.parametrize("entry_name", ["recover_draft", "recover_interrupted_operations"])
 def test_restore_link_index_phase_crash_recovers_through_public_entry(
     draft_factory: DraftFactory,

@@ -542,7 +542,7 @@ def advance_trash_lifecycle(
 def _recover_locked_trash(
     root: Path, journal: Journal, *, now: datetime, handoff: Handoff
 ) -> TrashResult | None:
-    """持锁 trash 日志恢复：succeeded/purge_committed 只清现场不调适配器；其余交 _advance_one。"""
+    """按 journal phase 收敛持锁 trash 现场。"""
     operation_id = journal.operation_id
     if journal.phase in (
         OperationPhase.TRASH_HANDOFF_SUCCEEDED,
@@ -571,9 +571,24 @@ def _recover_locked_trash(
         return TrashResult(
             operation_id=operation_id, phase=OperationPhase.COMPLETED, package=package_dir
         )
-    if journal.phase is OperationPhase.ROLLING_BACK:
-        # 回滚意图已耐久：trash 的 mutation 回滚由统一恢复入口继续（幂等跳过已恢复
-        # 目标），不得按生命周期推进或释放锁。终态化后返回 trash 结果形状。
+    if journal.phase is OperationPhase.TRASH_RETAINED:
+        # retained 只代表崩溃残留锁；恢复不得读取 handoff 副本、写 phase 或删除权威包。
+        release_lock(root, operation_id)
+        return None
+    if journal.phase is OperationPhase.TRASH_HANDOFF_PENDING:
+        # pending 已耐久记录移交意图，恢复可以继续同一次生命周期尝试。
+        return _advance_one_locked(root, operation_id, now=now, handoff=handoff)
+    if journal.phase in (
+        OperationPhase.ALLOCATING,
+        OperationPhase.PREPARED,
+        OperationPhase.APPLYING,
+        OperationPhase.VALIDATING,
+        OperationPhase.ROLLING_BACK,
+        OperationPhase.COMPLETED,
+        OperationPhase.ROLLED_BACK,
+    ) or journal.phase in _LINK_INDEX_PHASES:
+        # mutation、链接索引和终态 phase 都属于既有 operation recovery；不得按 trash
+        # 生命周期推进。终态化后返回 trash 结果形状。
         result = recover(root)
         return TrashResult(
             operation_id=result.operation_id,
@@ -581,18 +596,7 @@ def _recover_locked_trash(
             package=root / OUTGOING_RELATIVE / operation_id,
             changed_paths=result.changed_paths,
         )
-    if journal.phase in _LINK_INDEX_PHASES:
-        # 链接索引 phase 是严格前向阶段（spec §5）：复用公开 recovery 先收敛索引
-        # 结果再进入 trash_retained 并释放锁，不得按生命周期推进或跳过现场。
-        result = recover(root)
-        return TrashResult(
-            operation_id=result.operation_id,
-            phase=result.phase,
-            package=root / OUTGOING_RELATIVE / operation_id,
-            changed_paths=result.changed_paths,
-        )
-    # trash_retained/trash_handoff_pending 持锁：用持锁变体推进，不再重新获取锁。
-    return _advance_one_locked(root, operation_id, now=now, handoff=handoff)
+    raise DraftError(CheckCode.OPERATION_UNSUPPORTED_PHASE.value, journal.directory)
 
 
 def _handle_no_lock_dir(
