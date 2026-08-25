@@ -424,14 +424,14 @@ def test_recover_unlocked_operation_directory_identity_is_no_follow(
         assert sentinel.read_bytes() == sentinel_before
 
 
-def test_recover_removes_only_proven_empty_operation_directory(operation_draft: Path) -> None:
+def test_recover_preserves_proven_empty_operation_directory(operation_draft: Path) -> None:
     root = operation_draft
     entry = root / ".draft/operations" / ("b" * 32)
     entry.mkdir()
 
     recover(root)
 
-    assert not entry.exists()
+    assert entry.is_dir()
 
 
 def test_recover_rechecks_operation_directory_after_enumeration(
@@ -471,6 +471,125 @@ def test_recover_rechecks_operation_directory_after_enumeration(
 
     assert caught.value.code == CheckCode.PATH_SYMLINK_ESCAPE.value
     assert sentinel.read_bytes() == before
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "missing", "regular-file", "new-directory"])
+def test_recover_operation_directory_replacement_after_open_is_closed(
+    operation_draft: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    """operation 名在认证打开后改绑时，recover 保留两处现场且不读外部节点。"""
+    import draft.operations as operations_module
+
+    root = operation_draft
+    operation_id = "e" * 32
+    entry = write_journal(root, operation_id, "completed")
+    original_bytes = (entry / "journal.json").read_bytes()
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel.write_bytes(b"outside")
+    real_open = operations_module.os.open
+    replaced = False
+
+    def replace_after_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        nonlocal replaced
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if (
+            not replaced
+            and path == operation_id
+            and kwargs.get("dir_fd") is not None
+            and flags & os.O_DIRECTORY
+        ):
+            replaced = True
+            old = entry.with_name(operation_id + ".old")
+            os.rename(entry, old)
+            if replacement == "symlink":
+                entry.symlink_to(external, target_is_directory=True)
+            elif replacement == "regular-file":
+                entry.write_bytes(b"replacement")
+            elif replacement == "new-directory":
+                entry.mkdir()
+                (entry / "journal.json").write_bytes(b"replacement")
+        return descriptor
+
+    monkeypatch.setattr(operations_module.os, "open", replace_after_open)
+    expected = (
+        CheckCode.PATH_SYMLINK_ESCAPE.value
+        if replacement == "symlink"
+        else CheckCode.OPERATION_INCONSISTENT_STATE.value
+    )
+    with pytest.raises(DraftError) as caught:
+        recover(root)
+
+    assert caught.value.code == expected
+    assert (entry.with_name(operation_id + ".old") / "journal.json").read_bytes() == original_bytes
+    assert sentinel.read_bytes() == b"outside"
+
+
+def test_recover_maps_journal_eacces_and_copy_eio_to_stable_errors(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """无锁 journal/copy 的真实 I/O 失败不能泄漏原始 OSError 或产生副作用。"""
+    import draft.operations as operations_module
+
+    root = operation_draft
+    journal_dir = root / ".draft/operations" / ("f" * 32)
+    journal_dir.mkdir()
+    journal_path = journal_dir / "journal.json"
+    journal_path.write_bytes(_valid_journal_bytes("f" * 32, "allocating"))
+    before = journal_path.read_bytes()
+    real_stat = operations_module.os.stat
+
+    def deny_journal_stat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if path == "journal.json" and kwargs.get("dir_fd") is not None:
+            raise PermissionError(13, "permission denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(operations_module.os, "stat", deny_journal_stat)
+    with pytest.raises(DraftError) as caught:
+        recover(root)
+    assert caught.value.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
+    assert journal_path.read_bytes() == before
+
+    monkeypatch.undo()
+    journal_path.write_bytes(_valid_journal_bytes("f" * 32, "allocating"))
+    originals = journal_dir / "originals"
+    staged = journal_dir / "staged"
+    originals.mkdir()
+    staged.mkdir()
+    # Keep a valid allocating journal with authorized recovery leaves.
+    payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    payload["mutations"] = [
+        {
+            "path": "pages/a.md",
+            "kind": "write",
+            "before_sha256": sha256_bytes(b"original"),
+            "after_sha256": sha256_bytes(b"staged"),
+            "original": "originals/0000.bin",
+            "staged": "staged/0000.bin",
+            "applied": False,
+        }
+    ]
+    journal_path.write_text(json.dumps(payload), encoding="utf-8")
+    (originals / "0000.bin").write_bytes(b"original")
+    (staged / "0000.bin").write_bytes(b"staged")
+    real_open = operations_module.os.open
+
+    def fail_copy_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if path == "0000.bin" and kwargs.get("dir_fd") is not None:
+            raise OSError(5, "I/O error")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(operations_module.os, "open", fail_copy_open)
+    with pytest.raises(DraftError) as caught:
+        recover(root)
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    assert journal_path.is_file()
+    assert (originals / "0000.bin").read_bytes() == b"original"
+    assert (staged / "0000.bin").read_bytes() == b"staged"
 
 
 def test_recover_preserves_nonempty_operation_directory_without_journal(
@@ -1054,7 +1173,8 @@ def test_no_lock_allocating_orphan_is_cleaned(operation_draft: Path) -> None:
     result = recover(root)
 
     assert result.phase == "completed"
-    assert not journal_dir.exists()
+    assert journal_dir.is_dir()
+    assert not (journal_dir / "journal.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -2901,7 +3021,8 @@ def test_recover_publishes_bootstrap_pending_and_cleans_allocating(
 
     recover(root)
 
-    assert not journal_dir.exists()
+    assert journal_dir.is_dir()
+    assert not (journal_dir / "journal.json").exists()
 
 
 def test_clean_recovery_copies_converges_with_copy_pending(

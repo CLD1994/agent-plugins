@@ -32,21 +32,17 @@ from draft.operations import (
     durable_write,
     format_utc,
     fsync_directory,
-    iter_recovery_operation_directories,
     normalize_utc,
     operation_journal_path,
     read_journal,
     read_lock,
-    read_unlocked_operation_journal,
     recover,
     recover_digest_pending,
     recover_locked_operation,
     recover_quarantine,
-    recover_unlocked_operation,
     recover_unlocked_operations,
     reject_symlink_components,
     release_lock,
-    remove_empty_recovery_operation_directory,
     resolve_journal_pending,
     sha256_bytes,
     validate_operation_id,
@@ -69,12 +65,7 @@ from draft.trash_package import (
 
 Handoff = Callable[[str], None]
 
-__all__ = [
-    "iter_recovery_operation_directories",
-    "read_unlocked_operation_journal",
-    "recover_unlocked_operation",
-    "remove_empty_recovery_operation_directory",
-]
+__all__: list[str] = []
 
 SYSTEM_TRASH_DISPOSITION = "system_trash"
 EXPIRED_PURGE_DISPOSITION = "expired_purge"

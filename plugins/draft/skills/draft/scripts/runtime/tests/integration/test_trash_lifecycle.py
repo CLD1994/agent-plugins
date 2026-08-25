@@ -406,7 +406,8 @@ def test_no_lock_trash_allocating_orphan_is_cleaned(
 
     recover_interrupted_operations(root, now=CREATED)
 
-    assert not journal.directory.exists()
+    assert journal.directory.is_dir()
+    assert not (journal.directory / "journal.json").exists()
 
 
 def _write_unlinked_restore_allocating(root: Path, operation_id: str) -> Path:
@@ -597,7 +598,99 @@ def test_lifecycle_recovery_directory_identity_is_no_follow(
         assert sentinel.read_bytes() == sentinel_before
 
 
-def test_lifecycle_recovery_removes_only_empty_valid_operation_directory(
+@pytest.mark.parametrize("replacement", ["symlink", "missing", "regular-file", "new-directory"])
+def test_lifecycle_operation_directory_replacement_after_open_is_closed(
+    draft_factory: DraftFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    """生命周期入口在 operation 身份改绑后停止，并保留原节点和替换节点。"""
+    import os
+
+    import draft.operations as operations_module
+
+    root = build_trashable_draft(draft_factory)
+    operations = root / ".draft/operations"
+    operations.mkdir(parents=True, exist_ok=True)
+    operation_id = "6" * 32
+    entry = operations / operation_id
+    entry.mkdir()
+    journal = entry / "journal.json"
+    journal.write_bytes(
+        (
+            '{"journal_version": 4, "operation_id": "'
+            + operation_id
+            + '", "kind": "create", "phase": "completed", '
+            '"root_state": "registered", "observations": [], "mutations": [], '
+            '"remove_empty_directories": [], "metadata": {}}\n'
+        ).encode()
+    )
+    original_bytes = journal.read_bytes()
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel.write_bytes(b"outside")
+    real_open = operations_module.os.open
+    replaced = False
+
+    def replace_after_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        nonlocal replaced
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if (
+            not replaced
+            and path == operation_id
+            and kwargs.get("dir_fd") is not None
+            and flags & os.O_DIRECTORY
+        ):
+            replaced = True
+            old = entry.with_name(operation_id + ".old")
+            os.rename(entry, old)
+            if replacement == "symlink":
+                entry.symlink_to(external, target_is_directory=True)
+            elif replacement == "regular-file":
+                entry.write_bytes(b"replacement")
+            elif replacement == "new-directory":
+                entry.mkdir()
+                (entry / "journal.json").write_bytes(b"replacement")
+        return descriptor
+
+    monkeypatch.setattr(operations_module.os, "open", replace_after_open)
+    expected = (
+        CheckCode.PATH_SYMLINK_ESCAPE.value
+        if replacement == "symlink"
+        else CheckCode.OPERATION_INCONSISTENT_STATE.value
+    )
+    with pytest.raises(DraftError) as caught:
+        recover_interrupted_operations(root)
+    assert caught.value.code == expected
+    assert (entry.with_name(operation_id + ".old") / "journal.json").read_bytes() == original_bytes
+    assert sentinel.read_bytes() == b"outside"
+
+
+def test_lifecycle_maps_journal_eacces_to_stable_error(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import draft.operations as operations_module
+
+    root = build_trashable_draft(draft_factory)
+    operation_id = "7" * 32
+    journal_path = _write_unlinked_restore_allocating(root, operation_id)
+    real_stat = operations_module.os.stat
+
+    def deny_journal_stat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if path == "journal.json" and kwargs.get("dir_fd") is not None:
+            raise PermissionError(13, "permission denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(operations_module.os, "stat", deny_journal_stat)
+    with pytest.raises(DraftError) as caught:
+        recover_interrupted_operations(root)
+    assert caught.value.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
+    assert journal_path.is_file()
+
+
+def test_lifecycle_recovery_preserves_only_empty_valid_operation_directory(
     draft_factory: DraftFactory,
 ) -> None:
     root = build_trashable_draft(draft_factory)
@@ -607,7 +700,7 @@ def test_lifecycle_recovery_removes_only_empty_valid_operation_directory(
 
     recover_interrupted_operations(root)
 
-    assert not entry.exists()
+    assert entry.is_dir()
 
 
 def test_lifecycle_recovery_preserves_nonempty_operation_directory_without_journal(

@@ -406,6 +406,7 @@ def _publish_pending(
     write_step: DurabilityStep | None = None,
     file_fsync_step: DurabilityStep | None = None,
     directory_fsync_step: DurabilityStep | None = None,
+    identity_gate: Callable[[tuple[int, int]], None] | None = None,
 ) -> None:
     """在父目录句柄内把 content 耐久发布为 name（确定名 pending + 严格同步）。
 
@@ -433,6 +434,7 @@ def _publish_pending(
         if write_step is not None:
             durability_checkpoint(write_step)
         descriptor = os.open(pending, flags, 0o644, dir_fd=parent_fd)
+        pending_stat = os.fstat(descriptor)
     except FileExistsError as exc:
         raise DraftError("operation.external_change", code_path) from exc
     except OSError as exc:
@@ -446,10 +448,19 @@ def _publish_pending(
             os.fsync(handle.fileno())
     except OSError as exc:
         raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
+    pending_node = (pending_stat.st_dev, pending_stat.st_ino)
     _fsync_dir_fd(parent_fd, code_path, durability_step=directory_fsync_step)
     if publish == "link":
+        if identity_gate is not None:
+            identity_gate(pending_node)
         try:
-            os.link(pending, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.link(
+                pending,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
         except FileExistsError as exc:
             raise DraftError("operation.external_change", code_path) from exc
         except OSError as exc:
@@ -465,11 +476,15 @@ def _publish_pending(
             code_path=code_path,
         ):
             raise DraftError("operation.external_change", code_path)
+        if identity_gate is not None:
+            identity_gate(pending_node)
         try:
             os.unlink(pending, dir_fd=parent_fd)
         except OSError as exc:
             raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, code_path) from exc
     else:
+        if identity_gate is not None:
+            identity_gate(pending_node)
         try:
             os.replace(pending, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         except OSError as exc:
@@ -486,6 +501,7 @@ def _create_only_publish(
     write_step: DurabilityStep | None = None,
     file_fsync_step: DurabilityStep | None = None,
     directory_fsync_step: DurabilityStep | None = None,
+    identity_gate: Callable[[tuple[int, int]], None] | None = None,
 ) -> None:
     """create-only 发布：目标与 pending 都必须是 missing 的首次创建。
 
@@ -503,6 +519,7 @@ def _create_only_publish(
         write_step=write_step,
         file_fsync_step=file_fsync_step,
         directory_fsync_step=directory_fsync_step,
+        identity_gate=identity_gate,
     )
 
 
@@ -515,6 +532,7 @@ def _replace_publish(
     write_step: DurabilityStep | None = None,
     file_fsync_step: DurabilityStep | None = None,
     directory_fsync_step: DurabilityStep | None = None,
+    identity_gate: Callable[[tuple[int, int]], None] | None = None,
 ) -> None:
     """权威 journal 更新发布：调用方必须先验证授权 old→new 转换。
 
@@ -531,6 +549,7 @@ def _replace_publish(
         write_step=write_step,
         file_fsync_step=file_fsync_step,
         directory_fsync_step=directory_fsync_step,
+        identity_gate=identity_gate,
     )
 
 
@@ -657,6 +676,7 @@ def recover_digest_pending(
                     target.name,
                     src_dir_fd=parent_fd,
                     dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
                 )
             except FileExistsError as exc:
                 raise DraftError("operation.external_change", code_path) from exc
@@ -764,6 +784,7 @@ def recover_quarantine(
                     target.name,
                     src_dir_fd=parent_fd,
                     dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
                 )
             except FileExistsError:
                 # 原名已被占用：同时保留两者，报告外部变化。
@@ -1231,82 +1252,343 @@ def validate_operation_id(
 
 
 @dataclass
+class _RecoveryContext:
+    """无锁扫描期间 root/.draft/operations 的完整身份链。"""
+
+    root_fd: int
+    draft_fd: int
+    operations_fd: int
+    root_node: tuple[int, int]
+    draft_node: tuple[int, int]
+    operations_node: tuple[int, int]
+    root: Path
+
+    def _verify_fd(self, descriptor: int, node: tuple[int, int], path: Path) -> None:
+        try:
+            current = os.fstat(descriptor)
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, path) from exc
+        if (current.st_dev, current.st_ino) != node:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, path)
+
+    def verify(self) -> None:
+        self._verify_fd(self.root_fd, self.root_node, self.root)
+        try:
+            draft = os.stat(INTERNAL_DIR, dir_fd=self.root_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, self.root / INTERNAL_DIR
+            ) from exc
+        if stat.S_ISLNK(draft.st_mode):
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, self.root / INTERNAL_DIR)
+        if (draft.st_dev, draft.st_ino) != self.draft_node:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, self.root / INTERNAL_DIR)
+        self._verify_fd(self.draft_fd, self.draft_node, self.root / INTERNAL_DIR)
+        try:
+            operations = os.stat("operations", dir_fd=self.draft_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                self.root / OPERATIONS_RELATIVE,
+            ) from exc
+        if stat.S_ISLNK(operations.st_mode):
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, self.root / OPERATIONS_RELATIVE)
+        if (operations.st_dev, operations.st_ino) != self.operations_node:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, self.root / OPERATIONS_RELATIVE
+            )
+        self._verify_fd(self.operations_fd, self.operations_node, self.root / OPERATIONS_RELATIVE)
+
+    def close(self) -> None:
+        # Clear ownership before close so a close failure cannot cause a second attempt.
+        first_error: OSError | None = None
+        for attribute in ("operations_fd", "draft_fd", "root_fd"):
+            descriptor = getattr(self, attribute)
+            setattr(self, attribute, -1)
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, self.root
+            ) from first_error
+
+
+@dataclass
 class RecoveryOperationDirectory:
-    """无锁恢复期间 operation 目录的身份锚点。
+    """绑定到扫描上下文和 operations/<id> inode 的恢复目录。"""
 
-    ``display`` 只用于错误显示；所有 operation 内 I/O 都经 ``fd``，并且每次
-    消费名字前复核 operations 目录中的名字仍指向打开时的 inode。
-    """
-
-    parent_fd: int
+    context: _RecoveryContext
     fd: int
     name: str
     node: tuple[int, int]
     display: Path
+    leaves: dict[str, _RecoveryLeaf] | None = None
+
+    @property
+    def parent_fd(self) -> int:
+        return self.context.operations_fd
 
     def verify(self) -> None:
+        self.context.verify()
         try:
             current = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, self.display) from exc
         except OSError as exc:
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, self.display) from exc
         if stat.S_ISLNK(current.st_mode):
             raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, self.display)
         if (current.st_dev, current.st_ino) != self.node:
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, self.display)
+        try:
+            opened = os.fstat(self.fd)
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, self.display) from exc
+        if (opened.st_dev, opened.st_ino) != self.node:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, self.display)
 
     def close(self) -> None:
-        os.close(self.fd)
+        first_error: DraftError | None = None
+        if self.leaves is not None:
+            for leaf in self.leaves.values():
+                try:
+                    leaf.close()
+                except DraftError as exc:
+                    if first_error is None:
+                        first_error = exc
+            self.leaves.clear()
+        descriptor = self.fd
+        self.fd = -1
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                if first_error is None:
+                    first_error = DraftError(
+                        CheckCode.OPERATION_INCONSISTENT_STATE.value, self.display
+                    )
+                    first_error.__cause__ = exc
+        if first_error is not None:
+            raise first_error
 
 
-def _open_recovery_operations_fd(root: Path) -> int | None:
-    """从 root 逐组件 no-follow 打开 operations 目录；缺失返回 None。"""
-    draft_fd = -1
-    try:
-        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except OSError as exc:
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, root) from exc
+@dataclass
+class _RecoveryDirectoryHandle:
+    """operation 下的认证子目录句柄。"""
+
+    entry: RecoveryOperationDirectory
+    name: str
+    fd: int
+    node: tuple[int, int]
+    display: Path
+
+    def verify(self) -> None:
+        self.entry.verify()
+        try:
+            current = os.stat(self.name, dir_fd=self.entry.fd, follow_symlinks=False)
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, self.display) from exc
+        if stat.S_ISLNK(current.st_mode) or (current.st_dev, current.st_ino) != self.node:
+            code = (
+                CheckCode.PATH_SYMLINK_ESCAPE.value
+                if stat.S_ISLNK(current.st_mode)
+                else CheckCode.OPERATION_INCONSISTENT_STATE.value
+            )
+            raise DraftError(code, self.display)
+        try:
+            opened = os.fstat(self.fd)
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, self.display) from exc
+        if (opened.st_dev, opened.st_ino) != self.node:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, self.display)
+
+    def close(self) -> None:
+        descriptor = self.fd
+        self.fd = -1
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                raise DraftError(
+                    CheckCode.OPERATION_INCONSISTENT_STATE.value, self.display
+                ) from exc
+
+
+@dataclass
+class _RecoveryLeaf:
+    """operation FD 内的 no-follow 叶句柄和认证 inode。"""
+
+    parent: RecoveryOperationDirectory | _RecoveryDirectoryHandle
+    name: str
+    node: tuple[int, int] | None
+    fd: int | None
+    code: str
+    code_path: Path
+
+    @classmethod
+    def open(
+        cls,
+        entry: RecoveryOperationDirectory | _RecoveryDirectoryHandle,
+        name: str,
+        *,
+        code: str,
+        code_path: Path,
+    ) -> _RecoveryLeaf:
+        entry.verify()
+        parent_fd = entry.fd
+        try:
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return cls(entry, name, None, None, code, code_path)
+        except OSError as exc:
+            raise DraftError(code, code_path) from exc
+        if stat.S_ISLNK(current.st_mode):
+            return cls(entry, name, (current.st_dev, current.st_ino), None, code, code_path)
+        flags = os.O_RDONLY | os.O_NOFOLLOW
+        if stat.S_ISDIR(current.st_mode):
+            flags |= os.O_DIRECTORY
+        try:
+            descriptor = os.open(name, flags, dir_fd=parent_fd)
+            opened = os.fstat(descriptor)
+        except OSError as exc:
+            raise DraftError(code, code_path) from exc
+        node = (current.st_dev, current.st_ino)
+        if (opened.st_dev, opened.st_ino) != node:
+            with suppress(OSError):
+                os.close(descriptor)
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path) from None
+        return cls(entry, name, node, descriptor, code, code_path)
+
+    def verify(self) -> EntryKind:
+        self.parent.verify()
+        parent_fd = self.parent.fd
+        try:
+            current = os.stat(self.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            if self.node is None:
+                return EntryKind.MISSING
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, self.code_path) from exc
+        except OSError as exc:
+            raise DraftError(self.code, self.code_path) from exc
+        if stat.S_ISLNK(current.st_mode):
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, self.code_path)
+        current_node = (current.st_dev, current.st_ino)
+        if self.node is None or current_node != self.node:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, self.code_path)
+        if self.fd is not None:
+            try:
+                opened = os.fstat(self.fd)
+            except OSError as exc:
+                raise DraftError(self.code, self.code_path) from exc
+            if (opened.st_dev, opened.st_ino) != self.node:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, self.code_path)
+        if stat.S_ISREG(current.st_mode):
+            return EntryKind.FILE
+        if stat.S_ISDIR(current.st_mode):
+            return EntryKind.DIRECTORY
+        return EntryKind.OTHER
+
+    def read_verified(self) -> bytes:
+        if self.verify() is not EntryKind.FILE or self.fd is None:
+            raise DraftError(self.code, self.code_path)
+        try:
+            os.lseek(self.fd, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(self.fd, 1 << 16)
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
+        except OSError as exc:
+            raise DraftError(self.code, self.code_path) from exc
+
+    def unlink_verified(self) -> None:
+        if self.verify() is EntryKind.MISSING:
+            return
+        try:
+            os.unlink(self.name, dir_fd=self.parent.fd)
+        except OSError as exc:
+            raise DraftError(self.code, self.code_path) from exc
+
+    def close(self) -> None:
+        descriptor = self.fd
+        self.fd = None
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                raise DraftError(self.code, self.code_path) from exc
+
+
+def _open_recovery_operations_fd(root: Path) -> _RecoveryContext | None:
+    """从 root 逐组件 no-follow 打开并保留 operations 身份链。"""
+    root_fd = draft_fd = operations_fd = -1
+    root_path = root / OPERATIONS_RELATIVE
     try:
         try:
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            root_stat = os.fstat(root_fd)
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, root) from exc
+        try:
+            draft_entry = os.stat(INTERNAL_DIR, dir_fd=root_fd, follow_symlinks=False)
+            if stat.S_ISLNK(draft_entry.st_mode):
+                raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, root / INTERNAL_DIR)
             draft_fd = os.open(
                 INTERNAL_DIR,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                 dir_fd=root_fd,
             )
+            draft_stat = os.fstat(draft_fd)
         except FileNotFoundError:
             return None
         except OSError as exc:
-            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, root / INTERNAL_DIR) from exc
-        os.close(root_fd)
-        root_fd = -1
+            code = (
+                CheckCode.PATH_SYMLINK_ESCAPE.value
+                if getattr(exc, "errno", None) == errno.ELOOP
+                else CheckCode.OPERATION_INCONSISTENT_STATE.value
+            )
+            raise DraftError(code, root / INTERNAL_DIR) from exc
         try:
-            operations_stat = os.stat("operations", dir_fd=draft_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
-            raise DraftError(
-                CheckCode.OPERATION_INCONSISTENT_STATE.value,
-                root / INTERNAL_DIR / "operations",
-            ) from exc
-        operations_path = root / INTERNAL_DIR / "operations"
-        if stat.S_ISLNK(operations_stat.st_mode):
-            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, operations_path)
-        if not stat.S_ISDIR(operations_stat.st_mode):
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operations_path)
-        try:
+            operations_entry = os.stat("operations", dir_fd=draft_fd, follow_symlinks=False)
+            if stat.S_ISLNK(operations_entry.st_mode):
+                raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, root_path)
             operations_fd = os.open(
                 "operations",
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                 dir_fd=draft_fd,
             )
+            operations_stat = os.fstat(operations_fd)
+        except FileNotFoundError:
+            return None
         except OSError as exc:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operations_path) from exc
-        return operations_fd
+            code = (
+                CheckCode.PATH_SYMLINK_ESCAPE.value
+                if getattr(exc, "errno", None) == errno.ELOOP
+                else CheckCode.OPERATION_INCONSISTENT_STATE.value
+            )
+            raise DraftError(code, root_path) from exc
+        context = _RecoveryContext(
+            root_fd=root_fd,
+            draft_fd=draft_fd,
+            operations_fd=operations_fd,
+            root_node=(root_stat.st_dev, root_stat.st_ino),
+            draft_node=(draft_stat.st_dev, draft_stat.st_ino),
+            operations_node=(operations_stat.st_dev, operations_stat.st_ino),
+            root=root,
+        )
+        root_fd = draft_fd = operations_fd = -1
+        return context
     finally:
-        if root_fd >= 0:
-            os.close(root_fd)
-        # draft_fd is only needed while opening operations.
-        if draft_fd >= 0:
-            os.close(draft_fd)
+        for descriptor in (operations_fd, draft_fd, root_fd):
+            if descriptor >= 0:
+                with suppress(OSError):
+                    os.close(descriptor)
 
 
 @contextmanager
@@ -1314,15 +1596,18 @@ def open_recovery_operation_directories(
     root: Path,
 ) -> Generator[tuple[RecoveryOperationDirectory, ...], None, None]:
     """打开并验证本轮无锁恢复候选，退出时关闭全部 directory FD。"""
-    operations_fd = _open_recovery_operations_fd(root)
-    if operations_fd is None:
+    context = _open_recovery_operations_fd(root)
+    if context is None:
         yield ()
         return
     entries: list[RecoveryOperationDirectory] = []
     try:
+        context.verify()
         try:
             names = sorted(
-                entry.name for entry in os.scandir(operations_fd) if entry.name not in (".", "..")
+                entry.name
+                for entry in os.scandir(context.operations_fd)
+                if entry.name not in (".", "..")
             )
         except OSError as exc:
             raise DraftError(
@@ -1330,9 +1615,10 @@ def open_recovery_operation_directories(
                 root / OPERATIONS_RELATIVE,
             ) from exc
         for name in names:
+            context.verify()
             display = root / OPERATIONS_RELATIVE / name
             try:
-                current = os.stat(name, dir_fd=operations_fd, follow_symlinks=False)
+                current = os.stat(name, dir_fd=context.operations_fd, follow_symlinks=False)
             except FileNotFoundError as exc:
                 raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, display) from exc
             except OSError as exc:
@@ -1349,7 +1635,7 @@ def open_recovery_operation_directories(
                 operation_fd = os.open(
                     name,
                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=operations_fd,
+                    dir_fd=context.operations_fd,
                 )
             except OSError as exc:
                 code = (
@@ -1364,7 +1650,7 @@ def open_recovery_operation_directories(
                     raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, display)
                 entries.append(
                     RecoveryOperationDirectory(
-                        parent_fd=operations_fd,
+                        context=context,
                         fd=operation_fd,
                         name=name,
                         node=(current.st_dev, current.st_ino),
@@ -1377,150 +1663,83 @@ def open_recovery_operation_directories(
         yield tuple(entries)
     finally:
         for entry in entries:
-            with suppress(OSError):
+            with suppress(OSError, DraftError):
                 entry.close()
-        os.close(operations_fd)
-
-
-def iter_recovery_operation_directories(root: Path) -> tuple[Path, ...]:
-    """以 no-follow 方式列举可供恢复的 operation 目录。"""
-    reject_symlink_components(root, OPERATIONS_RELATIVE)
-    operations = root / OPERATIONS_RELATIVE
-    operations_kind = classify_node_or_error(
-        operations,
-        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
-        code_path=operations,
-    )
-    if operations_kind is EntryKind.MISSING:
-        return ()
-    if operations_kind is not EntryKind.DIRECTORY:
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operations)
-    try:
-        entries = tuple(sorted(operations.iterdir()))
-    except OSError as exc:
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operations) from exc
-    valid: list[Path] = []
-    for entry in entries:
-        kind = classify_node_or_error(
-            entry,
-            code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
-            code_path=entry,
-        )
-        if kind is EntryKind.SYMLINK:
-            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, entry)
-        if kind is not EntryKind.DIRECTORY:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
-        try:
-            validate_operation_id(entry.name, code=CheckCode.OPERATION_INCONSISTENT_STATE.value)
-        except DraftError as exc:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry) from exc
-        valid.append(entry)
-    return tuple(valid)
-
-
-def read_unlocked_operation_journal(root: Path, entry: Path) -> Journal | None:
-    """在已验证 operation 目录内读取 journal，并分类无日志目录现场。"""
-    journal_path = operation_journal_path(root, entry.name)
-    resolve_journal_pending(journal_path)
-    journal = _read_optional_journal(operation_journal_path(root, entry.name))
-    if journal is not None:
-        return journal
-    operation_directory = operation_journal_path(root, entry.name).parent
-    try:
-        empty = next(operation_directory.iterdir(), None) is None
-    except OSError as exc:
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operation_directory) from exc
-    if not empty:
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operation_directory)
-    return None
-
-
-def remove_empty_recovery_operation_directory(root: Path, entry: Path) -> None:
-    """只删除 reader 已证明为空的 operation 目录。"""
-    operation_directory = operation_journal_path(root, entry.name).parent
-    try:
-        operation_directory.rmdir()
-    except OSError as exc:
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operation_directory) from exc
+        with suppress(OSError, DraftError):
+            context.close()
 
 
 def _fd_display(entry: RecoveryOperationDirectory, name: str) -> Path:
     return entry.display / name
 
 
-def _classify_fd_name(
-    parent_fd: int,
+def _recovery_leaf(
+    entry: RecoveryOperationDirectory,
     name: str,
     *,
     code: str,
     code_path: Path,
-) -> EntryKind:
-    try:
-        mode = os.stat(name, dir_fd=parent_fd, follow_symlinks=False).st_mode
-    except FileNotFoundError:
-        return EntryKind.MISSING
-    except OSError as exc:
-        raise DraftError(code, code_path) from exc
-    if stat.S_ISLNK(mode):
-        return EntryKind.SYMLINK
-    if stat.S_ISREG(mode):
-        return EntryKind.FILE
-    if stat.S_ISDIR(mode):
-        return EntryKind.DIRECTORY
-    return EntryKind.OTHER
+) -> _RecoveryLeaf:
+    if entry.leaves is None:
+        entry.leaves = {}
+    leaf = entry.leaves.get(name)
+    if leaf is None:
+        leaf = _RecoveryLeaf.open(entry, name, code=code, code_path=code_path)
+        entry.leaves[name] = leaf
+    return leaf
+
+
+def _refresh_recovery_leaf(
+    entry: RecoveryOperationDirectory,
+    name: str,
+    *,
+    code: str,
+    code_path: Path,
+) -> _RecoveryLeaf:
+    if entry.leaves is not None:
+        old = entry.leaves.pop(name, None)
+        if old is not None:
+            old.close()
+    return _recovery_leaf(entry, name, code=code, code_path=code_path)
 
 
 def _read_optional_journal_fd(entry: RecoveryOperationDirectory) -> Journal | None:
-    entry.verify()
     path = _fd_display(entry, "journal.json")
-    kind = _classify_fd_name(
-        entry.fd,
+    leaf = _recovery_leaf(
+        entry,
         "journal.json",
         code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
         code_path=path,
     )
+    kind = leaf.verify()
     if kind is EntryKind.MISSING:
         return None
     if kind is not EntryKind.FILE:
         _raise_journal_invalid(path)
-    entry.verify()
     return _parse_journal_bytes(
-        _read_name_bytes(
-            entry.fd,
-            "journal.json",
-            code_path=path,
-            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
-        ),
+        leaf.read_verified(),
         path,
     )
 
 
 def _resolve_journal_pending_fd(entry: RecoveryOperationDirectory) -> None:
     """FD 版 pending 收敛；解析和转换验证仍复用既有纯权威函数。"""
-    entry.verify()
     pending_path = _fd_display(entry, "journal.json.pending")
-    pending_kind = _classify_fd_name(
-        entry.fd,
+    pending = _recovery_leaf(
+        entry,
         "journal.json.pending",
         code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
         code_path=pending_path,
     )
+    pending_kind = pending.verify()
     if pending_kind is EntryKind.MISSING:
         return
     old = _read_optional_journal_fd(entry)
     if pending_kind is not EntryKind.FILE:
-        if old is not None:
-            return
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, pending_path)
     try:
-        entry.verify()
         journal = _parse_journal_bytes(
-            _read_name_bytes(
-                entry.fd,
-                "journal.json.pending",
-                code_path=pending_path,
-                code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
-            ),
+            pending.read_verified(),
             pending_path,
         )
     except DraftError:
@@ -1530,13 +1749,38 @@ def _resolve_journal_pending_fd(entry: RecoveryOperationDirectory) -> None:
     validate_journal_transition(old, journal, path=_fd_display(entry, "journal.json"))
     entry.verify()
     try:
-        _replace_publish(
-            entry.fd,
+        pending.verify()
+        target = _recovery_leaf(
+            entry,
             "journal.json",
-            _journal_to_json(journal),
+            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
             code_path=_fd_display(entry, "journal.json"),
-            write_step=DurabilityStep.JOURNAL_WRITE,
-            directory_fsync_step=DurabilityStep.JOURNAL_DIRECTORY_FSYNC,
+        )
+        if target.verify() not in (EntryKind.FILE, EntryKind.MISSING):
+            _raise_journal_invalid(_fd_display(entry, "journal.json"))
+        durability_checkpoint(DurabilityStep.JOURNAL_WRITE)
+        os.replace(
+            pending.name,
+            "journal.json",
+            src_dir_fd=entry.fd,
+            dst_dir_fd=entry.fd,
+        )
+        _fsync_dir_fd(
+            entry.fd,
+            _fd_display(entry, "journal.json"),
+            durability_step=DurabilityStep.JOURNAL_DIRECTORY_FSYNC,
+        )
+        _refresh_recovery_leaf(
+            entry,
+            "journal.json",
+            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+            code_path=_fd_display(entry, "journal.json"),
+        )
+        _refresh_recovery_leaf(
+            entry,
+            "journal.json.pending",
+            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+            code_path=pending_path,
         )
     except OSError as exc:
         raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, pending_path) from exc
@@ -1564,9 +1808,27 @@ def write_unlocked_journal_fd(entry: RecoveryOperationDirectory, journal: Journa
     entry.verify()
     path = _fd_display(entry, "journal.json")
     old = _read_optional_journal_fd(entry)
+    old_leaf = _recovery_leaf(
+        entry,
+        "journal.json",
+        code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+        code_path=path,
+    )
     validate_journal_transition(old, journal, path=path)
     entry.verify()
+
+    def identity_gate(pending_node: tuple[int, int]) -> None:
+        entry.verify()
+        old_leaf.verify()
+        try:
+            current = os.stat("journal.json.pending", dir_fd=entry.fd, follow_symlinks=False)
+        except OSError as exc:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, path) from exc
+        if (current.st_dev, current.st_ino) != pending_node:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, path)
+
     if old is None:
+        old_leaf.verify()
         _create_only_publish(
             entry.fd,
             "journal.json",
@@ -1574,8 +1836,16 @@ def write_unlocked_journal_fd(entry: RecoveryOperationDirectory, journal: Journa
             code_path=path,
             write_step=DurabilityStep.JOURNAL_WRITE,
             directory_fsync_step=DurabilityStep.JOURNAL_DIRECTORY_FSYNC,
+            identity_gate=identity_gate,
+        )
+        _refresh_recovery_leaf(
+            entry,
+            "journal.json",
+            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+            code_path=path,
         )
     else:
+        old_leaf.verify()
         _replace_publish(
             entry.fd,
             "journal.json",
@@ -1583,24 +1853,14 @@ def write_unlocked_journal_fd(entry: RecoveryOperationDirectory, journal: Journa
             code_path=path,
             write_step=DurabilityStep.JOURNAL_WRITE,
             directory_fsync_step=DurabilityStep.JOURNAL_DIRECTORY_FSYNC,
+            identity_gate=identity_gate,
         )
-
-
-def remove_empty_recovery_operation_directory_fd(entry: RecoveryOperationDirectory) -> None:
-    """复核名字身份后，仅通过 operations FD 删除空 operation 目录。"""
-    entry.verify()
-    try:
-        with os.scandir(entry.fd) as scan:
-            nonempty = next(scan, None) is not None
-        if nonempty:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display)
-    except OSError as exc:
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display) from exc
-    entry.verify()
-    try:
-        os.rmdir(entry.name, dir_fd=entry.parent_fd)
-    except OSError as exc:
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display) from exc
+        _refresh_recovery_leaf(
+            entry,
+            "journal.json",
+            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+            code_path=path,
+        )
 
 
 def read_lock(root: Path) -> str | None:
@@ -3031,135 +3291,150 @@ def _clean_recovery_copies(journal: Journal) -> None:
 
 def _fd_recover_copy_leaf(
     entry: RecoveryOperationDirectory,
+    subdirectory: _RecoveryDirectoryHandle,
     parent_fd: int,
     name: str,
     expected_digest: str,
 ) -> None:
-    """FD 版 pending/quarantine 收敛，沿用同一份纯决策函数。"""
-    entry.verify()
+    """在认证 originals/staged 目录内收敛一个 copy leaf。"""
+    subdirectory.verify()
     display = entry.display / name
-    target = _AnchoredLeaf(
-        parent_fd,
+    target = _RecoveryLeaf.open(
+        subdirectory,
         name,
-        display,
-        CheckCode.OPERATION_INCONSISTENT_STATE.value,
-        display,
+        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+        code_path=display,
     )
-    pending = _AnchoredLeaf(
-        parent_fd,
+    pending = _RecoveryLeaf.open(
+        subdirectory,
         _pending_name(name),
-        display,
-        CheckCode.OPERATION_INCONSISTENT_STATE.value,
-        display,
+        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+        code_path=display,
     )
-    target_kind = target.classify()
-    pending_kind = pending.classify()
-    decision = _pending_decision(
-        target_kind=target_kind,
-        pending_kind=pending_kind,
-        target_digest=sha256_bytes(target.read()) if target_kind is EntryKind.FILE else None,
-        pending_digest=sha256_bytes(pending.read()) if pending_kind is EntryKind.FILE else None,
-        expected_digest=expected_digest,
-    )
-    if decision == "external":
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, display)
-    if decision == "publish":
-        entry.verify()
-        try:
-            os.link(pending.name, target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        except FileExistsError as exc:
-            raise DraftError("operation.external_change", display) from exc
-        except OSError as exc:
-            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, display) from exc
-        _fsync_dir_fd(parent_fd, display)
-        if sha256_bytes(target.read()) != expected_digest or not _same_name_node(
-            parent_fd,
-            pending.name,
-            _name_node(parent_fd, target.name, code="operation.external_change", code_path=display),
-            code="operation.external_change",
-            code_path=display,
-        ):
-            raise DraftError("operation.external_change", display)
-        entry.verify()
-        try:
-            os.unlink(pending.name, dir_fd=parent_fd)
-        except OSError as exc:
-            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, display) from exc
-        _fsync_dir_fd(parent_fd, display)
-    elif decision == "delete":
-        entry.verify()
-        if sha256_bytes(pending.read()) != expected_digest:
-            raise DraftError("operation.external_change", display)
-        try:
-            os.unlink(pending.name, dir_fd=parent_fd)
-        except OSError as exc:
-            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, display) from exc
-        _fsync_dir_fd(parent_fd, display)
+    try:
+        target_kind = target.verify()
+        pending_kind = pending.verify()
+        decision = _pending_decision(
+            target_kind=target_kind,
+            pending_kind=pending_kind,
+            target_digest=sha256_bytes(target.read_verified())
+            if target_kind is EntryKind.FILE
+            else None,
+            pending_digest=sha256_bytes(pending.read_verified())
+            if pending_kind is EntryKind.FILE
+            else None,
+            expected_digest=expected_digest,
+        )
+        if decision == "external":
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, display)
+        if decision == "publish":
+            subdirectory.verify()
+            pending.verify()
+            target.verify()
+            try:
+                os.link(
+                    pending.name,
+                    target.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise DraftError("operation.external_change", display) from exc
+            except OSError as exc:
+                raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, display) from exc
+            _fsync_dir_fd(parent_fd, display)
+            target.close()
+            target = _RecoveryLeaf.open(
+                subdirectory,
+                name,
+                code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                code_path=display,
+            )
+            if sha256_bytes(target.read_verified()) != expected_digest:
+                raise DraftError("operation.external_change", display)
+            pending.verify()
+            target.verify()
+            pending.unlink_verified()
+            _fsync_dir_fd(parent_fd, display)
+        elif decision == "delete":
+            pending.verify()
+            if sha256_bytes(pending.read_verified()) != expected_digest:
+                raise DraftError("operation.external_change", display)
+            pending.unlink_verified()
+            _fsync_dir_fd(parent_fd, display)
+    finally:
+        target.close()
+        pending.close()
 
 
 def _fd_recover_quarantine_leaf(
     entry: RecoveryOperationDirectory,
+    subdirectory: _RecoveryDirectoryHandle,
     parent_fd: int,
     name: str,
     expected_digest: str,
 ) -> None:
-    entry.verify()
+    subdirectory.verify()
     display = entry.display / name
-    target = _AnchoredLeaf(
-        parent_fd, name, display, CheckCode.OPERATION_INCONSISTENT_STATE.value, display
+    target = _RecoveryLeaf.open(
+        subdirectory,
+        name,
+        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+        code_path=display,
     )
-    quarantine = _AnchoredLeaf(
-        parent_fd,
+    quarantine = _RecoveryLeaf.open(
+        subdirectory,
         _quarantine_name(name),
-        display,
-        CheckCode.OPERATION_INCONSISTENT_STATE.value,
-        display,
+        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+        code_path=display,
     )
-    target_kind = target.classify()
-    quarantine_kind = quarantine.classify()
-    decision = _quarantine_decision(
-        target_kind=target_kind,
-        quarantine_kind=quarantine_kind,
-        target_digest=sha256_bytes(target.read()) if target_kind is EntryKind.FILE else None,
-        quarantine_digest=(
-            sha256_bytes(quarantine.read()) if quarantine_kind is EntryKind.FILE else None
-        ),
-        expected_digest=expected_digest,
-    )
-    if decision == "external":
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, display)
-    if decision == "restore":
-        entry.verify()
-        try:
-            os.link(quarantine.name, target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        except FileExistsError as exc:
-            raise DraftError("operation.external_change", display) from exc
-        except OSError as exc:
-            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, display) from exc
-        _fsync_dir_fd(parent_fd, display)
-        if sha256_bytes(target.read()) != expected_digest or not _same_name_node(
-            parent_fd,
-            quarantine.name,
-            _name_node(parent_fd, target.name, code="operation.external_change", code_path=display),
-            code="operation.external_change",
-            code_path=display,
-        ):
-            raise DraftError("operation.external_change", display)
-        try:
-            os.unlink(quarantine.name, dir_fd=parent_fd)
-        except OSError as exc:
-            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, display) from exc
-        _fsync_dir_fd(parent_fd, display)
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, display)
-    if decision in ("complete", "delete_stale"):
-        entry.verify()
-        if sha256_bytes(quarantine.read()) != expected_digest:
-            raise DraftError("operation.external_change", display)
-        try:
-            os.unlink(quarantine.name, dir_fd=parent_fd)
-        except OSError as exc:
-            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, display) from exc
-        _fsync_dir_fd(parent_fd, display)
+    try:
+        target_kind = target.verify()
+        quarantine_kind = quarantine.verify()
+        decision = _quarantine_decision(
+            target_kind=target_kind,
+            quarantine_kind=quarantine_kind,
+            target_digest=sha256_bytes(target.read_verified())
+            if target_kind is EntryKind.FILE
+            else None,
+            quarantine_digest=sha256_bytes(quarantine.read_verified())
+            if quarantine_kind is EntryKind.FILE
+            else None,
+            expected_digest=expected_digest,
+        )
+        if decision == "external":
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, display)
+        if decision == "restore":
+            subdirectory.verify()
+            quarantine.verify()
+            target.verify()
+            try:
+                os.link(
+                    quarantine.name,
+                    target.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise DraftError("operation.external_change", display) from exc
+            except OSError as exc:
+                raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, display) from exc
+            _fsync_dir_fd(parent_fd, display)
+            quarantine.verify()
+            quarantine.unlink_verified()
+            _fsync_dir_fd(parent_fd, display)
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, display)
+        if decision in ("complete", "delete_stale"):
+            quarantine.verify()
+            if sha256_bytes(quarantine.read_verified()) != expected_digest:
+                raise DraftError("operation.external_change", display)
+            quarantine.unlink_verified()
+            _fsync_dir_fd(parent_fd, display)
+    finally:
+        target.close()
+        quarantine.close()
 
 
 def _fd_clean_recovery_copies(entry: RecoveryOperationDirectory, journal: Journal) -> None:
@@ -3173,6 +3448,11 @@ def _fd_clean_recovery_copies(entry: RecoveryOperationDirectory, journal: Journa
     for sub in ("originals", "staged"):
         entry.verify()
         try:
+            sub_stat = os.stat(sub, dir_fd=entry.fd, follow_symlinks=False)
+            if stat.S_ISLNK(sub_stat.st_mode) or not stat.S_ISDIR(sub_stat.st_mode):
+                if stat.S_ISLNK(sub_stat.st_mode):
+                    raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, entry.display / sub)
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display / sub)
             sub_fd = os.open(
                 sub,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -3184,11 +3464,19 @@ def _fd_clean_recovery_copies(entry: RecoveryOperationDirectory, journal: Journa
             raise DraftError(
                 CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display / sub
             ) from exc
+        subdirectory = _RecoveryDirectoryHandle(
+            entry=entry,
+            name=sub,
+            fd=sub_fd,
+            node=(sub_stat.st_dev, sub_stat.st_ino),
+            display=entry.display / sub,
+        )
         try:
+            subdirectory.verify()
             allowed = registered[sub]
             for name, digest in sorted(allowed.items()):
-                _fd_recover_copy_leaf(entry, sub_fd, name, digest)
-                _fd_recover_quarantine_leaf(entry, sub_fd, name, digest)
+                _fd_recover_copy_leaf(entry, subdirectory, sub_fd, name, digest)
+                _fd_recover_quarantine_leaf(entry, subdirectory, sub_fd, name, digest)
             try:
                 names = tuple(os.scandir(sub_fd))
             except OSError as exc:
@@ -3206,29 +3494,70 @@ def _fd_clean_recovery_copies(entry: RecoveryOperationDirectory, journal: Journa
                         entry.display / sub / item.name,
                     )
             for name, digest in sorted(allowed.items()):
-                entry.verify()
-                leaf = _AnchoredLeaf(
-                    sub_fd,
+                subdirectory.verify()
+                leaf = _RecoveryLeaf.open(
+                    subdirectory,
                     name,
-                    entry.display / sub / name,
-                    CheckCode.OPERATION_INCONSISTENT_STATE.value,
-                    entry.display / sub / name,
+                    code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                    code_path=entry.display / sub / name,
                 )
-                if leaf.classify() is EntryKind.MISSING:
-                    continue
-                if leaf.classify() is not EntryKind.FILE or sha256_bytes(leaf.read()) != digest:
-                    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, leaf.display)
-                entry.verify()
-                leaf.quarantine_delete(digest)
-            entry.verify()
+                try:
+                    kind = leaf.verify()
+                    if kind is EntryKind.MISSING:
+                        continue
+                    if kind is not EntryKind.FILE or sha256_bytes(leaf.read_verified()) != digest:
+                        raise DraftError(
+                            CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display / sub / name
+                        )
+                    subdirectory.verify()
+                    leaf.verify()
+                    # The copy leaf is consumed only after its same-inode gate.
+                    quarantine_name = _quarantine_name(name)
+                    try:
+                        os.link(
+                            name,
+                            quarantine_name,
+                            src_dir_fd=sub_fd,
+                            dst_dir_fd=sub_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileExistsError as exc:
+                        raise DraftError(
+                            CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display / sub / name
+                        ) from exc
+                    except OSError as exc:
+                        raise DraftError(
+                            CheckCode.OPERATION_DURABILITY_FAILED.value, entry.display / sub / name
+                        ) from exc
+                    _fsync_dir_fd(sub_fd, entry.display / sub / name)
+                    leaf.verify()
+                    quarantine = _RecoveryLeaf.open(
+                        subdirectory,
+                        quarantine_name,
+                        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                        code_path=entry.display / sub / name,
+                    )
+                    try:
+                        if sha256_bytes(quarantine.read_verified()) != digest:
+                            raise DraftError(
+                                CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                                entry.display / sub / name,
+                            )
+                        leaf.unlink_verified()
+                        _fsync_dir_fd(sub_fd, entry.display / sub / name)
+                        quarantine.unlink_verified()
+                        _fsync_dir_fd(sub_fd, entry.display / sub / name)
+                    finally:
+                        quarantine.close()
+                finally:
+                    leaf.close()
+            subdirectory.verify()
             with os.scandir(sub_fd) as scan:
                 nonempty = next(scan, None) is not None
             if nonempty:
                 raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display / sub)
-        finally:
-            os.close(sub_fd)
-        entry.verify()
-        try:
+            subdirectory.verify()
+            entry.verify()
             os.rmdir(sub, dir_fd=entry.fd)
         except FileNotFoundError:
             pass
@@ -3236,6 +3565,8 @@ def _fd_clean_recovery_copies(entry: RecoveryOperationDirectory, journal: Journa
             raise DraftError(
                 CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display / sub
             ) from exc
+        finally:
+            subdirectory.close()
 
 
 def finalize_operation(
@@ -4912,6 +5243,7 @@ def _publish_pending_to_target(
                 target.name,
                 src_dir_fd=target.parent_fd,
                 dst_dir_fd=target.parent_fd,
+                follow_symlinks=False,
             )
         except FileExistsError as exc:
             raise DraftError("operation.external_change", code_path) from exc
@@ -5297,43 +5629,11 @@ def verify_locked_terminal_operation(
         raise DraftError("operation.external_change", root) from exc
 
 
-def recover_unlocked_operation(root: Path, journal: Journal) -> None:
-    """按单份 journal 分类无锁 operation，不扫描其他 operation。"""
-    if journal.phase is OperationPhase.ALLOCATING:
-        # allocating 只拥有日志登记的恢复材料；先精确校验并清理材料，再删除日志，
-        # 最后移除已为空的 operation 目录。未知成员或类型会在第一次删除前拒绝。
-        known_names = {"journal.json", "originals", "staged"}
-        extra = [path for path in journal.directory.iterdir() if path.name not in known_names]
-        if extra:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-        _clean_recovery_copies(journal)
-        operation_journal_path(root, journal.operation_id).unlink()
-        journal.directory.rmdir()
-        return
-    if (
-        journal.phase in _MID_WRITE_PHASES
-        or journal.phase in _LINK_INDEX_PHASES
-        or journal.phase is OperationPhase.TRASH_HANDOFF_SUCCEEDED
-        or journal.phase is OperationPhase.TRASH_PURGE_COMMITTED
-    ):
-        # 无锁中间/索引/已提交 trash phase 表示锁在不应释放的阶段丢失，必须保留证据。
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-    if journal.phase in (
-        OperationPhase.COMPLETED,
-        OperationPhase.ROLLED_BACK,
-        OperationPhase.TRASH_RETAINED,
-        OperationPhase.TRASH_HANDOFF_PENDING,
-    ):
-        # 终态或等待态只保留审计，不在无锁入口推进生命周期。
-        return
-    # 显式白名单之外的当前或未来 phase 都必须失败关闭。
-    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-
-
 def _recover_unlocked_operation_fd(
     entry: RecoveryOperationDirectory,
     journal: Journal,
     journals: Mapping[str, Journal],
+    entries: tuple[RecoveryOperationDirectory, ...],
 ) -> OperationResult | None:
     """共享无锁分派：restore 关联扫描与普通 operation phase 同一入口。"""
     if journal.kind is OperationKind.RESTORE:
@@ -5351,10 +5651,39 @@ def _recover_unlocked_operation_fd(
                     raise DraftError(
                         CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory
                     )
+            journals = _refresh_unlocked_journals(entries)
+            current = journals.get(entry.name)
+            if current is None or current.operation_id != journal.operation_id:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+            if "restores_trash_operation" in current.metadata:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+            for candidate in journals.values():
+                if (
+                    candidate.kind is OperationKind.TRASH
+                    and candidate.metadata.get(RESTORE_OPERATION_ID_KEY) == journal.operation_id
+                ):
+                    raise DraftError(
+                        CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory
+                    )
             entry.verify()
             _fd_clean_recovery_copies(entry, journal)
             entry.verify()
-            write_unlocked_journal_fd(entry, _with_phase(journal, OperationPhase.ROLLED_BACK))
+            # copy 清理后、写入 rolled_back 前再次刷新全部认证 journal。
+            journals = _refresh_unlocked_journals(entries)
+            current = journals.get(entry.name)
+            if current is None or current.operation_id != journal.operation_id:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+            if "restores_trash_operation" in current.metadata:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+            for candidate in journals.values():
+                if (
+                    candidate.kind is OperationKind.TRASH
+                    and candidate.metadata.get(RESTORE_OPERATION_ID_KEY) == journal.operation_id
+                ):
+                    raise DraftError(
+                        CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory
+                    )
+            write_unlocked_journal_fd(entry, _with_phase(current, OperationPhase.ROLLED_BACK))
             return OperationResult(
                 operation_id=journal.operation_id,
                 kind=OperationKind.RESTORE.value,
@@ -5376,15 +5705,23 @@ def _recover_unlocked_operation_fd(
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display)
         _fd_clean_recovery_copies(entry, journal)
         entry.verify()
+        journal_leaf = _recovery_leaf(
+            entry,
+            "journal.json",
+            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+            code_path=entry.display / "journal.json",
+        )
+        journal_leaf.verify()
         try:
             os.unlink("journal.json", dir_fd=entry.fd)
         except OSError as exc:
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display) from exc
-        entry.verify()
-        try:
-            os.rmdir(entry.name, dir_fd=entry.parent_fd)
-        except OSError as exc:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display) from exc
+        _refresh_recovery_leaf(
+            entry,
+            "journal.json",
+            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+            code_path=entry.display / "journal.json",
+        )
         return None
     if (
         journal.phase in _MID_WRITE_PHASES
@@ -5403,6 +5740,19 @@ def _recover_unlocked_operation_fd(
     raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
 
 
+def _refresh_unlocked_journals(
+    entries: tuple[RecoveryOperationDirectory, ...],
+) -> dict[str, Journal]:
+    """从仍持有的 operation/journal 句柄重读本轮关联事实。"""
+    refreshed: dict[str, Journal] = {}
+    for candidate_entry in entries:
+        candidate_entry.verify()
+        candidate = read_unlocked_operation_journal_fd(candidate_entry)
+        if candidate is not None:
+            refreshed[candidate_entry.name] = candidate
+    return refreshed
+
+
 def recover_unlocked_operations(
     root: Path,
     *,
@@ -5412,12 +5762,11 @@ def recover_unlocked_operations(
     results: list[OperationResult] = []
     with open_recovery_operation_directories(root) as entries:
         journals_by_name: dict[str, Journal] = {}
-        empty: list[RecoveryOperationDirectory] = []
         # 先完整读取并锚定本轮候选，restore 分类不得在扫描不完整时产生副作用。
         for entry in entries:
             journal = read_unlocked_operation_journal_fd(entry)
             if journal is None:
-                empty.append(entry)
+                continue
             else:
                 journals_by_name[entry.name] = journal
         for entry in entries:
@@ -5426,12 +5775,11 @@ def recover_unlocked_operations(
             journal = journals_by_name.get(entry.name)
             if journal is None:
                 continue
-            result = _recover_unlocked_operation_fd(entry, journal, journals_by_name)
+            result = _recover_unlocked_operation_fd(entry, journal, journals_by_name, entries)
             if result is not None:
                 results.append(result)
-        for entry in empty:
-            if entry.name != skip_operation_id:
-                remove_empty_recovery_operation_directory_fd(entry)
+        # Empty operation directories are retained: rmdir cannot atomically gate the
+        # name against the authenticated inode in the no-lock protocol.
     return tuple(results)
 
 
