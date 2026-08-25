@@ -255,10 +255,198 @@
   git commit -m "fix(draft): classify unlocked recovery states"
   ```
 
+### 任务 5：修复共享 `recover` 对 restore 的无锁分派回归
+
+**文件：**
+- 修改：`plugins/draft/skills/draft/scripts/runtime/src/draft/operations.py:4718-4786`
+- 测试：`plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py:892-941,2493-2510`
+
+**接口：**
+- 输入：`operations.recover(root_path: Path)` 在无锁时扫描到的、已经由 `read_journal`
+  验证目录身份与 kind/phase 所有权的 `Journal`
+- 输出：所有 kind 共用 `recover_unlocked_operation(root: Path, journal: Journal) -> None`
+  的 phase 分类；restore 只有关联 `allocating` 的特殊终态化留在扫描循环
+
+无锁 restore 决策表：
+
+| phase/关联状态 | `operations.recover` 动作 | 不变量 |
+| --- | --- | --- |
+| `allocating` 且 metadata 含 `restores_trash_operation` | 清恢复副本并写 `rolled_back` | 保留关联恢复的审计事实 |
+| 其他 `allocating` | 委托共享 helper 精确清理 operation 目录 | 保持修复前的通用孤儿分配语义 |
+| `prepared/applying/validating/rolling_back` | `operation.inconsistent_state` | restore 写入阶段也必须持锁 |
+| 三个 link-index phase | `operation.inconsistent_state` | restore 索引收敛阶段也必须持锁 |
+| `completed/rolled_back` | 不修改 | 合法无锁终态只保留审计 |
+
+- [ ] **步骤 1：写无锁 restore RED 矩阵和错误路径 RED**
+
+  在 `test_operations.py` 增加合法 restore journal 构造器，并参数化覆盖
+  `prepared`、`applying`、`validating`、`rolling_back`、`link_index_updating`、
+  `link_index_published`、`link_index_rebuild_required`。索引 phase 必须携带规格 §4 要求的
+  `link_index_revision/result/sha256` 字段，确保 RED 来自无锁分类而不是 journal 解析失败。
+  每个状态调用 `operations.recover(root)` 都精确断言
+  `CheckCode.OPERATION_INCONSISTENT_STATE`，并比较调用前后的 operation tree bytes 不变。
+
+  ```python
+  def write_restore_phase_journal(
+      root: Path, operation_id: str, phase: OperationPhase
+  ) -> Path:
+      journal_dir = root / ".draft/operations" / operation_id
+      journal_dir.mkdir(parents=True)
+      payload: dict[str, object] = {
+          "journal_version": JOURNAL_VERSION,
+          "operation_id": operation_id,
+          "kind": OperationKind.RESTORE.value,
+          "phase": phase.value,
+          "root_state": "registered",
+          "observations": [],
+          "mutations": [],
+          "remove_empty_directories": [],
+          "metadata": {},
+      }
+      if phase is OperationPhase.LINK_INDEX_UPDATING:
+          payload["link_index_revision"] = "1"
+      elif phase is OperationPhase.LINK_INDEX_PUBLISHED:
+          payload.update(
+              link_index_revision="1",
+              link_index_result="published",
+              link_index_sha256="a" * 64,
+          )
+      elif phase is OperationPhase.LINK_INDEX_REBUILD_REQUIRED:
+          payload.update(
+              link_index_revision="1",
+              link_index_result="rebuild_required",
+          )
+      (journal_dir / "journal.json").write_text(json.dumps(payload), encoding="utf-8")
+      return journal_dir
+
+  @pytest.mark.parametrize(
+      "phase",
+      [
+          OperationPhase.PREPARED,
+          OperationPhase.APPLYING,
+          OperationPhase.VALIDATING,
+          OperationPhase.ROLLING_BACK,
+          OperationPhase.LINK_INDEX_UPDATING,
+          OperationPhase.LINK_INDEX_PUBLISHED,
+          OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
+      ],
+  )
+  def test_no_lock_restore_nonterminal_phase_is_inconsistent(
+      operation_draft: Path, phase: OperationPhase
+  ) -> None:
+      root = operation_draft
+      journal_dir = write_restore_phase_journal(root, "2" * 32, phase)
+      before = {
+          path.relative_to(journal_dir): path.read_bytes()
+          for path in journal_dir.rglob("*")
+          if path.is_file()
+      }
+
+      with pytest.raises(DraftError) as caught:
+          recover(root)
+
+      assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+      after = {
+          path.relative_to(journal_dir): path.read_bytes()
+          for path in journal_dir.rglob("*")
+          if path.is_file()
+      }
+      assert after == before
+  ```
+
+  扩展 `test_no_lock_allocating_with_unknown_content_is_inconsistent`：除错误码和现场外，
+  精确断言 `DraftError.path == journal_dir`，锁定修复前的稳定错误路径协议。
+
+- [ ] **步骤 2：运行 RED，确认当前回归可证伪**
+
+  ```bash
+  uv run --project plugins/draft/skills/draft/scripts/runtime --locked pytest \
+    plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py \
+    -q -k 'no_lock_restore or no_lock_allocating_with_unknown_content'
+  ```
+
+  预期：restore 矩阵因当前实现静默成功而 FAIL；未知成员用例因错误路径是具体成员而
+  FAIL。不得接受 journal 解析失败、夹具字段非法或其他错误码造成的伪 RED。
+
+- [ ] **步骤 3：让所有 kind 经过共享 helper，并让未知 phase 失败关闭**
+
+  扫描循环只保留关联 restore `allocating` 的特殊分支；该分支完成后 `continue`，其他
+  journal 无条件调用 `recover_unlocked_operation`：
+
+  ```python
+  if (
+      journal.kind is OperationKind.RESTORE
+      and journal.phase is OperationPhase.ALLOCATING
+      and "restores_trash_operation" in journal.metadata
+  ):
+      _clean_recovery_copies(journal)
+      write_journal(_with_phase(journal, OperationPhase.ROLLED_BACK))
+      continue
+  recover_unlocked_operation(root, journal)
+  ```
+
+  在 helper 中用唯一的显式白名单表达合法无锁审计态：`completed`、`rolled_back`、
+  `trash_retained`、`trash_handoff_pending`。`allocating` 清理分支之后，白名单内返回；
+  其余当前或未来 phase 统一报 `operation.inconsistent_state`。不得按 kind 绕过 phase
+  分类，不得用枚举补集把未来 phase 自动归入合法跳过态。allocating 未知成员继续报
+  `journal.directory`，不得改为具体成员路径。
+
+- [ ] **步骤 4：补齐 allocating 与终态 restore 的回归证据**
+
+  增加一个未关联 restore `allocating` 用例，证明 `operations.recover` 仍精确删除其空
+  operation 目录；增加 `completed/rolled_back` 参数化用例，证明日志字节保持不变。
+  这些用例只验证共享 operations 边界，不替代 `trash_lifecycle` 对 R/T 反向关联的集成测试。
+
+  ```python
+  def test_no_lock_unlinked_restore_allocating_is_cleaned(operation_draft: Path) -> None:
+      journal_dir = write_restore_phase_journal(
+          operation_draft, "3" * 32, OperationPhase.ALLOCATING
+      )
+      recover(operation_draft)
+      assert not journal_dir.exists()
+
+  @pytest.mark.parametrize(
+      "phase", [OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK]
+  )
+  def test_no_lock_restore_terminal_journal_is_preserved(
+      operation_draft: Path, phase: OperationPhase
+  ) -> None:
+      journal_dir = write_restore_phase_journal(operation_draft, "4" * 32, phase)
+      journal_path = journal_dir / "journal.json"
+      before = journal_path.read_bytes()
+      recover(operation_draft)
+      assert journal_path.read_bytes() == before
+  ```
+
+- [ ] **步骤 5：运行定向测试与静态门禁**
+
+  ```bash
+  uv run --project plugins/draft/skills/draft/scripts/runtime --locked pytest \
+    plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py \
+    plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash_lifecycle.py -q
+  uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff check \
+    plugins/draft/skills/draft/scripts/runtime/src/draft/operations.py \
+    plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py
+  uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff format --check \
+    plugins/draft/skills/draft/scripts/runtime/src/draft/operations.py \
+    plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py
+  ```
+
+  预期：定向测试全部 PASS；Ruff 与 format check 通过；随后按插件作用域门禁运行 strict
+  Pyright，必须为 0 errors。
+
+- [ ] **步骤 6：提交修复**
+
+  ```bash
+  git add plugins/draft/skills/draft/scripts/runtime/src/draft/operations.py \
+    plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py
+  git commit -m "fix(draft): preserve unlocked restore classification"
+  ```
+
 ## 自检
 
 - 规格覆盖：§13.5 的 recover/lifecycle 分离、§14 的 recover 只恢复已有 operation、无锁
-  phase、已开始 handoff 的恢复以及提交后清理均映射到决策表和测试。
+  phase、已开始 handoff 的恢复、提交后清理以及跨 kind 共享分派均映射到决策表和测试。
 - 占位符扫描：没有 TBD/TODO 或要求执行者自行选择语义的步骤。
 - 类型一致性：两个应用边界签名沿用现有实现；`_recover_locked_trash` 继续返回
   `TrashResult | None`，`recover_unlocked_operation` 不返回业务结果，调用方公开返回仍为
