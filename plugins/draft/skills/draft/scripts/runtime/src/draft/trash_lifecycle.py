@@ -642,7 +642,8 @@ def _handle_no_lock_dir(
             OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
         ):
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-        # trash_retained/trash_handoff_pending：交给批量推进。
+        # 无锁 retained/pending 不是 recovery-pending 现场：公开 recover 跳过；允许的
+        # 普通受管命令会在独立的生命周期前置入口扫描它们。
         return None
     # 普通操作终态：保留审计；中间阶段由 operations.recover 处理（无锁视为 inconsistent）。
     if journal.phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
