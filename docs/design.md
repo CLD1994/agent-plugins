@@ -365,7 +365,7 @@ topic/
 2. `draft init --candidate TARGET` 建立固定候选根；Agent 把内容建立到候选根并重写，来源始终保持不变；
 3. Agent 连续调用普通结构命令（`create`/`move`/`promote`/`collapse`/`status set`/`relation add|remove`/`trash`/`restore`/`generate-conclusions`），命令间可直接编辑标题、正文和正文链接；候选命令按操作级门禁执行，不要求整个候选根无错；
 4. Agent 自主选择检查点，用 `draft check --code <CODE> --limit N --offset 0` 按诊断类别批量修复；
-5. 完整候选检查全绿后执行 `draft adopt`，再以普通 `draft check` 验证已登记草稿。
+5. 完整候选检查 `errors` 为空后执行 `draft adopt`，再以普通 `draft check` 验证已登记草稿。
 
 程序只判断最终候选是否满足当前协议，不识别旧标签，也不替 Agent 决定旧语义。纯链接列表由 Agent 无须询问地逐行展开为每行单目标；旧行含额外语义，或展开后同一标签重复指向同一规范化目标时，由 Agent 结合上下文决定如何保留、合并或重写，无法确定时再询问用户。外部结构链接同样由 Agent 决定是导入页面、改为正文引用、移除关系还是询问用户；候选检查只验证最终结构关系都位于草稿根内。
 

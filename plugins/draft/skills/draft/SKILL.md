@@ -78,7 +78,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 入口选择：
 
 - 全新讨论 -> `draft init <ROOT>`
-- 任意旧布局 -> `draft init --candidate <ROOT>` 建立固定候选根，Agent 按当前格式和语义重写并逐步调用普通命令，`draft check` 全绿后 `draft adopt`；具体规则见 [migration.md](references/migration.md)
+- 任意旧布局 -> `draft init --candidate <ROOT>` 建立固定候选根，Agent 按当前格式和语义重写并逐步调用普通命令，完整候选检查 `errors` 为空后执行 `draft adopt`；具体规则见 [migration.md](references/migration.md)
 
 ## 即时维护循环
 

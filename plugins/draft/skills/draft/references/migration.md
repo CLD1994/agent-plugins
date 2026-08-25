@@ -19,9 +19,9 @@
    整个候选根无错。
 5. `draft check --count-only` 或 `draft check --code <CODE>` 选择检查点，按诊断类别
    批量修复。
-6. `draft check` 全绿后才可登记；完整扫描可以机会式维护内部 link-index journal、制品
-   和 flag，但不修改迁移内容、marker 或回收生命周期。结构写命令的 `--dry-run` 使用
-   同一事实与计划边界，不产生 journal、revision、索引制品或 flag。
+6. 完整候选检查 `errors` 为空后才可登记；扫描可以机会式维护内部 link-index journal、
+   制品和 flag，但不修改迁移内容、marker 或回收生命周期。结构写命令的 `--dry-run`
+   使用同一事实与计划边界，不产生 journal、revision、索引制品或 flag。
 7. `draft adopt` 原子推进为 `root_state=registered`。索引性能降级 warning 不阻止登记；
    页面 errors、journal/索引制品矛盾、耐久失败或 recovery pending 等内部状态错误会
    阻止登记。
