@@ -409,6 +409,169 @@ def test_no_lock_trash_allocating_orphan_is_cleaned(
     assert not journal.directory.exists()
 
 
+def _write_unlinked_restore_allocating(root: Path, operation_id: str) -> Path:
+    import json
+
+    (root / ".draft/operations").mkdir(parents=True, exist_ok=True)
+    directory = root / ".draft/operations" / operation_id
+    directory.mkdir()
+    journal: dict[str, object] = {
+        "journal_version": JOURNAL_VERSION,
+        "operation_id": operation_id,
+        "kind": OperationKind.RESTORE.value,
+        "phase": OperationPhase.ALLOCATING.value,
+        "root_state": "registered",
+        "observations": [],
+        "mutations": [],
+        "remove_empty_directories": [],
+        "metadata": {},
+    }
+    path = directory / "journal.json"
+    path.write_text(json.dumps(journal) + "\n", encoding="utf-8")
+    return path
+
+
+def _lifecycle_tree_bytes(directory: Path) -> dict[Path, bytes]:
+    return {
+        path.relative_to(directory): path.read_bytes()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_unlinked_restore_cleanup_failure_preserves_allocating_scene(
+    draft_factory: DraftFactory,
+) -> None:
+    root = build_trashable_draft(draft_factory)
+    journal_path = _write_unlinked_restore_allocating(root, "0" * 32)
+    originals = journal_path.parent / "originals"
+    originals.mkdir()
+    (originals / "unexpected.bin").write_bytes(b"unexpected")
+    before = _lifecycle_tree_bytes(journal_path.parent)
+
+    for _ in range(2):
+        with pytest.raises(DraftError) as caught:
+            recover_interrupted_operations(root)
+        assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+        assert _phase(root, "0" * 32) == OperationPhase.ALLOCATING.value
+        assert _lifecycle_tree_bytes(journal_path.parent) == before
+
+
+def test_unlinked_restore_without_copies_rolls_back_idempotently(
+    draft_factory: DraftFactory,
+) -> None:
+    root = build_trashable_draft(draft_factory)
+    journal_path = _write_unlinked_restore_allocating(root, "1" * 32)
+
+    recover_interrupted_operations(root)
+
+    assert _phase(root, "1" * 32) == OperationPhase.ROLLED_BACK.value
+    rolled_back = journal_path.read_bytes()
+    recover_interrupted_operations(root)
+    assert journal_path.read_bytes() == rolled_back
+
+
+def test_unlinked_restore_retries_terminal_write_after_cleanup(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import draft.trash_lifecycle as lifecycle_module
+
+    root = build_trashable_draft(draft_factory)
+    journal_path = _write_unlinked_restore_allocating(root, "2" * 32)
+    real_write = lifecycle_module.write_journal
+    state = {"failed": False}
+
+    def fail_once(journal: object) -> None:
+        if not state["failed"]:
+            state["failed"] = True
+            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, journal_path)
+        real_write(journal)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(lifecycle_module, "write_journal", fail_once)
+    with pytest.raises(DraftError) as caught:
+        recover_interrupted_operations(root)
+    assert caught.value.code == CheckCode.OPERATION_DURABILITY_FAILED.value
+    assert _phase(root, "2" * 32) == OperationPhase.ALLOCATING.value
+    monkeypatch.undo()
+
+    recover_interrupted_operations(root)
+    assert _phase(root, "2" * 32) == OperationPhase.ROLLED_BACK.value
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("symlink", CheckCode.PATH_SYMLINK_ESCAPE.value),
+        ("regular-file", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+        ("invalid-id-directory", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+        ("nonempty-without-journal", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+    ],
+)
+def test_lifecycle_recovery_directory_identity_is_no_follow(
+    draft_factory: DraftFactory,
+    tmp_path: Path,
+    case: str,
+    expected_code: str,
+) -> None:
+    root = build_trashable_draft(draft_factory)
+    (root / ".draft/operations").mkdir(parents=True, exist_ok=True)
+    operations = root / ".draft/operations"
+    entry = operations / ("3" * 32 if case != "invalid-id-directory" else "not-an-id")
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel.write_bytes(b"outside")
+    if case == "symlink":
+        entry.symlink_to(sentinel)
+    elif case == "regular-file":
+        entry.write_bytes(b"not a directory")
+    else:
+        entry.mkdir()
+        (entry / "inside").write_bytes(b"inside")
+    before = _lifecycle_tree_bytes(operations)
+    sentinel_before = sentinel.read_bytes()
+
+    for _ in range(2):
+        with pytest.raises(DraftError) as caught:
+            recover_interrupted_operations(root)
+        assert caught.value.code == expected_code
+        assert caught.value.paths == (entry,)
+        assert _lifecycle_tree_bytes(operations) == before
+        assert sentinel.read_bytes() == sentinel_before
+
+
+def test_lifecycle_recovery_removes_only_empty_valid_operation_directory(
+    draft_factory: DraftFactory,
+) -> None:
+    root = build_trashable_draft(draft_factory)
+    (root / ".draft/operations").mkdir(parents=True, exist_ok=True)
+    entry = root / ".draft/operations" / ("4" * 32)
+    entry.mkdir()
+
+    recover_interrupted_operations(root)
+
+    assert not entry.exists()
+
+
+def test_lifecycle_recovery_preserves_nonempty_operation_directory_without_journal(
+    draft_factory: DraftFactory,
+) -> None:
+    root = build_trashable_draft(draft_factory)
+    (root / ".draft/operations").mkdir(parents=True, exist_ok=True)
+    entry = root / ".draft/operations" / ("5" * 32)
+    entry.mkdir()
+    (entry / "unexpected").write_bytes(b"inside")
+    before = _lifecycle_tree_bytes(entry)
+
+    with pytest.raises(DraftError) as caught:
+        recover_interrupted_operations(root)
+
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    assert caught.value.paths == (entry,)
+    assert _lifecycle_tree_bytes(entry) == before
+
+
 @pytest.mark.parametrize(
     "phase",
     [

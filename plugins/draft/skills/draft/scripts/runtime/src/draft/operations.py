@@ -1230,6 +1230,67 @@ def validate_operation_id(
     return value
 
 
+def iter_recovery_operation_directories(root: Path) -> tuple[Path, ...]:
+    """以 no-follow 方式列举可供恢复的 operation 目录。"""
+    reject_symlink_components(root, OPERATIONS_RELATIVE)
+    operations = root / OPERATIONS_RELATIVE
+    operations_kind = classify_node_or_error(
+        operations,
+        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+        code_path=operations,
+    )
+    if operations_kind is EntryKind.MISSING:
+        return ()
+    if operations_kind is not EntryKind.DIRECTORY:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operations)
+    try:
+        entries = tuple(sorted(operations.iterdir()))
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operations) from exc
+    valid: list[Path] = []
+    for entry in entries:
+        kind = classify_node_or_error(
+            entry,
+            code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+            code_path=entry,
+        )
+        if kind is EntryKind.SYMLINK:
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, entry)
+        if kind is not EntryKind.DIRECTORY:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
+        try:
+            validate_operation_id(entry.name, code=CheckCode.OPERATION_INCONSISTENT_STATE.value)
+        except DraftError as exc:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry) from exc
+        valid.append(entry)
+    return tuple(valid)
+
+
+def read_unlocked_operation_journal(root: Path, entry: Path) -> Journal | None:
+    """在已验证 operation 目录内读取 journal，并分类无日志目录现场。"""
+    reject_symlink_components(root, OPERATIONS_RELATIVE)
+    journal_path = entry / "journal.json"
+    resolve_journal_pending(journal_path)
+    journal = _read_optional_journal(journal_path)
+    if journal is not None:
+        return journal
+    try:
+        empty = next(entry.iterdir(), None) is None
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry) from exc
+    if not empty:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
+    return None
+
+
+def _remove_empty_recovery_operation_directory(entry: Path) -> None:
+    """只删除 reader 已证明为空的 operation 目录。"""
+    try:
+        entry.rmdir()
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry) from exc
+
+
 def read_lock(root: Path) -> str | None:
     reject_symlink_components(root, LOCK_RELATIVE)
     lock = root / LOCK_RELATIVE
@@ -4754,34 +4815,11 @@ def recover(root_path: Path) -> OperationResult:
     if operation_id is not None:
         return _recover_locked(root, operation_id)
 
-    reject_symlink_components(root, OPERATIONS_RELATIVE)
-    operations = root / OPERATIONS_RELATIVE
-    if not operations.is_dir():
-        return OperationResult(
-            operation_id="", kind="recover", phase=OperationPhase.COMPLETED, changed_paths=()
-        )
-    for entry in sorted(operations.iterdir()):
-        if not entry.is_dir():
+    for entry in iter_recovery_operation_directories(root):
+        journal = read_unlocked_operation_journal(root, entry)
+        if journal is None:
+            _remove_empty_recovery_operation_directory(entry)
             continue
-        journal_path = entry / "journal.json"
-        if not journal_path.is_file():
-            # 操作目录无 journal：只剩崩溃遗留 pending 时发布有效日志后继续处理；
-            # 非法 pending 报损坏（不按文件名删除）；既无 journal 也无 pending 跳过。
-            pending_path = entry / _pending_name("journal.json")
-            if (
-                classify_node_or_error(
-                    pending_path,
-                    code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
-                    code_path=pending_path,
-                )
-                is EntryKind.MISSING
-            ):
-                continue
-            resolve_journal_pending(journal_path)
-        else:
-            # journal 与 pending 并存：pending 是更新的完整日志，先发布。
-            resolve_journal_pending(journal_path)
-        journal = read_journal(journal_path)
         if (
             journal.kind is OperationKind.RESTORE
             and journal.phase is OperationPhase.ALLOCATING

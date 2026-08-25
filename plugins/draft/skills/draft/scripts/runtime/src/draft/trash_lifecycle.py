@@ -28,15 +28,18 @@ from draft.operations import (
     HANDOFF_RETRY_INTERVAL,
     Journal,
     TrashDeadlines,
+    _remove_empty_recovery_operation_directory,  # pyright: ignore[reportPrivateUsage]
     acquire_lock,
     clean_recovery_copies,
     durable_write,
     format_utc,
     fsync_directory,
+    iter_recovery_operation_directories,
     normalize_utc,
     operation_journal_path,
     read_journal,
     read_lock,
+    read_unlocked_operation_journal,
     recover,
     recover_digest_pending,
     recover_locked_operation,
@@ -589,22 +592,8 @@ def _recover_locked_trash(
     )
 
 
-def _handle_no_lock_dir(root: Path, entry: Path) -> LifecycleResult | None:
+def _handle_no_lock_dir(root: Path, entry: Path, journal: Journal) -> LifecycleResult | None:
     """无锁操作目录分类：放弃孤儿分配碎片、保留损坏现场、忽略终态审计。"""
-    reject_symlink_components(root, OPERATIONS_RELATIVE)
-    if entry.is_symlink():
-        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, entry)
-    journal_path = operation_journal_path(root, entry.name)
-    if not journal_path.is_file():
-        # 无 journal 且无 pending：空目录可回收，否则按非空现场保留。
-        if not any(entry.iterdir()):
-            entry.rmdir()
-            return None
-        # 只有崩溃遗留 pending：发布有效日志后继续，非法 pending 报损坏（回归 H2）。
-        resolve_journal_pending(journal_path)
-    else:
-        resolve_journal_pending(journal_path)
-    journal = read_journal(journal_path)
     if journal.kind is OperationKind.RESTORE:
         if journal.phase in (
             OperationPhase.COMPLETED,
@@ -620,8 +609,8 @@ def _handle_no_lock_dir(root: Path, entry: Path) -> LifecycleResult | None:
             and not journal.mutations
             and not _restore_linked_back(root, journal)
         ):
-            write_journal(with_phase(journal, OperationPhase.ROLLED_BACK))
             clean_recovery_copies(journal)
+            write_journal(with_phase(journal, OperationPhase.ROLLED_BACK))
             return OperationResult(
                 operation_id=journal.operation_id,
                 kind="restore",
@@ -636,26 +625,12 @@ def _handle_no_lock_dir(root: Path, entry: Path) -> LifecycleResult | None:
 
 def _restore_linked_back(root: Path, restore_journal: Journal) -> bool:
     """R 是否被某个 T 反向关联（如是则不当孤儿放弃）。"""
-    reject_symlink_components(root, OPERATIONS_RELATIVE)
-    operations = root / OPERATIONS_RELATIVE
-    if not operations.is_dir():
-        return False
-    for entry in operations.iterdir():
-        if entry.is_symlink():
-            # 链接条目绝不能静默跳过：否则可能漏掉真实反向关联，把 R 误判为孤儿。
-            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, entry)
-        if not entry.is_dir() or entry.name == restore_journal.operation_id:
+    for entry in iter_recovery_operation_directories(root):
+        if entry.name == restore_journal.operation_id:
             continue
-        back_path = operation_journal_path(root, entry.name)
-        if not back_path.is_file():
-            if not any(entry.iterdir()):
-                # 空预分配碎片：无证据可言，与无锁分类对空目录的处理一致。
-                continue
-            # 非空目录缺日志：证据可能已丢失，停止并保留现场，不得误判孤儿。
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
-        # 日志不可读（损坏/版本不符）时绝不跳过：该日志可能正是本 R 的反向关联
-        # 证据，吞掉错误会把证据缺失误判为无关联，进而把 R 错误写成 rolled_back。
-        candidate = read_journal(back_path)
+        candidate = read_unlocked_operation_journal(root, entry)
+        if candidate is None:
+            continue
         if (
             candidate.kind is OperationKind.TRASH
             and candidate.metadata.get("restore_operation_id") == restore_journal.operation_id
@@ -822,14 +797,15 @@ def recover_interrupted_operations(
         else:
             results.append(recover(resolved))
 
-    reject_symlink_components(resolved, OPERATIONS_RELATIVE)
-    operations = resolved / OPERATIONS_RELATIVE
-    if operations.is_dir():
-        for entry in sorted(operations.iterdir()):
-            if not entry.is_dir() or entry.name == locked:
-                continue
-            result = _handle_no_lock_dir(resolved, entry)
-            if result is not None:
-                results.append(result)
+    for entry in iter_recovery_operation_directories(resolved):
+        if entry.name == locked:
+            continue
+        journal = read_unlocked_operation_journal(resolved, entry)
+        if journal is None:
+            _remove_empty_recovery_operation_directory(entry)
+            continue
+        result = _handle_no_lock_dir(resolved, entry, journal)
+        if result is not None:
+            results.append(result)
 
     return tuple(results)

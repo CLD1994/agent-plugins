@@ -371,6 +371,87 @@ def test_business_after_state_survives_journal_durability_failure(
     assert (root / "pages/b.md").read_bytes() == new_b
 
 
+def _recovery_tree_bytes(directory: Path) -> dict[Path, bytes]:
+    return {
+        path.relative_to(directory): path.read_bytes()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("symlink", CheckCode.PATH_SYMLINK_ESCAPE.value),
+        ("regular-file", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+        ("invalid-id-directory", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+        ("nonempty-without-journal", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+    ],
+)
+def test_recover_unlocked_operation_directory_identity_is_no_follow(
+    operation_draft: Path,
+    tmp_path: Path,
+    case: str,
+    expected_code: str,
+) -> None:
+    """recover 不跳过非法 operation 子项，也不读取链接目标。"""
+    root = operation_draft
+    operations = root / ".draft/operations"
+    entry = operations / ("a" * 32 if case != "invalid-id-directory" else "not-an-id")
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel.write_bytes(b"outside")
+    if case == "symlink":
+        entry.symlink_to(sentinel)
+    elif case == "regular-file":
+        entry.write_bytes(b"not a directory")
+    else:
+        entry.mkdir()
+        if case == "invalid-id-directory":
+            (entry / "sentinel").write_bytes(b"inside")
+        else:
+            (entry / "unexpected").write_bytes(b"inside")
+
+    before = _recovery_tree_bytes(operations) if operations.is_dir() else {}
+    sentinel_before = sentinel.read_bytes()
+    for _ in range(2):
+        with pytest.raises(DraftError) as caught:
+            recover(root)
+        assert caught.value.code == expected_code
+        assert caught.value.paths == (entry,)
+        assert _recovery_tree_bytes(operations) == before
+        assert sentinel.read_bytes() == sentinel_before
+
+
+def test_recover_removes_only_proven_empty_operation_directory(operation_draft: Path) -> None:
+    root = operation_draft
+    entry = root / ".draft/operations" / ("b" * 32)
+    entry.mkdir()
+
+    recover(root)
+
+    assert not entry.exists()
+
+
+def test_recover_preserves_nonempty_operation_directory_without_journal(
+    operation_draft: Path,
+) -> None:
+    root = operation_draft
+    entry = root / ".draft/operations" / ("c" * 32)
+    entry.mkdir()
+    artifact = entry / "unexpected"
+    artifact.write_bytes(b"inside")
+    before = _recovery_tree_bytes(entry)
+
+    with pytest.raises(DraftError) as caught:
+        recover(root)
+
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    assert caught.value.paths == (entry,)
+    assert _recovery_tree_bytes(entry) == before
+
+
 def test_journal_operation_id_must_match_directory(operation_draft: Path) -> None:
     root = operation_draft
     directory_id = "1" * 32
