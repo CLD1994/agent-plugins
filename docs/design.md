@@ -491,7 +491,7 @@ revision 与 SHA-256，一致则补原成功终态，不一致则停止并保留
 `link_index_updating` 后不回滚业务结果，不分配新的 revision；恢复只清理当前 operation
 的 staging 文件，不使用通配符触碰其他 operation 或未知内部文件。
 
-锁不因为“时间过去很久”就自动判为陈旧。锁指向合法操作日志时按日志恢复；锁指向缺失或损坏的日志时报告客观损坏并保留现场，不能擅自解锁。没有锁的 `allocating` 操作目录尚未取得写权限，可以作为未开始操作清理；预分配在初始日志落盘前崩溃遗留的空操作目录同样没有授权，只能作为未关联分配残留清理，不能被后续操作复用。没有锁却声称已经进入 `prepared` 或写入阶段的日志属于矛盾状态，必须停止检查。这样 Codex 和 Claude Code 看到的是同一份可恢复事实，不需要访问对方的平台数据目录。
+锁不因为“时间过去很久”就自动判为陈旧。锁指向合法操作日志时按日志恢复；锁指向缺失或损坏的日志时报告客观损坏并保留现场，不能擅自解锁。没有锁只表示候选尚未被当前命令观察到持锁，不授予写入、清理或 phase transition 权限。发现 `allocating` 日志或预分配崩溃留下的空 operation 目录后，恢复器必须先取得匹配 operation lock，在锁内重读并确认当前事实；前者才可转为 `rolled_back` 并清理授权材料，后者才可作为 benign allocation residue 删除且不得复用。没有锁却声称已经进入 `prepared` 或写入阶段的日志属于矛盾状态，必须停止检查。这样 Codex 和 Claude Code 看到的是同一份可恢复事实，不需要访问对方的平台数据目录。
 
 `check` 对 `candidate` 与 `registered` 使用同一协议并始终完整扫描；CLI 可以机会式维护链接索引，但不修改 Markdown、marker，不推进回收生命周期，也不执行 recovery。底层纯 checker 的 `maintain_index=False` 保持只读。候选写命令按操作级门禁执行，不隐式运行完整检查。`adopt` 以 `kind="adopt"` 的普通操作日志承载登记事务：完整候选预检查可以机会式维护索引，索引性能降级 warning 不阻止登记；页面 errors、journal/制品矛盾、耐久失败或 recovery pending 阻止登记。marker 的 `candidate→registered` 替换作为唯一受管根 mutation 原子提交；marker 是最后一项受管根变更，替换后只核对 after 摘要并完成日志。恢复按 `OperationKind.ADOPT` 单向收敛：marker 仍是 before 时可在重新证明观察未变后前向完成，marker 已是 after 时只完成提交与清理，绝不回滚根身份。因此 `recover` 对任何受管根都按 marker、锁与操作日志判定，不猜测根状态。
 
@@ -545,7 +545,7 @@ trash
 恢复操作必须按以下顺序建立可构造的不变量：
 
 1. 先耐久创建关联恢复日志 `R`，阶段为 `allocating`，其 `metadata.restores_trash_operation` 必须存在并指向原回收操作 `T`；创建顺序遵守第 12 节的操作目录父项同步规则；
-2. 以 `R` 取得草稿写锁，并在锁内重新读取 `T`，确认它仍为 `trash_retained`、当前时间仍在窗口内、权威包及摘要有效且没有其他恢复认领；若写锁已经存在，本次尚未关联的 `R=allocating` 必须同步转为 `rolled_back`、清理分配材料，并返回 `operation.recovery_required`，不得把无法证明存活性的旧锁猜成普通忙碌状态；
+2. 以 `R` 取得草稿写锁，并在锁内重新读取 `T`，确认它仍为 `trash_retained`、当前时间仍在窗口内、权威包及摘要有效且没有其他恢复认领；若写锁已经存在，本次不得修改尚未被 `T` 认领的 `R=allocating`，而是保留它并返回 `operation.recovery_required`。后续 `recover` 只有在取得 R 的匹配 lock 后，才可在锁内把它收敛为 `rolled_back` 并清理分配材料；
 3. 把 `R.operation_id` 耐久写入 `T.metadata.restore_operation_id`，形成双向关联；只有这一步完成才算在期限前耐久认领；
 4. 使用已经存在的 `R` 生成并执行恢复计划，不能重新分配日志或丢弃反向关联；
 5. 保持 `R` 的同一把写锁，只有在 `R` 的完整 mutation 与 `T` 锚定的包证据逐段对应、恢复后文件仍匹配全部 after 摘要且 `R` 已耐久完成后，才能把 `T` 转为 `rolled_back`，清理权威包与恢复材料，最后释放锁。
