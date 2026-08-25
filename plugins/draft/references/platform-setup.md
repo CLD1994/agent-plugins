@@ -215,7 +215,7 @@ OSError 必须在最窄文件操作边界转换为稳定错误码并保留异常
 草稿结构（领域与操作退出码）：
 
 - 结构命令提示 `operation.recovery_required` -> `uvx --isolated --from "<skill_root>/scripts/runtime" draft recover ROOT`。恢复只读取草稿内的锁与操作日志，不依赖运行模式。
-- `trash` 把页面落地为 7 天保留态（`trash_retained`），不立即移交系统回收站；7 天内可 `draft restore ROOT OPERATION_ID` 恢复。到期后的系统回收站移交和最终清理由 `recover ROOT` 或普通结构写命令惰性推进（24 小时节流，30 天后最终清理），Agent 不需要维护计时器。
+- `trash` 把页面落地为 7 天保留态（`trash_retained`），不立即移交系统回收站；7 天内可 `draft restore ROOT OPERATION_ID` 恢复。到期后的系统回收站移交和最终清理只由允许的普通结构写命令前置推进（24 小时节流，30 天后最终清理），Agent 不需要维护计时器；`recover ROOT` 只收敛 recovery pending operation，不推进 retained trash 生命周期。
 - 普通投递明确失败只产生警告并继续原命令；状态损坏（`operation.inconsistent_state` 等）才停止写入。`restore` 回滚退出 3、`ok=false`，权威包仍保留，不要报告"已恢复"。
 - `recover` 报告外部修改 -> 有人在操作期间编辑了受管理文件；工具保留现场，由你人工决定取舍，不要删除锁或日志目录。
 - 钩子未注入信封 -> 确认宿主已信任并登记该插件钩子（安装后重载/重启过会话）、当前会话已 bind 过；未绑定会话只会看到 session_id 一行。
