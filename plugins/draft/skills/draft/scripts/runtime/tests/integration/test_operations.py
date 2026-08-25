@@ -235,6 +235,44 @@ def write_trash_journal(
     return journal_dir
 
 
+def write_restore_phase_journal(
+    root: Path,
+    operation_id: str,
+    phase: OperationPhase,
+    *,
+    metadata: dict[str, str] | None = None,
+) -> Path:
+    """写入合法 restore phase journal，用于无锁 recover 分派测试。"""
+    journal_dir = root / ".draft/operations" / operation_id
+    journal_dir.mkdir(parents=True)
+    payload: dict[str, object] = {
+        "journal_version": JOURNAL_VERSION,
+        "operation_id": operation_id,
+        "kind": OperationKind.RESTORE.value,
+        "phase": phase.value,
+        "root_state": "registered",
+        "observations": [],
+        "mutations": [],
+        "remove_empty_directories": [],
+        "metadata": {} if metadata is None else metadata,
+    }
+    if phase is OperationPhase.LINK_INDEX_UPDATING:
+        payload["link_index_revision"] = "1"
+    elif phase is OperationPhase.LINK_INDEX_PUBLISHED:
+        payload.update(
+            link_index_revision="1",
+            link_index_result="published",
+            link_index_sha256="a" * 64,
+        )
+    elif phase is OperationPhase.LINK_INDEX_REBUILD_REQUIRED:
+        payload.update(
+            link_index_revision="1",
+            link_index_result="rebuild_required",
+        )
+    (journal_dir / "journal.json").write_text(json.dumps(payload), encoding="utf-8")
+    return journal_dir
+
+
 def test_version_one_journal_is_explicitly_unsupported(operation_draft: Path) -> None:
     path = write_raw_journal(operation_draft, version=1)
     with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_VERSION_UNSUPPORTED.value):
@@ -897,6 +935,64 @@ def test_no_lock_allocating_orphan_is_cleaned(operation_draft: Path) -> None:
 
     assert result.phase == "completed"
     assert not journal_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        OperationPhase.PREPARED,
+        OperationPhase.APPLYING,
+        OperationPhase.VALIDATING,
+        OperationPhase.ROLLING_BACK,
+        OperationPhase.LINK_INDEX_UPDATING,
+        OperationPhase.LINK_INDEX_PUBLISHED,
+        OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
+    ],
+)
+def test_no_lock_restore_nonterminal_phase_is_inconsistent(
+    operation_draft: Path, phase: OperationPhase
+) -> None:
+    root = operation_draft
+    journal_dir = write_restore_phase_journal(root, "2" * 32, phase)
+    before = {
+        path.relative_to(journal_dir): path.read_bytes()
+        for path in journal_dir.rglob("*")
+        if path.is_file()
+    }
+
+    with pytest.raises(DraftError) as caught:
+        recover(root)
+
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    after = {
+        path.relative_to(journal_dir): path.read_bytes()
+        for path in journal_dir.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_no_lock_unlinked_restore_allocating_is_cleaned(operation_draft: Path) -> None:
+    journal_dir = write_restore_phase_journal(operation_draft, "3" * 32, OperationPhase.ALLOCATING)
+
+    recover(operation_draft)
+
+    assert not journal_dir.exists()
+
+
+@pytest.mark.parametrize("phase", [OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK])
+def test_no_lock_restore_terminal_journal_is_preserved(
+    operation_draft: Path, phase: OperationPhase
+) -> None:
+    journal_dir = write_restore_phase_journal(
+        operation_draft, "4" * 32, phase, metadata={"restores_trash_operation": "5" * 32}
+    )
+    journal_path = journal_dir / "journal.json"
+    before = journal_path.read_bytes()
+
+    recover(operation_draft)
+
+    assert journal_path.read_bytes() == before
 
 
 def test_lock_with_missing_journal_is_preserved(operation_draft: Path) -> None:
@@ -2503,8 +2599,10 @@ def test_no_lock_allocating_with_unknown_content_is_inconsistent(
     unknown = journal_dir / "unknown.txt"
     unknown.write_text("unknown\n", encoding="utf-8")
 
-    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value) as caught:
         recover(root)
+
+    assert caught.value.paths == (journal_dir,)
 
     assert unknown.is_file()
 

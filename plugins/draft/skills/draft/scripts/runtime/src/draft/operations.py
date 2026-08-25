@@ -4723,7 +4723,7 @@ def recover_unlocked_operation(root: Path, journal: Journal) -> None:
         known_names = {"journal.json", "originals", "staged"}
         extra = [path for path in journal.directory.iterdir() if path.name not in known_names]
         if extra:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, extra[0])
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
         _clean_recovery_copies(journal)
         operation_journal_path(root, journal.operation_id).unlink()
         journal.directory.rmdir()
@@ -4736,8 +4736,16 @@ def recover_unlocked_operation(root: Path, journal: Journal) -> None:
     ):
         # 无锁中间/索引/已提交 trash phase 表示锁在不应释放的阶段丢失，必须保留证据。
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-    # completed / rolled_back / trash_retained / trash_handoff_pending：终态或等待态，
-    # 只保留审计，不在无锁入口推进生命周期。
+    if journal.phase in (
+        OperationPhase.COMPLETED,
+        OperationPhase.ROLLED_BACK,
+        OperationPhase.TRASH_RETAINED,
+        OperationPhase.TRASH_HANDOFF_PENDING,
+    ):
+        # 终态或等待态只保留审计，不在无锁入口推进生命周期。
+        return
+    # 显式白名单之外的当前或未来 phase 都必须失败关闭。
+    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
 
 
 def recover(root_path: Path) -> OperationResult:
@@ -4774,16 +4782,16 @@ def recover(root_path: Path) -> OperationResult:
             # journal 与 pending 并存：pending 是更新的完整日志，先发布。
             resolve_journal_pending(journal_path)
         journal = read_journal(journal_path)
-        if journal.kind is OperationKind.RESTORE and journal.phase is OperationPhase.ALLOCATING:
-            if "restores_trash_operation" in journal.metadata:
-                # 关联恢复日志必须继续存在：无锁放弃为 rolled_back，保留审计事实。
-                _clean_recovery_copies(journal)
-                write_journal(_with_phase(journal, OperationPhase.ROLLED_BACK))
-                continue
-        elif journal.kind is not OperationKind.RESTORE:
-            recover_unlocked_operation(root, journal)
-        # restore 的其他 phase 由 trash_lifecycle 读取 R/T 关联后分类；普通 terminal/pending
-        # phase 在这里仅保留审计。
+        if (
+            journal.kind is OperationKind.RESTORE
+            and journal.phase is OperationPhase.ALLOCATING
+            and "restores_trash_operation" in journal.metadata
+        ):
+            # 关联恢复日志必须继续存在：无锁放弃为 rolled_back，保留审计事实。
+            _clean_recovery_copies(journal)
+            write_journal(_with_phase(journal, OperationPhase.ROLLED_BACK))
+            continue
+        recover_unlocked_operation(root, journal)
     return OperationResult(
         operation_id="", kind="recover", phase=OperationPhase.COMPLETED, changed_paths=()
     )
