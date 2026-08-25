@@ -882,7 +882,7 @@ uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff format
 - 批量推进中前项成功、当前项损坏时公开返回前项结果和停止位置，后续项保持完全未触碰；同一失败发生在结构写前置推进时，请求的结构写不开始；
 - 当前、未知和非法 `format_version` 与 `journal_version`，以及候选检查与临时态复核都通过后 `adopt` 才发布最终 `draft.json`；
 - `journal_version=4` 的链接索引 phase/字段矩阵、`published`/`rebuild_required` authority、revision/SHA-256/flag 一致性、完整 Markdown 摘要新鲜度和目录节点快照；
-- notification 的固定 `files_changed_notification` 信封、candidate/registered 根、无路径清单、已有锁吸收和非预期异常边界；`check`、`query page`、`query backlinks` 的机会式维护及完整事实回退；`query links`、无关 query、dry-run、init 和 recover 的内部无写入边界；
+- notification 的固定 `files_changed_notification` 信封、candidate/registered 根、无路径清单、已有锁吸收和非预期异常边界；`check`、`query page`、`query backlinks` 的机会式维护及完整事实回退；`query links`、无关 query、dry-run 和 init 不写索引，以及 recover 只收敛已有 pending operation、不触发独立索引维护或新 revision；
 - 索引发布/flag 降级 warning 保留业务成功、journal durability failure 退出 `3` 并保留现场、adopt 对 warning 与内部状态错误的不同分类；
 - `link_index_updating`、`link_index_published` 和 `link_index_rebuild_required` 各恢复窗口，以及 recover 不推进 retained trash 生命周期；
 - `platform` 从插件 CLI、模型、JSON 和路径中完全删除，文件名为原始 `session_id` 的 SHA-256，payload 错配时拒绝返回 root；binding 不再保存 `skill_name` 或 `skill_digest`；

@@ -58,7 +58,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 - 除 `init` 外，需要草稿根的命令统一使用可选 `--root ROOT`，缺省回退到绝对 `DRAFT_ROOT`，再回退到物理 `pwd` 祖先发现；`init` 只接受位置 `ROOT`。
 - `SOURCE`、`TARGET`、`PAGE`、`CHILD`、`HUB` 是草稿根内规范相对页面路径（如 `pages/a.md`、`pages/hub/index.md`），不接受目录别名。
 - `check` 对 `candidate` 与 `registered` 使用同一检查协议并始终完整扫描；CLI 可以机会式维护内部 link-index journal、制品和 flag，但不修改 Markdown、marker 或回收生命周期。底层纯 checker 的 `maintain_index=False` 只表示内部只读边界，不是 CLI 契约。
-- `notify files-changed --root ROOT` 适用于 candidate 与 registered 根，是外部批量编辑稳定后的可选后置通知；它不接收路径、变更类型、rename map 或 stdin 清单，也不支持 `--dry-run`。成功退出码为 `0`，JSON 固定为 `{"result_type":"files_changed_notification"}`，不返回 revision、warning、变化文件数或消费者状态；已有锁或已分类的索引维护故障仍表示通知送达。
+- `notify files-changed --root ROOT` 适用于 candidate 与 registered 根，是外部批量编辑稳定后的可选后置通知，不是索引进入 `fresh` 的必要前置，也不是故障恢复命令；它不接收路径、变更类型、rename map 或 stdin 清单，也不支持 `--dry-run`。成功退出码为 `0`，JSON 固定为 `{"result_type":"files_changed_notification"}`，不返回 revision、warning、变化文件数或消费者状态；已有锁或已分类的索引维护故障仍表示通知送达。
 - 结构写命令的 `--dry-run` 使用相同事实和计划边界，但不创建 journal、revision、索引制品或 flag。
 
 ## 第一性边界
@@ -113,7 +113,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 ## 回收与恢复
 
 - `trash` 把页面和权威删除包落地为 7 天保留态（`trash_retained`），不立即移交系统回收站；有其他入站引用时命令拒绝并列出阻碍，先人工解除或改指再回收。
-- `trash` 后 7 天内可 `draft restore ROOT OPERATION_ID` 恢复页面；到期后的系统回收站移交和最终清理由允许的已登记命令前置推进，Agent 不需要维护计时器。`draft recover ROOT` 只按 journal 证据收敛 recovery pending operation，不推进 retained trash 的到期、移交或清理。索引阶段中，`link_index_updating` 前向进入 `link_index_rebuild_required`；`link_index_published` 验证目标 revision/SHA-256 后补原终态；`link_index_rebuild_required` 尽力补 flag 后补原终态。不分配新 revision，也不因派生缓存故障回滚已验证业务内容。最终清理（`trash_purge_committed`）只在到达清理期限后最后一次投递明确失败时发生，是永久删除授权。
+- `trash` 后 7 天内可 `draft restore ROOT OPERATION_ID` 恢复页面；到期后的系统回收站移交和最终清理由允许的已登记命令前置推进，Agent 不需要维护计时器。`draft recover ROOT` 只按 journal 证据收敛 recovery pending operation，不推进 retained trash 的到期、移交或清理。普通 stale 或已耐久降级的链接索引由可选 notification、`check`、`query page` 或 `query backlinks` 根据当前根事实机会式维护，不属于 `recover`。索引阶段中，`link_index_updating` 前向进入 `link_index_rebuild_required`；`link_index_published` 验证目标 revision/SHA-256 后补原终态；`link_index_rebuild_required` 尽力补 flag 后补原终态。不分配新 revision，也不因派生缓存故障回滚已验证业务内容。最终清理（`trash_purge_committed`）只在到达清理期限后最后一次投递明确失败时发生，是永久删除授权。
 - `restore` 回滚不是成功：恢复未完成时 `exit 3`、JSON `ok=false`（`result_type=restore`），权威删除包仍保留；JSON 不暴露内部 phase，遇到 `exit 3` 时不要报告"已恢复"。
 - 移交明确失败只产生警告并继续原命令；状态损坏（`operation.inconsistent_state` 等）才停止写入。索引发布失败但已耐久记录 `link_index.rebuild_required` 时，业务结果仍成功，退出码为 `0`，并返回索引 warning；`link_index.rebuild_flag_update_failed` 同样只是 warning。journal 结果无法耐久写入时返回 operation error，退出码为 `3`，保留锁和现场供 `recover` 处理。结构命令提示需要恢复时，先运行 `draft recover ROOT` 做机械恢复，不要删除锁或日志目录；恢复结果无法解释或需要取舍时再停止并询问用户（见硬停止条件）。
 - `.draft/` 下的操作日志、权威删除包和锁是工具内部状态，绝不手工编辑。
