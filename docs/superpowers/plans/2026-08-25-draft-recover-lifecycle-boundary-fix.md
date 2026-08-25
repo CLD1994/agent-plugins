@@ -443,10 +443,241 @@
   git commit -m "fix(draft): preserve unlocked restore classification"
   ```
 
+### 任务 6：让未关联 restore 的无锁放弃在清理成功后才终态化
+
+**文件：**
+- 修改：`plugins/draft/skills/draft/scripts/runtime/src/draft/trash_lifecycle.py:617-632`
+- 测试：`plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash_lifecycle.py:974-1016`
+
+**接口：**
+- 输入：无锁、`kind=restore`、`phase=allocating`、无 mutation 且没有 trash 反向关联的
+  `Journal`
+- 输出：成功时清除已授权恢复副本、耐久写 `rolled_back` 并返回对应 `OperationResult`；
+  任何清理验证失败时不修改 journal、恢复副本或受管内容
+
+放弃顺序决策表：
+
+| 恢复副本事实 | 动作 | 可观察结果 |
+| --- | --- | --- |
+| `originals`/`staged` 缺失或只含已登记且摘要匹配的副本 | 清副本，再写 `rolled_back` | journal 为终态，第二次 recover 不产生额外副作用 |
+| 任一目录有未知成员、链接、错误类型或摘要不符 | 停止 | `operation.inconsistent_state`；journal 仍为 `allocating`；树字节不变；第二次调用报同一错误 |
+| 清理成功但终态 journal 写入失败 | 停止 | 保留 `allocating` journal；后续 recover 可幂等重试写终态 |
+
+- [ ] **步骤 1：写失败顺序 RED**
+
+  在 `test_trash_lifecycle.py` 构造无锁、未关联 restore `allocating` journal，在其
+  `originals/` 写入未登记的 `unexpected.bin`；保存 operation 目录所有文件 bytes。连续两次
+  调用 `recover_interrupted_operations(root)`，每次都断言如下：
+
+  ```python
+  def tree_bytes(directory: Path) -> dict[Path, bytes]:
+      return {
+          path.relative_to(directory): path.read_bytes()
+          for path in directory.rglob("*")
+          if path.is_file()
+      }
+
+  with pytest.raises(DraftError) as caught:
+      recover_interrupted_operations(root)
+  assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+  assert read_journal(journal_path).phase is OperationPhase.ALLOCATING
+  assert tree_bytes(journal.directory) == before
+  ```
+
+  同一组增加无副本的成功用例：调用后 `read_journal(journal_path).phase` 为
+  `ROLLED_BACK`，且第二次调用不改 journal bytes。夹具不创建 trash 反向关联，避免把
+  R/T 协调状态当成无锁孤儿分支。再用 `monkeypatch` 在成功清理后让
+  `draft.trash_lifecycle.write_journal` 抛 `DraftError(\"operation.durability_failed\")`：第一次
+  必须保留 `allocating` journal，撤销 stub 后第二次调用必须写成 `rolled_back`，证明清理与
+  journal 写入之间的失败不会被终态跳过掩盖。
+
+- [ ] **步骤 2：运行 RED**
+
+  ```bash
+  uv run --project plugins/draft/skills/draft/scripts/runtime --locked pytest \
+    plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash_lifecycle.py \
+    -q -k 'unlinked_restore or orphan_restore'
+  ```
+
+  预期：未知副本用例当前第一次会把 journal 写为 `rolled_back` 后才报错，故 phase/tree
+  断言 FAIL；成功用例可为绿，不得把它作为 RED 证据。
+
+- [ ] **步骤 3：只调换孤儿 restore 的两个耐久动作**
+
+  在 `_handle_no_lock_dir` 的未关联 restore allocating 分支中先调用
+  `clean_recovery_copies(journal)`，其成功返回后才执行
+  `write_journal(with_phase(journal, OperationPhase.ROLLED_BACK))`。保持现有 R/T 反向关联
+  判定、返回值与错误码；不要把清理失败解释成终态、不要清理未知顶层内容、不要新增
+  catch-and-continue 分支。
+
+- [ ] **步骤 4：运行 GREEN 与定向静态检查**
+
+  ```bash
+  uv run --project plugins/draft/skills/draft/scripts/runtime --locked pytest \
+    plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash_lifecycle.py -q
+  uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff check \
+    plugins/draft/skills/draft/scripts/runtime/src/draft/trash_lifecycle.py \
+    plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash_lifecycle.py
+  ```
+
+  预期：全部 PASS；随后运行 strict Pyright，必须为 0 errors。
+
+### 任务 7：统一无锁 operation 目录身份扫描与 journal 读取
+
+**文件：**
+- 修改：`plugins/draft/skills/draft/scripts/runtime/src/draft/operations.py:821-833,4751-4795`
+- 修改：`plugins/draft/skills/draft/scripts/runtime/src/draft/trash_lifecycle.py:592-664,825-834`
+- 测试：`plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py`
+- 测试：`plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash_lifecycle.py`
+
+**接口：**
+- 新增：`iter_recovery_operation_directories(root: Path) -> tuple[Path, ...]`
+- 新增：`read_unlocked_operation_journal(root: Path, entry: Path) -> Journal | None`
+- 消费者：`operations.recover`、`recover_interrupted_operations` 与 `_restore_linked_back`
+
+目录扫描决策表：
+
+| `.draft/operations` 或子项状态 | 动作 | 错误/副作用 |
+| --- | --- | --- |
+| operations 目录不存在 | 返回空元组 | 无副作用 |
+| operations 不是目录 | 停止 | `operation.inconsistent_state`，保留现场 |
+| 子项是符号链接（含悬空、指向文件或目录） | 停止 | `path.symlink_escape`，不读取目标 |
+| 子项不是目录，或目录名不是 32 位小写十六进制 ID | 停止 | `operation.inconsistent_state`，保留现场 |
+| 合法 ID 的空目录且没有 journal/pending | 仅由顶层恢复循环删除空目录 | 不复用 ID；重复调用稳定 |
+| 合法 ID 的非空目录缺 journal/pending | 停止 | `operation.inconsistent_state`，树字节不变 |
+| journal 或 pending 节点类型错误/解析错误 | 停止 | 既有 `operation.journal_corrupt` 语义与路径 |
+| 合法当前 journal | 解析并交现有 phase 分派 | 不在扫描器复制 phase 规则 |
+
+- [ ] **步骤 1：为两个公开入口写共享身份 RED 矩阵**
+
+  在两个集成测试文件分别覆盖 `operations.recover` 和
+  `recover_interrupted_operations`。每个用例创建独立 root，参数化下列子项，并在失败后
+  再调用一次：
+
+  ```python
+  cases = [
+      ("symlink", CheckCode.PATH_SYMLINK_ESCAPE.value),
+      ("regular-file", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+      ("invalid-id-directory", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+      ("nonempty-without-journal", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+  ]
+  ```
+
+  symlink 指向根外目录并写入 sentinel；断言两次失败的 code/path 一致且 sentinel、操作
+  目录 tree bytes 均不变。另为合法 ID 空目录断言两个入口都会删除它；为合法 ID 非空无
+  journal 目录断言不会删除。不得只验证 `Path.is_dir()`，必须覆盖悬空链接和指向普通文件
+  的链接之一。
+
+- [ ] **步骤 2：运行 RED**
+
+  ```bash
+  uv run --project plugins/draft/skills/draft/scripts/runtime --locked pytest \
+    plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py \
+    plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash_lifecycle.py \
+    -q -k 'recovery_scan or no_lock_operation_directory'
+  ```
+
+  预期：至少 `operations.recover` 对链接/非目录或无 journal 目录的静默跳过断言 FAIL；
+  生命周期入口对链接指向文件或普通文件的静默跳过断言 FAIL。不得用损坏 journal 代替
+  目录身份 RED。
+
+- [ ] **步骤 3：实现共享 no-follow 扫描边界**
+
+  `iter_recovery_operation_directories` 必须先调用 `reject_symlink_components`，再用
+  `classify_node_or_error`（而不是 `Path.is_dir()`）分类 operations 目录与每个子项；它
+  只返回已验证为普通目录且名称已由 `validate_operation_id` 验证的子项。`iterdir` 的
+  `OSError` 映射为 `operation.inconsistent_state`，不得吞掉。对子项 ID 验证失败时，将
+  `DraftError` 映射为 path 指向该子项的 `operation.inconsistent_state`。
+
+  `read_unlocked_operation_journal` 只接收上述合法子项：journal 存在时先收敛合法 pending
+  再解析；journal 缺失且 pending 缺失时，只有确定目录为空才返回 `None`；非空目录报
+  `operation.inconsistent_state`。它不删除目录。顶层两个入口在得到 `None` 后用 `rmdir`
+  删除空目录，`rmdir` 失败也报 `operation.inconsistent_state`。`_restore_linked_back`
+  必须复用目录枚举器，继续把缺 journal 的非空兄弟作为不一致证据，不得为读取兄弟而清理它。
+
+- [ ] **步骤 4：替换两个入口的本地扫描循环**
+
+  `operations.recover` 与 `recover_interrupted_operations` 都按以下形状消费共享边界；保留
+  已有锁跳过、关联 restore allocating 和 phase 分派，不把它们移入扫描器：
+
+  ```python
+  for entry in iter_recovery_operation_directories(root):
+      journal = read_unlocked_operation_journal(root, entry)
+      if journal is None:
+          remove_empty_recovery_operation_directory(entry)
+          continue
+      # 既有 kind/phase 分派
+  ```
+
+  可以把 `remove_empty_recovery_operation_directory` 设为私有 helper；它只能 `rmdir` 已由
+  reader 证明为空的目录：
+
+  ```python
+  def _remove_empty_recovery_operation_directory(entry: Path) -> None:
+      try:
+          entry.rmdir()
+      except OSError as exc:
+          raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry) from exc
+  ```
+
+  不得引入递归删除、glob、目录名字符串拼接或按 `OperationKind` 复制 phase 清单。
+
+- [ ] **步骤 5：运行 GREEN、静态检查与提交**
+
+  ```bash
+  uv run --project plugins/draft/skills/draft/scripts/runtime --locked pytest \
+    plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py \
+    plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash_lifecycle.py -q
+  uv run --project plugins/draft/skills/draft/scripts/runtime --locked ruff check \
+    plugins/draft/skills/draft/scripts/runtime/src/draft/operations.py \
+    plugins/draft/skills/draft/scripts/runtime/src/draft/trash_lifecycle.py \
+    plugins/draft/skills/draft/scripts/runtime/tests/integration/test_operations.py \
+    plugins/draft/skills/draft/scripts/runtime/tests/integration/test_trash_lifecycle.py
+  ```
+
+  预期：全部 PASS；format check、strict Pyright 0 errors 与 `git diff --check` 通过。
+  只暂存本任务的四个 runtime 文件，提交信息为
+  `fix(draft): validate unlocked recovery directories`。
+
+### 任务 8：将已完成实施计划收敛为当前契约
+
+**文件：**
+- 修改：`docs/superpowers/plans/2026-08-25-draft-recover-lifecycle-boundary-fix.md`
+
+**接口：**
+- 输入：任务 1-7 已确认的恢复行为、`docs/design.md` 的权威协议与本轮 review notes
+- 输出：只描述当前有效恢复边界、决策表和验证命令的中文契约文档
+
+- [ ] **步骤 1：移除已完成过程表述**
+
+  将该文件改为当前契约，而不是历史执行记录：删除“当前实现会失败”、RED/GREEN 预期、
+  已完成任务的 commit 指令、修复前行为和要求执行者重现过去缺陷的复选框。不要只勾选
+  复选框保留旧叙事。历史审查过程只保留在 `docs/review-notes/` 与 progress ledger。
+
+- [ ] **步骤 2：保留可验证的当前行为**
+
+  文档必须保留以下当前决策：recover 与到期 lifecycle 分离；locked retained/pending/
+  committed cleanup 路由；无锁所有 kind 的 allocating/mid-write/index/terminal/pending
+  分类；目录身份与 journal 读取决策表；失败保留、重复执行与 network/Windows 验证边界。
+  验收只引用现存测试文件和当前门禁命令，不宣称尚未运行的平台已验证。
+
+- [ ] **步骤 3：验证并提交文档收口**
+
+  ```bash
+  rg -n '当前实现会|预期：FAIL|RED|GREEN|git commit -m|recover_draft' \
+    docs/superpowers/plans/2026-08-25-draft-recover-lifecycle-boundary-fix.md
+  git diff --check
+  git add docs/superpowers/plans/2026-08-25-draft-recover-lifecycle-boundary-fix.md
+  git commit -m "docs(draft): record recovery lifecycle contract"
+  ```
+
+  预期：检索无结果，diff check 通过；文档保持中文主体，代码标识符和命令保持原文。
+
 ## 自检
 
 - 规格覆盖：§13.5 的 recover/lifecycle 分离、§14 的 recover 只恢复已有 operation、无锁
-  phase、已开始 handoff 的恢复、提交后清理以及跨 kind 共享分派均映射到决策表和测试。
+  phase、已开始 handoff 的恢复、提交后清理、跨 kind 共享分派以及目录身份/失败重试均
+  映射到决策表和测试。
 - 占位符扫描：没有 TBD/TODO 或要求执行者自行选择语义的步骤。
 - 类型一致性：两个应用边界签名沿用现有实现；`_recover_locked_trash` 继续返回
   `TrashResult | None`，`recover_unlocked_operation` 不返回业务结果，调用方公开返回仍为
