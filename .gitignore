@@ -57,3 +57,9 @@ htmlcov/
 
 # Local review notes
 docs/review-notes
+
+# node js
+node_modules/
+
+# pnpm
+.pnpm-store/
