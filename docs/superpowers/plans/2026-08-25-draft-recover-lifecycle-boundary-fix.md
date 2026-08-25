@@ -39,8 +39,9 @@ kind、phase、锁 operation_id、journal 内容或节点类型不一致时，�
 
 ## 无锁 Operation
 
-无锁目录由 `recover_interrupted_operations` 分类。非 restore 日志统一交给
-`recover_unlocked_operation(root, journal)`，不在生命周期层复制 phase 清单。
+`operations.recover` 与 `recover_interrupted_operations` 共享无锁目录分类边界。非
+restore 日志统一交给 `recover_unlocked_operation(root, journal)`，不在生命周期层复制
+phase 清单。
 
 | kind/phase | 动作 | 结果与失败语义 |
 | --- | --- | --- |
@@ -81,10 +82,10 @@ kind、phase、锁 operation_id、journal 内容或节点类型不一致时，�
 符号链接。`remove_empty_recovery_operation_directory(root, entry)` 在 `rmdir` 前同样
 从该重建路径取得目录并执行 no-follow 校验。
 
-因此，枚举完成后若 `operations/<合法 ID>` 被替换为指向 root 外部的符号链接，任何
-后续读取、pending 收敛、空目录检查或删除都返回精确的
-`CheckCode.PATH_SYMLINK_ESCAPE.value`，不得读取或修改 root 外内容。这个检查位于
-所有外部目标读取之前。
+因此，在任一次后续 pending 收敛、journal 读取、空目录检查或删除开始前，若
+`operations/<合法 ID>` 已被替换为指向 root 外部的符号链接，相应的重建路径检查返回
+精确的 `CheckCode.PATH_SYMLINK_ESCAPE.value`，不得读取或修改 root 外内容。这个检查位于
+该次操作的所有外部目标读取之前。
 
 ## 职责边界
 
