@@ -1278,10 +1278,10 @@ def _due_package_root(tmp_path: Path) -> Path:
     return root
 
 
-def test_check_is_read_only_and_does_not_advance_due_package(
+def test_check_does_not_advance_due_package(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """check 严格只读：已到期包只作为持久化事实报告，不触发回收生命周期推进。"""
+    """check 不推进回收生命周期：已到期包只作为持久化事实报告。"""
     root = _due_package_root(tmp_path)
     calls: list[str] = []
     monkeypatch.setattr("draft.trash_lifecycle._default_handoff", calls.append)
