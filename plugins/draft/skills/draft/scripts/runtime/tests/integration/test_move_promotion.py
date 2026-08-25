@@ -43,7 +43,7 @@ def test_move_promotes_unmanaged_file_and_rewrites_all_linkers(
 
     assert not (root / "00-background.md").exists()
     promoted = (root / "pages/00-background.md").read_text(encoding="utf-8")
-    assert "[站内](a.md)" in promoted          # 出站：新基址下 pages 内相对
+    assert "[站内](a.md)" in promoted  # 出站：新基址下 pages 内相对
     assert "[本地](../sibling.md)" in promoted  # 出站：指向留下的未受管理文件
     page_a = (root / "pages/a.md").read_text(encoding="utf-8")
     assert "[旧稿](00-background.md)" in page_a  # 受管理链接者
@@ -270,7 +270,7 @@ def test_move_rejects_and_names_undecodable_unmanaged_file(
 
     assert caught.value.code == "structure.dirty"
     assert "gbk-legacy.md" in caught.value.details
-    assert (root / "stray.md").exists()          # 拒绝后零写入
+    assert (root / "stray.md").exists()  # 拒绝后零写入
     assert not (root / "pages/stray.md").exists()
 
 
@@ -300,9 +300,7 @@ def test_move_promotion_recovers_after_interrupt(
     root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
     (root / "stray.md").write_text("正文 [站内](index.md)。\n", encoding="utf-8")
 
-    def _interrupted_apply_delete(
-        root: Path, target: Path, *, expected_digest: str
-    ) -> None:
+    def _interrupted_apply_delete(root: Path, target: Path, *, expected_digest: str) -> None:
         raise OSError("注入中断")
 
     monkeypatch.setattr("draft.operations._apply_delete", _interrupted_apply_delete)
@@ -347,8 +345,8 @@ def test_move_directory_promotes_tree_and_leaves_non_markdown(
     # 图片原地留下：出站图片链接按新基址重算回留存的图片位置（规格 §11.2）。
     assert "[图](../../../legacy-notes/topic/img.png)" in moved_hub.read_text(encoding="utf-8")
     assert (root / "pages/legacy-notes/topic/a.md").is_file()
-    assert (
-        "[枢纽](index.md)" in (root / "pages/legacy-notes/topic/a.md").read_text(encoding="utf-8")
+    assert "[枢纽](index.md)" in (root / "pages/legacy-notes/topic/a.md").read_text(
+        encoding="utf-8"
     )
     assert (legacy / "topic" / "img.png").is_file()  # 非 .md 原地留下
     assert not (legacy / "topic" / "index.md").exists()
@@ -406,13 +404,9 @@ def test_move_managed_directory_reparents_physically(
         "> 父主题：[根索引](../../index.md)\n\n正文。\n"
         "\n## 子主题\n\n- [页面 A](a.md)\n"
     )
-    page_a = (
-        "# 页面 A\n\n> 状态：`已确认：说明`\n>\n"
-        "> 父主题：[主题枢纽](index.md)\n\n正文。\n"
-    )
+    page_a = "# 页面 A\n\n> 状态：`已确认：说明`\n>\n> 父主题：[主题枢纽](index.md)\n\n正文。\n"
     hub_archive = (
-        "# 归档枢纽\n\n> 状态：`已确认：枢纽`\n>\n"
-        "> 父主题：[根索引](../../index.md)\n\n正文。\n"
+        "# 归档枢纽\n\n> 状态：`已确认：枢纽`\n>\n> 父主题：[根索引](../../index.md)\n\n正文。\n"
     )
     root = draft_factory(
         {
@@ -450,7 +444,7 @@ def test_move_rejects_conclusions_source_on_candidate(
         move_entries(root, ["conclusions.md"], "pages/conclusions.md")
 
     assert caught.value.code == "structure.protected"
-    assert (root / "conclusions.md").exists()          # 拒绝后零写入
+    assert (root / "conclusions.md").exists()  # 拒绝后零写入
     assert not (root / "pages/conclusions.md").exists()
 
 
@@ -466,7 +460,7 @@ def test_move_rejects_conclusions_source_in_batch(
 
     assert caught.value.code == "structure.protected"
     assert not (root / "pages/conclusions.md").exists()
-    assert not (root / "pages/a.md").exists()          # 批量中任一来源命中即拒绝整批
+    assert not (root / "pages/a.md").exists()  # 批量中任一来源命中即拒绝整批
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +603,7 @@ def test_move_directory_source_with_symlink_entry_rejects_batch(
         move_entries(root, ["legacy"], "pages")
 
     assert caught.value.code == CheckCode.PATH_SYMLINK_ESCAPE.value
-    assert (legacy / "index.md").exists()      # 整批拒绝，零写入
+    assert (legacy / "index.md").exists()  # 整批拒绝，零写入
 
 
 def test_move_empty_directory_source_reports_unknown_page(
@@ -646,7 +640,7 @@ def test_move_batch_remaps_cross_links_within_moved_set(draft_factory: DraftFact
     move_entries(root, ["a.md", "b.md"], "pages")
 
     moved_a = (root / "pages/a.md").read_text(encoding="utf-8")
-    assert "[乙](b.md)" in moved_a        # 同批同目录移动，相对形式不变且指向新位置
+    assert "[乙](b.md)" in moved_a  # 同批同目录移动，相对形式不变且指向新位置
     assert "[乙](pages/b.md)" not in moved_a
 
 
@@ -659,7 +653,7 @@ def test_move_preserves_anchors_in_rebased_links(draft_factory: DraftFactory) ->
     move_entries(root, ["src.md"], "pages/src.md")
 
     text = (root / "pages/src.md").read_text(encoding="utf-8")
-    assert "[节](../legacy/other.md#sec)" in text   # 锚点保留，路径按新基址重算
+    assert "[节](../legacy/other.md#sec)" in text  # 锚点保留，路径按新基址重算
 
 
 # ---------------------------------------------------------------------------
@@ -669,22 +663,16 @@ def test_move_preserves_anchors_in_rebased_links(draft_factory: DraftFactory) ->
 
 def test_move_managed_directory_source_parent_mismatch(draft_factory: DraftFactory) -> None:
     hub_topic = (
-        "# 主题枢纽\n\n> 状态：`已确认：枢纽`\n>\n"
-        "> 父主题：[根索引](../../index.md)\n\n正文。\n"
+        "# 主题枢纽\n\n> 状态：`已确认：枢纽`\n>\n> 父主题：[根索引](../../index.md)\n\n正文。\n"
     )
-    page_a = (
-        "# 页面 A\n\n> 状态：`已确认：说明`\n>\n"
-        "> 父主题：[主题枢纽](index.md)\n\n正文。\n"
-    )
+    page_a = "# 页面 A\n\n> 状态：`已确认：说明`\n>\n> 父主题：[主题枢纽](index.md)\n\n正文。\n"
     hub_archive = (
-        "# 归档枢纽\n\n> 状态：`已确认：枢纽`\n>\n"
-        "> 父主题：[根索引](../../index.md)\n\n正文。\n"
+        "# 归档枢纽\n\n> 状态：`已确认：枢纽`\n>\n> 父主题：[根索引](../../index.md)\n\n正文。\n"
     )
     # pages/other/x.md 声明父主题指向将被移走的 pages/topic/index.md；x 自身不移动，
     # 其物理父页（pages/other/index.md 位置的页面）不是枢纽移动后的位置 → 无法重写。
     page_x = (
-        "# 异页\n\n> 状态：`已确认：说明`\n>\n"
-        "> 父主题：[主题枢纽](../topic/index.md)\n\n正文。\n"
+        "# 异页\n\n> 状态：`已确认：说明`\n>\n> 父主题：[主题枢纽](../topic/index.md)\n\n正文。\n"
     )
     root = draft_factory(
         {
@@ -717,14 +705,8 @@ def test_move_closure_extension_does_not_leak_to_promote(draft_factory: DraftFac
         "- [主题](pages/topic.md)\n"
         "- [子页](pages/child.md)\n"
     )
-    topic = (
-        "# 主题\n\n> 状态：`待讨论`\n>\n"
-        "> 父主题：[根索引](../index.md)\n\n正文。\n"
-    )
-    child = (
-        "# 子页\n\n> 状态：`待讨论`\n>\n"
-        "> 父主题：[根索引](../index.md)\n\n正文。\n"
-    )
+    topic = "# 主题\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n\n正文。\n"
+    child = "# 子页\n\n> 状态：`待讨论`\n>\n> 父主题：[根索引](../index.md)\n\n正文。\n"
     root = draft_factory(
         {"index.md": index, "pages/topic.md": topic, "pages/child.md": child},
         root_state=RootState.CANDIDATE,

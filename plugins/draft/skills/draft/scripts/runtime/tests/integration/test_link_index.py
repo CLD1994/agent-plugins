@@ -260,9 +260,7 @@ def test_scan_known_document_with_stale_sha256_still_reparses(tmp_path: Path) ->
     from draft.link_index import IndexedFile, OutboundEdge
 
     path = Path("pages/a.md")
-    old_edge = OutboundEdge(
-        ResourceIdentity(ResourceKind.PAGE, "pages/old.md"), LinkSpan(0, 1)
-    )
+    old_edge = OutboundEdge(ResourceIdentity(ResourceKind.PAGE, "pages/old.md"), LinkSpan(0, 1))
     stale = IndexedFile(path=path, sha256="b" * 64, outbound=(old_edge,))
 
     scan = scan_link_index(root, baseline=None, known_documents=(stale,))
@@ -501,8 +499,7 @@ def test_second_mutation_converges_incrementally_to_next_revision(
     )
     move_entries(root, ["pages/a.md"], "pages/b.md")
     journals_after_first = {
-        path: path.read_bytes()
-        for path in (root / ".draft/operations").glob("*/journal.json")
+        path: path.read_bytes() for path in (root / ".draft/operations").glob("*/journal.json")
     }
 
     move_entries(root, ["pages/b.md"], "pages/c.md")

@@ -52,9 +52,7 @@ def decode_and_extract(raw: bytes) -> tuple[str, tuple[MarkdownLink, ...]] | Non
         return None
 
 
-def merged_blocking(
-    facts_blocking: Sequence[Path], closure: MoveClosure
-) -> tuple[Path, ...]:
+def merged_blocking(facts_blocking: Sequence[Path], closure: MoveClosure) -> tuple[Path, ...]:
     return tuple(sorted(set(facts_blocking) | set(closure.blocking)))
 
 
@@ -150,9 +148,7 @@ def _scan_entry(
                 continue
             if descendant.suffix != ".md":
                 continue
-            _scan_unmanaged_file(
-                root, descendant.relative_to(root), graph, unmanaged, blocking
-            )
+            _scan_unmanaged_file(root, descendant.relative_to(root), graph, unmanaged, blocking)
         return
     if not absolute.is_file() or absolute.suffix != ".md":
         return
@@ -213,6 +209,4 @@ def _scan_unmanaged_file(
         )
         for link in links
     )
-    unmanaged[relative] = UnmanagedFile(
-        text=text, references=references, sha256=sha256_bytes(raw)
-    )
+    unmanaged[relative] = UnmanagedFile(text=text, references=references, sha256=sha256_bytes(raw))

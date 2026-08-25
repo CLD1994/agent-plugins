@@ -1346,9 +1346,7 @@ def test_trash_projects_operation_index_warnings_to_index_warnings(
     result = trash_page(root, Path("pages/b.md"), now=DUE_NOW)
 
     assert result.phase is OperationPhase.TRASH_RETAINED
-    assert [warning.code for warning in result.index_warnings] == [
-        "link_index.rebuild_required"
-    ]
+    assert [warning.code for warning in result.index_warnings] == ["link_index.rebuild_required"]
     # trash 生命周期自己的 warning 与索引 warning 分离。
     assert result.warnings == ()
     assert (root / ".draft/link-index-rebuild-required.flag").exists()
@@ -1429,9 +1427,9 @@ def test_recover_does_not_advance_due_retained_package(
     root = _lazy_root(draft_factory)
     (root / "pages/c.md").write_text(LAZY_B.replace("乙", "丙"), encoding="utf-8")
     (root / "index.md").write_text(
-        (root / "index.md").read_text(encoding="utf-8").replace(
-            "- [乙](pages/b.md)", "- [乙](pages/b.md)\n- [丙](pages/c.md)"
-        ),
+        (root / "index.md")
+        .read_text(encoding="utf-8")
+        .replace("- [乙](pages/b.md)", "- [乙](pages/b.md)\n- [丙](pages/c.md)"),
         encoding="utf-8",
     )
 

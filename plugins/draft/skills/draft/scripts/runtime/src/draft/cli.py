@@ -879,14 +879,10 @@ def _dispatch(
 
         operands = [cast(str, value) for value in args.operands]
         if len(operands) < 2:
-            raise DraftError(
-                MOVE_OPERANDS_INVALID, details=("至少需要一个 SOURCE 和一个 TARGET",)
-            )
+            raise DraftError(MOVE_OPERANDS_INVALID, details=("至少需要一个 SOURCE 和一个 TARGET",))
         sources, target = operands[:-1], operands[-1]
         if target_kind_of(target) is TargetKind.FILE and len(sources) > 1:
-            raise DraftError(
-                MOVE_OPERANDS_INVALID, details=("文件目标只允许一个文件 SOURCE",)
-            )
+            raise DraftError(MOVE_OPERANDS_INVALID, details=("文件目标只允许一个文件 SOURCE",))
         if _is_dry_run(args):
             return _dry_run_write(
                 args,
@@ -1157,9 +1153,7 @@ def _dispatch(
         if result.reason is not None:
             payload["reason"] = result.reason.value
         if result.operation is not None:
-            payload["changed_paths"] = [
-                path.as_posix() for path in result.operation.changed_paths
-            ]
+            payload["changed_paths"] = [path.as_posix() for path in result.operation.changed_paths]
         else:
             payload["changed_paths"] = []
         if result.warnings:

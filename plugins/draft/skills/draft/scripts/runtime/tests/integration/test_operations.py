@@ -242,9 +242,7 @@ def test_version_one_journal_is_explicitly_unsupported(operation_draft: Path) ->
 
 
 @pytest.mark.parametrize("version", [3, "2"])
-def test_non_current_journal_version_is_rejected(
-    operation_draft: Path, version: object
-) -> None:
+def test_non_current_journal_version_is_rejected(operation_draft: Path, version: object) -> None:
     # version=None 由 write_raw_journal 默认取当前权威版本，不再表示损坏。
     path = write_raw_journal(operation_draft, version=version)
     with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_VERSION_UNSUPPORTED.value):
@@ -306,9 +304,10 @@ def test_business_after_state_survives_journal_durability_failure(
     root = operation_draft
     plan, _old_a, _old_b, new_a, new_b = two_write_plan(root)
 
-    with durability_observer_scope(FailingDurability({step: occurrence})), pytest.raises(
-        DraftError
-    ) as caught:
+    with (
+        durability_observer_scope(FailingDurability({step: occurrence})),
+        pytest.raises(DraftError) as caught,
+    ):
         execute_plan(plan)
 
     assert caught.value.code == CheckCode.OPERATION_DURABILITY_FAILED.value
@@ -1204,9 +1203,7 @@ def test_recover_without_link_index_result_still_cleans_planned_directories(
 # ---------------------------------------------------------------------------
 
 
-def crash_after_link_index_write(
-    monkeypatch: pytest.MonkeyPatch, phase: OperationPhase
-) -> None:
+def crash_after_link_index_write(monkeypatch: pytest.MonkeyPatch, phase: OperationPhase) -> None:
     """真实 writer 耐久写入目标索引 phase 后抛进程退出；只命中该 phase 的首次写入。"""
     import draft.operations as operations_module
 
@@ -1223,9 +1220,7 @@ def crash_after_link_index_write(
     monkeypatch.setattr(operations_module, "write_journal", write_then_crash)
 
 
-def crash_before_link_index_write(
-    monkeypatch: pytest.MonkeyPatch, phase: OperationPhase
-) -> None:
+def crash_before_link_index_write(monkeypatch: pytest.MonkeyPatch, phase: OperationPhase) -> None:
     """在目标索引 phase 的 journal 耐久写入前抛进程退出（副作用已发生、日志未推进）。"""
     import draft.operations as operations_module
 
@@ -1249,9 +1244,7 @@ def _persist_interrupted_operation(
     if phase is OperationPhase.LINK_INDEX_REBUILD_REQUIRED:
         import draft.link_index_maintenance as maintenance
 
-        def fail_scan(
-            _root: Path, baseline: object = None, known_documents: object = ()
-        ) -> object:
+        def fail_scan(_root: Path, baseline: object = None, known_documents: object = ()) -> object:
             raise DraftError("operation.index_update_failed", _root)
 
         monkeypatch.setattr(maintenance, "scan_link_index", fail_scan)

@@ -234,10 +234,7 @@ def test_backlinks_from_index_dedupes_and_sorts_sources() -> None:
 
 def test_backlinks_from_index_missing_target_is_empty() -> None:
     content = LinkIndexContent(files={}, backlinks={}, directories={})
-    assert (
-        backlinks_from_index(content, ResourceIdentity(ResourceKind.PAGE, "pages/none.md"))
-        == ()
-    )
+    assert backlinks_from_index(content, ResourceIdentity(ResourceKind.PAGE, "pages/none.md")) == ()
 
 
 def test_page_summary_injects_backlink_count() -> None:
@@ -348,9 +345,7 @@ def test_query_backlinks_uses_full_closure_when_degraded(mocker: MockerFixture) 
     from_index.assert_not_called()
     from_root.assert_called_once()
     assert payload["items"] == [{"page": "notes.md"}]
-    assert payload["warnings"] == [
-        {"code": "link_index.rebuild_required", "severity": "warning"}
-    ]
+    assert payload["warnings"] == [{"code": "link_index.rebuild_required", "severity": "warning"}]
     assert exit_code == 0
 
 
@@ -430,9 +425,7 @@ def test_maintain_link_index_for_query_fresh_reuses_published_baseline(
     )
     baseline = MagicMock()
     baseline.index = LinkIndexContent(files={}, backlinks={}, directories={})
-    mocker.patch(
-        "draft.link_index_maintenance.load_link_index_baseline", return_value=baseline
-    )
+    mocker.patch("draft.link_index_maintenance.load_link_index_baseline", return_value=baseline)
     commit = mocker.patch("draft.link_index_maintenance.commit_link_index_update")
     result = maintain_link_index_for_query(ROOT, graph, RootState.REGISTERED)
     assert result.index is baseline.index

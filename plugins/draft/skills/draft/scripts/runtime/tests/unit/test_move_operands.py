@@ -202,9 +202,7 @@ def test_validate_results_rejects_outside_namespace() -> None:
     graph = _graph_from_texts({Path("index.md"): _INDEX})
 
     with pytest.raises(DraftError) as caught:
-        validate_results(
-            graph, _request_for_validation({Path("s.md"): Path("notes/s.md")})
-        )
+        validate_results(graph, _request_for_validation({Path("s.md"): Path("notes/s.md")}))
     assert caught.value.code == "structure.invalid_target"
 
 
@@ -273,9 +271,7 @@ def test_validate_results_rejects_missing_parent() -> None:
 
     # 父页 pages/topic/index.md 无人占据 → missing_parent
     with pytest.raises(DraftError) as caught:
-        validate_results(
-            graph, _request_for_validation({Path("t/a.md"): Path("pages/topic/a.md")})
-        )
+        validate_results(graph, _request_for_validation({Path("t/a.md"): Path("pages/topic/a.md")}))
     assert caught.value.code == "structure.missing_parent"
 
 

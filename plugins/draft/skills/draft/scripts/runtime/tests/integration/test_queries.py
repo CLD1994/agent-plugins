@@ -486,9 +486,7 @@ def test_query_backlinks_equivalence_across_index_states(
     assert code == 0
     items = cast("list[dict[str, object]]", rebuild["items"])
     assert [item["page"] for item in items] == expected
-    assert rebuild["warnings"] == [
-        {"code": "link_index.rebuild_required", "severity": "warning"}
-    ]
+    assert rebuild["warnings"] == [{"code": "link_index.rebuild_required", "severity": "warning"}]
 
     # 恢复扫描后（rebuild_required 状态）查询发布并返回相同结果。
     code, recovered = run_json(args, capsys)
@@ -559,9 +557,7 @@ def test_query_backlinks_full_closure_equivalence_across_index_states(
     assert code == 0
     items = cast("list[dict[str, object]]", rebuild["items"])
     assert [item["page"] for item in items] == ["index.md", "notes.md", "pages/b.md"]
-    assert rebuild["warnings"] == [
-        {"code": "link_index.rebuild_required", "severity": "warning"}
-    ]
+    assert rebuild["warnings"] == [{"code": "link_index.rebuild_required", "severity": "warning"}]
 
     # 恢复扫描后发布并返回相同结果。
     code, recovered = run_json(args, capsys)
@@ -606,9 +602,7 @@ def test_query_page_backlink_count_full_closure_across_index_states(
     monkeypatch.undo()
     assert code == 0
     assert rebuild["backlink_count"] == 3
-    assert rebuild["warnings"] == [
-        {"code": "link_index.rebuild_required", "severity": "warning"}
-    ]
+    assert rebuild["warnings"] == [{"code": "link_index.rebuild_required", "severity": "warning"}]
 
 
 def test_query_backlinks_degraded_fallback_skips_undecodable_markdown(
@@ -628,9 +622,7 @@ def test_query_backlinks_degraded_fallback_skips_undecodable_markdown(
     assert code == 0
     items = cast("list[dict[str, object]]", payload["items"])
     assert [item["page"] for item in items] == ["index.md", "pages/b.md"]
-    assert payload["warnings"] == [
-        {"code": "link_index.rebuild_required", "severity": "warning"}
-    ]
+    assert payload["warnings"] == [{"code": "link_index.rebuild_required", "severity": "warning"}]
 
 
 def test_query_backlinks_journal_durability_failure_is_nonzero(

@@ -552,9 +552,7 @@ def load_generation_graph(root: Path, *, marker_state: MarkerState | None = None
     return _load_graph_with_conclusions(resolved, marker_state)
 
 
-def _load_graph_with_conclusions(
-    root: Path, marker_state: MarkerState | None
-) -> DraftGraph:
+def _load_graph_with_conclusions(root: Path, marker_state: MarkerState | None) -> DraftGraph:
     """专用容错加载：generated 时容忍缺失/损坏的结论页（可替换目标）。"""
     from draft.graph import load_graph_tolerant
 

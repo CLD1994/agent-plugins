@@ -108,18 +108,13 @@ class BenchmarkResult:
 
 @dataclass
 class _Observation:
-    scan_stats: list[LinkIndexScanStats] = field(
-        default_factory=list[LinkIndexScanStats]
-    )
+    scan_stats: list[LinkIndexScanStats] = field(default_factory=list[LinkIndexScanStats])
     journal_write_count: int = 0
     journal_write_bytes: int = 0
 
 
 def _marker_bytes() -> bytes:
-    return (
-        b'{"format_version":1,"root_state":"registered",'
-        b'"conclusions_state":"not_generated"}\n'
-    )
+    return b'{"format_version":1,"root_state":"registered","conclusions_state":"not_generated"}\n'
 
 
 def _write_dataset(root: Path, markdown_files: int, seed: int) -> None:
@@ -298,9 +293,7 @@ def _build_initial(root: Path) -> None:
 def _query_backlinks(root: Path) -> None:
     output = StringIO()
     with redirect_stdout(output):
-        exit_code = cli_main(
-            ["query", "backlinks", "--root", str(root), "doc-00001.md", "--json"]
-        )
+        exit_code = cli_main(["query", "backlinks", "--root", str(root), "doc-00001.md", "--json"])
     if exit_code != 0:
         raise RuntimeError(f"query backlinks exited with {exit_code}: {output.getvalue()}")
     try:
@@ -337,9 +330,7 @@ def _rebuild_then_recover(root: Path) -> None:
         maintenance_module.scan_link_index = original_scan
 
 
-def _scenario_action(
-    root: Path, scenario: Scenario, markdown_files: int
-) -> Callable[[], object]:
+def _scenario_action(root: Path, scenario: Scenario, markdown_files: int) -> Callable[[], object]:
     if scenario is Scenario.FIRST_BUILD:
         return lambda: maintain_link_index(root)
     if scenario is Scenario.FRESH_QUERY_BACKLINKS:
@@ -440,9 +431,7 @@ def run_benchmark_suite(
             for scenario in Scenario:
                 root = workspace / f"files-{count}" / scenario
                 results.append(
-                    run_benchmark_scenario(
-                        scenario, markdown_files=count, root=root, seed=seed
-                    )
+                    run_benchmark_scenario(scenario, markdown_files=count, root=root, seed=seed)
                 )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(

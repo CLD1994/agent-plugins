@@ -76,9 +76,7 @@ def map_sources(sources: Sequence[MoveSource], target: MoveTarget) -> dict[Path,
     for source in sources:
         if source.kind is SourceKind.DIRECTORY:
             for member in source.members:
-                results[member] = target.path / source.path.name / member.relative_to(
-                    source.path
-                )
+                results[member] = target.path / source.path.name / member.relative_to(source.path)
         else:
             results[source.path] = target.path / source.path.name
     return results

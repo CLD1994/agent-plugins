@@ -915,9 +915,13 @@ def _directory_snapshot(root: Path) -> dict[Path, tuple[DirectoryMember, ...]]:
             for name in sorted((*dirnames, *filenames)):
                 entry = directory_path / name
                 kind = (
-                    "directory" if entry.is_dir() and not entry.is_symlink() else
-                    "file" if entry.is_file() and not entry.is_symlink() else
-                    "symlink" if entry.is_symlink() else "other"
+                    "directory"
+                    if entry.is_dir() and not entry.is_symlink()
+                    else "file"
+                    if entry.is_file() and not entry.is_symlink()
+                    else "symlink"
+                    if entry.is_symlink()
+                    else "other"
                 )
                 members.append(DirectoryMember(name, kind))
             directories[relative] = tuple(members)

@@ -141,9 +141,7 @@ def test_generate_conclusions_cli_projects_publish_failure_warning(
 
     assert code == 0
     assert payload["generated"] is True
-    assert payload["warnings"] == [
-        {"code": "link_index.rebuild_required", "severity": "warning"}
-    ]
+    assert payload["warnings"] == [{"code": "link_index.rebuild_required", "severity": "warning"}]
     assert (root / "conclusions.md").is_file()
     assert (root / ".draft/link-index-rebuild-required.flag").is_file()
     journal_paths = tuple((root / ".draft/operations").glob("*/journal.json"))

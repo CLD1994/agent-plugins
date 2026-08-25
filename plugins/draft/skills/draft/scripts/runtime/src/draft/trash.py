@@ -596,9 +596,7 @@ def _build_restore_plan_impl(
     if sha256_file(resolved / parent_path) != parent_hash:
         raise DraftError("operation.validation_failed", parent_path, details=("restore_conflict",))
     if root_state is RootState.REGISTERED:
-        report = check_draft(
-            resolved, include_operation_state=False, marker_state=marker.state
-        )
+        report = check_draft(resolved, include_operation_state=False, marker_state=marker.state)
         if report.errors:
             codes = tuple(issue.code for issue in report.errors)
             raise DraftError("operation.validation_failed", resolved, details=codes)

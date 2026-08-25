@@ -917,9 +917,7 @@ def test_main_dispatch_os_error_returns_runtime_exit_code(
 
 
 def test_notify_files_changed_parser_has_no_path_operands() -> None:
-    args = cli.build_parser().parse_args(
-        ["notify", "files-changed", "--root", "/draft", "--json"]
-    )
+    args = cli.build_parser().parse_args(["notify", "files-changed", "--root", "/draft", "--json"])
     assert args.command == "notify"
     assert args.notify_command == "files-changed"
     assert not hasattr(args, "paths")
@@ -927,9 +925,7 @@ def test_notify_files_changed_parser_has_no_path_operands() -> None:
 
 def test_notify_parser_rejects_path_operands() -> None:
     with pytest.raises(SystemExit):
-        cli.build_parser().parse_args(
-            ["notify", "files-changed", "--root", "/draft", "pages/a.md"]
-        )
+        cli.build_parser().parse_args(["notify", "files-changed", "--root", "/draft", "pages/a.md"])
 
 
 def test_notify_parser_requires_subcommand() -> None:
@@ -1005,6 +1001,4 @@ def test_is_expected_link_index_maintenance_error_absorbs_classified_codes() -> 
 def test_is_expected_link_index_maintenance_error_rejects_program_contract_errors() -> None:
     assert not cli.is_expected_link_index_maintenance_error(DraftError("operation.plan_invalid"))
     assert not cli.is_expected_link_index_maintenance_error(DraftError("cli.unknown_command"))
-    assert not cli.is_expected_link_index_maintenance_error(
-        DraftError(RootCode.NOT_FOUND.value)
-    )
+    assert not cli.is_expected_link_index_maintenance_error(DraftError(RootCode.NOT_FOUND.value))

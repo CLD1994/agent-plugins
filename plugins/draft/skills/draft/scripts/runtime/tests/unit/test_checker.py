@@ -887,9 +887,7 @@ def test_check_link_index_maintenance_durability_failure_is_error(
         side_effect=DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, ROOT),
     )
     issues = check_link_index_maintenance(ROOT, _graph(), RootState.REGISTERED)
-    assert issues == (
-        _issue(CheckCode.OPERATION_DURABILITY_FAILED.value, ROOT),
-    )
+    assert issues == (_issue(CheckCode.OPERATION_DURABILITY_FAILED.value, ROOT),)
 
 
 def test_check_link_index_maintenance_artifact_inconsistency_is_error(

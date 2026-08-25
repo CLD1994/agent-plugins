@@ -470,7 +470,7 @@ def test_extract_body_links_without_machine_block() -> None:
 
 
 def test_extract_body_links_resolves_defined_reference_links() -> None:
-    text = "看 [旧稿][legacy]。\n\n[legacy]: 00-bg.md \"标题\"\n"
+    text = '看 [旧稿][legacy]。\n\n[legacy]: 00-bg.md "标题"\n'
 
     assert [link.destination for link in extract_body_links(text)] == ["00-bg.md"]
 

@@ -4617,9 +4617,7 @@ def _recover_locked(
         )
     if journal.phase in _LINK_INDEX_PHASES:
         # 三个链接索引 phase 前向收敛（spec §12）：不进入通用 mutation 恢复。
-        return recover_link_index_phase(
-            root, journal, retain_terminal_lock=retain_terminal_lock
-        )
+        return recover_link_index_phase(root, journal, retain_terminal_lock=retain_terminal_lock)
     if journal.phase not in _MID_WRITE_PHASES:
         raise DraftError(
             "operation.unsupported_phase",

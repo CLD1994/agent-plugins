@@ -70,9 +70,7 @@ def _init_root(tmp_path: Path) -> Path:
 
 
 def _index(revision: str) -> LinkIndex:
-    return materialize_index(
-        revision, LinkIndexContent(files={}, backlinks={}, directories={})
-    )
+    return materialize_index(revision, LinkIndexContent(files={}, backlinks={}, directories={}))
 
 
 def _journal(directory: Path, *, revision: str) -> Journal:
@@ -290,9 +288,7 @@ def test_stage_link_index_rejects_symlink_staging(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("kind", ["directory", "other"])
-def test_stage_link_index_rejects_non_file_staging_nodes(
-    tmp_path: Path, kind: str
-) -> None:
+def test_stage_link_index_rejects_non_file_staging_nodes(tmp_path: Path, kind: str) -> None:
     root = _init_root(tmp_path)
     directory = root / ".draft" / "operations" / ("a" * 32)
     journal = _journal(directory, revision="1")
@@ -310,9 +306,7 @@ def test_stage_link_index_rejects_non_file_staging_nodes(
     assert staging.is_dir() if kind == "directory" else staging.is_fifo()
 
 
-def test_stage_link_index_write_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_stage_link_index_write_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = _init_root(tmp_path)
     directory = root / ".draft" / "operations" / ("a" * 32)
     journal = _journal(directory, revision="1")
@@ -400,9 +394,7 @@ def test_stage_link_index_rejects_symlink_ancestor(tmp_path: Path) -> None:
     # 把 .draft/operations 换成指向真实 operations 的符号链接。
     (root / ".draft" / "operations").rmdir()
     (root / ".draft" / "operations").symlink_to(real_ops, target_is_directory=True)
-    journal = dataclasses.replace(
-        journal, directory=root / ".draft" / "operations" / ("a" * 32)
-    )
+    journal = dataclasses.replace(journal, directory=root / ".draft" / "operations" / ("a" * 32))
 
     with pytest.raises(DraftError) as caught:
         stage_link_index(journal, _index("1"))
@@ -430,9 +422,7 @@ def test_publish_first_index_allowed_when_target_missing(tmp_path: Path) -> None
     # staging 被原子替换消费。
     assert not (directory / _STAGED_NAME).exists()
     # .draft/ 没有随机 .link-index.* 文件。
-    assert not any(
-        entry.name.startswith(".link-index.") for entry in (root / ".draft").iterdir()
-    )
+    assert not any(entry.name.startswith(".link-index.") for entry in (root / ".draft").iterdir())
 
 
 def test_publish_first_index_rejects_existing_regular_target(tmp_path: Path) -> None:
@@ -1905,9 +1895,7 @@ def test_benchmark_lstat_failure_keeps_path_and_stops_counting(tmp_path: Path) -
         monkeypatch.undo()
 
 
-def test_benchmark_walk_failure_keeps_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_benchmark_walk_failure_keeps_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from collections.abc import Callable, Iterator
 
     import benchmarks.link_index_maintenance as benchmark

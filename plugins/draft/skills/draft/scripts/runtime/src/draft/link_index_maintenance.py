@@ -153,11 +153,14 @@ def read_link_index_authority(root: Path) -> LinkIndexAuthority:
     journals: list[Journal] = []
     for entry in entries:
         child = Path(entry.path)
-        if classify_node_or_error(
-            child,
-            code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
-            code_path=child,
-        ) is not EntryKind.DIRECTORY:
+        if (
+            classify_node_or_error(
+                child,
+                code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                code_path=child,
+            )
+            is not EntryKind.DIRECTORY
+        ):
             continue  # 只接受目录；符号链接/普通文件不参与 authority。
         try:
             validate_operation_id(entry.name)

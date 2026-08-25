@@ -60,6 +60,7 @@ class DraftGraph:
     inbound_resources: Mapping[ResourceIdentity, tuple[Path, ...]] = field(
         default_factory=dict[ResourceIdentity, tuple[Path, ...]]
     )
+
     def page_digest(self, path: Path) -> str:
         """页面内容摘要：加载文本保留原始字节（含 \\r\\n），编码后即磁盘字节。"""
         return _sha256_hex(self.pages[path].text.encode("utf-8"))
@@ -540,9 +541,7 @@ def load_graph(root: Path, *, marker_state: MarkerState | None = None) -> DraftG
     return result.graph
 
 
-def load_graph_tolerant(
-    root: Path, *, marker_state: MarkerState | None = None
-) -> LoadResult:
+def load_graph_tolerant(root: Path, *, marker_state: MarkerState | None = None) -> LoadResult:
     """容错加载：candidate 与 registered 共享同一页面/关系/链接/路径协议。
 
     marker 是根身份的唯一权威：``load_graph_tolerant`` 读取并校验 marker，不按外部

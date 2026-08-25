@@ -749,9 +749,7 @@ def plan_move_from_arguments(
         if member in facts.graph.pages:
             moved_identities.add(ResourceIdentity(ResourceKind.PAGE, member.as_posix()))
         else:
-            moved_identities.add(
-                resolve_body_resource(root, ROOT_PAGE, member.as_posix()).identity
-            )
+            moved_identities.add(resolve_body_resource(root, ROOT_PAGE, member.as_posix()).identity)
     # 闭包只消费 v2 索引事实：先验证发布制品的可信任基线，再严格扫描证明 fresh；
     # 无法证明 fresh 时使用严格全根扫描事实（spec §8/§9，用户故事 8/9）。不再依赖
     # v1 维护层（Task 6 迁移）。
@@ -850,10 +848,10 @@ def move_page(root: Path, source: Path, target: Path) -> OperationResult:
         )
     )
     final_plan = replace(
-            plan,
-            mutations=tuple([*plan.mutations, *unmanaged_mutations]),
-            observations=merge_observations(plan.observations, closure_observations),
-            effects=tuple([*plan.effects, *unmanaged_effects]),
+        plan,
+        mutations=tuple([*plan.mutations, *unmanaged_mutations]),
+        observations=merge_observations(plan.observations, closure_observations),
+        effects=tuple([*plan.effects, *unmanaged_effects]),
     )
     # move 的正式执行以 execute_plan() 返回为边界：索引发布由通用 operation 索引阶段
     # 在锁内完成，返回后不再另行发布（spec §5/§6，Task 6 停用 _refresh_move_index）。

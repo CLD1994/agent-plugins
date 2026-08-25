@@ -240,9 +240,7 @@ _SPECS: dict[CheckCode, DiagnosticSpec] = {
     CheckCode.PATH_SYMLINK_ESCAPE: DiagnosticSpec(
         _FILE, _fixed(0), _text("路径包含越出受管理树的符号链接")
     ),
-    CheckCode.PATH_INTERNAL: DiagnosticSpec(
-        _FILE, _fixed(0), _text("操作数指向内部协议领地")
-    ),
+    CheckCode.PATH_INTERNAL: DiagnosticSpec(_FILE, _fixed(0), _text("操作数指向内部协议领地")),
     CheckCode.RELATION_DUPLICATE: DiagnosticSpec(
         _LINE,
         _fixed(2),

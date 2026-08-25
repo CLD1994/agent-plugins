@@ -204,9 +204,7 @@ def test_next_revision_increments_numerically() -> None:
 
 
 def test_next_revision_increments_huge_decimal() -> None:
-    assert next_link_index_revision(LinkIndexAuthority("9" * 100, None, None)) == (
-        "1" + "0" * 100
-    )
+    assert next_link_index_revision(LinkIndexAuthority("9" * 100, None, None)) == ("1" + "0" * 100)
 
 
 def test_link_index_baseline_is_frozen_pair() -> None:
@@ -268,9 +266,7 @@ def _stub_authority_and_baseline(
 def test_prepare_absent_returns_full_build_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _stub_authority_and_baseline(
-        monkeypatch, revision=None, result=None, baseline_index=None
-    )
+    _stub_authority_and_baseline(monkeypatch, revision=None, result=None, baseline_index=None)
     _stub_scan(monkeypatch, changed=True)
 
     prepared = prepare_link_index_update(Path("/draft"))
@@ -577,6 +573,7 @@ def test_commit_rebuild_required_records_degradation_warning(
         monkeypatch,
         authority=LinkIndexAuthority("5", LinkIndexResult.PUBLISHED, "a" * 64),
     )
+
     def no_flag(root: Path) -> ResultWarning | None:
         return None
 
@@ -602,6 +599,7 @@ def test_commit_rebuild_required_flag_failure_warning_order(
         monkeypatch,
         authority=LinkIndexAuthority("5", LinkIndexResult.PUBLISHED, "a" * 64),
     )
+
     def failing_flag(root: Path) -> ResultWarning | None:
         return ResultWarning("link_index.rebuild_flag_update_failed")
 

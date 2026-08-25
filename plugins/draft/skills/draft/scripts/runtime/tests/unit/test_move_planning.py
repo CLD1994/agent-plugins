@@ -272,7 +272,7 @@ def test_plan_move_request_unmanaged_move_rewrites_managed_linkers() -> None:
     linker_write = by_path[Path("pages/a.md")]
     assert linker_write.content is not None
     rewritten = linker_write.content.decode("utf-8")
-    assert "[旧稿](00-bg.md)" in rewritten      # 按 pages/a.md 新基址重算
+    assert "[旧稿](00-bg.md)" in rewritten  # 按 pages/a.md 新基址重算
     assert "../00-bg.md" not in rewritten
 
 
@@ -333,9 +333,7 @@ def test_plan_move_request_delegates_single_managed_file_to_plan_move() -> None:
     marker = _REGISTERED_SNAPSHOT
     observations = _structure_observations(graph)
     request = MoveRequest(
-        sources=(
-            MoveSource(Path("pages/a.md"), SourceKind.MANAGED_PAGE, (Path("pages/a.md"),)),
-        ),
+        sources=(MoveSource(Path("pages/a.md"), SourceKind.MANAGED_PAGE, (Path("pages/a.md"),)),),
         target=MoveTarget(Path("pages/c.md"), TargetKind.FILE),
         results={Path("pages/a.md"): Path("pages/c.md")},
     )
@@ -421,12 +419,12 @@ def test_plan_move_request_directory_source_reparents_members_under_prefix() -> 
     hub_mutation = by_path[Path("pages/archive/topic/index.md")]
     assert hub_mutation.content is not None
     hub = hub_mutation.content.decode("utf-8")
-    assert "父主题：[根](../index.md)" in hub      # 新物理父页 pages/archive/index.md
-    assert "- [甲](a.md)" in hub                  # 子导航随批保留：旧父随批移动，不判为改父
+    assert "父主题：[根](../index.md)" in hub  # 新物理父页 pages/archive/index.md
+    assert "- [甲](a.md)" in hub  # 子导航随批保留：旧父随批移动，不判为改父
     leaf_mutation = by_path[Path("pages/archive/topic/a.md")]
     assert leaf_mutation.content is not None
     leaf = leaf_mutation.content.decode("utf-8")
-    assert "父主题：[主题](index.md)" in leaf      # 新物理父页 pages/archive/topic/index.md
+    assert "父主题：[主题](index.md)" in leaf  # 新物理父页 pages/archive/topic/index.md
 
 
 _MOVE_BATCH_INDEX = """# 根

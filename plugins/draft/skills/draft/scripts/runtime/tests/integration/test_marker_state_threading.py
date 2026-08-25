@@ -283,9 +283,7 @@ def test_registered_write_command_reads_marker_twice(
     assert marker_reads == [root, root]
 
 
-def test_candidate_facts_read_marker_once(
-    tmp_path: Path, marker_reads: list[Path]
-) -> None:
+def test_candidate_facts_read_marker_once(tmp_path: Path, marker_reads: list[Path]) -> None:
     """candidate facts 链：snapshot 一次，tolerant 视图消费传入状态。"""
     root = tmp_path / "candidate"
     build_valid_candidate(root)

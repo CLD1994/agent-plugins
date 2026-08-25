@@ -180,9 +180,7 @@ class TolerantView:
     first_blocking: CheckIssue | None
 
 
-def load_tolerant_view(
-    root: Path, *, marker_state: MarkerState | None = None
-) -> TolerantView:
+def load_tolerant_view(root: Path, *, marker_state: MarkerState | None = None) -> TolerantView:
     """容错全根加载：只有能归属到具体页面的解析失败才可成为候选部分结果。
 
     marker/格式等无法归属到具体页面的根级损坏继续整体失败；未管理路径不属于
@@ -278,9 +276,7 @@ def pages_with_status(graph: GraphView, code: StatusCode) -> tuple[Path, ...]:
     return tuple(sorted(path for path, page in graph.pages.items() if page.status.code is code))
 
 
-def page_summary(
-    graph: GraphView, page: Path, *, backlink_count: int | None = None
-) -> PageSummary:
+def page_summary(graph: GraphView, page: Path, *, backlink_count: int | None = None) -> PageSummary:
     document = graph.pages.get(page)
     if document is None:
         raise DraftError(PAGE_NOT_FOUND, page)

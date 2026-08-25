@@ -235,9 +235,7 @@ def test_checker_enforces_link_index_target_node_kind(
 
     report = check_draft(root)
     target_issues = {
-        issue.code
-        for issue in report.errors
-        if issue.path == Path(".draft/link-index.json")
+        issue.code for issue in report.errors if issue.path == Path(".draft/link-index.json")
     }
     if shape in {"missing", "regular"}:
         assert target_issues == set()

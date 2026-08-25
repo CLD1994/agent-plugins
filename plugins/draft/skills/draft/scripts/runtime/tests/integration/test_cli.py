@@ -981,9 +981,7 @@ def test_move_shape_requires_source_and_target(
 ) -> None:
     root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
 
-    code, payload = run_json(
-        ["move", "pages/a.md", "--root", str(root), "--json"], capsys
-    )
+    code, payload = run_json(["move", "pages/a.md", "--root", str(root), "--json"], capsys)
 
     assert code == 2
     error = payload["error"]
@@ -1024,7 +1022,7 @@ def test_move_file_target_rejects_directory_source(
     error = payload["error"]
     assert isinstance(error, dict)
     assert error["code"] == "cli.move_operands_invalid"
-    assert (legacy / "index.md").exists()      # 拒绝零写入
+    assert (legacy / "index.md").exists()  # 拒绝零写入
     assert not (root / "pages/x.md").exists()
 
 
@@ -1034,9 +1032,7 @@ def test_move_prefix_target_promotes_unmanaged_file(
     root = draft_factory({"index.md": PAGE_INDEX}, root_state=RootState.CANDIDATE)
     (root / "stray.md").write_text("正文。\n", encoding="utf-8")
 
-    code, payload = run_json(
-        ["move", "stray.md", "pages", "--root", str(root), "--json"], capsys
-    )
+    code, payload = run_json(["move", "stray.md", "pages", "--root", str(root), "--json"], capsys)
 
     assert code == 0
     assert payload["result_type"] == "move"
@@ -1056,14 +1052,12 @@ def test_move_dry_run_reports_effects_without_writing(
     )
 
     assert code == 0
-    assert (root / "stray.md").is_file()            # 预演零写入
+    assert (root / "stray.md").is_file()  # 预演零写入
     assert not (root / "pages/stray.md").exists()
 
-    code, _payload = run_json(
-        ["move", "stray.md", "pages", "--root", str(root), "--json"], capsys
-    )
+    code, _payload = run_json(["move", "stray.md", "pages", "--root", str(root), "--json"], capsys)
     assert code == 0
-    assert (root / "pages/stray.md").is_file()      # 正式执行后就位
+    assert (root / "pages/stray.md").is_file()  # 正式执行后就位
 
 
 # ---------------------------------------------------------------------------
@@ -2281,9 +2275,7 @@ def _public_index_root(draft_factory: DraftFactory) -> Path:
     return draft_factory(
         {
             "index.md": PAGE_INDEX + "\n- [A](pages/a.md)\n",
-            "pages/a.md": (
-                "# A\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](../index.md)\n\nA。\n"
-            ),
+            "pages/a.md": ("# A\n\n> 状态：`已确认`\n>\n> 父主题：[根索引](../index.md)\n\nA。\n"),
         }
     )
 
@@ -2692,9 +2684,7 @@ def test_notify_corrupt_marker_is_domain_error(
     root = draft_factory({})
     (root / ".draft" / "draft.json").write_text("{corrupt", encoding="utf-8")
 
-    code, payload = run_json(
-        ["notify", "files-changed", "--root", str(root), "--json"], capsys
-    )
+    code, payload = run_json(["notify", "files-changed", "--root", str(root), "--json"], capsys)
     assert code == 2
     assert payload["ok"] is False
     assert payload["result_type"] == "error"
