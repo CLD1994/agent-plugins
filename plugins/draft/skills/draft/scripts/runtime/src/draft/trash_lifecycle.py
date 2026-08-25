@@ -29,7 +29,6 @@ from draft.operations import (
     Journal,
     TrashDeadlines,
     acquire_lock,
-    clean_recovery_copies,
     durable_write,
     format_utc,
     fsync_directory,
@@ -44,6 +43,7 @@ from draft.operations import (
     recover_locked_operation,
     recover_quarantine,
     recover_unlocked_operation,
+    recover_unlocked_operations,
     reject_symlink_components,
     release_lock,
     remove_empty_recovery_operation_directory,
@@ -68,6 +68,13 @@ from draft.trash_package import (
 )
 
 Handoff = Callable[[str], None]
+
+__all__ = [
+    "iter_recovery_operation_directories",
+    "read_unlocked_operation_journal",
+    "recover_unlocked_operation",
+    "remove_empty_recovery_operation_directory",
+]
 
 SYSTEM_TRASH_DISPOSITION = "system_trash"
 EXPIRED_PURGE_DISPOSITION = "expired_purge"
@@ -592,53 +599,6 @@ def _recover_locked_trash(
     )
 
 
-def _handle_no_lock_dir(root: Path, entry: Path, journal: Journal) -> LifecycleResult | None:
-    """无锁操作目录分类：放弃孤儿分配碎片、保留损坏现场、忽略终态审计。"""
-    if journal.kind is OperationKind.RESTORE:
-        if journal.phase in (
-            OperationPhase.COMPLETED,
-            OperationPhase.ROLLED_BACK,
-        ):
-            # 无锁终态 R：终态先于 T 提交/解关联且先于释放锁写入，因此无锁终态 R
-            # 必然意味着 T 已一致（rolled_back 或已解关联），是完整完成的审计记录
-            # （第十轮 H2）。剩余 T 认领只是审计痕迹，不是可恢复现场。
-            return None
-        # 孤儿未关联 R（allocating、无 mutation、无 T 反向关联）：安全放弃为 rolled_back。
-        if (
-            journal.phase is OperationPhase.ALLOCATING
-            and not journal.mutations
-            and not _restore_linked_back(root, journal)
-        ):
-            clean_recovery_copies(journal)
-            write_journal(with_phase(journal, OperationPhase.ROLLED_BACK))
-            return OperationResult(
-                operation_id=journal.operation_id,
-                kind="restore",
-                phase=OperationPhase.ROLLED_BACK,
-                changed_paths=(),
-            )
-        # 其余无锁 restore（被 T 关联或处于中间阶段）一律保留现场。
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-    recover_unlocked_operation(root, journal)
-    return None
-
-
-def _restore_linked_back(root: Path, restore_journal: Journal) -> bool:
-    """R 是否被某个 T 反向关联（如是则不当孤儿放弃）。"""
-    for entry in iter_recovery_operation_directories(root):
-        if entry.name == restore_journal.operation_id:
-            continue
-        candidate = read_unlocked_operation_journal(root, entry)
-        if candidate is None:
-            continue
-        if (
-            candidate.kind is OperationKind.TRASH
-            and candidate.metadata.get("restore_operation_id") == restore_journal.operation_id
-        ):
-            return True
-    return False
-
-
 def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleResult:
     """按 R/T 提交状态恢复锁内 restore（第十轮 H2，第十一轮 H1/M1 闭合）。
 
@@ -797,15 +757,6 @@ def recover_interrupted_operations(
         else:
             results.append(recover(resolved))
 
-    for entry in iter_recovery_operation_directories(resolved):
-        if entry.name == locked:
-            continue
-        journal = read_unlocked_operation_journal(resolved, entry)
-        if journal is None:
-            remove_empty_recovery_operation_directory(resolved, entry)
-            continue
-        result = _handle_no_lock_dir(resolved, entry, journal)
-        if result is not None:
-            results.append(result)
+    results.extend(recover_unlocked_operations(resolved, skip_operation_id=locked))
 
     return tuple(results)

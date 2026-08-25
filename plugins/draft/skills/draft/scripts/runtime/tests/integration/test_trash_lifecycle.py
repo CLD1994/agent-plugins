@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -471,24 +471,80 @@ def test_unlinked_restore_without_copies_rolls_back_idempotently(
     assert journal_path.read_bytes() == rolled_back
 
 
+def test_lifecycle_preserves_bidirectionally_linked_unlocked_restore(
+    draft_factory: DraftFactory,
+) -> None:
+    import json
+
+    root = build_trashable_draft(draft_factory)
+    operations = root / ".draft/operations"
+    operations.mkdir(parents=True, exist_ok=True)
+    restore_id = "8" * 32
+    trash_id = "9" * 32
+
+    def write(operation_id: str, kind: str, phase: str, metadata: dict[str, str]) -> Path:
+        directory = operations / operation_id
+        directory.mkdir()
+        path = directory / "journal.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "journal_version": JOURNAL_VERSION,
+                    "operation_id": operation_id,
+                    "kind": kind,
+                    "phase": phase,
+                    "root_state": "registered",
+                    "observations": [],
+                    "mutations": [],
+                    "remove_empty_directories": [],
+                    "metadata": metadata,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    restore_path = write(
+        restore_id,
+        OperationKind.RESTORE.value,
+        OperationPhase.ALLOCATING.value,
+        {"restores_trash_operation": trash_id},
+    )
+    trash_path = write(
+        trash_id,
+        OperationKind.TRASH.value,
+        OperationPhase.TRASH_RETAINED.value,
+        {"restore_operation_id": restore_id},
+    )
+    restore_before = restore_path.read_bytes()
+    trash_before = trash_path.read_bytes()
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        recover_interrupted_operations(root)
+
+    assert restore_path.read_bytes() == restore_before
+    assert trash_path.read_bytes() == trash_before
+
+
 def test_unlinked_restore_retries_terminal_write_after_cleanup(
     draft_factory: DraftFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import draft.trash_lifecycle as lifecycle_module
+    import draft.operations as operations_module
 
     root = build_trashable_draft(draft_factory)
     journal_path = _write_unlinked_restore_allocating(root, "2" * 32)
-    real_write = lifecycle_module.write_journal
+    real_replace = operations_module._replace_publish  # pyright: ignore[reportPrivateUsage]
     state = {"failed": False}
 
-    def fail_once(journal: object) -> None:
+    def fail_once(*args: object, **kwargs: object) -> None:
         if not state["failed"]:
             state["failed"] = True
             raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, journal_path)
-        real_write(journal)  # type: ignore[arg-type]
+        real_replace(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(lifecycle_module, "write_journal", fail_once)
+    monkeypatch.setattr(operations_module, "_replace_publish", fail_once)
     with pytest.raises(DraftError) as caught:
         recover_interrupted_operations(root)
     assert caught.value.code == CheckCode.OPERATION_DURABILITY_FAILED.value
@@ -1043,7 +1099,7 @@ def test_recovery_lifecycle_rechecks_operation_directory_after_enumeration(
     """生命周期恢复在枚举后遇到链接替换时，不读取 root 外 journal。"""
     import shutil
 
-    import draft.trash_lifecycle as lifecycle
+    import draft.operations as operations
 
     root = build_trashable_draft(draft_factory)
     pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
@@ -1053,15 +1109,19 @@ def test_recovery_lifecycle_rechecks_operation_directory_after_enumeration(
     external_entry = external / pending.operation_id
     shutil.copytree(entry, external_entry)
     sentinel = external_entry / "journal.json"
-    real_iter = lifecycle.iter_recovery_operation_directories
+    real_open = operations.os.open
+    replaced = False
 
-    def replace_after_enumeration(path: Path) -> tuple[Path, ...]:
-        entries = real_iter(path)
-        shutil.rmtree(entry)
-        entry.symlink_to(external_entry, target_is_directory=True)
-        return entries
+    def replace_after_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        nonlocal replaced
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if not replaced and path == pending.operation_id and kwargs.get("dir_fd") is not None:
+            replaced = True
+            shutil.rmtree(entry)
+            entry.symlink_to(external_entry, target_is_directory=True)
+        return descriptor
 
-    monkeypatch.setattr(lifecycle, "iter_recovery_operation_directories", replace_after_enumeration)
+    monkeypatch.setattr(operations.os, "open", replace_after_open)
     before = sentinel.read_bytes()
 
     with pytest.raises(DraftError) as caught:

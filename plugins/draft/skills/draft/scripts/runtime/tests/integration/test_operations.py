@@ -438,8 +438,6 @@ def test_recover_rechecks_operation_directory_after_enumeration(
     operation_draft: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """枚举后 operation 目录被替换为链接时，不读取 root 外 journal。"""
-    import shutil
-
     import draft.operations as operations
 
     root = operation_draft
@@ -451,17 +449,21 @@ def test_recover_rechecks_operation_directory_after_enumeration(
     external_entry.mkdir()
     sentinel = external_entry / "journal.json"
     sentinel.write_bytes((entry / "journal.json").read_bytes())
-    real_iter = operations.iter_recovery_operation_directories
+    real_open = operations.os.open
+    replaced = False
 
-    def replace_after_enumeration(path: Path) -> tuple[Path, ...]:
-        entries = real_iter(path)
-        shutil.rmtree(entry)
-        entry.symlink_to(external_entry, target_is_directory=True)
-        return entries
+    def replace_after_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        nonlocal replaced
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if not replaced and path == operation_id and kwargs.get("dir_fd") is not None:
+            replaced = True
+            import shutil
 
-    monkeypatch.setattr(
-        operations, "iter_recovery_operation_directories", replace_after_enumeration
-    )
+            shutil.rmtree(entry)
+            entry.symlink_to(external_entry, target_is_directory=True)
+        return descriptor
+
+    monkeypatch.setattr(operations.os, "open", replace_after_open)
     before = sentinel.read_bytes()
 
     with pytest.raises(DraftError) as caught:
@@ -1095,7 +1097,36 @@ def test_no_lock_unlinked_restore_allocating_is_cleaned(operation_draft: Path) -
 
     recover(operation_draft)
 
-    assert not journal_dir.exists()
+    assert journal_dir.exists()
+    assert read_journal(journal_dir / "journal.json").phase is OperationPhase.ROLLED_BACK
+
+
+def test_recover_preserves_bidirectionally_linked_unlocked_restore(
+    operation_draft: Path,
+) -> None:
+    root = operation_draft
+    restore_id = "8" * 32
+    trash_id = "9" * 32
+    restore_dir = write_restore_phase_journal(
+        root,
+        restore_id,
+        OperationPhase.ALLOCATING,
+        metadata={"restores_trash_operation": trash_id},
+    )
+    trash_dir = write_trash_journal(
+        root,
+        trash_id,
+        phase=OperationPhase.TRASH_RETAINED.value,
+        metadata={"restore_operation_id": restore_id},
+    )
+    restore_before = (restore_dir / "journal.json").read_bytes()
+    trash_before = (trash_dir / "journal.json").read_bytes()
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        recover(root)
+
+    assert (restore_dir / "journal.json").read_bytes() == restore_before
+    assert (trash_dir / "journal.json").read_bytes() == trash_before
 
 
 @pytest.mark.parametrize("phase", [OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK])

@@ -1,8 +1,8 @@
 # Draft Recover 当前契约
 
 本文记录 `draft recover` 当前有效的恢复边界、状态决策和验证入口。规范依据为
-`.scratch/draft-durable-link-index-maintenance/spec.md` §13.5、§14，以及
-`docs/design.md` §13.5。本文不记录实施过程、历史行为或提交步骤。
+`.scratch/draft-durable-link-index-maintenance/spec.md` §11、§12、§14，以及
+`docs/design.md` §13.3、§13.5。本文不记录实施过程、历史行为或提交步骤。
 
 ## 入口边界
 
@@ -39,15 +39,15 @@ kind、phase、锁 operation_id、journal 内容或节点类型不一致时，�
 
 ## 无锁 Operation
 
-`operations.recover` 与 `recover_interrupted_operations` 共享无锁目录分类边界。非
-restore 日志统一交给 `recover_unlocked_operation(root, journal)`，不在生命周期层复制
+`operations.recover` 与 `recover_interrupted_operations` 共享无锁目录分类边界和 restore
+关联分类器。非 restore 日志统一交给 operations 模块的无锁分派，不在生命周期层复制
 phase 清单。
 
 | kind/phase | 动作 | 结果与失败语义 |
 | --- | --- | --- |
 | 任意 kind，目录不存在 | 不产生候选 | 返回空结果 |
 | 非 restore kind，`allocating` | 精确预检 journal、`originals`、`staged` 等授权恢复材料；清理材料、journal 和空目录 | 仅清理 operation 自有材料；未知成员、类型或 I/O 失败时保留现场并报错 |
-| restore，`allocating`，无 mutation 且未被 Trash 关联 | 由 `_restore_linked_back` 复核关联后清恢复副本并写 `rolled_back` | 保留恢复终态审计；重复执行只读终态，不重复清理 |
+| restore，`allocating`，无 mutation 且完整扫描未发现 Trash 关联 | 由共享无锁分派复核双向关联后清恢复副本并写 `rolled_back` | 保留恢复终态审计；重复执行只读终态，不重复清理 |
 | restore，`allocating`，已被 Trash 关联 | 保留 R/T 审计关系，交 restore 生命周期决策 | 不把关联日志当孤儿放弃；决策不能收敛时失败关闭并保留现场 |
 | `prepared`、`applying`、`validating`、`rolling_back` | 拒绝无锁中间写入阶段 | `operation.inconsistent_state`，不修改现场 |
 | `link_index_updating`、`link_index_published`、`link_index_rebuild_required` | 拒绝无锁索引阶段 | `operation.inconsistent_state`，不修改现场 |
@@ -60,9 +60,10 @@ phase 清单。
 
 ## Recovery 目录身份
 
-`iter_recovery_operation_directories(root)` 先以 no-follow 方式检查 `.draft/operations`，
-再枚举其直接子项。每个子项必须是合法的 32 位小写十六进制 operation ID 的目录；
-枚举不授权后续沿旧路径读取或删除。
+恢复扫描从 root 经 `.draft/operations` 逐组件以 `O_DIRECTORY | O_NOFOLLOW` 打开目录
+FD，再枚举其直接子项。每个子项先记录 `(st_dev, st_ino)`，随后以同一 parent FD 和
+`O_DIRECTORY | O_NOFOLLOW` 打开；打开后的 `fstat` 必须与枚举身份一致。枚举不授权后续
+沿可重新解析的旧路径读取或删除。
 
 | 目录状态 | 决策 |
 | --- | --- |
@@ -76,27 +77,25 @@ phase 清单。
 | journal 或 `.pending` 收敛失败 | 返回 journal 对应稳定错误，保留现场 |
 | 合法 journal | 按 kind/phase 决策表交给对应恢复责任边界 |
 
-`read_unlocked_operation_journal(root, entry)` 在每次 `.pending` 收敛、journal 读取和
-空目录检查前，都从 `root` 与已经验证的 `entry.name` 调用
-`operation_journal_path(root, entry.name)` 重建路径。该函数先验证 ID，再逐组件拒绝
-符号链接。`remove_empty_recovery_operation_directory(root, entry)` 在 `rmdir` 前同样
-从该重建路径取得目录并执行 no-follow 校验。
+无锁恢复保存已打开的 operation directory FD。每次 `.pending` 收敛、journal 读取、
+恢复材料清理、空性检查、journal 发布和 `rmdir` 前，都经 operations parent FD 复核
+entry.name 仍指向打开时的 `(st_dev, st_ino)`；实际叶 I/O 经 operation FD 和 no-follow
+锚定叶完成。`Journal.directory` 在此边界只作为错误显示路径，不能作为 I/O 根；所有
+FD 在恢复上下文退出时关闭。
 
-因此，在任一次后续 pending 收敛、journal 读取、空目录检查或删除开始前，若
-`operations/<合法 ID>` 已被替换为指向 root 外部的符号链接，相应的重建路径检查返回
-精确的 `CheckCode.PATH_SYMLINK_ESCAPE.value`，不得读取或修改 root 外内容。这个检查位于
-该次操作的所有外部目标读取之前。
+因此，在任一次后续读取或副作用开始前，若 `operations/<合法 ID>` 已被替换为指向 root
+外部的符号链接，返回精确的 `CheckCode.PATH_SYMLINK_ESCAPE.value`；若缺失、类型变化或
+inode 改绑，返回 `CheckCode.OPERATION_INCONSISTENT_STATE.value`。不得读取或修改 root
+外内容，也不得在名字改绑后继续使用旧目录 FD 提交写入或清理。
 
 ## 职责边界
 
-- `recover_unlocked_operation` 只处理一份已经读取并验证的非 restore journal，负责
-  allocating 的精确自有材料清理、无锁 phase 白名单和失败保留。
-- `read_unlocked_operation_journal` 只负责安全重建路径、pending 收敛、journal 读取和
-  无 journal 目录的空性分类，不负责 phase 分派。
-- `remove_empty_recovery_operation_directory` 只删除 reader 已证明为空且再次通过
-  no-follow 路径验证的 operation 目录。
-- `_restore_linked_back` 通过同一个 reader 扫描其他 operation，确认 Trash 是否反向
-  关联 restore；reader 抛出的路径安全错误必须原样传播。
+- operations 模块的已锚定无锁分派负责完整扫描、restore 双向关联分类、allocating 清理、
+  无锁 phase 白名单和失败保留；两个公开入口只消费这一分派结果。
+- FD 版 journal reader 负责 pending 收敛、journal 解析和无 journal 目录的空性分类；
+  解析、schema 与 transition 验证继续使用 operations 模块既有权威函数。
+- FD 版清理只删除日志授权的恢复材料和空 operation 目录；不能递归删除、glob 或以
+  `Journal.directory` 重新解析路径。
 - `_recover_locked_trash` 负责持锁 Trash 的 phase 路由；链接索引和 mutation 的具体
   恢复继续使用 operations 模块权威原语。
 
