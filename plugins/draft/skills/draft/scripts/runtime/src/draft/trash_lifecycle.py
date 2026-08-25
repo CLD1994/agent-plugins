@@ -28,7 +28,6 @@ from draft.operations import (
     HANDOFF_RETRY_INTERVAL,
     Journal,
     TrashDeadlines,
-    _remove_empty_recovery_operation_directory,  # pyright: ignore[reportPrivateUsage]
     acquire_lock,
     clean_recovery_copies,
     durable_write,
@@ -47,6 +46,7 @@ from draft.operations import (
     recover_unlocked_operation,
     reject_symlink_components,
     release_lock,
+    remove_empty_recovery_operation_directory,
     resolve_journal_pending,
     sha256_bytes,
     validate_operation_id,
@@ -802,7 +802,7 @@ def recover_interrupted_operations(
             continue
         journal = read_unlocked_operation_journal(resolved, entry)
         if journal is None:
-            _remove_empty_recovery_operation_directory(entry)
+            remove_empty_recovery_operation_directory(resolved, entry)
             continue
         result = _handle_no_lock_dir(resolved, entry, journal)
         if result is not None:

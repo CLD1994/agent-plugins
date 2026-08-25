@@ -434,6 +434,43 @@ def test_recover_removes_only_proven_empty_operation_directory(operation_draft: 
     assert not entry.exists()
 
 
+def test_recover_rechecks_operation_directory_after_enumeration(
+    operation_draft: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """枚举后 operation 目录被替换为链接时，不读取 root 外 journal。"""
+    import shutil
+
+    import draft.operations as operations
+
+    root = operation_draft
+    operation_id = "d" * 32
+    entry = write_journal(root, operation_id, "completed")
+    external = tmp_path / "external"
+    external.mkdir()
+    external_entry = external / operation_id
+    external_entry.mkdir()
+    sentinel = external_entry / "journal.json"
+    sentinel.write_bytes((entry / "journal.json").read_bytes())
+    real_iter = operations.iter_recovery_operation_directories
+
+    def replace_after_enumeration(path: Path) -> tuple[Path, ...]:
+        entries = real_iter(path)
+        shutil.rmtree(entry)
+        entry.symlink_to(external_entry, target_is_directory=True)
+        return entries
+
+    monkeypatch.setattr(
+        operations, "iter_recovery_operation_directories", replace_after_enumeration
+    )
+    before = sentinel.read_bytes()
+
+    with pytest.raises(DraftError) as caught:
+        operations.recover(root)
+
+    assert caught.value.code == CheckCode.PATH_SYMLINK_ESCAPE.value
+    assert sentinel.read_bytes() == before
+
+
 def test_recover_preserves_nonempty_operation_directory_without_journal(
     operation_draft: Path,
 ) -> None:

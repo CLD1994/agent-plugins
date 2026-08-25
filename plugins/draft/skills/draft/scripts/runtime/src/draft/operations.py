@@ -1268,27 +1268,28 @@ def iter_recovery_operation_directories(root: Path) -> tuple[Path, ...]:
 
 def read_unlocked_operation_journal(root: Path, entry: Path) -> Journal | None:
     """在已验证 operation 目录内读取 journal，并分类无日志目录现场。"""
-    reject_symlink_components(root, OPERATIONS_RELATIVE)
-    journal_path = entry / "journal.json"
+    journal_path = operation_journal_path(root, entry.name)
     resolve_journal_pending(journal_path)
-    journal = _read_optional_journal(journal_path)
+    journal = _read_optional_journal(operation_journal_path(root, entry.name))
     if journal is not None:
         return journal
+    operation_directory = operation_journal_path(root, entry.name).parent
     try:
-        empty = next(entry.iterdir(), None) is None
+        empty = next(operation_directory.iterdir(), None) is None
     except OSError as exc:
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry) from exc
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operation_directory) from exc
     if not empty:
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operation_directory)
     return None
 
 
-def _remove_empty_recovery_operation_directory(entry: Path) -> None:
+def remove_empty_recovery_operation_directory(root: Path, entry: Path) -> None:
     """只删除 reader 已证明为空的 operation 目录。"""
+    operation_directory = operation_journal_path(root, entry.name).parent
     try:
-        entry.rmdir()
+        operation_directory.rmdir()
     except OSError as exc:
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry) from exc
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operation_directory) from exc
 
 
 def read_lock(root: Path) -> str | None:
@@ -4818,7 +4819,7 @@ def recover(root_path: Path) -> OperationResult:
     for entry in iter_recovery_operation_directories(root):
         journal = read_unlocked_operation_journal(root, entry)
         if journal is None:
-            _remove_empty_recovery_operation_directory(entry)
+            remove_empty_recovery_operation_directory(root, entry)
             continue
         if (
             journal.kind is OperationKind.RESTORE

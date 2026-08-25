@@ -1037,6 +1037,40 @@ def test_recovery_scan_rejects_symlinked_operations_dir(
     assert (external / "journal.json").read_bytes() == before
 
 
+def test_recovery_lifecycle_rechecks_operation_directory_after_enumeration(
+    draft_factory: DraftFactory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """生命周期恢复在枚举后遇到链接替换时，不读取 root 外 journal。"""
+    import shutil
+
+    import draft.trash_lifecycle as lifecycle
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    entry = root / ".draft/operations" / pending.operation_id
+    external = tmp_path / "external"
+    external.mkdir()
+    external_entry = external / pending.operation_id
+    shutil.copytree(entry, external_entry)
+    sentinel = external_entry / "journal.json"
+    real_iter = lifecycle.iter_recovery_operation_directories
+
+    def replace_after_enumeration(path: Path) -> tuple[Path, ...]:
+        entries = real_iter(path)
+        shutil.rmtree(entry)
+        entry.symlink_to(external_entry, target_is_directory=True)
+        return entries
+
+    monkeypatch.setattr(lifecycle, "iter_recovery_operation_directories", replace_after_enumeration)
+    before = sentinel.read_bytes()
+
+    with pytest.raises(DraftError) as caught:
+        recover_interrupted_operations(root)
+
+    assert caught.value.code == CheckCode.PATH_SYMLINK_ESCAPE.value
+    assert sentinel.read_bytes() == before
+
+
 def test_sub_operation_dir_symlink_is_reported_not_skipped(
     draft_factory: DraftFactory, tmp_path: Path
 ) -> None:
