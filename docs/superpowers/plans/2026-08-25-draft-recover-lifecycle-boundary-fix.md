@@ -595,6 +595,15 @@
   删除空目录，`rmdir` 失败也报 `operation.inconsistent_state`。`_restore_linked_back`
   必须复用目录枚举器，继续把缺 journal 的非空兄弟作为不一致证据，不得为读取兄弟而清理它。
 
+  枚举成功不是后续 I/O 的永久授权。reader 和空目录删除 helper 在每次读取、pending
+  收敛或 `rmdir` 前，必须只用 `root` 与经过验证的 `entry.name` 调用
+  `operation_journal_path(root, entry.name)` 重建目录路径；不得使用早前枚举得到的
+  `entry / "journal.json"` 继续跟随文件系统。这样子目录在枚举后被替换为符号链接时，
+  `reject_symlink_components` 必须在读取外部目标之前返回 `path.symlink_escape`。为这一
+  race 增加真实文件系统 RED：在 reader 前 monkeypatch 受控协作者把
+  `operations/<id>` 改为指向根外目录的符号链接，外部 sentinel bytes 保持不变，两条
+  公开入口都返回 `path.symlink_escape`。
+
 - [ ] **步骤 4：替换两个入口的本地扫描循环**
 
   `operations.recover` 与 `recover_interrupted_operations` 都按以下形状消费共享边界；保留
@@ -609,15 +618,17 @@
       # 既有 kind/phase 分派
   ```
 
-  可以把 `remove_empty_recovery_operation_directory` 设为私有 helper；它只能 `rmdir` 已由
-  reader 证明为空的目录：
+  `remove_empty_recovery_operation_directory(root: Path, entry: Path)` 是跨模块共享的公开
+  helper，不能以私有导入或 `pyright: ignore[reportPrivateUsage]` 传递。它只能 `rmdir` 已由
+  reader 证明为空、并在删除前重新由 `operation_journal_path` 验证的目录：
 
   ```python
-  def _remove_empty_recovery_operation_directory(entry: Path) -> None:
+  def remove_empty_recovery_operation_directory(root: Path, entry: Path) -> None:
+      directory = operation_journal_path(root, entry.name).parent
       try:
-          entry.rmdir()
+          directory.rmdir()
       except OSError as exc:
-          raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry) from exc
+          raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, directory) from exc
   ```
 
   不得引入递归删除、glob、目录名字符串拼接或按 `OperationKind` 复制 phase 清单。
