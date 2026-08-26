@@ -63,3 +63,5 @@ node_modules/
 
 # pnpm
 .pnpm-store/
+
+docs/tmp
