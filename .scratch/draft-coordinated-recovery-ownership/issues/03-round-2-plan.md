@@ -89,5 +89,13 @@ preflight，也不实施 Issue 05 的 descriptor close 改造。恢复材料、`
 
 ## 阻塞
 
-无。Issue 03 可在不改变顾问裁定的前提下先闭合全图分类、关系授权和 literal-owner gate；
-整组材料 capability 的实现与证明由 Issue 01 后续接入本轮产出的 participant closure。
+功能语义没有需要用户裁定的阻塞：Issue 03 可在不改变顾问裁定的前提下先闭合全图分类、关系
+授权和 literal-owner gate；整组材料 capability 的实现与证明由 Issue 01 后续接入本轮产出的
+participant closure。
+
+提交整理的阻塞：runtime 的 `operations.py`、`trash.py`、`trash_lifecycle.py`、`checker.py`、
+`diagnostic_codes.py`、`observations.py`、`structure.py` 及对应 11 个测试文件在本轮开始前已含
+3,600+ 行未提交 recovery/link-index 共同实现。第 2 轮在这些同一 hunks 中增加了优先级、facts
+和 literal-owner 修改，无法仅凭当前 diff 可靠区分任务前已有内容与本轮内容；因此本轮不暂存
+或提交该混合代码。已独立提交可以验证边界的规格、Issue、计划和 AGENTS 文档；代码应由持有
+这组统一实现基线的负责人整体复审后提交。
