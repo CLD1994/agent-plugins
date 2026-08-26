@@ -1,6 +1,6 @@
 # 09: 实现链接索引 phase 的恢复解释器
 
-**What to build:** 根据 operation journal 中已经耐久记录的事实恢复索引 phase，使进程中断后的 maintenance 或业务 operation 能够机械、幂等地前向收敛。
+**What to build:** 在协调恢复 spec 已选定 matching owner、完成 journal/R/T 分类并授权当前 operation 后，根据已经耐久记录的事实恢复链接索引 phase，使进程中断后的 maintenance 或业务 operation 能够机械、幂等地前向收敛。
 
 **Blocked by:** 08: 实现已持有 operation 的索引前向提交内核.
 
@@ -13,4 +13,5 @@
 - [ ] 已有成功终态但残留锁或当前 operation staging 时执行幂等已知清理；调用方可以要求终态后继续保留锁，以支持 trash/restore 双 journal 协调。
 - [ ] 恢复只清理当前 operation 精确拥有的 staging，不使用通配符，不删除其他 operation、索引目标、未知文件或未知目录。
 - [ ] `recover` 恢复原 kind 和 operation ID，不创建独立持久 operation，也不分配新的链接索引 revision。
+- [ ] 本 issue 不重新实现或覆盖协调恢复 spec 的 raw journal、R/T 图、phase 或 `recovery_required` 分类；所有错误仍按其优先级失败关闭并保留现场，`recovery_required` 只来自锁竞争/合法其他 owner。
 - [ ] 每个恢复 phase 都测试执行一次和重复执行，断言 journal、revision、索引摘要、flag、锁和 staging 最终一致。

@@ -164,12 +164,11 @@ flag 提供快速阻断”的模型：
 当前协议面向本地文件系统、单个受协调 CLI 写者、普通 I/O 失败和已定义耐久步骤后的
 进程中断。索引文件发布依赖同一文件系统内的原子替换、文件同步和目录同步。
 
-同一 Draft 根上的受协调写者只能通过唯一的 `.draft/operation.lock` 串行化。无锁扫描只
-发现和分类候选，绝不授权 journal、恢复材料、权威删除包或 operation 目录的删除、替换、
-硬链接或 phase 写入。任何需要这些副作用的恢复候选都必须先取得其 operation ID 的锁，
-在锁内重新读取当前目录、journal 和关联后再按状态机处理。对绕过锁、直接改名、替换或
-修改 `.draft/` 节点的同权限进程，协议不承诺 Python 标准库无法提供的原子命名空间防护；
-但扫描或读取时可观察到的符号链接、非法类型、损坏和身份不一致仍必须失败关闭。
+同一 Draft 根上的受协调写者只能通过唯一的 `.draft/operation.lock` 串行化。无锁发现、
+候选分类、R/T 关系、错误优先级和 owner 生命周期遵守协调恢复所有权 spec；本 spec 只
+规定索引阶段在该 owner 已取得 matching lock 并完成当前事实重读后如何接入。对绕过锁、
+直接改名、替换或修改 `.draft/` 节点的同权限进程，协议不承诺 Python 标准库无法提供的
+原子命名空间防护。
 
 调用方在执行 notification 前应完成外部批量编辑并使根进入稳定状态。程序拒绝把观察到
 的混合时点快照发布为完整索引；持续变化的根不会触发无限重试。
@@ -393,7 +392,8 @@ staging 的 SHA-256 必须等于 journal 的 `link_index_sha256`。发布目标�
 | `rebuild_required` | 缺失或普通文件 | 允许发布并替换普通旧文件 |
 | `published` | 与 journal 完全一致的普通文件 | 允许以更高 revision 替换 |
 | `published` | 缺失或内容不一致 | `operation.inconsistent_state` |
-| 任意状态 | 符号链接、目录或其他节点 | `operation.inconsistent_state` |
+| 任意状态 | 符号链接 | `path.symlink_escape` |
+| 任意状态 | 目录或其他异常节点 | `operation.inconsistent_state` |
 
 staging、目标及其祖先都使用 no-follow 边界。程序不得覆盖、递归删除或跟随异常内部
 节点。
@@ -449,49 +449,27 @@ journal 结果无法耐久写入时返回 `operation.durability_failed`，退出
 
 ### 12. 恢复
 
-`recover` 先处理入口时已经持有的 operation lock。入口无锁时，只读 discovery 必须完整
-收集当前 operation 目录、journal、`.pending` 存在性和 R/T 关系；它不收敛 `.pending`，
-也不清理材料。需要副作用的候选先尝试取得匹配 lock；竞争失败即停止，丢弃 discovery
-快照，不得继续用旧事实清理。成功取得锁后，必须重读当前事实；读取、认证或写入失败时
-保留 lock 与现场。
+R/T、journal 原始 shape/type、计划、图关系、phase 和锁竞争的恢复分类唯一由
+`.scratch/draft-coordinated-recovery-ownership/spec.md` 规定；本 spec 不复制或重新解释
+这些分类。协调恢复 spec 的错误优先级和“所有错误失败关闭并保留现场”要求同样适用于
+包含链接索引 phase 的 operation。`recover` 只在 matching lock 内收敛原 operation；无锁
+候选的 discovery、锁竞争和 lock ownership 也遵守该权威 spec。
 
-| discovery 当前事实 | 动作 |
-| --- | --- |
-| 空 operation 目录，无 journal 或 `.pending` | 取得匹配 lock，锁内再次确认为空后删除目录并同步父目录；不得复用该目录。 |
-| 非 restore 的 `allocating` | 取得匹配 lock；锁内写 `rolled_back` 后，只清理当前 journal 授权的材料并释放锁。 |
-| R/T 具有关联，或 terminal 有授权残留材料 | 只选择关系 owner 取得匹配 lock；锁内重读关系并调用相应恢复器。 |
-| 无关联 `trash_retained` | 保留；`recover` 不推进生命周期。 |
-| 有完整失败记录的无锁 `trash_handoff_pending` | 保留；仅生命周期入口在到期时重试。 |
-| 中间写入 phase、未知 kind/phase、损坏或关系错配 | 失败关闭，保留现场。 |
-
-R 到 T 的关联是 `R.metadata.restores_trash_operation == T.operation_id`，T 到 R 的关联是
-`T.metadata.restore_operation_id == R.operation_id`。只有双方 kind 和 ID 匹配的双向关联
-才是有效认领；唯一的预认领状态是 R 到 T 存在、T 到 R 尚未写入、且 R 仍为无 mutation 的
-`allocating`。其他单向、错配、目标缺失或多重认领均为 `operation.inconsistent_state`。
-
-`recover` 只在锁内收敛原 operation。链接索引阶段的规则如下：
+本 spec 只定义链接索引 phase 接入协调恢复器：
 
 | Phase | 恢复行为 |
 | --- | --- |
-| 索引阶段前 | 沿用该业务 operation 的前向完成或安全 rollback 规则 |
+| 索引阶段前 | 交给协调恢复 spec 定义的业务 operation 恢复分类 |
 | `link_index_updating` | 进入 `link_index_rebuild_required`；不猜测已发布，不重复增量发布 |
 | `link_index_published` | 验证目标 revision 和 SHA-256；一致则补终态，不一致则停止并保留现场 |
 | `link_index_rebuild_required` | 尽力补建 flag，然后补原有成功终态 |
 | 已有成功终态但残留锁或 staging | 幂等完成已知清理 |
 
-进入 `link_index_updating` 后不再允许业务 rollback。
-
-maintenance operation 的恢复规则（无锁发现后同样先取得匹配 lock）：
-
-- `allocating` 中断且没有索引副作用：写 `rolled_back` 并释放锁；
-- `link_index_updating`：进入 `rebuild_required`；
-- `link_index_published`：验证制品后完成；
-- `link_index_rebuild_required`：补 flag 后完成；
-- `completed`：幂等清理锁和已知 staging。
-
-恢复仅在持有匹配 lock、锁内重读并由当前 journal 授权后清理当前 operation 的
-`link-index.staged.json` 或其他恢复材料；不得使用通配符、旧扫描快照或无锁路径触碰其他
-operation 或 `.draft/` 下未知文件。
+进入 `link_index_updating` 后不再允许业务 rollback。`link-index.update` 的 allocating、
+锁生命周期、现场清理和 owner 选择同样交给协调恢复 spec；本 spec 只要求索引 phase 恢复
+解释器在当前 owner 已授权时使用同一 revision 前向收敛，并只清理当前 operation 精确拥有
+的 staging。不得使用通配符、旧扫描快照或无锁路径触碰其他 operation 或 `.draft/` 下未知
+文件。
 
 ### 13. notification
 

@@ -11,7 +11,7 @@
 - [ ] notification、普通业务写入、`check`、`query backlinks`、`query page` 和 adopt 预检查按规格路由到正确协调器。
 - [ ] `query links`、relations/status/recoverable 查询、dry-run、`init` 和 `recover` 不创建规格禁止的独立维护副作用。
 - [ ] Draft 内部根只接受 marker、锁、operations、trash、索引目标和 rebuild flag 等已拥有对象；operation 目录只接受该 operation 已有恢复材料和精确 staging。
-- [ ] 未知索引形似文件、随机临时文件、错误节点类型和符号链接报告稳定内部错误，checker 与 authority/storage 适配器使用同一分类规则。
+- [ ] 未知索引形似文件、随机临时文件和错误节点类型报告稳定内部错误；符号链接按协调恢复 spec 的路径边界分类为 `path.symlink_escape`。checker 与 authority/storage 适配器只验证自身 link-index phase 接入，不复制 R/T 恢复分类。
 - [ ] 所有业务入口都经过共同 operation 收敛边界，不存在命令完成后追加的专用索引刷新钩子。
 - [ ] warning 机器代码、severity、顺序和去重在写命令、query 与 `check` 投影之间一致；notification 不投影这些 warning。
 - [ ] 验收测试的入口清单从用户可见行为独立列出，不复制生产代码的 mutation 判定集合生成预期。
