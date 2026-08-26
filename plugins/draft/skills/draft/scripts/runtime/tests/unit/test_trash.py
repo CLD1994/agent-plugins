@@ -35,6 +35,8 @@ from draft.observations import EMPTY_OBSERVATIONS
 from draft.operations import (
     Journal,
     JournalMutation,
+    RestoreTrashAction,
+    RestoreTrashRelation,
     TrashDeadlines,
     sha256_bytes,
 )
@@ -42,8 +44,10 @@ from draft.resources import resolve_page_resources
 from draft.trash import (
     RestoreLinkState,
     RestoreRecoveryAction,
+    RestoreRecoveryFacts,
     require_retained_restore_window,
     restore_recovery_decision,
+    restore_recovery_decision_from_facts,
     trash_plan,
 )
 from draft.trash_package import OUTGOING_RELATIVE, PACKAGE_VERSION
@@ -329,6 +333,54 @@ def _trash_journal(
         link_index_revision=None,
         link_index_result=None,
         link_index_sha256=None,
+    )
+
+
+def _restore_recovery_facts(
+    *,
+    restore_phase: OperationPhase,
+    trash_phase: OperationPhase = OperationPhase.TRASH_RETAINED,
+    relation: RestoreTrashRelation,
+    ownership_action: RestoreTrashAction,
+    trash_metadata: dict[str, str] | None = None,
+) -> RestoreRecoveryFacts:
+    restore_id = "a" * 32
+    trash_id = "b" * 32
+    restore = Journal(
+        operation_id=restore_id,
+        kind=OperationKind.RESTORE,
+        phase=restore_phase,
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
+        mutations=(),
+        remove_empty_directories=(),
+        metadata={"restores_trash_operation": trash_id},
+        directory=Path("/draft/.draft/operations") / restore_id,
+        link_index_revision=None,
+        link_index_result=None,
+        link_index_sha256=None,
+    )
+    trash = Journal(
+        operation_id=trash_id,
+        kind=OperationKind.TRASH,
+        phase=trash_phase,
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
+        mutations=(),
+        remove_empty_directories=(),
+        metadata=dict(trash_metadata or {}),
+        directory=Path("/draft/.draft/operations") / trash_id,
+        link_index_revision=None,
+        link_index_result=None,
+        link_index_sha256=None,
+    )
+    return RestoreRecoveryFacts(
+        restore=restore,
+        trash=trash,
+        relation=relation,
+        owner_id=restore_id,
+        participant_ids=(restore_id, trash_id),
+        ownership_action=ownership_action,
     )
 
 
@@ -1032,6 +1084,74 @@ def _restore_decision(
         preclaim_bootstrap=preclaim_bootstrap,
         proven_unapplied=proven_unapplied,
     )
+
+
+@pytest.mark.parametrize(
+    ("facts", "expected"),
+    [
+        (
+            _restore_recovery_facts(
+                restore_phase=OperationPhase.ALLOCATING,
+                relation=RestoreTrashRelation.PRECLAIM,
+                ownership_action=RestoreTrashAction.RECOVER_PRECLAIM,
+            ),
+            RestoreRecoveryAction.ABANDON_UNCLAIMED_BOOTSTRAP,
+        ),
+        (
+            _restore_recovery_facts(
+                restore_phase=OperationPhase.APPLYING,
+                relation=RestoreTrashRelation.MATCHED,
+                ownership_action=RestoreTrashAction.RECOVER_MATCHED,
+                trash_metadata={"restore_operation_id": "a" * 32},
+            ),
+            RestoreRecoveryAction.RESUME_FORWARD,
+        ),
+        (
+            _restore_recovery_facts(
+                restore_phase=OperationPhase.ROLLED_BACK,
+                relation=RestoreTrashRelation.POST_UNCLAIM_CLEANUP,
+                ownership_action=RestoreTrashAction.CLEANUP_POST_UNCLAIM,
+            ),
+            RestoreRecoveryAction.FINISH_ABANDON_CLEANUP,
+        ),
+    ],
+)
+def test_restore_recovery_decision_from_facts_consumes_capability_action(
+    facts: RestoreRecoveryFacts,
+    expected: RestoreRecoveryAction,
+) -> None:
+    assert restore_recovery_decision_from_facts(ROOT, facts) is expected
+
+
+@pytest.mark.parametrize(
+    ("relation", "ownership_action"),
+    [
+        (RestoreTrashRelation.PRECLAIM, RestoreTrashAction.RECOVER_MATCHED),
+        (RestoreTrashRelation.MATCHED, RestoreTrashAction.CLEANUP_POST_UNCLAIM),
+        (RestoreTrashRelation.POST_UNCLAIM_CLEANUP, RestoreTrashAction.RECOVER_PRECLAIM),
+    ],
+)
+def test_restore_recovery_decision_from_facts_rejects_mismatched_capability_action(
+    relation: RestoreTrashRelation,
+    ownership_action: RestoreTrashAction,
+) -> None:
+    facts = _restore_recovery_facts(
+        restore_phase=OperationPhase.APPLYING
+        if relation is RestoreTrashRelation.MATCHED
+        else OperationPhase.ALLOCATING
+        if relation is RestoreTrashRelation.PRECLAIM
+        else OperationPhase.ROLLED_BACK,
+        relation=relation,
+        ownership_action=ownership_action,
+        trash_metadata={"restore_operation_id": "a" * 32}
+        if relation is RestoreTrashRelation.MATCHED
+        else None,
+    )
+
+    with pytest.raises(DraftError) as caught:
+        restore_recovery_decision_from_facts(ROOT, facts)
+
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
 
 
 # 权威期望分区（计划"行为契约一"，第十二轮 H1/H2 扩展）：关联从布尔提升为三值状态，

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from draft.cli_results import DryRunOperation, ResultType
 from draft.diagnostic_codes import (
+    OPERATION_PLAN_INVALID,
     CheckCode,
     InvalidRelationReason,
     InvalidStatusReason,
@@ -107,16 +108,37 @@ def _raw_registered_code_literals(path: Path, registered: frozenset[str]) -> lis
     )
 
 
-def _literal_owner_offenders(registered: frozenset[str]) -> dict[str, list[tuple[int, str]]]:
+def _literal_owner_offenders_in_paths(
+    paths: tuple[Path, ...], registered: frozenset[str]
+) -> dict[Path, list[tuple[int, str]]]:
     return {
-        path.relative_to(RUNTIME_ROOT).as_posix(): literals
-        for path in DIAGNOSTIC_CODE_LITERAL_CONSUMERS
+        path: literals
+        for path in paths
         if (literals := _raw_registered_code_literals(path, registered))
     }
 
 
+def _literal_owner_offenders(registered: frozenset[str]) -> dict[str, list[tuple[int, str]]]:
+    return {
+        path.relative_to(RUNTIME_ROOT).as_posix(): literals
+        for path, literals in _literal_owner_offenders_in_paths(
+            DIAGNOSTIC_CODE_LITERAL_CONSUMERS, registered
+        ).items()
+    }
+
+
 def test_registered_diagnostic_codes_have_one_literal_owner() -> None:
-    assert _literal_owner_offenders(frozenset(code.value for code in CheckCode)) == {}
+    registered = frozenset((*[code.value for code in CheckCode], OPERATION_PLAN_INVALID))
+    assert _literal_owner_offenders(registered) == {}
+
+
+def test_literal_owner_gate_reports_unregistered_consumer_literal(tmp_path: Path) -> None:
+    consumer = tmp_path / "consumer.py"
+    consumer.write_text('code = "operation.plan_invalid"\n', encoding="utf-8")
+
+    assert _literal_owner_offenders_in_paths(
+        (consumer,), frozenset({OPERATION_PLAN_INVALID})
+    ) == {consumer: [(1, OPERATION_PLAN_INVALID)]}
 
 
 def test_root_and_query_codes_have_one_literal_owner() -> None:

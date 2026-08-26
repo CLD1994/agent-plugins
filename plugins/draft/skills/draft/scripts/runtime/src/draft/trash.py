@@ -8,7 +8,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from draft.checker import check_draft
-from draft.diagnostic_codes import CheckCode
+from draft.diagnostic_codes import OPERATION_PLAN_INVALID, CheckCode
 from draft.errors import DraftError
 from draft.graph import (
     CONCLUSIONS_PAGE,
@@ -44,8 +44,12 @@ from draft.observations import ObservationManifest
 from draft.operations import (
     LOCK_RELATIVE,
     Journal,
+    RestoreTrashAction,
+    RestoreTrashRelation,
     TrashDeadlines,
+    _validate_locked_recovery_material,  # pyright: ignore[reportPrivateUsage]
     acquire_lock,
+    build_recovery_preflight,
     clean_recovery_copies,
     execute_plan,
     execute_preallocated_plan,
@@ -54,12 +58,14 @@ from draft.operations import (
     preallocate_journal,
     read_journal,
     read_lock,
+    read_locked_recovery_snapshot,
+    read_restore_trash_relation,
     release_lock,
     resolve_journal_pending,
+    restore_trash_action_for_relation,
     sha256_bytes,
     sha256_file,
     validate_operation_id,
-    validate_restore_link,
     verify_locked_terminal_operation,
     with_link_index_state,
     with_metadata,
@@ -330,6 +336,16 @@ def abandon_unlinked_restore(
     时零写入保留现场（不写 R、不清理、不解锁），交由公开恢复或一致拒绝。
     """
     journal_path = operation_journal_path(root, restore_id)
+    pending_path = journal_path.with_name("journal.json.pending")
+    if not journal_path.is_file() and not pending_path.is_file():
+        return
+    current_snapshot, pending_snapshot = read_locked_recovery_snapshot(root, restore_id)
+    _validate_locked_recovery_material(
+        root,
+        restore_id,
+        current_snapshot,
+        pending_snapshot,
+    )
     resolve_journal_pending(journal_path)
     if not journal_path.is_file():
         return
@@ -338,7 +354,7 @@ def abandon_unlinked_restore(
     if not isinstance(back_reference, str):
         return
     try:
-        trash_id = validate_operation_id(back_reference, code="operation.plan_invalid")
+        trash_id = validate_operation_id(back_reference, code=OPERATION_PLAN_INVALID)
     except DraftError:
         return
     if not is_restore_preclaim_bootstrap(journal, trash_id):
@@ -504,50 +520,125 @@ def restore_recovery_decision(
 
 @dataclasses.dataclass(frozen=True)
 class RestoreRecoveryFacts:
-    """恢复专用 R/T 关联事实：restore 与 trash 日志 + 三值关联分类。
+    """恢复专用 R/T 全图事实及其唯一 owner/action。
 
-    分类只接受 R→T 精确指向 + T 的 ``restore_operation_id`` 三种可区分状态
-    （MATCHED / TRASH_UNCLAIMED / CONFLICT）。ABANDON 先耐久删除 T claim 再清理
-    R 材料，因此 ``TRASH_UNCLAIMED`` 是程序自己写出的合法耐久中间状态（第十二轮 H1），
-    不得与 CONFLICT 折叠为同一个布尔 false。
+    ``relation``、``owner_id``、``participant_ids`` 和 ``ownership_action`` 都由
+    ``read_restore_trash_relation`` 的完整 effective graph 派生。旧的
+    ``RestoreLinkState`` 仅是 phase decision 的输入，不是恢复所有权来源。
     """
 
     restore: Journal
     trash: Journal
-    link_state: RestoreLinkState
+    relation: RestoreTrashRelation
+    owner_id: str
+    participant_ids: tuple[str, str]
+    ownership_action: RestoreTrashAction
 
 
 def load_restore_recovery_facts(root: Path, restore_id: str) -> RestoreRecoveryFacts:
-    """恢复专用关联读取：验证锁属 R、R kind/id 与 R→T，再分类 T 的 claim。
-
-    与业务计划验证（``validate_restore_link`` 要求严格双向往返）不同：恢复边界必须先
-    接受 R→T 正确而 T claim 缺失的合法耐久中间状态，否则会把自己写出的
-    ``TRASH_UNCLAIMED`` 拒绝为 plan_invalid。R→T 缺失/非法、T kind/id 错误直接抛
-    ``operation.plan_invalid``；T 指向其他 R/身份不可证明归 ``CONFLICT``，不得误归
-    unclaimed。
-    """
+    """匹配 R lock 下重读完整 effective graph 并返回唯一 restore capability。"""
     if read_lock(root) != restore_id:
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, root / LOCK_RELATIVE)
-    restore_journal = read_journal(operation_journal_path(root, restore_id))
-    if restore_journal.kind is not OperationKind.RESTORE:
-        raise DraftError("operation.plan_invalid", restore_journal.directory)
-    back_reference = restore_journal.metadata.get("restores_trash_operation")
-    if back_reference is None:
-        raise DraftError("operation.plan_invalid", restore_journal.directory)
-    trash_id = validate_operation_id(back_reference, code="operation.plan_invalid")
-    trash_path = operation_journal_path(root, trash_id)
-    resolve_journal_pending(trash_path)
-    trash_journal = read_journal(trash_path)
-    if trash_journal.kind is not OperationKind.TRASH or trash_journal.operation_id != trash_id:
-        raise DraftError("operation.plan_invalid", restore_journal.directory)
-    claim = trash_journal.metadata.get("restore_operation_id")
-    if claim == restore_journal.operation_id:
-        link_state = RestoreLinkState.MATCHED
-    elif claim is None:
+    facts = read_restore_trash_relation(root, restore_id)
+    restore_journal = facts.restore
+    trash_journal = facts.trash
+    if (
+        restore_journal is None
+        or restore_journal.kind is not OperationKind.RESTORE
+        or trash_journal is None
+        or trash_journal.kind is not OperationKind.TRASH
+    ):
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, root / OPERATIONS_RELATIVE)
+    if (
+        facts.owner_id != restore_id
+        or facts.participant_ids != (restore_id, trash_journal.operation_id)
+        or facts.action is None
+        or facts.relation
+        not in {
+            RestoreTrashRelation.MATCHED,
+            RestoreTrashRelation.PRECLAIM,
+            RestoreTrashRelation.POST_UNCLAIM_CLEANUP,
+        }
+    ):
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, restore_journal.directory)
+    owner_id = facts.owner_id
+    ownership_action = facts.action
+    if owner_id is None or ownership_action is None:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, restore_journal.directory)
+    return RestoreRecoveryFacts(
+        restore=restore_journal,
+        trash=trash_journal,
+        relation=facts.relation,
+        owner_id=owner_id,
+        participant_ids=(restore_id, trash_journal.operation_id),
+        ownership_action=ownership_action,
+    )
+
+
+def _preflight_restore_recovery(
+    root: Path,
+    restore_id: str,
+    trash_id: str,
+    *,
+    validate_retained_package: bool = False,
+) -> RestoreRecoveryFacts:
+    """在 matching R lock 内重读全图并验证整个 R/T participant closure。"""
+    facts = load_restore_recovery_facts(root, restore_id)
+    if facts.trash.operation_id != trash_id:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, facts.restore.directory)
+    # The relation reader supplies the owner/closure/action; the shared preflight then proves
+    # every participant's current/pending materials from that same matching-lock boundary.
+    build_recovery_preflight(
+        root,
+        restore_id,
+        effect="relation_update",
+        validate_retained_package=validate_retained_package,
+    )
+    return facts
+
+
+def restore_recovery_decision_from_facts(
+    root: Path,
+    facts: RestoreRecoveryFacts,
+) -> RestoreRecoveryAction:
+    """消费全图 capability action，在该 action 的 phase 子集内选择细化动作。"""
+    expected_action = restore_trash_action_for_relation(facts.relation)
+    if expected_action is not facts.ownership_action:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, facts.restore.directory)
+
+    if facts.ownership_action is RestoreTrashAction.RECOVER_PRECLAIM:
         link_state = RestoreLinkState.TRASH_UNCLAIMED
+        allowed_actions = frozenset({RestoreRecoveryAction.ABANDON_UNCLAIMED_BOOTSTRAP})
+    elif facts.ownership_action is RestoreTrashAction.RECOVER_MATCHED:
+        link_state = RestoreLinkState.MATCHED
+        allowed_actions = frozenset(
+            {
+                RestoreRecoveryAction.VERIFY_AND_COMMIT_CLEANUP,
+                RestoreRecoveryAction.RESUME_COMMITTED_CLEANUP,
+                RestoreRecoveryAction.RESUME_FORWARD,
+                RestoreRecoveryAction.RESUME_ROLLBACK,
+                RestoreRecoveryAction.ABANDON_UNAPPLIED,
+            }
+        )
+    elif facts.ownership_action is RestoreTrashAction.CLEANUP_POST_UNCLAIM:
+        link_state = RestoreLinkState.TRASH_UNCLAIMED
+        allowed_actions = frozenset({RestoreRecoveryAction.FINISH_ABANDON_CLEANUP})
     else:
-        link_state = RestoreLinkState.CONFLICT
-    return RestoreRecoveryFacts(restore=restore_journal, trash=trash_journal, link_state=link_state)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, facts.restore.directory)
+
+    needs_proof = facts.restore.phase in (OperationPhase.ALLOCATING, OperationPhase.PREPARED)
+    decision = restore_recovery_decision(
+        restore_phase=facts.restore.phase,
+        trash_phase=facts.trash.phase,
+        link_state=link_state,
+        preclaim_bootstrap=is_restore_preclaim_bootstrap(
+            facts.restore, facts.trash.operation_id
+        ),
+        proven_unapplied=restore_unapplied_fact(root, facts.restore) if needs_proof else False,
+    )
+    if decision not in allowed_actions:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, facts.restore.directory)
+    return decision
 
 
 def build_restore_plan(
@@ -1014,18 +1105,55 @@ def restore_retained_trash(
     try:
         trash_journal = read_journal(operation_journal_path(resolved, operation_id))
         require_retained_restore_window(trash_journal, normalized_now)
-        package = load_verified_package(resolved, trash_journal)
         require_no_existing_restore_claim(resolved, trash_journal, restore_id)
+        # PRECLAIM is the first R/T-owned side effect.  Prove the complete closure immediately
+        # before writing T's claim, after the retention and existing-claim checks have selected
+        # the only valid target.
+        build_recovery_preflight(
+            resolved,
+            restore_id,
+            effect="relation_update",
+            validate_retained_package=True,
+        ).consume()
+        package = load_verified_package(resolved, trash_journal)
     except DraftError:
         abandon_unlinked_restore(resolved, restore_id, release_owned_lock=True)
         raise
     linked_trash = with_metadata(trash_journal, {"restore_operation_id": restore_id})
-    write_journal(linked_trash)
+    claim_preflight = build_recovery_preflight(
+        resolved,
+        restore_id,
+        effect="relation_update",
+    ).consume()
+    write_journal(linked_trash, preflight=claim_preflight)
     try:
+        # The claim transition invalidates the previous PRECLAIM relation facts.  Re-authorize
+        # MATCHED before constructing the plan, while retaining the package snapshot that was
+        # verified before the claim.  The package observation in that snapshot is deliberately
+        # used to detect additions between verification and execution as restore_conflict.
+        build_recovery_preflight(
+            resolved,
+            restore_id,
+            effect="journal_write",
+        ).consume()
+        linked_trash = read_journal(operation_journal_path(resolved, operation_id))
         plan = build_restore_plan(resolved, restore_id, package, marker=marker)
         # 读集观察耐久写入预分配日志，供执行前复核与恢复使用。
         restore_journal = read_journal(operation_journal_path(resolved, restore_id))
-        write_journal(with_observations(restore_journal, plan.observations))
+        observations_preflight = build_recovery_preflight(
+            resolved,
+            restore_id,
+            effect="journal_write",
+        ).consume()
+        write_journal(
+            with_observations(restore_journal, plan.observations),
+            preflight=observations_preflight,
+        )
+        build_recovery_preflight(
+            resolved,
+            restore_id,
+            effect="journal_write",
+        ).consume()
         execute_preallocated_plan(plan, retain_terminal_lock=True)
     except DraftError as error:
         action = _restore_recovery_action(resolved, restore_id, operation_id)
@@ -1055,24 +1183,14 @@ def restore_retained_trash(
 
 
 def _restore_recovery_action(root: Path, restore_id: str, trash_id: str) -> RestoreRecoveryAction:
-    """从磁盘重读 R/T 并取得唯一权威决策；任何调用方都不得建立第二套 phase 表。
+    """从 matching lock 内的全图 facts 取得唯一恢复决策。
 
-    未应用证明只在决策需要时（ALLOCATING/PREPARED）采集；其他 phase 不读取目标，
-    避免引入本不存在的失败路径并绕过通用恢复器（round-12 M1）。
+    关系、owner 和 participant 只能来自 ``load_restore_recovery_facts``，它会重新读取
+    effective current/pending graph。这里绝不调用 ``validate_restore_link``：该旧 helper
+    会发布 pending，且只验证局部 R/T，不能为恢复授权。
     """
-    resolve_journal_pending(operation_journal_path(root, restore_id))
-    restore_journal = read_journal(operation_journal_path(root, restore_id))
-    trash_journal = validate_restore_link(root, restore_journal)
-    needs_proof = restore_journal.phase in (OperationPhase.ALLOCATING, OperationPhase.PREPARED)
-    return restore_recovery_decision(
-        restore_phase=restore_journal.phase,
-        trash_phase=trash_journal.phase,
-        # 业务调用点（restore_page）在 validate_restore_link 上已要求严格双向匹配：
-        # 不匹配直接抛错，不进入决策，故此处关联必为 MATCHED。
-        link_state=RestoreLinkState.MATCHED,
-        preclaim_bootstrap=is_restore_preclaim_bootstrap(restore_journal, trash_id),
-        proven_unapplied=restore_unapplied_fact(root, restore_journal) if needs_proof else False,
-    )
+    facts = _preflight_restore_recovery(root, restore_id, trash_id)
+    return restore_recovery_decision_from_facts(root, facts)
 
 
 def resolve_restore_execution(
@@ -1098,9 +1216,21 @@ def resolve_restore_execution(
     （TRASH_UNCLAIMED）会因此被拒绝为 plan_invalid（第十二轮 H1）。释放锁前对
     ``rolled_back`` 复用保锁终态证明（H2），证明失败不写 T、不清理、不解锁。
     """
-    resolve_journal_pending(operation_journal_path(root, restore_id))
-    terminal_restore = read_journal(operation_journal_path(root, restore_id))
-    current_trash = read_journal(operation_journal_path(root, trash_id))
+    facts = _preflight_restore_recovery(root, restore_id, trash_id)
+    if restore_recovery_decision_from_facts(root, facts) is not action:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, facts.restore.directory)
+    pending_preflight = build_recovery_preflight(
+        root,
+        restore_id,
+        effect="pending_publish",
+    ).consume()
+    resolve_journal_pending(
+        operation_journal_path(root, restore_id),
+        preflight=pending_preflight,
+    )
+    facts = _preflight_restore_recovery(root, restore_id, trash_id)
+    terminal_restore = facts.restore
+    current_trash = facts.trash
     changed = tuple(mutation.path for mutation in terminal_restore.mutations)
 
     if action is RestoreRecoveryAction.VERIFY_AND_COMMIT_CLEANUP:
@@ -1114,14 +1244,23 @@ def resolve_restore_execution(
         if package is None:
             package = load_verified_package(root, current_trash)
         verify_restore_after_state(root, current_trash, terminal_restore, package)
+        relation_preflight = build_recovery_preflight(
+            root,
+            restore_id,
+            effect="relation_update",
+        ).consume()
         write_journal(
             with_link_index_state(
                 with_phase(current_trash, OperationPhase.ROLLED_BACK),
                 revision=None,
                 result=None,
                 sha256=None,
-            )
+            ),
+            preflight=relation_preflight,
         )
+        facts = _preflight_restore_recovery(root, restore_id, trash_id)
+        terminal_restore = facts.restore
+        current_trash = facts.trash
         _commit_restore_cleanup(root, current_trash, restore_id, terminal_restore)
         return OperationResult(
             operation_id=restore_id,
@@ -1152,10 +1291,39 @@ def resolve_restore_execution(
             verify_locked_terminal_operation(root, restore_id, expected=OperationPhase.ROLLED_BACK)
         else:
             terminal_restore = with_phase(terminal_restore, OperationPhase.ROLLED_BACK)
-            write_journal(terminal_restore)
-        write_journal(without_metadata(current_trash, "restore_operation_id"))
-        clean_recovery_copies(terminal_restore)
-        release_lock(root, restore_id)
+            journal_preflight = build_recovery_preflight(
+                root,
+                restore_id,
+                effect="journal_write",
+            ).consume()
+            write_journal(terminal_restore, preflight=journal_preflight)
+            facts = _preflight_restore_recovery(root, restore_id, trash_id)
+            terminal_restore = facts.restore
+            current_trash = facts.trash
+        relation_preflight = build_recovery_preflight(
+            root,
+            restore_id,
+            effect="relation_update",
+        ).consume()
+        write_journal(
+            without_metadata(current_trash, "restore_operation_id"),
+            preflight=relation_preflight,
+        )
+        facts = _preflight_restore_recovery(root, restore_id, trash_id)
+        terminal_restore = facts.restore
+        current_trash = facts.trash
+        cleanup_preflight = build_recovery_preflight(
+            root,
+            restore_id,
+            effect="material_cleanup",
+        ).consume()
+        clean_recovery_copies(terminal_restore, preflight=cleanup_preflight)
+        release_preflight = build_recovery_preflight(
+            root,
+            restore_id,
+            effect="release",
+        ).consume()
+        release_lock(root, restore_id, preflight=release_preflight)
         if execution_error is not None:
             if execution_error.code in (
                 "operation.validation_failed",
@@ -1175,8 +1343,18 @@ def resolve_restore_execution(
         # 幂等清理 R 登记材料、释放 R 锁；不重写 T，不加载或删除权威包。释放锁前
         # 同样必须证明 target 仍为 before（H2），不得因 T 已解关联就跳过。
         verify_locked_terminal_operation(root, restore_id, expected=OperationPhase.ROLLED_BACK)
-        clean_recovery_copies(terminal_restore)
-        release_lock(root, restore_id)
+        cleanup_preflight = build_recovery_preflight(
+            root,
+            restore_id,
+            effect="material_cleanup",
+        ).consume()
+        clean_recovery_copies(terminal_restore, preflight=cleanup_preflight)
+        release_preflight = build_recovery_preflight(
+            root,
+            restore_id,
+            effect="release",
+        ).consume()
+        release_lock(root, restore_id, preflight=release_preflight)
         if execution_error is not None:
             raise DraftError(
                 CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory
@@ -1207,9 +1385,26 @@ def resolve_restore_execution(
                 CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory
             )
         terminal_restore = with_phase(terminal_restore, OperationPhase.ROLLED_BACK)
-        write_journal(terminal_restore)
-        clean_recovery_copies(terminal_restore)
-        release_lock(root, restore_id)
+        journal_preflight = build_recovery_preflight(
+            root,
+            restore_id,
+            effect="journal_write",
+        ).consume()
+        write_journal(terminal_restore, preflight=journal_preflight)
+        facts = _preflight_restore_recovery(root, restore_id, trash_id)
+        terminal_restore = facts.restore
+        cleanup_preflight = build_recovery_preflight(
+            root,
+            restore_id,
+            effect="material_cleanup",
+        ).consume()
+        clean_recovery_copies(terminal_restore, preflight=cleanup_preflight)
+        release_preflight = build_recovery_preflight(
+            root,
+            restore_id,
+            effect="release",
+        ).consume()
+        release_lock(root, restore_id, preflight=release_preflight)
         if execution_error is not None:
             raise DraftError(
                 CheckCode.OPERATION_INCONSISTENT_STATE.value, terminal_restore.directory
@@ -1237,11 +1432,46 @@ def _commit_restore_cleanup(
     """已提交 restore 的统一清理：授权包删除、R 恢复副本清理、释放 R 锁。
 
     M1：restore 清理授权从锁内重读的已提交 T journal 派生（rolled_back 已耐久写入）；
-    当前锁属于 R 操作（restore_id），双向关联已由 validate_restore_link 证明。
+    当前锁属于 R 操作（restore_id），双向关联由共享 preflight 证明。每个清理动作
+    都会丢弃前一轮快照并重新取得整组 capability。
     """
+    preflight = build_recovery_preflight(root, restore_id, effect="material_cleanup").consume()
+    trash_id = next(
+        (
+            participant_id
+            for participant_id, journal in preflight.current
+            if journal is not None and journal.kind is OperationKind.TRASH
+        ),
+        None,
+    )
+    restore = next(
+        (
+            journal
+            for participant_id, journal in preflight.current
+            if participant_id == restore_id and journal is not None
+        ),
+        None,
+    )
+    if trash_id is None or restore is None:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, root)
     clean_authoritative_package(
         root,
-        cleanup_authorization(root, current_trash.operation_id, lock_operation_id=restore_id),
+        cleanup_authorization(root, trash_id, lock_operation_id=restore_id),
+        preflight=preflight,
     )
-    clean_recovery_copies(terminal_restore)
-    release_lock(root, restore_id)
+    preflight = build_recovery_preflight(root, restore_id, effect="material_cleanup").consume()
+    restore = next(
+        (
+            journal
+            for participant_id, journal in preflight.current
+            if participant_id == restore_id and journal is not None
+        ),
+        None,
+    )
+    if restore is None:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, root)
+    clean_recovery_copies(restore, preflight=preflight)
+    release_preflight = build_recovery_preflight(
+        root, restore_id, effect="release"
+    ).consume()
+    release_lock(root, restore_id, preflight=release_preflight)

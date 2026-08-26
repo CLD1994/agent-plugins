@@ -1,3 +1,4 @@
+import errno
 import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -9,7 +10,14 @@ from draft.checker import check_draft
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.models import OperationKind, OperationPhase, RootState
-from draft.operations import JOURNAL_VERSION, Journal, operation_journal_path, read_journal
+from draft.operations import (
+    JOURNAL_VERSION,
+    Journal,
+    RecoveryPreflight,
+    operation_journal_path,
+    read_journal,
+    release_lock,
+)
 from draft.trash import restore_retained_trash, trash_page
 from draft.trash_lifecycle import recover_interrupted_operations
 from draft.trash_package import VerifiedTrashPackage
@@ -236,6 +244,22 @@ def _other_operation_dirs(root: Path, *exclude: str) -> list[Path]:
         for entry in sorted(operations.iterdir())
         if entry.is_dir() and entry.name not in exclude
     ]
+
+
+def _node_snapshot(directory: Path) -> dict[str, tuple[str, bytes | str | None]]:
+    """Capture a real tree without following injected symlinks."""
+    snapshot: dict[str, tuple[str, bytes | str | None]] = {}
+    for path in sorted(directory.rglob("*")):
+        relative = path.relative_to(directory).as_posix()
+        if path.is_symlink():
+            snapshot[relative] = ("symlink", path.readlink().as_posix())
+        elif path.is_dir():
+            snapshot[relative] = ("directory", None)
+        elif path.is_file():
+            snapshot[relative] = ("file", path.read_bytes())
+        else:
+            snapshot[relative] = ("other", None)
+    return snapshot
 
 
 def test_candidate_trash_then_restore_roundtrips(draft_factory: DraftFactory) -> None:
@@ -802,6 +826,134 @@ def test_package_evidence_mismatch_is_not_restore_conflict(
     assert not (root / ".draft/operation.lock").exists()
 
 
+class _RestoreMaterialFailure:
+    """Fail an applying journal publish after corrupting its real recovery material."""
+
+    def __init__(self, root: Path, trash_id: str, target: str, tamper: str) -> None:
+        self.root = root
+        self.trash_id = trash_id
+        self.target = target
+        self.tamper = tamper
+        self.fired = False
+        self.restore_current: bytes | None = None
+        self.restore_pending: bytes | None = None
+        self.trash_current: bytes | None = None
+        self.trash_pending: bytes | None = None
+        self.restore_directory: Path | None = None
+        self.restore_tree: dict[str, tuple[str, bytes | str | None]] | None = None
+        self.package_tree: dict[str, tuple[str, bytes | str | None]] | None = None
+
+    def checkpoint(self, step: object) -> None:
+        from draft.operations import DurabilityStep
+
+        if self.fired or step is not DurabilityStep.JOURNAL_DIRECTORY_FSYNC:
+            return
+        operations = self.root / ".draft/operations"
+        candidates = [
+            entry
+            for entry in sorted(operations.iterdir())
+            if entry.is_dir() and entry.name != self.trash_id
+        ]
+        if not candidates:
+            return
+        restore_directory = candidates[0]
+        material = restore_directory / self.target
+        if not material.is_dir():
+            return
+        members = [entry for entry in sorted(material.iterdir()) if entry.is_file()]
+        pending_path = restore_directory / "journal.json.pending"
+        if not members or not pending_path.is_file():
+            return
+
+        restore_path = restore_directory / "journal.json"
+        trash_path = operations / self.trash_id / "journal.json"
+        trash_pending_path = trash_path.with_name("journal.json.pending")
+        self.restore_directory = restore_directory
+        self.restore_current = restore_path.read_bytes()
+        self.restore_pending = pending_path.read_bytes()
+        self.trash_current = trash_path.read_bytes()
+        trash_pending = self.trash_current + b"\n"
+        trash_pending_path.write_bytes(trash_pending)
+        self.trash_pending = trash_pending
+
+        material_path = members[0]
+        if self.tamper == "unknown":
+            (material / "unexpected.bin").write_bytes(b"unexpected")
+        elif self.tamper == "symlink":
+            material_path.unlink()
+            external = self.root / "restore-material-external.bin"
+            external.write_bytes(b"outside")
+            material_path.symlink_to(external)
+        elif self.tamper == "directory":
+            material_path.unlink()
+            material_path.mkdir()
+        elif self.tamper == "digest":
+            material_path.write_bytes(b"wrong digest")
+        else:  # pragma: no cover
+            raise AssertionError(self.tamper)
+        self.restore_tree = _node_snapshot(restore_directory)
+        self.package_tree = _node_snapshot(
+            self.root / ".draft/trash/outgoing" / self.trash_id
+        )
+        self.fired = True
+        raise OSError(errno.EIO, "injected recovery material failure")
+
+
+@pytest.mark.parametrize("target", ["originals", "staged"])
+@pytest.mark.parametrize("tamper", ["unknown", "symlink", "directory", "digest"])
+def test_restore_execution_error_validates_r_and_t_before_pending_publish(
+    draft_factory: DraftFactory,
+    target: str,
+    tamper: str,
+) -> None:
+    """R/T pending and recovery material stay unchanged when preflight rejects unsafe bytes."""
+    from draft.operations import durability_observer_scope
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    observer = _RestoreMaterialFailure(root, pending.operation_id, target, tamper)
+
+    with (
+        durability_observer_scope(observer),
+        pytest.raises(DraftError) as caught,
+    ):
+        restore_retained_trash(root, pending.operation_id, now=NOW)
+
+    assert observer.fired, (caught.value, caught.value.__cause__)
+    assert observer.restore_directory is not None
+    assert observer.restore_current is not None
+    assert observer.restore_pending is not None
+    assert observer.trash_current is not None
+    assert observer.trash_pending is not None
+    assert observer.restore_tree is not None
+    assert observer.package_tree is not None
+    expected_code = (
+        CheckCode.PATH_SYMLINK_ESCAPE.value
+        if tamper == "symlink"
+        else CheckCode.OPERATION_INCONSISTENT_STATE.value
+    )
+    assert caught.value.code == expected_code
+    restore_directory = observer.restore_directory
+    assert (restore_directory / "journal.json").read_bytes() == observer.restore_current
+    assert (
+        restore_directory / "journal.json.pending"
+    ).read_bytes() == observer.restore_pending
+    assert (
+        root / ".draft/operations" / pending.operation_id / "journal.json"
+    ).read_bytes() == observer.trash_current
+    assert (
+        root / ".draft/operations" / pending.operation_id / "journal.json.pending"
+    ).read_bytes() == observer.trash_pending
+    assert _node_snapshot(restore_directory) == observer.restore_tree
+    assert (
+        _node_snapshot(root / ".draft/trash/outgoing" / pending.operation_id)
+        == observer.package_tree
+    )
+    assert (root / ".draft/operation.lock").read_text(encoding="utf-8").find(
+        restore_directory.name
+    ) >= 0
+
+
 def test_crash_between_r_completed_and_t_rolled_back_recovers(
     draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -941,6 +1093,31 @@ def test_committed_cleanup_recovers_from_crash_point(
     assert not (root / ".draft/operation.lock").exists()
 
 
+def test_unlocked_committed_restore_cleanup_retries_for_remaining_package(
+    draft_factory: DraftFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R/T 目录仅剩 journal 时，残留权威包仍是已提交清理授权。"""
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=NOW)
+    restore_id = _complete_restore_then_crash(
+        root,
+        pending.operation_id,
+        monkeypatch,
+        crash_after_t_commit=True,
+    )
+
+    # 模拟生命周期释放遗留锁后再进入未持锁恢复；包仍完整，不能被终态审计分支跳过。
+    release_lock(root, restore_id)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    assert package.is_dir()
+    report = recover_interrupted_operations(root, now=NOW)
+
+    assert any(result.operation_id == restore_id for result in report)
+    assert not package.exists()
+    assert not (root / ".draft/operation.lock").exists()
+
+
 # ---------------------------------------------------------------------------
 # 第十一轮 H1/Q1：restore 中段相位（applying/validating/rolling_back）的真实崩溃恢复。
 # 故障注入在真实 writer 写出相位的 I/O 接缝，不手工构造最终 JSON。
@@ -961,9 +1138,11 @@ def crash_after_restore_phase(
     real_write = operations_module.write_journal
     fired = False
 
-    def write_then_crash(journal: Journal) -> None:
+    def write_then_crash(
+        journal: Journal, *, preflight: RecoveryPreflight | None = None
+    ) -> None:
         nonlocal fired
-        real_write(journal)
+        real_write(journal, preflight=preflight)
         if not fired and journal.kind is OperationKind.RESTORE and journal.phase is phase:
             fired = True
             raise SimulatedProcessExit
@@ -1051,9 +1230,11 @@ def test_trash_link_index_phase_crash_recovers_to_retained_with_index_result(
     real_write = operations_module.write_journal
     fired = False
 
-    def write_then_crash(journal: Journal) -> None:
+    def write_then_crash(
+        journal: Journal, *, preflight: RecoveryPreflight | None = None
+    ) -> None:
         nonlocal fired
-        real_write(journal)
+        real_write(journal, preflight=preflight)
         if (
             not fired
             and journal.kind is OperationKind.TRASH
@@ -1096,9 +1277,11 @@ def test_trash_applying_phase_crash_recovers_mutation_through_public_entry(
     real_write = operations_module.write_journal
     fired = False
 
-    def write_then_crash(journal: Journal) -> None:
+    def write_then_crash(
+        journal: Journal, *, preflight: RecoveryPreflight | None = None
+    ) -> None:
         nonlocal fired
-        real_write(journal)
+        real_write(journal, preflight=preflight)
         if (
             not fired
             and journal.kind is OperationKind.TRASH
@@ -1330,9 +1513,11 @@ def crash_after_restore_unclaim(monkeypatch: pytest.MonkeyPatch) -> None:
     real_write = trash_module.write_journal
     fired = False
 
-    def write_then_crash(journal: Journal) -> None:
+    def write_then_crash(
+        journal: Journal, *, preflight: RecoveryPreflight | None = None
+    ) -> None:
         nonlocal fired
-        real_write(journal)
+        real_write(journal, preflight=preflight)
         if (
             not fired
             and journal.kind is OperationKind.TRASH
@@ -1557,7 +1742,9 @@ def _restore_preclaim_crash_scene(
     real_write = trash_module.write_journal
     fired = False
 
-    def write_then_crash(journal: Journal) -> None:
+    def write_then_crash(
+        journal: Journal, *, preflight: RecoveryPreflight | None = None
+    ) -> None:
         nonlocal fired
         if (
             not fired
@@ -1566,7 +1753,7 @@ def _restore_preclaim_crash_scene(
         ):
             fired = True
             raise SimulatedProcessExit
-        real_write(journal)
+        real_write(journal, preflight=preflight)
 
     monkeypatch.setattr(trash_module, "write_journal", write_then_crash)
     with pytest.raises(SimulatedProcessExit):
@@ -1599,9 +1786,11 @@ def crash_after_restore_rolled_back(monkeypatch: pytest.MonkeyPatch) -> None:
     real_write = trash_module.write_journal
     fired = False
 
-    def write_then_crash(journal: Journal) -> None:
+    def write_then_crash(
+        journal: Journal, *, preflight: RecoveryPreflight | None = None
+    ) -> None:
         nonlocal fired
-        real_write(journal)
+        real_write(journal, preflight=preflight)
         if (
             not fired
             and journal.kind is OperationKind.RESTORE
@@ -1797,10 +1986,10 @@ def test_restore_non_allocating_phases_do_not_collect_unapplied_proof(
         assert _read_journal(root, trash_id)["phase"] == "rolled_back"
 
 
-def test_restore_prepared_collects_unapplied_proof_once(
+def test_restore_prepared_rejects_stale_unapplied_proof_between_reads(
     draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """R=PREPARED：决策恰好采集一次 unapplied proof 并收敛为放弃（M1 正例）。"""
+    """R=PREPARED：刷新后未能再次证明未应用时失败关闭并保留现场。"""
     root, restore_id, trash_id = _apply_restore_mid_phase_crash(
         draft_factory, monkeypatch, OperationPhase.PREPARED
     )
@@ -1808,22 +1997,24 @@ def test_restore_prepared_collects_unapplied_proof_once(
 
     calls: list[object] = []
 
-    def spy(*args: object, **kwargs: object) -> bool:
+    def changing_proof(*args: object, **kwargs: object) -> bool:
         calls.append(1)
-        return True
+        return len(calls) == 1
 
-    monkeypatch.setattr(trash_module, "_proven_unapplied_restore", spy)
+    monkeypatch.setattr(trash_module, "_proven_unapplied_restore", changing_proof)
 
-    _recover_through_public_entry(root)
+    with pytest.raises(DraftError) as caught:
+        _recover_through_public_entry(root)
 
-    assert len(calls) == 1
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    assert len(calls) >= 2
     from draft.operations import read_lock
 
-    assert read_lock(root) is None
-    assert _read_journal(root, restore_id)["phase"] == "rolled_back"
+    assert read_lock(root) == restore_id
+    assert _read_journal(root, restore_id)["phase"] == "prepared"
     t = _read_journal(root, trash_id)
     assert t["phase"] == "trash_retained"
-    assert "restore_operation_id" not in t["metadata"]
+    assert t["metadata"]["restore_operation_id"] == restore_id
 
 
 def test_restore_applying_directory_target_stable_error(
@@ -1923,9 +2114,11 @@ def _committed_cleanup_scene(
         journal: Journal,
         auth: PackageAuthorization,
         leaves_bytes: dict[Path, bytes],
+        *,
+        preflight: RecoveryPreflight | None = None,
     ) -> None:
         nonlocal fired
-        real_write_evidence(journal, auth, leaves_bytes)
+        real_write_evidence(journal, auth, leaves_bytes, preflight=preflight)
         if not fired:
             fired = True
             raise SimulatedProcessExit
@@ -2525,8 +2718,10 @@ def test_unexplained_external_change_preserves_claim_lock_and_package(
 
     original_write = operations_module.write_journal
 
-    def inject_unrecognizable_page(journal: object) -> None:
-        original_write(journal)  # type: ignore[arg-type]
+    def inject_unrecognizable_page(
+        journal: object, *, preflight: RecoveryPreflight | None = None
+    ) -> None:
+        original_write(journal, preflight=preflight)  # type: ignore[arg-type]
         if getattr(journal, "phase", None) is OperationPhase.VALIDATING:
             # 已应用页面被改成 before/after 都无法识别的状态：回滚无法分类。
             (root / "pages/obsolete.md").write_text("不可识别的并发垃圾内容\n", encoding="utf-8")

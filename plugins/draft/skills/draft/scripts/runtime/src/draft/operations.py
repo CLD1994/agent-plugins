@@ -6,11 +6,12 @@ import json
 import os
 import re
 import stat
+import sys
 import uuid
 from collections.abc import Callable, Generator, Mapping, Set
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
@@ -23,6 +24,7 @@ from draft.diagnostic_codes import (
     LINK_INDEX_REBUILD_REQUIRED,
     OPERATION_EXTERNAL_CHANGE,
     OPERATION_INDEX_UPDATE_FAILED,
+    OPERATION_PLAN_INVALID,
     CheckCode,
 )
 from draft.errors import DraftError
@@ -36,6 +38,7 @@ from draft.models import (
     OperationResult,
     ResultWarning,
     RootState,
+    TrashResult,
 )
 from draft.observations import (
     EntryKind,
@@ -644,6 +647,7 @@ def recover_digest_pending(
     *,
     code: str,
     code_path: Path,
+    preflight: RecoveryPreflight | None = None,
 ) -> None:
     """把崩溃遗留的 ``<目标>.pending`` 收敛为已发布/已消费状态。
 
@@ -651,6 +655,8 @@ def recover_digest_pending(
     内分类复核，类型/摘要不符即外部改写，保留现场报错，不按文件名形状批量删除。
     发布用 no-clobber link（目标在发布瞬间出现即外部变化，保留两者）。
     """
+    if preflight is not None:
+        preflight.require_effect("material_cleanup")
     with anchored_leaf(root, relative, code=code, code_path=code_path) as target:
         if isinstance(target, _MissingLeaf):
             return  # 中间父组件缺失：目标与 pending 都必然缺失，无可收敛。
@@ -752,6 +758,7 @@ def recover_quarantine(
     *,
     code: str,
     code_path: Path,
+    preflight: RecoveryPreflight | None = None,
 ) -> None:
     """把崩溃遗留的 ``<目标>.quarantine`` 收敛为已删除/已恢复状态。
 
@@ -759,6 +766,8 @@ def recover_quarantine(
     精确授权 quarantine；类型/摘要不符即外部改写，恢复原名或保留现场报错，不按文件名
     形状批量删除。
     """
+    if preflight is not None:
+        preflight.require_effect("material_cleanup")
     with anchored_leaf(root, relative, code=code, code_path=code_path) as target:
         if isinstance(target, _MissingLeaf):
             return
@@ -1378,52 +1387,10 @@ class RecoveryOperationDirectory:
 
 
 @dataclass
-class _RecoveryDirectoryHandle:
-    """operation 下的认证子目录句柄。"""
-
-    entry: RecoveryOperationDirectory
-    name: str
-    fd: int
-    node: tuple[int, int]
-    display: Path
-
-    def verify(self) -> None:
-        self.entry.verify()
-        try:
-            current = os.stat(self.name, dir_fd=self.entry.fd, follow_symlinks=False)
-        except OSError as exc:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, self.display) from exc
-        if stat.S_ISLNK(current.st_mode) or (current.st_dev, current.st_ino) != self.node:
-            code = (
-                CheckCode.PATH_SYMLINK_ESCAPE.value
-                if stat.S_ISLNK(current.st_mode)
-                else CheckCode.OPERATION_INCONSISTENT_STATE.value
-            )
-            raise DraftError(code, self.display)
-        try:
-            opened = os.fstat(self.fd)
-        except OSError as exc:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, self.display) from exc
-        if (opened.st_dev, opened.st_ino) != self.node:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, self.display)
-
-    def close(self) -> None:
-        descriptor = self.fd
-        self.fd = -1
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError as exc:
-                raise DraftError(
-                    CheckCode.OPERATION_INCONSISTENT_STATE.value, self.display
-                ) from exc
-
-
-@dataclass
 class _RecoveryLeaf:
     """operation FD 内的 no-follow 叶句柄和认证 inode。"""
 
-    parent: RecoveryOperationDirectory | _RecoveryDirectoryHandle
+    parent: RecoveryOperationDirectory
     name: str
     node: tuple[int, int] | None
     fd: int | None
@@ -1433,7 +1400,7 @@ class _RecoveryLeaf:
     @classmethod
     def open(
         cls,
-        entry: RecoveryOperationDirectory | _RecoveryDirectoryHandle,
+        entry: RecoveryOperationDirectory,
         name: str,
         *,
         code: str,
@@ -1452,16 +1419,28 @@ class _RecoveryLeaf:
         flags = os.O_RDONLY | os.O_NOFOLLOW
         if stat.S_ISDIR(current.st_mode):
             flags |= os.O_DIRECTORY
+        descriptor: int | None = None
         try:
             descriptor = os.open(name, flags, dir_fd=parent_fd)
             opened = os.fstat(descriptor)
         except OSError as exc:
+            if descriptor is not None:
+                # Keep the fstat/open failure as the primary diagnostic; ownership was
+                # transferred to this branch and the descriptor was attempted exactly once.
+                try:
+                    os.close(descriptor)
+                except OSError as close_error:
+                    exc.add_note(f"descriptor close failed: {close_error!r}")
             raise DraftError(code, code_path) from exc
+        assert descriptor is not None
         node = (current.st_dev, current.st_ino)
         if (opened.st_dev, opened.st_ino) != node:
-            with suppress(OSError):
+            primary = DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
+            try:
                 os.close(descriptor)
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path) from None
+            except OSError as close_error:
+                primary.add_note(f"descriptor close failed: {close_error!r}")
+            raise primary
         return cls(entry, name, node, descriptor, code, code_path)
 
     def verify(self) -> EntryKind:
@@ -1585,35 +1564,68 @@ def _open_recovery_operations_fd(root: Path) -> _RecoveryContext | None:
         root_fd = draft_fd = operations_fd = -1
         return context
     finally:
+        close_error: OSError | None = None
         for descriptor in (operations_fd, draft_fd, root_fd):
             if descriptor >= 0:
-                with suppress(OSError):
+                try:
                     os.close(descriptor)
+                except OSError as exc:
+                    if close_error is None:
+                        close_error = exc
+        if close_error is not None:
+            active = sys.exc_info()[1]
+            if isinstance(active, BaseException):
+                active.add_note(f"descriptor close failed: {close_error!r}")
+            else:
+                raise DraftError(
+                    CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                    root_path,
+                ) from close_error
 
 
 @contextmanager
 def open_recovery_operation_directories(
     root: Path,
+    *,
+    operation_id: str | None = None,
 ) -> Generator[tuple[RecoveryOperationDirectory, ...], None, None]:
-    """打开并验证本轮无锁恢复候选，退出时关闭全部 directory FD。"""
+    """打开并验证本轮恢复候选，退出时关闭全部 directory FD。
+
+    ``operation_id`` 用于已有 matching lock 的窄重读，避免把目录名重新解析为
+    未认证的路径或依赖其他 operation 的扫描结果。
+    """
     context = _open_recovery_operations_fd(root)
     if context is None:
         yield ()
         return
     entries: list[RecoveryOperationDirectory] = []
+    primary_error: BaseException | None = None
     try:
         context.verify()
-        try:
-            names = sorted(
-                entry.name
-                for entry in os.scandir(context.operations_fd)
-                if entry.name not in (".", "..")
-            )
-        except OSError as exc:
-            raise DraftError(
-                CheckCode.OPERATION_INCONSISTENT_STATE.value,
-                root / OPERATIONS_RELATIVE,
-            ) from exc
+        if operation_id is not None:
+            try:
+                validate_operation_id(
+                    operation_id,
+                    code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                )
+            except DraftError as exc:
+                raise DraftError(
+                    CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                    root / OPERATIONS_RELATIVE / operation_id,
+                ) from exc
+            names = [operation_id]
+        else:
+            try:
+                names = sorted(
+                    entry.name
+                    for entry in os.scandir(context.operations_fd)
+                    if entry.name not in (".", "..")
+                )
+            except OSError as exc:
+                raise DraftError(
+                    CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                    root / OPERATIONS_RELATIVE,
+                ) from exc
         for name in names:
             context.verify()
             display = root / OPERATIONS_RELATIVE / name
@@ -1658,15 +1670,34 @@ def open_recovery_operation_directories(
                     )
                 )
             except BaseException:
-                os.close(operation_fd)
+                try:
+                    os.close(operation_fd)
+                except OSError as close_os_error:
+                    # Preserve the fstat/identity error as primary while recording the
+                    # exactly-once close failure for diagnostics.
+                    active = sys.exc_info()[1]
+                    if isinstance(active, BaseException):
+                        active.add_note(f"descriptor close failed: {close_os_error!r}")
                 raise
         yield tuple(entries)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
+        close_error: DraftError | None = None
         for entry in entries:
-            with suppress(OSError, DraftError):
+            try:
                 entry.close()
-        with suppress(OSError, DraftError):
+            except DraftError as exc:
+                if close_error is None:
+                    close_error = exc
+        try:
             context.close()
+        except DraftError as exc:
+            if close_error is None:
+                close_error = exc
+        if primary_error is None and close_error is not None:
+            raise close_error
 
 
 def _fd_display(entry: RecoveryOperationDirectory, name: str) -> Path:
@@ -1689,25 +1720,13 @@ def _recovery_leaf(
     return leaf
 
 
-def _refresh_recovery_leaf(
-    entry: RecoveryOperationDirectory,
-    name: str,
-    *,
-    code: str,
-    code_path: Path,
-) -> _RecoveryLeaf:
-    if entry.leaves is not None:
-        old = entry.leaves.pop(name, None)
-        if old is not None:
-            old.close()
-    return _recovery_leaf(entry, name, code=code, code_path=code_path)
-
-
-def _read_optional_journal_fd(entry: RecoveryOperationDirectory) -> Journal | None:
-    path = _fd_display(entry, "journal.json")
+def _read_optional_journal_fd(
+    entry: RecoveryOperationDirectory, *, name: str = "journal.json"
+) -> Journal | None:
+    path = _fd_display(entry, name)
     leaf = _recovery_leaf(
         entry,
-        "journal.json",
+        name,
         code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
         code_path=path,
     )
@@ -1722,145 +1741,57 @@ def _read_optional_journal_fd(entry: RecoveryOperationDirectory) -> Journal | No
     )
 
 
-def _resolve_journal_pending_fd(entry: RecoveryOperationDirectory) -> None:
-    """FD 版 pending 收敛；解析和转换验证仍复用既有纯权威函数。"""
-    pending_path = _fd_display(entry, "journal.json.pending")
-    pending = _recovery_leaf(
-        entry,
-        "journal.json.pending",
-        code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
-        code_path=pending_path,
-    )
-    pending_kind = pending.verify()
-    if pending_kind is EntryKind.MISSING:
-        return
-    old = _read_optional_journal_fd(entry)
-    if pending_kind is not EntryKind.FILE:
-        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, pending_path)
-    try:
-        journal = _parse_journal_bytes(
-            pending.read_verified(),
-            pending_path,
-        )
-    except DraftError:
-        if old is not None:
-            return
-        raise
-    validate_journal_transition(old, journal, path=_fd_display(entry, "journal.json"))
-    entry.verify()
-    try:
-        pending.verify()
-        target = _recovery_leaf(
-            entry,
-            "journal.json",
-            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
-            code_path=_fd_display(entry, "journal.json"),
-        )
-        if target.verify() not in (EntryKind.FILE, EntryKind.MISSING):
-            _raise_journal_invalid(_fd_display(entry, "journal.json"))
-        durability_checkpoint(DurabilityStep.JOURNAL_WRITE)
-        os.replace(
-            pending.name,
-            "journal.json",
-            src_dir_fd=entry.fd,
-            dst_dir_fd=entry.fd,
-        )
-        _fsync_dir_fd(
-            entry.fd,
-            _fd_display(entry, "journal.json"),
-            durability_step=DurabilityStep.JOURNAL_DIRECTORY_FSYNC,
-        )
-        _refresh_recovery_leaf(
-            entry,
-            "journal.json",
-            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
-            code_path=_fd_display(entry, "journal.json"),
-        )
-        _refresh_recovery_leaf(
-            entry,
-            "journal.json.pending",
-            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
-            code_path=pending_path,
-        )
-    except OSError as exc:
-        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, pending_path) from exc
+@dataclass(frozen=True)
+class _UnlockedRecoveryDiscovery:
+    """未持锁阶段可携带的只读事实；不能作为后续写入授权。"""
+
+    operation_id: str
+    journal: Journal | None
+    pending_journal: Journal | None
+    member_names: frozenset[str]
+    display: Path
+    # Trash 权威包的节点形状只用于判断终态是否还有已提交清理残留；任何实际清理
+    # 仍须在 matching lock 内由 cleanup_authorization 重新授权。
+    package_kind: EntryKind = EntryKind.MISSING
 
 
-def read_unlocked_operation_journal_fd(entry: RecoveryOperationDirectory) -> Journal | None:
-    """从已锚定 operation FD 读取 journal，并只用该 FD 检查空目录。"""
-    _resolve_journal_pending_fd(entry)
+def _discover_unlocked_operation_fd(
+    entry: RecoveryOperationDirectory,
+) -> _UnlockedRecoveryDiscovery:
+    """读取一个候选的当前形状，不发布 pending 或改动恢复材料。"""
     journal = _read_optional_journal_fd(entry)
-    if journal is not None:
-        return journal
+    pending_journal = _read_optional_journal_fd(entry, name="journal.json.pending")
     entry.verify()
     try:
-        names = tuple(os.scandir(entry.fd))
+        with os.scandir(entry.fd) as iterator:
+            member_names = frozenset(item.name for item in iterator)
     except OSError as exc:
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display) from exc
-    if names:
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display)
-    return None
+    effective_journal = pending_journal if pending_journal is not None else journal
+    package_kind = EntryKind.MISSING
+    if (
+        effective_journal is not None
+        and effective_journal.kind is OperationKind.TRASH
+        and effective_journal.phase is OperationPhase.ROLLED_BACK
+    ):
+        from draft.trash_package import OUTGOING_RELATIVE
 
-
-def write_unlocked_journal_fd(entry: RecoveryOperationDirectory, journal: Journal) -> None:
-    """在已锚定 operation FD 内写 journal；Journal.directory 仅作为显示路径。"""
-    _resolve_journal_pending_fd(entry)
-    entry.verify()
-    path = _fd_display(entry, "journal.json")
-    old = _read_optional_journal_fd(entry)
-    old_leaf = _recovery_leaf(
-        entry,
-        "journal.json",
-        code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
-        code_path=path,
+        package_relative = OUTGOING_RELATIVE
+        reject_symlink_components(entry.context.root, package_relative)
+        package_path = entry.context.root / package_relative / entry.name
+        package_kind = classify_node_or_error(
+            package_path,
+            code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
+            code_path=package_path,
+        )
+    return _UnlockedRecoveryDiscovery(
+        operation_id=entry.name,
+        journal=journal,
+        pending_journal=pending_journal,
+        member_names=member_names,
+        display=entry.display,
+        package_kind=package_kind,
     )
-    validate_journal_transition(old, journal, path=path)
-    entry.verify()
-
-    def identity_gate(pending_node: tuple[int, int]) -> None:
-        entry.verify()
-        old_leaf.verify()
-        try:
-            current = os.stat("journal.json.pending", dir_fd=entry.fd, follow_symlinks=False)
-        except OSError as exc:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, path) from exc
-        if (current.st_dev, current.st_ino) != pending_node:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, path)
-
-    if old is None:
-        old_leaf.verify()
-        _create_only_publish(
-            entry.fd,
-            "journal.json",
-            _journal_to_json(journal),
-            code_path=path,
-            write_step=DurabilityStep.JOURNAL_WRITE,
-            directory_fsync_step=DurabilityStep.JOURNAL_DIRECTORY_FSYNC,
-            identity_gate=identity_gate,
-        )
-        _refresh_recovery_leaf(
-            entry,
-            "journal.json",
-            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
-            code_path=path,
-        )
-    else:
-        old_leaf.verify()
-        _replace_publish(
-            entry.fd,
-            "journal.json",
-            _journal_to_json(journal),
-            code_path=path,
-            write_step=DurabilityStep.JOURNAL_WRITE,
-            directory_fsync_step=DurabilityStep.JOURNAL_DIRECTORY_FSYNC,
-            identity_gate=identity_gate,
-        )
-        _refresh_recovery_leaf(
-            entry,
-            "journal.json",
-            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
-            code_path=path,
-        )
 
 
 def read_lock(root: Path) -> str | None:
@@ -1888,7 +1819,14 @@ def read_lock(root: Path) -> str | None:
     return validate_operation_id(operation_id)
 
 
-def release_lock(root: Path, operation_id: str) -> None:
+def release_lock(
+    root: Path,
+    operation_id: str,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> None:
+    if preflight is not None:
+        preflight.require_effect("release", participant_id=operation_id)
     current = read_lock(root)
     if current != operation_id:
         raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, root / LOCK_RELATIVE)
@@ -1929,6 +1867,493 @@ class Journal:
     link_index_revision: str | None
     link_index_result: LinkIndexResult | None
     link_index_sha256: str | None
+
+
+class RestoreTrashRelation(StrEnum):
+    """R/T claim 图的唯一关系分类。
+
+    关系分类只描述当前全图事实；是否允许某个 phase 进入锁内动作由
+    ``validate_restore_trash_relations`` 在同一责任边界继续验证。
+    """
+
+    UNRELATED = "unrelated"
+    PRECLAIM = "preclaim"
+    POST_UNCLAIM_CLEANUP = "post_unclaim_cleanup"
+    MATCHED = "matched"
+    DANGLING_TARGET = "dangling_target"
+    FORWARD_ONLY = "forward_only"
+    REVERSE_ONLY = "reverse_only"
+    MISMATCHED = "mismatched"
+    MULTIPLE = "multiple"
+
+
+class RestoreTrashAction(StrEnum):
+    """合法 R/T 关系授予 restore owner 的唯一锁内动作。"""
+
+    RECOVER_PRECLAIM = "recover_preclaim"
+    RECOVER_MATCHED = "recover_matched"
+    CLEANUP_POST_UNCLAIM = "cleanup_post_unclaim"
+
+
+_RESTORE_TRASH_ACTION_BY_RELATION: Mapping[
+    RestoreTrashRelation, RestoreTrashAction
+] = {
+    RestoreTrashRelation.PRECLAIM: RestoreTrashAction.RECOVER_PRECLAIM,
+    RestoreTrashRelation.MATCHED: RestoreTrashAction.RECOVER_MATCHED,
+    RestoreTrashRelation.POST_UNCLAIM_CLEANUP: RestoreTrashAction.CLEANUP_POST_UNCLAIM,
+}
+
+
+def restore_trash_action_for_relation(
+    relation: RestoreTrashRelation,
+) -> RestoreTrashAction | None:
+    """返回批准关系的唯一 capability action；未批准关系不授予 action。"""
+    return _RESTORE_TRASH_ACTION_BY_RELATION.get(relation)
+
+
+@dataclass(frozen=True)
+class RestoreTrashOwnership:
+    """全图关系分类派生的 owner、participant closure 与 action。"""
+
+    relation: RestoreTrashRelation
+    owner_id: str | None
+    participant_ids: tuple[str, ...]
+    action: RestoreTrashAction | None
+
+
+_RESTORE_BACK_REFERENCE = "restores_trash_operation"
+
+
+def _restore_forward_id(journal: Journal) -> object:
+    return journal.metadata.get(_RESTORE_BACK_REFERENCE)
+
+
+def _trash_reverse_id(journal: Journal) -> object:
+    return journal.metadata.get(RESTORE_OPERATION_ID_KEY)
+
+
+def _is_restore_id(value: object) -> bool:
+    return isinstance(value, str) and _OPERATION_ID.fullmatch(value) is not None
+
+
+def _is_restore_preclaim_pair(restore: Journal, trash: Journal) -> bool:
+    """严格识别尚未写入 T 反向 claim 的 restore bootstrap。"""
+    return (
+        restore.kind is OperationKind.RESTORE
+        and restore.phase is OperationPhase.ALLOCATING
+        and restore.observations.entries == ()
+        and restore.mutations == ()
+        and restore.remove_empty_directories == ()
+        and restore.metadata == {_RESTORE_BACK_REFERENCE: trash.operation_id}
+        and trash.kind is OperationKind.TRASH
+        and trash.phase is OperationPhase.TRASH_RETAINED
+        and RESTORE_OPERATION_ID_KEY not in trash.metadata
+    )
+
+
+def _is_restore_post_unclaim_pair(restore: Journal, trash: Journal) -> bool:
+    """识别 R 已回滚、T claim 已耐久删除的授权清理窗口。"""
+    return (
+        restore.kind is OperationKind.RESTORE
+        and restore.phase is OperationPhase.ROLLED_BACK
+        and trash.kind is OperationKind.TRASH
+        and trash.phase is OperationPhase.TRASH_RETAINED
+        and RESTORE_OPERATION_ID_KEY not in trash.metadata
+    )
+
+
+def _matched_restore_phase_pair(restore: Journal, trash: Journal) -> bool:
+    if trash.phase is OperationPhase.TRASH_RETAINED:
+        return restore.phase in {
+            OperationPhase.ALLOCATING,
+            OperationPhase.PREPARED,
+            OperationPhase.APPLYING,
+            OperationPhase.VALIDATING,
+            OperationPhase.LINK_INDEX_UPDATING,
+            OperationPhase.LINK_INDEX_PUBLISHED,
+            OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
+            OperationPhase.ROLLING_BACK,
+            OperationPhase.ROLLED_BACK,
+            OperationPhase.COMPLETED,
+        }
+    return (
+        trash.phase is OperationPhase.ROLLED_BACK
+        and restore.phase is OperationPhase.COMPLETED
+    )
+
+
+def classify_restore_trash_relations(
+    journals: Mapping[str, Journal],
+) -> dict[str, RestoreTrashRelation]:
+    """基于全部当前 journals 构建纯 R/T 关系分类。
+
+    该函数不访问文件系统、不发布 pending，也不执行任何副作用。输入 journal 已经
+    通过 raw/v4 解析边界；因此非 string 的 metadata 只能在该边界映射为
+    ``operation.journal_corrupt``，这里只处理已解析对象的关系图与 phase。
+    """
+    statuses = {operation_id: RestoreTrashRelation.UNRELATED for operation_id in journals}
+    forward_targets: dict[str, list[str]] = {}
+    restore_targets: dict[str, str] = {}
+    reverse_values: dict[str, object] = {}
+    reverse_targets: dict[str, str] = {}
+
+    for operation_id, journal in journals.items():
+        if journal.kind is OperationKind.RESTORE:
+            forward = _restore_forward_id(journal)
+            if not _is_restore_id(forward):
+                statuses[operation_id] = RestoreTrashRelation.FORWARD_ONLY
+            else:
+                target_id = cast(str, forward)
+                restore_targets[operation_id] = target_id
+                forward_targets.setdefault(target_id, []).append(operation_id)
+        elif journal.kind is OperationKind.TRASH and RESTORE_OPERATION_ID_KEY in journal.metadata:
+            reverse = _trash_reverse_id(journal)
+            reverse_values[operation_id] = reverse
+            if _is_restore_id(reverse):
+                reverse_targets[operation_id] = cast(str, reverse)
+            else:
+                statuses[operation_id] = RestoreTrashRelation.REVERSE_ONLY
+
+    # A target with more than one forward owner is globally ambiguous. Mark both the
+    # target and every R owner before considering any lower-priority phase rule.
+    for target_id, owners in forward_targets.items():
+        if len(owners) <= 1:
+            continue
+        for owner in owners:
+            statuses[owner] = RestoreTrashRelation.MULTIPLE
+        if target_id in statuses:
+            statuses[target_id] = RestoreTrashRelation.MULTIPLE
+
+    for restore_id, target_id in restore_targets.items():
+        if statuses[restore_id] is RestoreTrashRelation.MULTIPLE:
+            continue
+        target = journals.get(target_id)
+        if target is None:
+            statuses[restore_id] = RestoreTrashRelation.DANGLING_TARGET
+            continue
+        if target.kind is not OperationKind.TRASH:
+            statuses[restore_id] = RestoreTrashRelation.MISMATCHED
+            continue
+        if statuses.get(target_id) is RestoreTrashRelation.MULTIPLE:
+            statuses[restore_id] = RestoreTrashRelation.MULTIPLE
+            continue
+        if RESTORE_OPERATION_ID_KEY not in target.metadata:
+            if _is_restore_preclaim_pair(journals[restore_id], target):
+                statuses[restore_id] = RestoreTrashRelation.PRECLAIM
+                statuses[target_id] = RestoreTrashRelation.PRECLAIM
+            elif _is_restore_post_unclaim_pair(journals[restore_id], target):
+                statuses[restore_id] = RestoreTrashRelation.POST_UNCLAIM_CLEANUP
+                statuses[target_id] = RestoreTrashRelation.POST_UNCLAIM_CLEANUP
+            else:
+                statuses[restore_id] = RestoreTrashRelation.FORWARD_ONLY
+            continue
+        reverse = reverse_values[target_id]
+        if not _is_restore_id(reverse):
+            statuses[restore_id] = RestoreTrashRelation.MISMATCHED
+            continue
+        if cast(str, reverse) != restore_id:
+            statuses[restore_id] = RestoreTrashRelation.MISMATCHED
+            statuses[target_id] = RestoreTrashRelation.MISMATCHED
+            continue
+        statuses[restore_id] = RestoreTrashRelation.MATCHED
+        statuses[target_id] = RestoreTrashRelation.MATCHED
+
+    # Reverse claims are checked independently so T-only, dangling and mismatched
+    # claims cannot disappear merely because no R forward path was selected above.
+    for trash_id, restore_id in reverse_targets.items():
+        if statuses[trash_id] is RestoreTrashRelation.MULTIPLE:
+            continue
+        restore = journals.get(restore_id)
+        if restore is None:
+            statuses[trash_id] = RestoreTrashRelation.DANGLING_TARGET
+            continue
+        if restore.kind is not OperationKind.RESTORE:
+            statuses[trash_id] = RestoreTrashRelation.MISMATCHED
+            continue
+        if restore_targets.get(restore_id) != trash_id:
+            statuses[trash_id] = RestoreTrashRelation.REVERSE_ONLY
+            if statuses[restore_id] is RestoreTrashRelation.UNRELATED:
+                statuses[restore_id] = RestoreTrashRelation.FORWARD_ONLY
+            continue
+        if len(forward_targets.get(trash_id, ())) > 1:
+            statuses[trash_id] = RestoreTrashRelation.MULTIPLE
+
+    return statuses
+
+
+def validate_restore_trash_relations(
+    journals: Mapping[str, Journal],
+    operation_id: str | None = None,
+) -> dict[str, RestoreTrashRelation]:
+    """按 raw/type → R plan → 全图关系 → phase 优先级验证 R/T 图。
+
+    ``operation_id`` 为 ``None`` 时验证全图并在第一个稳定错误处停止；传入 operation ID
+    时仍先完成全图身份/计划检查，再只对该 operation 的关系与 phase 授权作出结论。
+    返回值是同一份纯分类结果，供 checker 与锁内 resolver 共享。
+    """
+    # Journal objects normally have string metadata because _parse_journal enforces it. Keep
+    # this check here too: callers constructing facts directly must not bypass raw/type priority.
+    # Complete each priority phase over the entire graph before moving to the next one. In
+    # particular, do not let the lexical order of operation IDs decide whether an R plan or a
+    # T graph error masks another journal's raw/type failure.
+    for operation_key in sorted(journals):
+        journal = journals[operation_key]
+        if any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in cast(Mapping[object, object], journal.metadata).items()
+        ):
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal.directory)
+
+    # R's forward claim is a plan precondition. It has priority over every graph fact,
+    # including a malformed reverse claim elsewhere in the operation graph.
+    for operation_key in sorted(journals):
+        journal = journals[operation_key]
+        if journal.kind is OperationKind.RESTORE:
+            raw_metadata = cast(Mapping[object, object], journal.metadata)
+            forward = raw_metadata.get(_RESTORE_BACK_REFERENCE)
+            if not _is_restore_id(forward):
+                raise DraftError(OPERATION_PLAN_INVALID, journal.directory)
+
+    # A syntactically invalid T reverse claim is a graph error, after all R plans have
+    # been proved. Metadata type was already checked in the preceding raw/type phase.
+    for operation_key in sorted(journals):
+        journal = journals[operation_key]
+        if journal.kind is OperationKind.TRASH and RESTORE_OPERATION_ID_KEY in journal.metadata:
+            raw_metadata = cast(Mapping[object, object], journal.metadata)
+            reverse = raw_metadata.get(RESTORE_OPERATION_ID_KEY)
+            if not isinstance(reverse, str):
+                raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal.directory)
+            if not _is_restore_id(reverse):
+                # T claim has the right raw type but an invalid lexical identity: graph error.
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+
+    statuses = classify_restore_trash_relations(journals)
+    ids = (operation_id,) if operation_id is not None else tuple(sorted(journals))
+    for current_id in ids:
+        if current_id not in journals:
+            continue
+        relation = statuses[current_id]
+        if relation in {
+            RestoreTrashRelation.UNRELATED,
+            RestoreTrashRelation.PRECLAIM,
+            RestoreTrashRelation.POST_UNCLAIM_CLEANUP,
+        }:
+            continue
+        if relation is RestoreTrashRelation.MATCHED:
+            current = journals[current_id]
+            if current.kind is OperationKind.RESTORE:
+                restore = current
+                target_id = cast(str, _restore_forward_id(restore))
+                trash = journals.get(target_id)
+            else:
+                trash = current
+                restore_id = cast(str, _trash_reverse_id(trash))
+                restore = journals.get(restore_id)
+            if (
+                restore is None
+                or trash is None
+                or restore.kind is not OperationKind.RESTORE
+                or trash.kind is not OperationKind.TRASH
+                or not _matched_restore_phase_pair(restore, trash)
+            ):
+                raise DraftError(
+                    CheckCode.OPERATION_INCONSISTENT_STATE.value, current.directory
+                )
+            continue
+        if relation is RestoreTrashRelation.REVERSE_ONLY:
+            trash = journals[current_id]
+            if trash.kind is OperationKind.TRASH:
+                restore_id = _trash_reverse_id(trash)
+                restore = (
+                    journals.get(cast(str, restore_id))
+                    if _is_restore_id(restore_id)
+                    else None
+                )
+                # A T claim to an existing R whose forward claim is absent is a plan error,
+                # not a generic graph mismatch.  The distinction matters for both direct T
+                # recovery and whole-graph checker projection.
+                if (
+                    restore is not None
+                    and restore.kind is OperationKind.RESTORE
+                    and not _is_restore_id(_restore_forward_id(restore))
+                ):
+                    raise DraftError(OPERATION_PLAN_INVALID, restore.directory)
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, journals[current_id].directory
+            )
+        raise DraftError(
+            CheckCode.OPERATION_INCONSISTENT_STATE.value, journals[current_id].directory
+        )
+    return statuses
+
+
+def classify_restore_trash_ownership(
+    journals: Mapping[str, Journal],
+) -> dict[str, RestoreTrashOwnership]:
+    """从完整有效 journal 图纯粹派生 R/T owner、participants 和 action。
+
+    本函数先沿用同一 raw/type、forward plan、图和 phase 优先级验证输入。仅三种批准
+    关系拥有 capability；其余关系（包括无关 operation）都不从局部调用或反向 claim
+    推断 owner。
+    """
+    statuses = validate_restore_trash_relations(journals)
+    ownership: dict[str, RestoreTrashOwnership] = {}
+    for operation_id, relation in statuses.items():
+        action = restore_trash_action_for_relation(relation)
+        if action is None:
+            ownership[operation_id] = RestoreTrashOwnership(relation, None, (), None)
+            continue
+        journal = journals[operation_id]
+        if journal.kind is OperationKind.RESTORE:
+            restore_id = operation_id
+            trash_id = cast(str, _restore_forward_id(journal))
+        else:
+            trash_id = operation_id
+            restore_id = next(
+                candidate_id
+                for candidate_id, candidate in journals.items()
+                if candidate.kind is OperationKind.RESTORE
+                and _restore_forward_id(candidate) == trash_id
+            )
+        ownership[operation_id] = RestoreTrashOwnership(
+            relation,
+            restore_id,
+            (restore_id, trash_id),
+            action,
+        )
+    return ownership
+
+
+@dataclass(frozen=True)
+class RestoreTrashRelationFacts:
+    """锁内当前 R/T journal 与唯一关系分类。"""
+
+    operation_id: str
+    relation: RestoreTrashRelation
+    restore: Journal | None
+    trash: Journal | None
+    owner_id: str | None
+    participant_ids: tuple[str, ...]
+    action: RestoreTrashAction | None
+
+
+RecoveryEffect = Literal[
+    "pending_publish",
+    "journal_write",
+    "material_cleanup",
+    "relation_update",
+    "handoff",
+    "release",
+    "mutation",
+]
+
+
+@dataclass
+class RecoveryPreflight:
+    """一项恢复副作用的锁内、整组只读授权。
+
+    The object deliberately stores the current/pending projections that were proved together;
+    callers must discard it after the authorized operation and build a new one before the next
+    operation.  It is a capability-shaped boundary, not a replacement for the durable writer.
+    """
+
+    root: Path
+    owner_id: str
+    participant_ids: tuple[str, ...]
+    relation: RestoreTrashRelation
+    action: RestoreTrashAction | None
+    current: tuple[tuple[str, Journal | None], ...]
+    pending: tuple[tuple[str, Journal | None], ...]
+    effect: RecoveryEffect
+    validate_retained_package: bool = False
+    _consumed: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def authorize(self) -> RecoveryPreflight:
+        """在消费前确认 lock、整图关系和各 participant 仍是本轮事实。"""
+        if read_lock(self.root) != self.owner_id:
+            raise DraftError(
+                CheckCode.OPERATION_RECOVERY_REQUIRED.value,
+                self.root / LOCK_RELATIVE,
+            )
+        fact = read_restore_trash_relation(self.root, self.owner_id)
+        fact_owner = fact.owner_id if fact.owner_id is not None else self.owner_id
+        fact_participants = fact.participant_ids or (self.owner_id,)
+        if (
+            fact_owner != self.owner_id
+            or fact.relation is not self.relation
+            or fact.action is not self.action
+            or fact_participants != self.participant_ids
+        ):
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                self.root / OPERATIONS_RELATIVE / self.owner_id,
+            )
+        expected_current = dict(self.current)
+        expected_pending = dict(self.pending)
+        if set(expected_current) != set(self.participant_ids) or set(expected_pending) != set(
+            self.participant_ids
+        ):
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                self.root / OPERATIONS_RELATIVE / self.owner_id,
+            )
+        for participant_id in self.participant_ids:
+            current, pending = read_locked_recovery_snapshot(self.root, participant_id)
+            if current != expected_current[participant_id] or pending != expected_pending[
+                participant_id
+            ]:
+                raise DraftError(
+                    CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                    operation_journal_path(self.root, participant_id),
+                )
+            _validate_locked_recovery_material(self.root, participant_id, current, pending)
+        if self.validate_retained_package:
+            _validate_retained_package_preflight(self.root, self.current, self.pending)
+        return self
+
+    def require_effect(
+        self,
+        effect: RecoveryEffect,
+        *,
+        participant_id: str | None = None,
+    ) -> RecoveryPreflight:
+        """在底层副作用边界重新确认一次性 capability。"""
+        if not self._consumed or self.effect != effect:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                operation_journal_path(self.root, self.owner_id),
+            )
+        target_id = self.owner_id if participant_id is None else participant_id
+        if target_id not in self.participant_ids:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                operation_journal_path(self.root, target_id),
+            )
+        if effect == "release" and target_id != self.owner_id:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                operation_journal_path(self.root, target_id),
+            )
+        self.authorize()
+        return self
+
+    def consume(self) -> RecoveryPreflight:
+        """消费一次副作用授权；同一份事实不能授权两个动作。"""
+        if self._consumed:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                operation_journal_path(self.root, self.owner_id),
+            )
+        # Mark the capability before returning to the caller.  A failing durable helper must
+        # not leave an apparently fresh token that can be reused for a different side effect.
+        self.authorize()
+        self._consumed = True
+        return self
+
+
+def is_empty_allocation_residue(member_names: Set[str], journal: Journal | None) -> bool:
+    """统一判定无 journal/pending 且无其他成员的合法 allocation residue。"""
+    return journal is None and not member_names
 
 
 def _journal_to_json(journal: Journal) -> bytes:
@@ -2567,6 +2992,8 @@ def _read_optional_journal(path: Path) -> Journal | None:
     )
     if node is EntryKind.MISSING:
         return None
+    if node is EntryKind.SYMLINK:
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, path)
     if node is not EntryKind.FILE:
         _raise_journal_invalid(path)
     return _parse_journal_bytes(
@@ -2574,14 +3001,32 @@ def _read_optional_journal(path: Path) -> Journal | None:
     )
 
 
+def read_optional_journal(path: Path) -> Journal | None:
+    """只读读取 current/pending journal；缺失返回 None，不产生任何发布副作用。"""
+    return _read_optional_journal(path)
+
+
 def read_journal(journal_path: Path) -> Journal:
+    node = classify_node_or_error(
+        journal_path,
+        code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+        code_path=journal_path,
+    )
+    if node is EntryKind.SYMLINK:
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, journal_path)
+    if node is not EntryKind.FILE:
+        _raise_journal_invalid(journal_path)
     return _parse_journal_bytes(
         _read_persistent_bytes(journal_path, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value),
         journal_path,
     )
 
 
-def resolve_journal_pending(journal_path: Path) -> None:
+def resolve_journal_pending(
+    journal_path: Path,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> None:
     """把崩溃遗留的 ``journal.json.pending`` 收敛为已发布日志。
 
     只有能由当前耐久 journal 通过一次合法状态转换产生的完整新对象才可发布：
@@ -2591,6 +3036,11 @@ def resolve_journal_pending(journal_path: Path) -> None:
     旧 journal 推进（崩溃容错，checker 报告残留），旧 journal 缺失时无法继续报损坏。
     绝不按文件名删除 pending。
     """
+    if preflight is not None:
+        preflight.require_effect(
+            "pending_publish",
+            participant_id=journal_path.parent.name,
+        )
     pending_path = journal_path.with_name(_pending_name(journal_path.name))
     pending_kind = classify_node_or_error(
         pending_path, code=CheckCode.OPERATION_JOURNAL_CORRUPT.value, code_path=pending_path
@@ -2598,6 +3048,8 @@ def resolve_journal_pending(journal_path: Path) -> None:
     if pending_kind is EntryKind.MISSING:
         return
     old = _read_optional_journal(journal_path)
+    if pending_kind is EntryKind.SYMLINK:
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, pending_path)
     if pending_kind is not EntryKind.FILE:
         if old is not None:
             return  # 类型错误 pending：保留旧 journal 推进，checker 报告。
@@ -2794,7 +3246,11 @@ def _parse_journal(data: object, journal_path: Path) -> Journal:
     return journal
 
 
-def write_journal(journal: Journal) -> None:
+def write_journal(
+    journal: Journal,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> None:
     """耐久写入 journal，发布前验证 new 是当前持久 journal 的合法单步后继。
 
     先收敛崩溃遗留 pending（有效后继发布、半写残留保留旧 journal），再从磁盘重读当前
@@ -2802,7 +3258,25 @@ def write_journal(journal: Journal) -> None:
     bootstrap（无旧 journal）走 create-only；更新走经过转换验证的原子 replace。
     """
     path = journal.directory / "journal.json"
-    resolve_journal_pending(path)
+    if preflight is None:
+        resolve_journal_pending(path)
+    else:
+        # R/T claim and unlink transitions are relation updates, while ordinary phase changes
+        # use the journal-write effect.  Both are journal publications, but keeping the effect
+        # distinction lets the capability encode the stronger participant closure for relation
+        # changes.
+        if preflight.effect == "relation_update":
+            preflight.require_effect("relation_update", participant_id=journal.operation_id)
+        else:
+            preflight.require_effect("journal_write", participant_id=journal.operation_id)
+        pending_path = path.with_name(_pending_name(path.name))
+        pending_kind = classify_node_or_error(
+            pending_path,
+            code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+            code_path=pending_path,
+        )
+        if pending_kind is not EntryKind.MISSING:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, pending_path)
     old = _read_optional_journal(path)
     validate_journal_transition(old, journal, path=path)
     parent_fd = ensure_directory_chain(
@@ -3089,6 +3563,7 @@ def _apply_write(
     *,
     expected_current: str | None,
     code_path: Path,
+    preflight: RecoveryPreflight | None = None,
 ) -> None:
     """摘要绑定受管写。
 
@@ -3102,6 +3577,8 @@ def _apply_write(
     日志只授权把摘要精确的节点转换为目标状态，绝不覆盖最后复核后才出现的不同节点；
     崩溃遗留的 ``{目标}.pending/.quarantine`` 由恢复按授权摘要收敛。
     """
+    if preflight is not None:
+        preflight.require_effect("mutation")
     cursor = root
     for part in target.parts[:-1]:
         cursor /= part
@@ -3133,9 +3610,17 @@ def _apply_write(
         )
 
 
-def _apply_delete(root: Path, target: Path, *, expected_digest: str) -> None:
+def _apply_delete(
+    root: Path,
+    target: Path,
+    *,
+    expected_digest: str,
+    preflight: RecoveryPreflight | None = None,
+) -> None:
     """摘要绑定受管删：目标必须当前为 expected_digest 的精确普通文件，
     经节点事务隔离验证后消费；缺失（提交点后幂等清理）容忍。"""
+    if preflight is not None:
+        preflight.require_effect("mutation")
     with anchored_leaf(
         root, target, code=CheckCode.PATH_SYMLINK_ESCAPE.value, code_path=root / target
     ) as leaf:
@@ -3180,7 +3665,11 @@ def _execute_apply_phase(root: Path, journal: Journal) -> Journal:
     return current
 
 
-def _clean_recovery_copies(journal: Journal) -> None:
+def _clean_recovery_copies(
+    journal: Journal,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> None:
     """按日志登记路径精确清理恢复副本（originals/staged）。
 
     全局无副作用预检两个目录的全部成员：任何未登记成员、符号链接、错误类型或
@@ -3191,6 +3680,8 @@ def _clean_recovery_copies(journal: Journal) -> None:
     容忍。journal.json 不属于本函数清理范围，由调用方按"最后处理 journal"的状态
     机决定。
     """
+    owner_id = preflight.owner_id if preflight is not None else None
+    next_preflight = preflight
     registered: dict[str, dict[str, str]] = {"originals": {}, "staged": {}}
     for mutation in journal.mutations:
         if (
@@ -3223,12 +3714,28 @@ def _clean_recovery_copies(journal: Journal) -> None:
         # 先收敛崩溃遗留的登记文件 pending/quarantine：发布/消费后才做
         # 未知成员检查，否则 .pending/.quarantine 会作为未登记成员被拒绝且锁永久保留。
         for name, digest in sorted(allowed.items()):
+            pending_preflight = _consume_recovery_preflight(
+                journal.directory.parent.parent.parent,
+                owner_id=owner_id,
+                participant_id=journal.operation_id,
+                effect="material_cleanup",
+                current=next_preflight,
+            )
             recover_digest_pending(
                 journal.directory,
                 Path(sub) / name,
                 digest,
                 code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
                 code_path=journal.directory / sub / name,
+                preflight=pending_preflight,
+            )
+            next_preflight = None
+            quarantine_preflight = _consume_recovery_preflight(
+                journal.directory.parent.parent.parent,
+                owner_id=owner_id,
+                participant_id=journal.operation_id,
+                effect="material_cleanup",
+                current=next_preflight,
             )
             recover_quarantine(
                 journal.directory,
@@ -3236,7 +3743,9 @@ def _clean_recovery_copies(journal: Journal) -> None:
                 digest,
                 code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
                 code_path=journal.directory / sub / name,
+                preflight=quarantine_preflight,
             )
+            next_preflight = None
         for entry in directory.iterdir():
             relative = Path(sub) / entry.name
             if entry.name not in allowed:
@@ -3269,7 +3778,15 @@ def _clean_recovery_copies(journal: Journal) -> None:
                 if sha256_bytes(leaf.read()) != registered[sub][relative.name]:
                     raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, relative)
                 # 隔离→验证→删除：验证与删除同一锚定句柄。
+                _consume_recovery_preflight(
+                    journal.directory.parent.parent.parent,
+                    owner_id=owner_id,
+                    participant_id=journal.operation_id,
+                    effect="material_cleanup",
+                    current=next_preflight,
+                )
                 leaf.quarantine_delete(registered[sub][relative.name])
+                next_preflight = None
         directory = journal.directory / sub
         if (
             classify_node_or_error(
@@ -3286,287 +3803,15 @@ def _clean_recovery_copies(journal: Journal) -> None:
                 code_path=directory,
             ) as leaf:
                 if leaf.classify() is EntryKind.DIRECTORY:
+                    _consume_recovery_preflight(
+                        journal.directory.parent.parent.parent,
+                        owner_id=owner_id,
+                        participant_id=journal.operation_id,
+                        effect="material_cleanup",
+                        current=next_preflight,
+                    )
                     leaf.rmdir()
-
-
-def _fd_recover_copy_leaf(
-    entry: RecoveryOperationDirectory,
-    subdirectory: _RecoveryDirectoryHandle,
-    parent_fd: int,
-    name: str,
-    expected_digest: str,
-) -> None:
-    """在认证 originals/staged 目录内收敛一个 copy leaf。"""
-    subdirectory.verify()
-    display = entry.display / name
-    target = _RecoveryLeaf.open(
-        subdirectory,
-        name,
-        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
-        code_path=display,
-    )
-    pending = _RecoveryLeaf.open(
-        subdirectory,
-        _pending_name(name),
-        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
-        code_path=display,
-    )
-    try:
-        target_kind = target.verify()
-        pending_kind = pending.verify()
-        decision = _pending_decision(
-            target_kind=target_kind,
-            pending_kind=pending_kind,
-            target_digest=sha256_bytes(target.read_verified())
-            if target_kind is EntryKind.FILE
-            else None,
-            pending_digest=sha256_bytes(pending.read_verified())
-            if pending_kind is EntryKind.FILE
-            else None,
-            expected_digest=expected_digest,
-        )
-        if decision == "external":
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, display)
-        if decision == "publish":
-            subdirectory.verify()
-            pending.verify()
-            target.verify()
-            try:
-                os.link(
-                    pending.name,
-                    target.name,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
-                    follow_symlinks=False,
-                )
-            except FileExistsError as exc:
-                raise DraftError("operation.external_change", display) from exc
-            except OSError as exc:
-                raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, display) from exc
-            _fsync_dir_fd(parent_fd, display)
-            target.close()
-            target = _RecoveryLeaf.open(
-                subdirectory,
-                name,
-                code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
-                code_path=display,
-            )
-            if sha256_bytes(target.read_verified()) != expected_digest:
-                raise DraftError("operation.external_change", display)
-            pending.verify()
-            target.verify()
-            pending.unlink_verified()
-            _fsync_dir_fd(parent_fd, display)
-        elif decision == "delete":
-            pending.verify()
-            if sha256_bytes(pending.read_verified()) != expected_digest:
-                raise DraftError("operation.external_change", display)
-            pending.unlink_verified()
-            _fsync_dir_fd(parent_fd, display)
-    finally:
-        target.close()
-        pending.close()
-
-
-def _fd_recover_quarantine_leaf(
-    entry: RecoveryOperationDirectory,
-    subdirectory: _RecoveryDirectoryHandle,
-    parent_fd: int,
-    name: str,
-    expected_digest: str,
-) -> None:
-    subdirectory.verify()
-    display = entry.display / name
-    target = _RecoveryLeaf.open(
-        subdirectory,
-        name,
-        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
-        code_path=display,
-    )
-    quarantine = _RecoveryLeaf.open(
-        subdirectory,
-        _quarantine_name(name),
-        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
-        code_path=display,
-    )
-    try:
-        target_kind = target.verify()
-        quarantine_kind = quarantine.verify()
-        decision = _quarantine_decision(
-            target_kind=target_kind,
-            quarantine_kind=quarantine_kind,
-            target_digest=sha256_bytes(target.read_verified())
-            if target_kind is EntryKind.FILE
-            else None,
-            quarantine_digest=sha256_bytes(quarantine.read_verified())
-            if quarantine_kind is EntryKind.FILE
-            else None,
-            expected_digest=expected_digest,
-        )
-        if decision == "external":
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, display)
-        if decision == "restore":
-            subdirectory.verify()
-            quarantine.verify()
-            target.verify()
-            try:
-                os.link(
-                    quarantine.name,
-                    target.name,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
-                    follow_symlinks=False,
-                )
-            except FileExistsError as exc:
-                raise DraftError("operation.external_change", display) from exc
-            except OSError as exc:
-                raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, display) from exc
-            _fsync_dir_fd(parent_fd, display)
-            quarantine.verify()
-            quarantine.unlink_verified()
-            _fsync_dir_fd(parent_fd, display)
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, display)
-        if decision in ("complete", "delete_stale"):
-            quarantine.verify()
-            if sha256_bytes(quarantine.read_verified()) != expected_digest:
-                raise DraftError("operation.external_change", display)
-            quarantine.unlink_verified()
-            _fsync_dir_fd(parent_fd, display)
-    finally:
-        target.close()
-        quarantine.close()
-
-
-def _fd_clean_recovery_copies(entry: RecoveryOperationDirectory, journal: Journal) -> None:
-    """在 operation FD 内完成精确恢复材料预检、收敛和清理。"""
-    registered: dict[str, dict[str, str]] = {"originals": {}, "staged": {}}
-    for mutation in journal.mutations:
-        if mutation.original is not None and mutation.before_sha256 is not None:
-            registered["originals"][mutation.original.name] = mutation.before_sha256
-        if mutation.staged is not None and mutation.after_sha256 is not None:
-            registered["staged"][mutation.staged.name] = mutation.after_sha256
-    for sub in ("originals", "staged"):
-        entry.verify()
-        try:
-            sub_stat = os.stat(sub, dir_fd=entry.fd, follow_symlinks=False)
-            if stat.S_ISLNK(sub_stat.st_mode) or not stat.S_ISDIR(sub_stat.st_mode):
-                if stat.S_ISLNK(sub_stat.st_mode):
-                    raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, entry.display / sub)
-                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display / sub)
-            sub_fd = os.open(
-                sub,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=entry.fd,
-            )
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise DraftError(
-                CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display / sub
-            ) from exc
-        subdirectory = _RecoveryDirectoryHandle(
-            entry=entry,
-            name=sub,
-            fd=sub_fd,
-            node=(sub_stat.st_dev, sub_stat.st_ino),
-            display=entry.display / sub,
-        )
-        try:
-            subdirectory.verify()
-            allowed = registered[sub]
-            for name, digest in sorted(allowed.items()):
-                _fd_recover_copy_leaf(entry, subdirectory, sub_fd, name, digest)
-                _fd_recover_quarantine_leaf(entry, subdirectory, sub_fd, name, digest)
-            try:
-                names = tuple(os.scandir(sub_fd))
-            except OSError as exc:
-                raise DraftError(
-                    CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display / sub
-                ) from exc
-            for item in names:
-                if (
-                    item.name not in allowed
-                    and item.name not in {_pending_name(name) for name in allowed}
-                    and item.name not in {_quarantine_name(name) for name in allowed}
-                ):
-                    raise DraftError(
-                        CheckCode.OPERATION_INCONSISTENT_STATE.value,
-                        entry.display / sub / item.name,
-                    )
-            for name, digest in sorted(allowed.items()):
-                subdirectory.verify()
-                leaf = _RecoveryLeaf.open(
-                    subdirectory,
-                    name,
-                    code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
-                    code_path=entry.display / sub / name,
-                )
-                try:
-                    kind = leaf.verify()
-                    if kind is EntryKind.MISSING:
-                        continue
-                    if kind is not EntryKind.FILE or sha256_bytes(leaf.read_verified()) != digest:
-                        raise DraftError(
-                            CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display / sub / name
-                        )
-                    subdirectory.verify()
-                    leaf.verify()
-                    # The copy leaf is consumed only after its same-inode gate.
-                    quarantine_name = _quarantine_name(name)
-                    try:
-                        os.link(
-                            name,
-                            quarantine_name,
-                            src_dir_fd=sub_fd,
-                            dst_dir_fd=sub_fd,
-                            follow_symlinks=False,
-                        )
-                    except FileExistsError as exc:
-                        raise DraftError(
-                            CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display / sub / name
-                        ) from exc
-                    except OSError as exc:
-                        raise DraftError(
-                            CheckCode.OPERATION_DURABILITY_FAILED.value, entry.display / sub / name
-                        ) from exc
-                    _fsync_dir_fd(sub_fd, entry.display / sub / name)
-                    leaf.verify()
-                    quarantine = _RecoveryLeaf.open(
-                        subdirectory,
-                        quarantine_name,
-                        code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
-                        code_path=entry.display / sub / name,
-                    )
-                    try:
-                        if sha256_bytes(quarantine.read_verified()) != digest:
-                            raise DraftError(
-                                CheckCode.OPERATION_INCONSISTENT_STATE.value,
-                                entry.display / sub / name,
-                            )
-                        leaf.unlink_verified()
-                        _fsync_dir_fd(sub_fd, entry.display / sub / name)
-                        quarantine.unlink_verified()
-                        _fsync_dir_fd(sub_fd, entry.display / sub / name)
-                    finally:
-                        quarantine.close()
-                finally:
-                    leaf.close()
-            subdirectory.verify()
-            with os.scandir(sub_fd) as scan:
-                nonempty = next(scan, None) is not None
-            if nonempty:
-                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display / sub)
-            subdirectory.verify()
-            entry.verify()
-            os.rmdir(sub, dir_fd=entry.fd)
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            raise DraftError(
-                CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display / sub
-            ) from exc
-        finally:
-            subdirectory.close()
+                    next_preflight = None
 
 
 def finalize_operation(
@@ -3579,6 +3824,7 @@ def finalize_operation(
     changed_paths: tuple[Path, ...] | None = None,
     settle_empty_directories: bool = True,
     warnings: tuple[ResultWarning, ...] = (),
+    recovery_preflight: RecoveryPreflight | None = None,
 ) -> OperationResult:
     """Mark a terminal phase; by default clean recovery copies then release the lock.
 
@@ -3596,14 +3842,40 @@ def finalize_operation(
     路径保留默认清理。``warnings`` 是索引阶段产生的稳定公开 warning，随成功结果返回。
     """
     terminal = _with_phase(journal, phase)
-    write_journal(terminal)
-    if not retain_terminal_lock:
-        _clean_recovery_copies(journal)
-        release_lock(root, journal.operation_id)
+    if recovery_preflight is None:
+        write_journal(terminal)
+    else:
+        write_journal(terminal, preflight=recovery_preflight)
+    # Planned directory removal is a named side effect and must happen while the matching lock
+    # still protects the terminal snapshot.  In particular, release must never precede this
+    # cleanup and leave a caller holding an unverified Journal after the lock is gone.
     if settle_empty_directories:
+        owner_id = recovery_preflight.owner_id if recovery_preflight is not None else None
+        next_preflight: RecoveryPreflight | None = None
         for relative in journal.remove_empty_directories:
+            _consume_recovery_preflight(
+                root,
+                owner_id=owner_id,
+                participant_id=journal.operation_id,
+                effect="material_cleanup",
+                current=next_preflight,
+            )
             with suppress(OSError):
                 (root / relative).rmdir()
+            next_preflight = None
+    if not retain_terminal_lock:
+        if recovery_preflight is None:
+            _clean_recovery_copies(journal)
+            release_lock(root, journal.operation_id)
+        else:
+            cleanup_preflight = build_recovery_preflight(
+                root, journal.operation_id, effect="material_cleanup"
+            ).consume()
+            _clean_recovery_copies(journal, preflight=cleanup_preflight)
+            release_preflight = build_recovery_preflight(
+                root, journal.operation_id, effect="release"
+            ).consume()
+            release_lock(root, journal.operation_id, preflight=release_preflight)
     if changed_paths is None:
         changed_paths = tuple(mutation.path for mutation in journal.mutations)
     return OperationResult(
@@ -3615,9 +3887,13 @@ def finalize_operation(
     )
 
 
-def clean_recovery_copies(journal: Journal) -> None:
+def clean_recovery_copies(
+    journal: Journal,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> None:
     """公开恢复副本清理入口，供恢复包装层在终态证明后调用。"""
-    _clean_recovery_copies(journal)
+    _clean_recovery_copies(journal, preflight=preflight)
 
 
 def _rollback(
@@ -3626,6 +3902,7 @@ def _rollback(
     *,
     retain_terminal_lock: bool = False,
     changed_paths: tuple[Path, ...] | None = None,
+    recovery: bool = False,
 ) -> OperationResult:
     """Restore every target to its before state; requires all targets classifiable."""
     for mutation in journal.mutations:
@@ -3637,17 +3914,29 @@ def _rollback(
     # 后缀，恢复器必须凭 phase 区分授权摘要。普通操作不再允许
     # prepared/applying/validating 直接写 rolled_back。
     rolling = _with_phase(journal, OperationPhase.ROLLING_BACK)
-    write_journal(rolling)
+    if recovery:
+        journal_preflight = build_recovery_preflight(
+            root, journal.operation_id, effect="journal_write"
+        ).consume()
+        write_journal(rolling, preflight=journal_preflight)
+    else:
+        write_journal(rolling)
     for mutation in reversed(journal.mutations):
         current = sha256_file(root / mutation.path)
         if current == mutation.before_sha256:
             continue
+        mutation_preflight: RecoveryPreflight | None = None
+        if recovery:
+            mutation_preflight = build_recovery_preflight(
+                root, journal.operation_id, effect="mutation"
+            ).consume()
         if mutation.before_sha256 is None:
             # 回滚新建 WRITE：目标当前为 after 精确节点，节点事务隔离验证后消费。
             _apply_delete(
                 root,
                 mutation.path,
                 expected_digest=cast("str", mutation.after_sha256),
+                preflight=mutation_preflight,
             )
         else:
             original = journal.directory / cast("Path", mutation.original)
@@ -3662,7 +3951,13 @@ def _rollback(
                 original.read_bytes(),
                 expected_current=mutation.after_sha256,
                 code_path=root / mutation.path,
+                preflight=mutation_preflight,
             )
+    terminal_preflight = (
+        build_recovery_preflight(root, journal.operation_id, effect="journal_write").consume()
+        if recovery
+        else None
+    )
     return finalize_operation(
         root,
         rolling,
@@ -3670,6 +3965,7 @@ def _rollback(
         journal.kind,
         retain_terminal_lock=retain_terminal_lock,
         changed_paths=changed_paths,
+        recovery_preflight=terminal_preflight,
     )
 
 
@@ -3679,6 +3975,7 @@ def _finish_forward(
     *,
     retain_terminal_lock: bool = False,
     changed_paths: tuple[Path, ...] | None = None,
+    recovery: bool = False,
 ) -> OperationResult:
     """Apply remaining after states, validate, and complete or roll back."""
     current = journal
@@ -3700,14 +3997,32 @@ def _finish_forward(
                 current,
                 retain_terminal_lock=retain_terminal_lock,
                 changed_paths=changed_paths,
+                recovery=recovery,
             )
-        current = _apply_one(root, current, mutation)
+        mutation_preflight = (
+            build_recovery_preflight(root, current.operation_id, effect="mutation").consume()
+            if recovery
+            else None
+        )
+        current = _apply_one(root, current, mutation, preflight=mutation_preflight)
     return _validate_and_complete(
-        root, current, retain_terminal_lock=retain_terminal_lock, changed_paths=changed_paths
+        root,
+        current,
+        retain_terminal_lock=retain_terminal_lock,
+        changed_paths=changed_paths,
+        recovery=recovery,
     )
 
 
-def _apply_one(root: Path, journal: Journal, mutation: JournalMutation) -> Journal:
+def _apply_one(
+    root: Path,
+    journal: Journal,
+    mutation: JournalMutation,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> Journal:
+    if preflight is not None:
+        preflight.require_effect("mutation", participant_id=journal.operation_id)
     if mutation.kind is MutationKind.WRITE:
         staged = journal.directory / cast("Path", mutation.staged)
         content = staged.read_bytes()
@@ -3721,7 +4036,13 @@ def _apply_one(root: Path, journal: Journal, mutation: JournalMutation) -> Journ
     else:
         _apply_delete(root, mutation.path, expected_digest=cast("str", mutation.before_sha256))
     updated = _with_applied(journal, mutation.path)
-    write_journal(updated)
+    if preflight is None:
+        write_journal(updated)
+    else:
+        journal_preflight = build_recovery_preflight(
+            root, journal.operation_id, effect="journal_write"
+        ).consume()
+        write_journal(updated, preflight=journal_preflight)
     return updated
 
 
@@ -3792,7 +4113,12 @@ class _OperationIndexSettlement:
     warnings: tuple[ResultWarning, ...]
 
 
-def settle_link_index_for_operation(root: Path, journal: Journal) -> _OperationIndexSettlement:
+def settle_link_index_for_operation(
+    root: Path,
+    journal: Journal,
+    *,
+    recovery: bool = False,
+) -> _OperationIndexSettlement:
     """在业务结果验证后、终态前收敛链接索引结果（spec §5/§10/§11）。
 
     在产生任何索引 staging、目标替换或 flag 副作用前先耐久写 ``link_index_updating``；
@@ -3814,11 +4140,21 @@ def settle_link_index_for_operation(root: Path, journal: Journal) -> _OperationI
         result=None,
         sha256=None,
     )
-    write_journal(updating)
+    if recovery:
+        updating_preflight = build_recovery_preflight(
+            root, journal.operation_id, effect="journal_write"
+        ).consume()
+        write_journal(updating, preflight=updating_preflight)
+    else:
+        write_journal(updating)
     if prepared.requires_rebuild:
-        return _finish_operation_rebuild_required(root, updating, next_revision)
+        return _finish_operation_rebuild_required(
+            root, updating, next_revision, recovery=recovery
+        )
     try:
-        return _finish_operation_published(root, updating, prepared, next_revision)
+        return _finish_operation_published(
+            root, updating, prepared, next_revision, recovery=recovery
+        )
     except DraftError as exc:
         if exc.code in (OPERATION_INDEX_UPDATE_FAILED, OPERATION_EXTERNAL_CHANGE):
             # 发布失败但可耐久记录：降级到 rebuild_required（spec §10/§11）。
@@ -3831,6 +4167,8 @@ def _finish_operation_published(
     updating: Journal,
     prepared: PreparedLinkIndexUpdate,
     next_revision: str,
+    *,
+    recovery: bool = False,
 ) -> _OperationIndexSettlement:
     """staging 写入、原子发布并耐久写 ``link_index_published``（spec §10）。
 
@@ -3841,17 +4179,43 @@ def _finish_operation_published(
 
     assert prepared.scan is not None
     index = maintenance.materialize_index(next_revision, prepared.scan.content)
-    digest = maintenance.stage_link_index(updating, index)
-    maintenance.publish_staged_link_index(root, updating, digest)
+    stage_preflight = (
+        build_recovery_preflight(root, updating.operation_id, effect="material_cleanup").consume()
+        if recovery
+        else None
+    )
+    digest = maintenance.stage_link_index(updating, index, preflight=stage_preflight)
+    publish_preflight = (
+        build_recovery_preflight(root, updating.operation_id, effect="material_cleanup").consume()
+        if recovery
+        else None
+    )
+    if publish_preflight is None:
+        maintenance.publish_staged_link_index(root, updating, digest)
+    else:
+        maintenance.publish_staged_link_index(
+            root, updating, digest, preflight=publish_preflight
+        )
     published = with_link_index_state(
         with_phase(updating, OperationPhase.LINK_INDEX_PUBLISHED),
         revision=next_revision,
         result=LinkIndexResult.PUBLISHED,
         sha256=digest,
     )
-    write_journal(published)
+    if recovery:
+        published_preflight = build_recovery_preflight(
+            root, updating.operation_id, effect="journal_write"
+        ).consume()
+        write_journal(published, preflight=published_preflight)
+    else:
+        write_journal(published)
     warnings: list[ResultWarning] = []
-    flag_warning = maintenance.remove_rebuild_flag(root)
+    flag_preflight = (
+        build_recovery_preflight(root, updating.operation_id, effect="material_cleanup").consume()
+        if recovery
+        else None
+    )
+    flag_warning = maintenance.remove_rebuild_flag(root, preflight=flag_preflight)
     if flag_warning is not None:
         warnings.append(flag_warning)
     return _OperationIndexSettlement(journal=published, warnings=tuple(warnings))
@@ -3861,6 +4225,8 @@ def _finish_operation_rebuild_required(
     root: Path,
     updating: Journal,
     next_revision: str,
+    *,
+    recovery: bool = False,
 ) -> _OperationIndexSettlement:
     """耐久记录 ``rebuild_required`` 并补建 flag（spec §10/§11）。
 
@@ -3875,13 +4241,29 @@ def _finish_operation_rebuild_required(
         result=LinkIndexResult.REBUILD_REQUIRED,
         sha256=None,
     )
-    write_journal(rebuild)
+    if recovery:
+        rebuild_preflight = build_recovery_preflight(
+            root, updating.operation_id, effect="journal_write"
+        ).consume()
+        write_journal(rebuild, preflight=rebuild_preflight)
+    else:
+        write_journal(rebuild)
     warnings: list[ResultWarning] = [ResultWarning(LINK_INDEX_REBUILD_REQUIRED)]
-    flag_warning = maintenance.ensure_rebuild_flag(root)
+    flag_preflight = (
+        build_recovery_preflight(root, updating.operation_id, effect="material_cleanup").consume()
+        if recovery
+        else None
+    )
+    flag_warning = maintenance.ensure_rebuild_flag(root, preflight=flag_preflight)
     if flag_warning is not None:
         warnings.append(flag_warning)
     # 发布失败降级路径可能残留 staging：幂等清理当前 operation 的 staging。
-    maintenance.cleanup_link_index_staging(updating)
+    cleanup_preflight = (
+        build_recovery_preflight(root, updating.operation_id, effect="material_cleanup").consume()
+        if recovery
+        else None
+    )
+    maintenance.cleanup_link_index_staging(updating, preflight=cleanup_preflight)
     return _OperationIndexSettlement(journal=rebuild, warnings=tuple(warnings))
 
 
@@ -3891,9 +4273,16 @@ def _validate_and_complete(
     *,
     retain_terminal_lock: bool = False,
     changed_paths: tuple[Path, ...] | None = None,
+    recovery: bool = False,
 ) -> OperationResult:
     current = _with_phase(journal, OperationPhase.VALIDATING)
-    write_journal(current)
+    if recovery:
+        validation_preflight = build_recovery_preflight(
+            root, journal.operation_id, effect="journal_write"
+        ).consume()
+        write_journal(current, preflight=validation_preflight)
+    else:
+        write_journal(current)
     if journal.root_state is RootState.REGISTERED:
         # registered 根的应用后完整检查是事务提交前的二次确认。
         try:
@@ -3905,6 +4294,7 @@ def _validate_and_complete(
                     current,
                     retain_terminal_lock=retain_terminal_lock,
                     changed_paths=changed_paths,
+                    recovery=recovery,
                 )
                 raise DraftError(
                     "operation.validation_failed", root, details=error.details
@@ -3919,7 +4309,7 @@ def _validate_and_complete(
     current = settle_planned_empty_directories(root, current)
     warnings: tuple[ResultWarning, ...] = ()
     if operation_changes_link_index(current):
-        settlement = settle_link_index_for_operation(root, current)
+        settlement = settle_link_index_for_operation(root, current, recovery=recovery)
         current = settlement.journal
         warnings = settlement.warnings
     if current.kind is OperationKind.TRASH:
@@ -3934,6 +4324,13 @@ def _validate_and_complete(
             changed_paths=changed_paths,
             settle_empty_directories=False,
             warnings=warnings,
+            recovery_preflight=(
+                build_recovery_preflight(
+                    root, current.operation_id, effect="journal_write"
+                ).consume()
+                if recovery
+                else None
+            ),
         )
     return finalize_operation(
         root,
@@ -3943,7 +4340,14 @@ def _validate_and_complete(
         retain_terminal_lock=retain_terminal_lock,
         changed_paths=changed_paths,
         settle_empty_directories=False,
-        warnings=warnings,
+            warnings=warnings,
+            recovery_preflight=(
+                build_recovery_preflight(
+                    root, current.operation_id, effect="journal_write"
+                ).consume()
+                if recovery
+                else None
+            ),
     )
 
 
@@ -3961,16 +4365,16 @@ def preallocate_journal(
     父目录 fsync 保证“引用方已耐久时，被引用的操作目录必然存在”。
     已存在的操作目录绝不复用：直接报 operation.id_conflict，不打开也不改写其内容。
     """
-    validate_operation_id(operation_id, code="operation.plan_invalid")
+    validate_operation_id(operation_id, code=OPERATION_PLAN_INVALID)
     if kind is OperationKind.RESTORE:
         back_reference = metadata.get("restores_trash_operation")
         if back_reference is None:
-            raise DraftError("operation.plan_invalid", root / OPERATIONS_RELATIVE / operation_id)
-        validate_operation_id(back_reference, code="operation.plan_invalid")
+            raise DraftError(OPERATION_PLAN_INVALID, root / OPERATIONS_RELATIVE / operation_id)
+        validate_operation_id(back_reference, code=OPERATION_PLAN_INVALID)
     operations = root / OPERATIONS_RELATIVE
     reject_symlink_components(root, OPERATIONS_RELATIVE)
     if operations.exists() and not operations.is_dir():
-        raise DraftError("operation.plan_invalid", operations)
+        raise DraftError(OPERATION_PLAN_INVALID, operations)
     operations.mkdir(parents=True, exist_ok=True)
     fsync_directory(operations.parent)
     directory = operations / operation_id
@@ -4000,11 +4404,11 @@ def preallocate_journal(
 def validate_restore_link(root: Path, restore_journal: Journal) -> Journal:
     """唯一双向关联验证：恢复日志必须指向回收日志，且回收日志必须回指本恢复操作。"""
     if restore_journal.kind is not OperationKind.RESTORE:
-        raise DraftError("operation.plan_invalid", restore_journal.directory)
+        raise DraftError(OPERATION_PLAN_INVALID, restore_journal.directory)
     back_reference = restore_journal.metadata.get("restores_trash_operation")
     if back_reference is None:
-        raise DraftError("operation.plan_invalid", restore_journal.directory)
-    back_id = validate_operation_id(back_reference, code="operation.plan_invalid")
+        raise DraftError(OPERATION_PLAN_INVALID, restore_journal.directory)
+    back_id = validate_operation_id(back_reference, code=OPERATION_PLAN_INVALID)
     back_path = operation_journal_path(root, back_id)
     resolve_journal_pending(back_path)
     back_journal = read_journal(back_path)
@@ -4012,13 +4416,13 @@ def validate_restore_link(root: Path, restore_journal: Journal) -> Journal:
         back_journal.kind is not OperationKind.TRASH
         or back_journal.metadata.get("restore_operation_id") != restore_journal.operation_id
     ):
-        raise DraftError("operation.plan_invalid", restore_journal.directory)
+        raise DraftError(OPERATION_PLAN_INVALID, restore_journal.directory)
     return back_journal
 
 
 def operation_journal_path(root: Path, operation_id: str) -> Path:
     """唯一的日志路径构造：先验证 operation_id 形状，再逐组件拒绝符号链接。"""
-    validated = validate_operation_id(operation_id, code="operation.plan_invalid")
+    validated = validate_operation_id(operation_id, code=OPERATION_PLAN_INVALID)
     relative = OPERATIONS_RELATIVE / validated / "journal.json"
     reject_symlink_components(root, relative)
     return root / relative
@@ -4027,8 +4431,8 @@ def operation_journal_path(root: Path, operation_id: str) -> Path:
 def require_plan_operation_id(plan: OperationPlan) -> str:
     value = plan.metadata.get("operation_id")
     if value is None:
-        raise DraftError("operation.plan_invalid", plan.root)
-    return validate_operation_id(value, code="operation.plan_invalid")
+        raise DraftError(OPERATION_PLAN_INVALID, plan.root)
+    return validate_operation_id(value, code=OPERATION_PLAN_INVALID)
 
 
 def validate_preallocated_journal(plan: OperationPlan, journal: Journal) -> None:
@@ -4038,7 +4442,7 @@ def validate_preallocated_journal(plan: OperationPlan, journal: Journal) -> None
         or journal.phase is not OperationPhase.ALLOCATING
         or journal.mutations
     ):
-        raise DraftError("operation.plan_invalid", journal.directory)
+        raise DraftError(OPERATION_PLAN_INVALID, journal.directory)
     if journal.kind is OperationKind.RESTORE:
         validate_restore_link(plan.root, journal)
 
@@ -4058,7 +4462,7 @@ def execute_plan(plan: OperationPlan) -> OperationResult:
         raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, root / LOCK_RELATIVE)
 
     operation_id = validate_operation_id(
-        plan.metadata.get("operation_id") or uuid.uuid4().hex, code="operation.plan_invalid"
+        plan.metadata.get("operation_id") or uuid.uuid4().hex, code=OPERATION_PLAN_INVALID
     )
     directory = root / OPERATIONS_RELATIVE / operation_id
     existing_journal_path = directory / "journal.json"
@@ -4112,7 +4516,7 @@ def execute_preallocated_plan(
     root = resolve_draft_root(plan.root)
     operation_id = require_plan_operation_id(plan)
     if read_lock(root) != operation_id:
-        raise DraftError("operation.plan_invalid", root)
+        raise DraftError(OPERATION_PLAN_INVALID, root)
     journal = read_journal(operation_journal_path(root, operation_id))
     validate_preallocated_journal(plan, journal)
     # 预分配执行同样复核读集观察（如 restore 的权威包）：计划与日志的读集在
@@ -4144,7 +4548,7 @@ def _execute_allocated_plan(
     operation_id = journal.operation_id
     directory = journal.directory
     if lock_already_held and read_lock(root) != operation_id:
-        raise DraftError("operation.plan_invalid", root)
+        raise DraftError(OPERATION_PLAN_INVALID, root)
 
     mutations: list[JournalMutation] = []
     original_contents: dict[int, bytes] = {}
@@ -4172,7 +4576,7 @@ def _execute_allocated_plan(
             ):
                 if not retain_terminal_lock:
                     release_lock(root, operation_id)
-                raise DraftError("operation.plan_invalid", root / mutation.path)
+                raise DraftError(OPERATION_PLAN_INVALID, root / mutation.path)
             staged_name = Path("staged") / f"{index:04d}.bin"
             staged_contents[index] = mutation.content
         mutations.append(
@@ -4303,7 +4707,22 @@ def _recover_changed_paths(journal: Journal) -> tuple[Path, ...]:
 
 
 def _classify(root: Path, mutation: JournalMutation) -> str:
-    current = sha256_file(root / mutation.path)
+    path = root / mutation.path
+    try:
+        node = path.lstat()
+    except FileNotFoundError:
+        current = None
+    except OSError as exc:
+        raise DraftError("operation.external_change", path) from exc
+    else:
+        if stat.S_ISLNK(node.st_mode):
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, path)
+        if not stat.S_ISREG(node.st_mode):
+            raise DraftError("operation.external_change", path)
+        try:
+            current = sha256_bytes(path.read_bytes())
+        except OSError as exc:
+            raise DraftError("operation.external_change", path) from exc
     if current == mutation.before_sha256:
         return "before"
     if current == mutation.after_sha256:
@@ -4330,6 +4749,534 @@ def _verify_recovery_material(journal: Journal) -> None:
                 raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, staged)
 
 
+def _classify_recovery_name(parent_fd: int, name: str, *, code_path: Path) -> EntryKind:
+    """在已打开的父目录内以 no-follow 分类恢复材料成员。"""
+    try:
+        node = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return EntryKind.MISSING
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path) from exc
+    if stat.S_ISLNK(node.st_mode):
+        return EntryKind.SYMLINK
+    if stat.S_ISREG(node.st_mode):
+        return EntryKind.FILE
+    if stat.S_ISDIR(node.st_mode):
+        return EntryKind.DIRECTORY
+    return EntryKind.OTHER
+
+
+def _open_recovery_directory(parent_fd: int, name: str, *, code_path: Path) -> int | None:
+    """在已打开的父目录内 no-follow 打开一个可选恢复材料目录。"""
+    kind = _classify_recovery_name(parent_fd, name, code_path=code_path)
+    if kind is EntryKind.MISSING:
+        return None
+    if kind is EntryKind.SYMLINK:
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, code_path)
+    if kind is not EntryKind.DIRECTORY:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
+    try:
+        return os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        code = (
+            CheckCode.PATH_SYMLINK_ESCAPE.value
+            if getattr(exc, "errno", None) == errno.ELOOP
+            else CheckCode.OPERATION_INCONSISTENT_STATE.value
+        )
+        raise DraftError(code, code_path) from exc
+
+
+def _registered_recovery_material(journal: Journal) -> dict[str, dict[str, str]]:
+    registered: dict[str, dict[str, str]] = {"originals": {}, "staged": {}}
+    for mutation in journal.mutations:
+        if mutation.original is not None and mutation.before_sha256 is not None:
+            registered["originals"][mutation.original.name] = mutation.before_sha256
+        if mutation.staged is not None and mutation.after_sha256 is not None:
+            registered["staged"][mutation.staged.name] = mutation.after_sha256
+    return registered
+
+
+def _validate_authorized_recovery_tree_fd(
+    operation_fd: int,
+    top_name: str,
+    authorized: Mapping[Path, str],
+    *,
+    code_path: Path,
+    material_error_code: str,
+) -> None:
+    """以 operation FD 锚定验证一棵带精确叶授权的恢复材料树。
+
+    目录成员只允许授权叶、其 pending/quarantine 派生名和授权叶所需的父目录。
+    所有分类、打开和读取都沿 no-follow 目录句柄进行；本函数只读，不消费任何
+    pending/quarantine，供会在后续阶段清理或发布的材料共用前置门禁。
+    """
+    root_kind = _classify_recovery_name(
+        operation_fd, top_name, code_path=code_path
+    )
+    if root_kind is EntryKind.MISSING:
+        return
+    if root_kind is EntryKind.SYMLINK:
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, code_path)
+    if root_kind is not EntryKind.DIRECTORY:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
+
+    allowed_dirs = {Path()}
+    digest_by_path: dict[Path, str] = {}
+    for relative, digest in authorized.items():
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path)
+        digest_by_path[relative] = digest
+        digest_by_path[relative.with_name(_pending_name(relative.name))] = digest
+        digest_by_path[relative.with_name(_quarantine_name(relative.name))] = digest
+        cursor = relative.parent
+        while cursor != Path():
+            allowed_dirs.add(cursor)
+            cursor = cursor.parent
+
+    root_fd = _open_recovery_directory(operation_fd, top_name, code_path=code_path)
+    assert root_fd is not None
+
+    def visit(directory_fd: int, relative_directory: Path) -> None:
+        try:
+            names = tuple(entry.name for entry in os.scandir(directory_fd))
+        except OSError as exc:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path
+            ) from exc
+        for name in names:
+            relative = relative_directory / name
+            member_path = code_path / relative
+            kind = _classify_recovery_name(
+                directory_fd, name, code_path=member_path
+            )
+            if kind is EntryKind.SYMLINK:
+                raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, member_path)
+            if relative in allowed_dirs:
+                if kind is not EntryKind.DIRECTORY:
+                    raise DraftError(
+                        CheckCode.OPERATION_INCONSISTENT_STATE.value, member_path
+                    )
+                child_fd = _open_recovery_directory(
+                    directory_fd, name, code_path=member_path
+                )
+                assert child_fd is not None
+                try:
+                    visit(child_fd, relative)
+                finally:
+                    os.close(child_fd)
+                continue
+            expected_digest = digest_by_path.get(relative)
+            if expected_digest is None:
+                raise DraftError(
+                    CheckCode.OPERATION_INCONSISTENT_STATE.value, member_path
+                )
+            if kind is not EntryKind.FILE:
+                raise DraftError(
+                    CheckCode.OPERATION_INCONSISTENT_STATE.value, member_path
+                )
+            content = _read_name_bytes(
+                directory_fd,
+                name,
+                code_path=member_path,
+                code=material_error_code,
+            )
+            if sha256_bytes(content) != expected_digest:
+                raise DraftError(material_error_code, member_path)
+
+    try:
+        visit(root_fd, Path())
+    finally:
+        os.close(root_fd)
+
+
+def _validate_recovery_material_fd(journal: Journal, operation_fd: int) -> None:
+    """在已认证的 operation FD 内只读验证 journal 节点和恢复材料。
+
+    这里统一执行所有恢复阶段共用的节点、成员白名单和摘要证明；缺失的登记材料仍
+    交给具体 phase 的恢复规则解释（prepare 可能在登记后、创建前崩溃）。本函数绝不
+    发布、删除或改写任何名字。
+    """
+    registered = _registered_recovery_material(journal)
+    operation_path = journal.directory
+    material_error_code = (
+        CheckCode.OPERATION_JOURNAL_CORRUPT.value
+        if journal.phase is OperationPhase.ROLLING_BACK
+        else CheckCode.OPERATION_INCONSISTENT_STATE.value
+    )
+    try:
+        names = tuple(entry.name for entry in os.scandir(operation_fd))
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operation_path) from exc
+
+    allowed_top_level = {"journal.json", "journal.json.pending", "originals", "staged"}
+    if journal.phase in _LINK_INDEX_PHASES:
+        from draft import link_index_maintenance as maintenance
+
+        allowed_top_level.update(
+            {
+                maintenance.LINK_INDEX_STAGED_FILE_NAME,
+                _pending_name(maintenance.LINK_INDEX_STAGED_FILE_NAME),
+            }
+        )
+    if journal.kind is OperationKind.TRASH:
+        from draft import trash_package
+
+        allowed_top_level.update(
+            {
+                trash_package._CLEANUP_EVIDENCE_NAME,  # pyright: ignore[reportPrivateUsage]
+                _pending_name(trash_package._CLEANUP_EVIDENCE_NAME),  # pyright: ignore[reportPrivateUsage]
+                _quarantine_name(trash_package._CLEANUP_EVIDENCE_NAME),  # pyright: ignore[reportPrivateUsage]
+                "attempt",
+            }
+        )
+    attempt_kind = EntryKind.MISSING
+    for name in names:
+        member_path = operation_path / name
+        if name not in allowed_top_level:
+            kind = _classify_recovery_name(operation_fd, name, code_path=member_path)
+            if kind is EntryKind.SYMLINK:
+                raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, member_path)
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operation_path)
+        kind = _classify_recovery_name(operation_fd, name, code_path=member_path)
+        if kind is EntryKind.SYMLINK:
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, member_path)
+        if name == "attempt":
+            attempt_kind = kind
+        if name in {"journal.json", "journal.json.pending"}:
+            if kind is not EntryKind.FILE:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, member_path)
+        elif name in {"originals", "staged", "attempt"}:
+            if kind is not EntryKind.DIRECTORY:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, member_path)
+        elif kind is not EntryKind.FILE:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, member_path)
+
+    for subdirectory in ("originals", "staged"):
+        directory_path = operation_path / subdirectory
+        directory_fd = _open_recovery_directory(
+            operation_fd,
+            subdirectory,
+            code_path=directory_path,
+        )
+        if directory_fd is None:
+            continue
+        try:
+            try:
+                entries = tuple(entry.name for entry in os.scandir(directory_fd))
+            except OSError as exc:
+                raise DraftError(
+                    CheckCode.OPERATION_INCONSISTENT_STATE.value, directory_path
+                ) from exc
+            allowed = registered[subdirectory]
+            allowed_members = {
+                derived: digest
+                for name, digest in allowed.items()
+                for derived in (name, _pending_name(name), _quarantine_name(name))
+            }
+            for name in entries:
+                member_path = directory_path / name
+                expected_digest = allowed_members.get(name)
+                kind = _classify_recovery_name(
+                    directory_fd,
+                    name,
+                    code_path=member_path,
+                )
+                if kind is EntryKind.SYMLINK:
+                    raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, member_path)
+                if expected_digest is None:
+                    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, member_path)
+                if kind is not EntryKind.FILE:
+                    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, member_path)
+                content = _read_name_bytes(
+                    directory_fd,
+                    name,
+                    code_path=member_path,
+                    code=material_error_code,
+                )
+                if sha256_bytes(content) != expected_digest:
+                    raise DraftError(material_error_code, member_path)
+        finally:
+            os.close(directory_fd)
+
+    if journal.kind is OperationKind.TRASH:
+        from draft import trash_package
+
+        if attempt_kind is EntryKind.DIRECTORY:
+            authorization = trash_package.parse_package_authorization(
+                journal, operation_path / "attempt"
+            )
+            _validate_authorized_recovery_tree_fd(
+                operation_fd,
+                "attempt",
+                {
+                    Path("package.json"): authorization.package_json_digest,
+                    authorization.payload_relative: authorization.payload_digest,
+                },
+                code_path=operation_path / "attempt",
+                material_error_code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
+            )
+
+        evidence = trash_package.classify_cleanup_evidence_artifacts(journal)
+        if evidence is not None and trash_package.cleanup_evidence_protocol_corrupt(
+            final=evidence[0],
+            pending=evidence[1],
+            quarantine=evidence[2],
+            final_pending_same_node=evidence[3],
+            final_quarantine_same_node=evidence[4],
+        ):
+            raise DraftError(
+                CheckCode.TRASH_PACKAGE_CORRUPT.value,
+                operation_path / trash_package._CLEANUP_EVIDENCE_NAME,
+            )
+
+
+def _validate_allocating_recovery_material(journal: Journal) -> None:
+    """在 allocating 终态写入前只读验证当前恢复材料和成员授权。"""
+
+    try:
+        operation_fd = os.open(
+            journal.directory,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        code = (
+            CheckCode.PATH_SYMLINK_ESCAPE.value
+            if getattr(exc, "errno", None) == errno.ELOOP
+            else CheckCode.OPERATION_INCONSISTENT_STATE.value
+        )
+        raise DraftError(code, journal.directory) from exc
+
+    try:
+        _validate_recovery_material_fd(journal, operation_fd)
+    finally:
+        os.close(operation_fd)
+
+
+def _validate_locked_journal_node(
+    operation_fd: int,
+    *,
+    name: str,
+    expected: Journal | None,
+    code_path: Path,
+) -> None:
+    """确认锁内 journal/pending 节点仍与锁前解析快照一致。"""
+    kind = _classify_recovery_name(operation_fd, name, code_path=code_path)
+    if expected is None:
+        if kind is EntryKind.MISSING:
+            return
+        if kind is EntryKind.SYMLINK:
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, code_path)
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
+    if kind is EntryKind.SYMLINK:
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, code_path)
+    if kind is not EntryKind.FILE:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
+    parsed = _parse_journal_bytes(
+        _read_name_bytes(
+            operation_fd,
+            name,
+            code_path=code_path,
+            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+        ),
+        code_path,
+    )
+    if parsed != expected:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
+
+
+def _validate_locked_recovery_material(
+    root: Path,
+    operation_id: str,
+    current: Journal | None,
+    pending: Journal | None,
+) -> None:
+    """在 matching lock 内独立证明 current/pending 与恢复材料。
+
+    ``pending`` 只是下一次耐久转换的候选，不能借用 ``current`` 的材料授权，
+    ``current`` 也不能因存在 pending 而跳过验证。任何会被下一步消费的磁盘
+    材料必须同时落在两个节点各自的授权投影中；因此这里刻意不选择 effective
+    journal 作为唯一验证输入。
+    """
+    if current is None and pending is None:
+        raise DraftError(
+            CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+            operation_journal_path(root, operation_id),
+        )
+    for journal in (current, pending):
+        if journal is not None and journal.operation_id != operation_id:
+            raise DraftError(
+                CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+                operation_journal_path(root, operation_id),
+            )
+    if current is not None and pending is not None:
+        if current.kind is not pending.kind:
+            raise DraftError(
+                CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+                operation_journal_path(root, operation_id),
+            )
+        validate_journal_transition(
+            current,
+            pending,
+            path=operation_journal_path(root, operation_id),
+        )
+    elif pending is not None:
+        # Current 不存在时只允许 create-only bootstrap，不能把任意 pending 当作
+        # 可发布状态；转换验证是该例外的唯一权威判断。
+        validate_journal_transition(
+            None,
+            pending,
+            path=operation_journal_path(root, operation_id),
+        )
+    with open_recovery_operation_directories(root, operation_id=operation_id) as entries:
+        if len(entries) != 1:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                root / OPERATIONS_RELATIVE / operation_id,
+            )
+        entry = entries[0]
+        entry.verify()
+        operation_dir = root / OPERATIONS_RELATIVE / operation_id
+        _validate_locked_journal_node(
+            entry.fd,
+            name="journal.json",
+            expected=current,
+            code_path=operation_dir / "journal.json",
+        )
+        _validate_locked_journal_node(
+            entry.fd,
+            name="journal.json.pending",
+            expected=pending,
+            code_path=operation_dir / "journal.json.pending",
+        )
+        for journal in (current, pending):
+            if journal is not None:
+                _validate_recovery_material_fd(journal, entry.fd)
+
+
+def build_recovery_preflight(
+    root: Path,
+    operation_id: str,
+    *,
+    effect: RecoveryEffect,
+    validate_retained_package: bool = False,
+) -> RecoveryPreflight:
+    """从当前 matching lock 和完整关系图取得一项副作用的整组 capability。
+
+    The operation ID is only the lookup anchor.  For an R/T graph the owner, participant
+    closure, and action always come from the full relation facts; a caller cannot substitute a
+    locally assembled pair or an old journal snapshot.  ``validate_retained_package`` is used
+    by lifecycle before publishing ``trash_handoff_pending``.
+    """
+    if read_lock(root) != operation_id:
+        raise DraftError(
+            CheckCode.OPERATION_RECOVERY_REQUIRED.value,
+            root / LOCK_RELATIVE,
+        )
+    relation = read_restore_trash_relation(root, operation_id)
+    if relation.owner_id is not None and relation.owner_id != operation_id:
+        raise DraftError(
+            CheckCode.OPERATION_RECOVERY_REQUIRED.value,
+            relation.trash.directory if relation.trash is not None else root,
+        )
+    if relation.owner_id is None:
+        participant_ids = (operation_id,)
+        action = None
+    else:
+        if relation.action is None or not relation.participant_ids:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                root / OPERATIONS_RELATIVE / operation_id,
+            )
+        participant_ids = relation.participant_ids
+        action = relation.action
+    current_values: list[tuple[str, Journal | None]] = []
+    pending_values: list[tuple[str, Journal | None]] = []
+    for participant_id in participant_ids:
+        current, pending = read_locked_recovery_snapshot(root, participant_id)
+        _validate_locked_recovery_material(root, participant_id, current, pending)
+        current_values.append((participant_id, current))
+        pending_values.append((participant_id, pending))
+
+    preflight = RecoveryPreflight(
+        root=root,
+        owner_id=operation_id,
+        participant_ids=participant_ids,
+        relation=relation.relation,
+        action=action,
+        current=tuple(current_values),
+        pending=tuple(pending_values),
+        effect=effect,
+        validate_retained_package=validate_retained_package,
+    )
+    if validate_retained_package:
+        _validate_retained_package_preflight(root, preflight.current, preflight.pending)
+    return preflight
+
+
+def _validate_retained_package_preflight(
+    root: Path,
+    current: tuple[tuple[str, Journal | None], ...],
+    pending: tuple[tuple[str, Journal | None], ...],
+) -> None:
+    """验证 handoff 前仍由本轮 participant facts 授权的 retained package。"""
+    trash = next(
+        (
+            journal
+            for _, journal in current
+            if journal is not None and journal.kind is OperationKind.TRASH
+        ),
+        None,
+    )
+    if trash is None:
+        trash = next(
+            (
+                journal
+                for _, journal in pending
+                if journal is not None and journal.kind is OperationKind.TRASH
+            ),
+            None,
+        )
+    if (
+        trash is None
+        or trash.phase
+        not in (OperationPhase.TRASH_RETAINED, OperationPhase.TRASH_HANDOFF_PENDING)
+    ):
+        raise DraftError(
+            CheckCode.TRASH_PACKAGE_CORRUPT.value,
+            root / OPERATIONS_RELATIVE,
+        )
+    from draft.trash_package import load_verified_package
+
+    load_verified_package(root, trash)
+
+
+def _consume_recovery_preflight(
+    root: Path,
+    *,
+    owner_id: str | None,
+    participant_id: str,
+    effect: RecoveryEffect,
+    current: RecoveryPreflight | None,
+) -> RecoveryPreflight | None:
+    """Return the one capability for the next recovery side effect.
+
+    Recovery helpers use this at the narrow action boundary.  A supplied capability is only
+    usable once; subsequent actions must rebuild it from the complete lock-bound snapshot.
+    ``owner_id`` is intentionally separate from ``participant_id`` because restore cleanup acts
+    on T while the matching lock belongs to R.
+    """
+    if current is not None:
+        current.require_effect(effect, participant_id=participant_id)
+        return current
+    if owner_id is None:
+        return None
+    return build_recovery_preflight(root, owner_id, effect=effect).consume()
+
+
 def _recover_terminal(
     root: Path,
     journal: Journal,
@@ -4343,19 +5290,31 @@ def _recover_terminal(
         if _classify(root, mutation) != expected:
             raise DraftError("operation.external_change", root / mutation.path)
     if not retain_terminal_lock:
-        _clean_recovery_copies(journal)
+        cleanup_preflight = build_recovery_preflight(
+            root, operation_id, effect="material_cleanup"
+        ).consume()
+        _clean_recovery_copies(journal, preflight=cleanup_preflight)
         if journal.link_index_revision is None:
             # 携带索引结果的 completed 终态：计划内目录已在发布前收敛（spec §6），
             # 残留即已发布索引事实，不得再删；无索引字段的终态保持旧清理行为。
             for relative in journal.remove_empty_directories:
+                build_recovery_preflight(
+                    root, operation_id, effect="material_cleanup"
+                ).consume()
                 with suppress(OSError):
                     (root / relative).rmdir()
         if journal.kind is OperationKind.LINK_INDEX_UPDATE:
             # maintenance completed：幂等清理锁和已知 staging（spec §12）。
             from draft import link_index_maintenance as maintenance
 
-            maintenance.cleanup_link_index_staging(journal)
-        release_lock(root, operation_id)
+            staging_preflight = build_recovery_preflight(
+                root, operation_id, effect="material_cleanup"
+            ).consume()
+            maintenance.cleanup_link_index_staging(journal, preflight=staging_preflight)
+        release_preflight = build_recovery_preflight(
+            root, operation_id, effect="release"
+        ).consume()
+        release_lock(root, operation_id, preflight=release_preflight)
     return OperationResult(
         operation_id=operation_id,
         kind=journal.kind.value,
@@ -4401,9 +5360,21 @@ def recover_link_index_phase(
             result=LinkIndexResult.REBUILD_REQUIRED,
             sha256=None,
         )
-        write_journal(rebuild)
-        maintenance.ensure_rebuild_flag(root)
-        maintenance.cleanup_link_index_staging(rebuild)
+        write_preflight = build_recovery_preflight(
+            root, journal.operation_id, effect="journal_write"
+        ).consume()
+        write_journal(rebuild, preflight=write_preflight)
+        flag_preflight = build_recovery_preflight(
+            root, journal.operation_id, effect="material_cleanup"
+        ).consume()
+        maintenance.ensure_rebuild_flag(root, preflight=flag_preflight)
+        staging_preflight = build_recovery_preflight(
+            root, journal.operation_id, effect="material_cleanup"
+        ).consume()
+        maintenance.cleanup_link_index_staging(rebuild, preflight=staging_preflight)
+        terminal_preflight = build_recovery_preflight(
+            root, journal.operation_id, effect="journal_write"
+        ).consume()
         return finalize_operation(
             root,
             rebuild,
@@ -4412,10 +5383,17 @@ def recover_link_index_phase(
             retain_terminal_lock=retain_terminal_lock,
             settle_empty_directories=False,
             changed_paths=changed_paths,
+            recovery_preflight=terminal_preflight,
         )
     if journal.phase is OperationPhase.LINK_INDEX_PUBLISHED:
         maintenance.verify_published_link_index(root, journal)
-        maintenance.cleanup_link_index_staging(journal)
+        staging_preflight = build_recovery_preflight(
+            root, journal.operation_id, effect="material_cleanup"
+        ).consume()
+        maintenance.cleanup_link_index_staging(journal, preflight=staging_preflight)
+        terminal_preflight = build_recovery_preflight(
+            root, journal.operation_id, effect="journal_write"
+        ).consume()
         return finalize_operation(
             root,
             journal,
@@ -4424,10 +5402,20 @@ def recover_link_index_phase(
             retain_terminal_lock=retain_terminal_lock,
             settle_empty_directories=False,
             changed_paths=changed_paths,
+            recovery_preflight=terminal_preflight,
         )
     # LINK_INDEX_REBUILD_REQUIRED：尽力补建 flag，然后补原有成功终态。
-    maintenance.ensure_rebuild_flag(root)
-    maintenance.cleanup_link_index_staging(journal)
+    flag_preflight = build_recovery_preflight(
+        root, journal.operation_id, effect="material_cleanup"
+    ).consume()
+    maintenance.ensure_rebuild_flag(root, preflight=flag_preflight)
+    staging_preflight = build_recovery_preflight(
+        root, journal.operation_id, effect="material_cleanup"
+    ).consume()
+    maintenance.cleanup_link_index_staging(journal, preflight=staging_preflight)
+    terminal_preflight = build_recovery_preflight(
+        root, journal.operation_id, effect="journal_write"
+    ).consume()
     return finalize_operation(
         root,
         journal,
@@ -4436,6 +5424,7 @@ def recover_link_index_phase(
         retain_terminal_lock=retain_terminal_lock,
         settle_empty_directories=False,
         changed_paths=changed_paths,
+        recovery_preflight=terminal_preflight,
     )
 
 
@@ -4811,8 +5800,14 @@ def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> Operation
         expected = "after" if journal.phase is OperationPhase.COMPLETED else "before"
         if current != expected:
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-        _clean_recovery_copies(journal)
-        release_lock(root, operation_id)
+        cleanup_preflight = build_recovery_preflight(
+            root, operation_id, effect="material_cleanup"
+        ).consume()
+        _clean_recovery_copies(journal, preflight=cleanup_preflight)
+        release_preflight = build_recovery_preflight(
+            root, operation_id, effect="release"
+        ).consume()
+        release_lock(root, operation_id, preflight=release_preflight)
         return OperationResult(
             operation_id=operation_id,
             kind=journal.kind.value,
@@ -4824,9 +5819,19 @@ def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> Operation
     if current == "after":
         # 登记已生效（marker 已是 registered）：只完成日志提交、清理并解锁。
         committed = _with_phase(journal, OperationPhase.COMPLETED)
-        write_journal(committed)
-        _clean_recovery_copies(journal)
-        release_lock(root, operation_id)
+        write_preflight = build_recovery_preflight(
+            root, operation_id, effect="journal_write"
+        ).consume()
+        write_journal(committed, preflight=write_preflight)
+        current = read_journal(operation_journal_path(root, operation_id))
+        cleanup_preflight = build_recovery_preflight(
+            root, operation_id, effect="material_cleanup"
+        ).consume()
+        _clean_recovery_copies(current, preflight=cleanup_preflight)
+        release_preflight = build_recovery_preflight(
+            root, operation_id, effect="release"
+        ).consume()
+        release_lock(root, operation_id, preflight=release_preflight)
         return OperationResult(
             operation_id=operation_id,
             kind=journal.kind.value,
@@ -4837,13 +5842,28 @@ def _recover_adopt(root: Path, journal: Journal, operation_id: str) -> Operation
     changed, _ = _verify_observations_for_recovery(root, journal, explained_mutations=(marker,))
     if changed:
         rolled = _with_phase(journal, OperationPhase.ROLLED_BACK)
-        write_journal(rolled)
-        _clean_recovery_copies(journal)
-        release_lock(root, operation_id)
+        write_preflight = build_recovery_preflight(
+            root, operation_id, effect="journal_write"
+        ).consume()
+        write_journal(rolled, preflight=write_preflight)
+        current = read_journal(operation_journal_path(root, operation_id))
+        cleanup_preflight = build_recovery_preflight(
+            root, operation_id, effect="material_cleanup"
+        ).consume()
+        _clean_recovery_copies(current, preflight=cleanup_preflight)
+        release_preflight = build_recovery_preflight(
+            root, operation_id, effect="release"
+        ).consume()
+        release_lock(root, operation_id, preflight=release_preflight)
         # 外部修改必须可观察："已安全放弃 adopt" 不等于恢复成功（规格 §12.2）。
         # 已证明 marker 未提交且回滚安全，释放锁后仍报告外部变化。
         raise DraftError("operation.external_change", root / changed[0])
-    return _finish_forward(root, journal, changed_paths=(MARKER_PATH,))
+    return _finish_forward(
+        root,
+        journal,
+        changed_paths=(MARKER_PATH,),
+        recovery=True,
+    )
 
 
 def _planned_created_directory_closure(
@@ -5116,13 +6136,20 @@ def _rollback_artifact_actions(
     return (MutationRecoveryAction.EXTERNAL,)
 
 
-def _recover_managed_temp_quarantines(root: Path, journal: Journal) -> None:
+def _recover_managed_temp_quarantines(
+    root: Path,
+    journal: Journal,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> None:
     """恢复前把崩溃遗留的 managed temp quarantine 收敛。
 
     在观察复核之前运行：被中断的 consume 删除留下的 ``{temp}.quarantine`` 会被观察
     复核当成无法解释的新文件；先按授权摘要精确分类（精确→删除完成，不符→恢复原名
     并报错），让观察复核在干净树上前进。
     """
+    owner_id = preflight.owner_id if preflight is not None else None
+    next_preflight = preflight
     planned_dirs = _planned_created_directory_closure(journal.observations, journal.mutations)
     for index, mutation in enumerate(journal.mutations):
         if mutation.kind is not MutationKind.WRITE or mutation.after_sha256 is None:
@@ -5145,13 +6172,22 @@ def _recover_managed_temp_quarantines(root: Path, journal: Journal) -> None:
             planned_created_directories=planned_dirs,
         ):
             raise DraftError("operation.external_change", root / quarantine_path)
+        quarantine_preflight = _consume_recovery_preflight(
+            root,
+            owner_id=owner_id,
+            participant_id=journal.operation_id,
+            effect="material_cleanup",
+            current=next_preflight,
+        )
         recover_quarantine(
             root,
             relative,
             mutation.after_sha256,
             code="operation.external_change",
             code_path=root / relative,
+            preflight=quarantine_preflight,
         )
+        next_preflight = None
 
 
 def _artifact_state_of(
@@ -5170,12 +6206,20 @@ def _artifact_state_of(
 
 
 def _consume_named_artifact(
-    root: Path, relative: Path, *, name: str, expected_digest: str, code_path: Path
+    root: Path,
+    relative: Path,
+    *,
+    name: str,
+    expected_digest: str,
+    code_path: Path,
+    preflight: RecoveryPreflight | None = None,
 ) -> None:
     """inode+内容复核后消费（删除）崩溃遗留 artifact 名。
 
     只删除我们验证过的同一节点；缺失幂等容忍，类型/摘要不符保留现场报外部变化。
     """
+    if preflight is not None:
+        preflight.require_effect("material_cleanup")
     with anchored_leaf(
         root, relative, code="operation.external_change", code_path=code_path
     ) as target:
@@ -5211,13 +6255,20 @@ def _consume_named_artifact(
 
 
 def _publish_pending_to_target(
-    root: Path, relative: Path, *, expected_digest: str, code_path: Path
+    root: Path,
+    relative: Path,
+    *,
+    expected_digest: str,
+    code_path: Path,
+    preflight: RecoveryPreflight | None = None,
 ) -> None:
     """把授权 pending（内容摘要=expected）create-only 发布为目标并消费 pending。
 
     目标必须缺失（no-clobber link）：发布瞬间目标已出现即外部变化。发布后复核内容
     仍是授权内容且 pending 未被替换，再删除 pending。pending 与目标在同一锚定句柄内。
     """
+    if preflight is not None:
+        preflight.require_effect("material_cleanup")
     with anchored_leaf(
         root, relative, code="operation.external_change", code_path=code_path
     ) as target:
@@ -5276,8 +6327,11 @@ def _publish_recovery_content_to_target(
     content: bytes,
     expected_digest: str,
     code_path: Path,
+    preflight: RecoveryPreflight | None = None,
 ) -> None:
     """create-only 把恢复内容（staged=after / original=before）发布为目标。"""
+    if preflight is not None:
+        preflight.require_effect("material_cleanup")
     with anchored_leaf(
         root, mutation.path, code="operation.external_change", code_path=code_path
     ) as target:
@@ -5299,12 +6353,15 @@ def _execute_mutation_artifact_actions(
     direction: MutationDirection,
     actions: tuple[MutationRecoveryAction, ...],
     code_path: Path,
+    preflight: RecoveryPreflight | None = None,
 ) -> None:
     """按纯决策表动作执行 artifact 收敛（I/O 层）。
 
     摘要来源固定：pending=after（正向）/before（回滚）、staged=after、original=before。
     不在此处按 before/after 是否为空猜方向。
     """
+    if preflight is not None:
+        preflight.require_effect("material_cleanup", participant_id=journal.operation_id)
     for action in actions:
         if action is MutationRecoveryAction.RETRY_APPLY:
             continue  # 无 artifact 收敛，交给阶段流继续应用。
@@ -5325,7 +6382,10 @@ def _execute_mutation_artifact_actions(
                 raise DraftError("operation.external_change", code_path)
             if action is MutationRecoveryAction.PUBLISH_PENDING:
                 _publish_pending_to_target(
-                    root, relative, expected_digest=expected, code_path=code_path
+                    root,
+                    relative,
+                    expected_digest=expected,
+                    code_path=code_path,
                 )
             else:
                 _consume_named_artifact(
@@ -5379,7 +6439,11 @@ def _execute_mutation_artifact_actions(
 
 
 def _recover_mutation_artifacts(
-    root: Path, journal: Journal, *, direction: MutationDirection
+    root: Path,
+    journal: Journal,
+    *,
+    direction: MutationDirection,
+    preflight: RecoveryPreflight | None = None,
 ) -> None:
     """方向感知收敛受管写/删应用的崩溃遗留 pending/quarantine。
 
@@ -5390,6 +6454,8 @@ def _recover_mutation_artifacts(
     由计划时缺失证明（``artifact_plan_time_absent``）才可消费或发布：计划前既有节点
     即使字节恰好相同也不移动、不删除、不覆盖。
     """
+    owner_id = preflight.owner_id if preflight is not None else None
+    next_preflight = preflight
     planned_dirs = _planned_created_directory_closure(journal.observations, journal.mutations)
     for mutation in journal.mutations:
         relative = mutation.path
@@ -5444,19 +6510,56 @@ def _recover_mutation_artifacts(
                 planned_created_directories=planned_dirs,
             ),
         )
-        _execute_mutation_artifact_actions(
-            root,
-            journal,
-            mutation,
-            relative,
-            direction=direction,
-            actions=actions,
-            code_path=code_path,
-        )
+        if MutationRecoveryAction.EXTERNAL in actions:
+            raise DraftError("operation.external_change", code_path)
+        for action in actions:
+            if action in (
+                MutationRecoveryAction.PUBLISH_PENDING,
+                MutationRecoveryAction.CONSUME_PENDING,
+                MutationRecoveryAction.CONSUME_QUARANTINE,
+                MutationRecoveryAction.PUBLISH_STAGED,
+                MutationRecoveryAction.PUBLISH_ORIGINAL,
+            ):
+                # The action list was derived from the preceding snapshot.  Before each
+                # durable artifact action, prove that the journal and the complete relation
+                # still match that snapshot; the next capability then reads the whole closure.
+                latest, latest_pending = read_locked_recovery_journals(
+                    root, journal.operation_id
+                )
+                _validate_locked_recovery_material(
+                    root, journal.operation_id, latest, latest_pending
+                )
+                if latest != journal:
+                    raise DraftError(
+                        CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                        operation_journal_path(root, journal.operation_id),
+                    )
+                action_preflight = _consume_recovery_preflight(
+                    root,
+                    owner_id=owner_id,
+                    participant_id=journal.operation_id,
+                    effect="material_cleanup",
+                    current=next_preflight,
+                )
+                _execute_mutation_artifact_actions(
+                    root,
+                    journal,
+                    mutation,
+                    relative,
+                    direction=direction,
+                    actions=(action,),
+                    code_path=code_path,
+                    preflight=action_preflight,
+                )
+                next_preflight = None
 
 
 def _clean_owned_temp_artifacts(
-    root: Path, journal: Journal, consume_temps: frozenset[Path]
+    root: Path,
+    journal: Journal,
+    consume_temps: frozenset[Path],
+    *,
+    preflight: RecoveryPreflight | None = None,
 ) -> None:
     """清理决策表允许消费的崩溃遗留临时文件（精确相对路径 + 摘要复核）。
 
@@ -5465,6 +6568,8 @@ def _clean_owned_temp_artifacts(
     mutation 的 after 摘要一致，类型不符或摘要不符（决策与清理之间被外部改写）即
     外部篡改，停止并保留现场。不扫描父目录猜测候选。
     """
+    owner_id = preflight.owner_id if preflight is not None else None
+    next_preflight = preflight
     planned_dirs = _planned_created_directory_closure(journal.observations, journal.mutations)
     for index, mutation in enumerate(journal.mutations):
         if mutation.kind is not MutationKind.WRITE or mutation.after_sha256 is None:
@@ -5491,7 +6596,15 @@ def _clean_owned_temp_artifacts(
                 raise DraftError("operation.external_change", temporary)
             if sha256_bytes(leaf.read()) != mutation.after_sha256:
                 raise DraftError("operation.external_change", temporary)
+            _consume_recovery_preflight(
+                root,
+                owner_id=owner_id,
+                participant_id=journal.operation_id,
+                effect="material_cleanup",
+                current=next_preflight,
+            )
             leaf.quarantine_delete(mutation.after_sha256)
+        next_preflight = None
 
 
 def _recover_locked(
@@ -5499,13 +6612,61 @@ def _recover_locked(
     operation_id: str,
     *,
     retain_terminal_lock: bool = False,
+    restore_owner_dispatch: bool = False,
 ) -> OperationResult:
-    # 先把崩溃遗留的 journal pending 发布为最新日志，再从最新日志恢复。
-    resolve_journal_pending(operation_journal_path(root, operation_id))
-    journal = read_journal(operation_journal_path(root, operation_id))
-    if journal.operation_id != operation_id:
-        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal.directory)
+    journal_path = operation_journal_path(root, operation_id)
+    # A bootstrap ``journal.json.pending`` can be the only durable journal after a crash. Read
+    # and classify that snapshot while the matching lock is held; publication happens only after
+    # the shared full-graph relation check below.
+    current_snapshot, pending_journal = read_locked_recovery_snapshot(root, operation_id)
+    pending_only = current_snapshot is None
+    journal = current_snapshot if current_snapshot is not None else pending_journal
+    if journal is None:
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+    relation = read_restore_trash_relation(root, operation_id)
+    if relation.owner_id is not None and relation.owner_id != operation_id:
+        raise DraftError(
+            CheckCode.OPERATION_RECOVERY_REQUIRED.value,
+            relation.trash.directory if relation.trash else root,
+        )
+    _validate_locked_recovery_material(
+        root,
+        operation_id,
+        current_snapshot,
+        pending_journal,
+    )
+    if pending_only:
+        # The relation reader consumed the pending snapshot as the effective journal.  Only now
+        # may the matching lock publish it; the next strict read is the sole authority for the
+        # resolver and also re-checks that no writer changed the namespace.
+        pending_preflight = build_recovery_preflight(
+            root, operation_id, effect="pending_publish"
+        ).consume()
+        resolve_journal_pending(journal_path, preflight=pending_preflight)
+        journal, pending_journal = read_locked_recovery_journals(root, operation_id)
+        _validate_locked_recovery_material(root, operation_id, journal, pending_journal)
+    if journal.kind is OperationKind.RESTORE and not restore_owner_dispatch:
+        # Restore R is the sole owner of R/T recovery. Direct recover must not downgrade it
+        # to generic allocating rollback, even when its phase is allocating.
+        from draft.trash_lifecycle import (  # pyright: ignore[reportPrivateUsage]
+            _recover_locked_restore,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        return cast(OperationResult, _recover_locked_restore(root, journal))
+    if journal.phase is OperationPhase.ALLOCATING:
+        authorization = journal
+        if pending_journal is not None:
+            validate_journal_transition(journal, pending_journal, path=journal_path)
+            authorization = pending_journal
+        _validate_allocating_recovery_material(authorization)
+    pending_preflight = build_recovery_preflight(
+        root, operation_id, effect="pending_publish"
+    ).consume()
+    resolve_journal_pending(journal_path, preflight=pending_preflight)
+    journal, pending_journal = read_locked_recovery_journals(root, operation_id)
+    _validate_locked_recovery_material(root, operation_id, journal, pending_journal)
     if journal.kind is OperationKind.ADOPT:
+        build_recovery_preflight(root, operation_id, effect="journal_write").consume()
         return _recover_adopt(root, journal, operation_id)
     if journal.phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
         return _recover_terminal(
@@ -5516,13 +6677,27 @@ def _recover_locked(
         # 不一致，保留现场，不得静默放弃。
         if _allocating_has_index_artifacts(journal):
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+        _validate_allocating_recovery_material(journal)
         # 完整计划尚未耐久形成：不得前向完成，只能放弃、清理分配材料并释放锁。
         # retain_terminal_lock=True 时只耐久终态，材料与锁交由恢复包装层统一处理。
         abandoned = _with_phase(journal, OperationPhase.ROLLED_BACK)
-        write_journal(abandoned)
+        journal_preflight = build_recovery_preflight(
+            root, operation_id, effect="journal_write"
+        ).consume()
+        write_journal(abandoned, preflight=journal_preflight)
         if not retain_terminal_lock:
-            _clean_recovery_copies(journal)
-            release_lock(root, operation_id)
+            refreshed, refreshed_pending = read_locked_recovery_journals(root, operation_id)
+            _validate_locked_recovery_material(
+                root, operation_id, refreshed, refreshed_pending
+            )
+            cleanup_preflight = build_recovery_preflight(
+                root, operation_id, effect="material_cleanup"
+            ).consume()
+            _clean_recovery_copies(refreshed, preflight=cleanup_preflight)
+            release_preflight = build_recovery_preflight(
+                root, operation_id, effect="release"
+            ).consume()
+            release_lock(root, operation_id, preflight=release_preflight)
         return OperationResult(
             operation_id=operation_id,
             kind=journal.kind.value,
@@ -5531,7 +6706,9 @@ def _recover_locked(
         )
     if journal.phase in _LINK_INDEX_PHASES:
         # 三个链接索引 phase 前向收敛（spec §12）：不进入通用 mutation 恢复。
-        return recover_link_index_phase(root, journal, retain_terminal_lock=retain_terminal_lock)
+        return recover_link_index_phase(
+            root, journal, retain_terminal_lock=retain_terminal_lock
+        )
     if journal.phase not in _MID_WRITE_PHASES:
         raise DraftError(
             "operation.unsupported_phase",
@@ -5543,20 +6720,46 @@ def _recover_locked(
         # 回滚意图已耐久：先按方向收敛回滚 artifact（quarantine 保存 after、pending
         # 保存 before），再继续回滚。_rollback 幂等跳过已恢复目标，全部恢复后终态化
         # 为 rolled_back（retain_terminal_lock=True 时保留锁与材料）。
-        _recover_mutation_artifacts(root, journal, direction=MutationDirection.ROLLBACK)
+        artifact_preflight = build_recovery_preflight(
+            root, operation_id, effect="material_cleanup"
+        ).consume()
+        _recover_mutation_artifacts(
+            root,
+            journal,
+            direction=MutationDirection.ROLLBACK,
+            preflight=artifact_preflight,
+        )
+        journal, pending_journal = read_locked_recovery_journals(root, operation_id)
+        _validate_locked_recovery_material(root, operation_id, journal, pending_journal)
         return _rollback(
             root,
             journal,
             retain_terminal_lock=retain_terminal_lock,
             changed_paths=_recover_changed_paths(journal),
+            recovery=True,
         )
     # 先把崩溃遗留的 managed temp quarantine 收敛：被中断的 consume 删除
     # 留下的 ``{temp}.quarantine`` 若不在观察复核前处理，会被当成无法解释的新文件。
-    _recover_managed_temp_quarantines(root, journal)
+    temp_preflight = build_recovery_preflight(
+        root, operation_id, effect="material_cleanup"
+    ).consume()
+    _recover_managed_temp_quarantines(root, journal, preflight=temp_preflight)
+    journal, pending_journal = read_locked_recovery_journals(root, operation_id)
+    _validate_locked_recovery_material(root, operation_id, journal, pending_journal)
     # 再按方向收敛受管写/删应用的崩溃遗留 pending/quarantine（正向：quarantine 保存
     # before、pending 保存 after）：在 _classify 与观察复核前收敛，否则
     # 会被误判为无法解释的外部变化。只有计划时证明缺失的 artifact 才可消费/发布。
-    _recover_mutation_artifacts(root, journal, direction=MutationDirection.FORWARD)
+    artifact_preflight = build_recovery_preflight(
+        root, operation_id, effect="material_cleanup"
+    ).consume()
+    _recover_mutation_artifacts(
+        root,
+        journal,
+        direction=MutationDirection.FORWARD,
+        preflight=artifact_preflight,
+    )
+    journal, pending_journal = read_locked_recovery_journals(root, operation_id)
+    _validate_locked_recovery_material(root, operation_id, journal, pending_journal)
     for mutation in journal.mutations:
         if _classify(root, mutation) == "unknown":
             raise DraftError("operation.external_change", root / mutation.path)
@@ -5573,13 +6776,24 @@ def _recover_locked(
         # prepared 崩溃（originals/staged 已登记但应用未开始）：先耐久进入 applying，
         # 再按 _finish_forward 逐条应用；prepared→validating 不是合法阶段边。
         current = _with_phase(current, OperationPhase.APPLYING)
-        write_journal(current)
-    _clean_owned_temp_artifacts(root, current, consume_temps)
+        journal_preflight = build_recovery_preflight(
+            root, operation_id, effect="journal_write"
+        ).consume()
+        write_journal(current, preflight=journal_preflight)
+        current, pending_journal = read_locked_recovery_journals(root, operation_id)
+        _validate_locked_recovery_material(root, operation_id, current, pending_journal)
+    temp_preflight = build_recovery_preflight(
+        root, operation_id, effect="material_cleanup"
+    ).consume()
+    _clean_owned_temp_artifacts(root, current, consume_temps, preflight=temp_preflight)
+    current, pending_journal = read_locked_recovery_journals(root, operation_id)
+    _validate_locked_recovery_material(root, operation_id, current, pending_journal)
     return _finish_forward(
         root,
         current,
         retain_terminal_lock=retain_terminal_lock,
         changed_paths=_recover_changed_paths(current),
+        recovery=True,
     )
 
 
@@ -5602,6 +6816,7 @@ def recover_locked_operation(
         root,
         operation_id,
         retain_terminal_lock=retain_terminal_lock,
+        restore_owner_dispatch=True,
     )
 
 
@@ -5629,157 +6844,546 @@ def verify_locked_terminal_operation(
         raise DraftError("operation.external_change", root) from exc
 
 
-def _recover_unlocked_operation_fd(
+class _UnlockedRecoveryAction(StrEnum):
+    RETAIN = "retain"
+    LOCK_AND_EMPTY_CLEANUP = "lock_and_empty_cleanup"
+    LOCK_AND_RECOVER = "lock_and_recover"
+
+
+@dataclass(frozen=True)
+class _UnlockedRecoveryCandidate:
+    operation_id: str
+    action: _UnlockedRecoveryAction
+
+
+def _read_recovery_operation_members(entry: RecoveryOperationDirectory) -> tuple[str, ...]:
+    """在已认证 operation FD 内读取当前成员名，并复核目录身份。"""
+    entry.verify()
+    try:
+        members = tuple(item.name for item in os.scandir(entry.fd))
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display) from exc
+    return members
+
+
+def _verify_residue_member_nodes(
     entry: RecoveryOperationDirectory,
-    journal: Journal,
-    journals: Mapping[str, Journal],
-    entries: tuple[RecoveryOperationDirectory, ...],
-) -> OperationResult | None:
-    """共享无锁分派：restore 关联扫描与普通 operation phase 同一入口。"""
-    if journal.kind is OperationKind.RESTORE:
-        if journal.phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
-            return None
-        if journal.phase is OperationPhase.ALLOCATING and not journal.mutations:
-            # metadata 键本身即为 R 的前向认领证据；不能只看目标是否存在。
-            if "restores_trash_operation" in journal.metadata:
-                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-            for candidate in journals.values():
-                if (
-                    candidate.kind is OperationKind.TRASH
-                    and candidate.metadata.get(RESTORE_OPERATION_ID_KEY) == journal.operation_id
-                ):
-                    raise DraftError(
-                        CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory
-                    )
-            journals = _refresh_unlocked_journals(entries)
-            current = journals.get(entry.name)
-            if current is None or current.operation_id != journal.operation_id:
-                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-            if "restores_trash_operation" in current.metadata:
-                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-            for candidate in journals.values():
-                if (
-                    candidate.kind is OperationKind.TRASH
-                    and candidate.metadata.get(RESTORE_OPERATION_ID_KEY) == journal.operation_id
-                ):
-                    raise DraftError(
-                        CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory
-                    )
-            entry.verify()
-            _fd_clean_recovery_copies(entry, journal)
-            entry.verify()
-            # copy 清理后、写入 rolled_back 前再次刷新全部认证 journal。
-            journals = _refresh_unlocked_journals(entries)
-            current = journals.get(entry.name)
-            if current is None or current.operation_id != journal.operation_id:
-                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-            if "restores_trash_operation" in current.metadata:
-                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-            for candidate in journals.values():
-                if (
-                    candidate.kind is OperationKind.TRASH
-                    and candidate.metadata.get(RESTORE_OPERATION_ID_KEY) == journal.operation_id
-                ):
-                    raise DraftError(
-                        CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory
-                    )
-            write_unlocked_journal_fd(entry, _with_phase(current, OperationPhase.ROLLED_BACK))
-            return OperationResult(
-                operation_id=journal.operation_id,
-                kind=OperationKind.RESTORE.value,
-                phase=OperationPhase.ROLLED_BACK,
-                changed_paths=(),
-            )
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-
-    if journal.phase is OperationPhase.ALLOCATING:
-        known_names = {"journal.json", "originals", "staged"}
-        entry.verify()
+    members: tuple[str, ...],
+) -> None:
+    """以 no-follow 复核成员节点，拒绝符号链接或成员身份消失。"""
+    for name in members:
         try:
-            extra = tuple(
-                item.name for item in os.scandir(entry.fd) if item.name not in known_names
-            )
+            member = os.stat(name, dir_fd=entry.fd, follow_symlinks=False)
         except OSError as exc:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display) from exc
-        if extra:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display
+            ) from exc
+        if stat.S_ISLNK(member.st_mode):
+            raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, entry.display / name)
+
+
+def _raise_nonempty_residue(entry: RecoveryOperationDirectory, members: tuple[str, ...]) -> None:
+    """非空 residue 不可清理；成员中的符号链接保留更精确的诊断。"""
+    _verify_residue_member_nodes(entry, members)
+    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display)
+
+
+def _confirm_empty_operation_directory(entry: RecoveryOperationDirectory) -> None:
+    """锁内二次确认空目录；成员或身份变化时失败关闭。"""
+    # 两次枚举之间再次验证 inode，避免把一次空快照当作删除授权。
+    first = _read_recovery_operation_members(entry)
+    if first:
+        _raise_nonempty_residue(entry, first)
+    second = _read_recovery_operation_members(entry)
+    if second:
+        _raise_nonempty_residue(entry, second)
+    entry.verify()
+
+
+def _try_cleanup_matching_empty_allocation_residue(
+    root: Path,
+    operation_id: str,
+) -> bool:
+    """已有 matching lock 时先确认并清理严格空 operation 目录。
+
+    返回 ``False`` 表示当前 operation 有成员，应交给既有锁内 journal resolver；不携带
+    未认证快照。返回 ``True`` 表示目录已删除且父目录已同步、matching lock 已释放。
+    """
+    operation_path = root / OPERATIONS_RELATIVE / operation_id
+    reject_symlink_components(root, OPERATIONS_RELATIVE / operation_id)
+    try:
+        initial = os.stat(operation_path, follow_symlinks=False)
+    except FileNotFoundError:
+        # Let the normal locked journal read preserve the established corrupt-journal
+        # classification for a lock whose operation directory was never allocated.
+        return False
+    except OSError as exc:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operation_path) from exc
+    if stat.S_ISLNK(initial.st_mode):
+        raise DraftError(CheckCode.PATH_SYMLINK_ESCAPE.value, operation_path)
+    if not stat.S_ISDIR(initial.st_mode):
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, operation_path)
+    with open_recovery_operation_directories(root, operation_id=operation_id) as entries:
+        entry = next((item for item in entries if item.name == operation_id), None)
+        if entry is None:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                root / OPERATIONS_RELATIVE / operation_id,
+            )
+        if entry.node != (initial.st_dev, initial.st_ino):
             raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display)
-        _fd_clean_recovery_copies(entry, journal)
-        entry.verify()
-        journal_leaf = _recovery_leaf(
-            entry,
-            "journal.json",
-            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
-            code_path=entry.display / "journal.json",
-        )
-        journal_leaf.verify()
+        members = _read_recovery_operation_members(entry)
+        if members:
+            _verify_residue_member_nodes(entry, members)
+            return False
+        _confirm_empty_operation_directory(entry)
         try:
-            os.unlink("journal.json", dir_fd=entry.fd)
+            os.rmdir(entry.name, dir_fd=entry.parent_fd)
         except OSError as exc:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display) from exc
-        _refresh_recovery_leaf(
-            entry,
-            "journal.json",
-            code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
-            code_path=entry.display / "journal.json",
+            # rmdir itself is the final namespace gate. Re-read before classifying a
+            # concurrently-added member, and never retry a failed deletion.
+            try:
+                current = _read_recovery_operation_members(entry)
+            except DraftError as reread_error:
+                raise reread_error from exc
+            if current:
+                _raise_nonempty_residue(entry, current)
+            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, entry.display) from exc
+        _fsync_dir_fd(entry.parent_fd, entry.display.parent)
+        release_lock(root, operation_id)
+        return True
+
+
+def _confirm_empty_allocation_residue(
+    entry: RecoveryOperationDirectory,
+    *,
+    operation_id: str,
+) -> None:
+    """在 matching lock 内确认 operation 目录仍为空并删除其名字。
+
+    discovery 只授权一次锁内确认。确认和 ``rmdir`` 都使用已认证的 operation/parent
+    descriptor；任何当前成员、节点变化或删除竞态都失败关闭并保留现场。
+    """
+    _confirm_empty_operation_directory(entry)
+    try:
+        os.rmdir(entry.name, dir_fd=entry.parent_fd)
+    except OSError as exc:
+        # A coordinated writer cannot mutate this operation while we hold its lock, but
+        # an external namespace race can still make rmdir observe a new member. Re-read
+        # before choosing the stable failure classification and never retry deletion.
+        try:
+            current = _read_recovery_operation_members(entry)
+        except DraftError as reread_error:
+            raise reread_error from exc
+        if current:
+            _raise_nonempty_residue(entry, current)
+        raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, entry.display) from exc
+    _fsync_dir_fd(entry.parent_fd, entry.display.parent)
+    release_lock(entry.context.root, operation_id)
+
+
+def _recover_empty_allocation_residue_locked(root: Path, operation_id: str) -> None:
+    """锁内重读并闭合无 journal/pending 的空 allocation residue。"""
+    with open_recovery_operation_directories(root) as entries:
+        entry = next((item for item in entries if item.name == operation_id), None)
+        if entry is None:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                root / OPERATIONS_RELATIVE / operation_id,
+            )
+        _confirm_empty_allocation_residue(entry, operation_id=operation_id)
+
+
+def _discover_empty_allocation_residues(root: Path) -> tuple[str, ...]:
+    """只发现空 operation 目录，不解析或分类其他 operation journal。"""
+    operation_ids: list[str] = []
+    with open_recovery_operation_directories(root) as entries:
+        for entry in entries:
+            entry.verify()
+            try:
+                members = tuple(os.scandir(entry.fd))
+            except OSError as exc:
+                raise DraftError(
+                    CheckCode.OPERATION_INCONSISTENT_STATE.value, entry.display
+                ) from exc
+            if not members:
+                operation_ids.append(entry.name)
+    return tuple(operation_ids)
+
+
+def recover_empty_allocation_residues(root: Path) -> None:
+    """清理所有待确认的空 allocation residue；供生命周期入口复用。"""
+    for operation_id in _discover_empty_allocation_residues(root):
+        try:
+            acquire_lock(root, operation_id)
+            _recover_empty_allocation_residue_locked(root, operation_id)
+        except DraftError as error:
+            # Keep the lifecycle report tied to the candidate that failed while preserving
+            # the original stable code and cause.
+            if error.paths and error.paths[0] == root / LOCK_RELATIVE:
+                raise DraftError(
+                    error.code,
+                    root / OPERATIONS_RELATIVE / operation_id,
+                    details=error.details,
+                ) from error
+            raise
+
+
+def read_locked_recovery_snapshot(
+    root: Path,
+    operation_id: str,
+) -> tuple[Journal | None, Journal | None]:
+    """在任何锁内 resolver 前只读解析 current/pending journal。
+
+    本函数只解析单个 operation 的 raw current/pending 节点，不解释 R/T 关系或转换。
+    调用方必须先通过完整 effective graph reader 完成 raw/type、R forward plan、graph 和
+    phase/action 分类，再在 matching lock 内验证材料或发布 pending。返回 ``(None, pending)``
+    表示 create-only bootstrap 尚未发布。
+    """
+    journal_path = operation_journal_path(root, operation_id)
+    journal = _read_optional_journal(journal_path)
+    pending_journal = _read_optional_journal(journal_path.with_name("journal.json.pending"))
+    if journal is None and pending_journal is None:
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+    if journal is not None and journal.operation_id != operation_id:
+        raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal.directory)
+    return journal, pending_journal
+
+
+def read_locked_recovery_journals(root: Path, operation_id: str) -> tuple[Journal, Journal | None]:
+    """读取必须已有 current journal 的锁内快照。"""
+    journal, pending_journal = read_locked_recovery_snapshot(root, operation_id)
+    if journal is None:
+        raise DraftError(
+            CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+            operation_journal_path(root, operation_id),
         )
-        return None
-    if (
-        journal.phase in _MID_WRITE_PHASES
-        or journal.phase in _LINK_INDEX_PHASES
-        or journal.phase
-        in (OperationPhase.TRASH_HANDOFF_SUCCEEDED, OperationPhase.TRASH_PURGE_COMMITTED)
-    ):
-        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
-    if journal.phase in (
-        OperationPhase.COMPLETED,
-        OperationPhase.ROLLED_BACK,
-        OperationPhase.TRASH_RETAINED,
-        OperationPhase.TRASH_HANDOFF_PENDING,
-    ):
-        return None
-    raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+    return journal, pending_journal
 
 
-def _refresh_unlocked_journals(
-    entries: tuple[RecoveryOperationDirectory, ...],
+def _effective_recovery_journals(
+    discoveries: tuple[_UnlockedRecoveryDiscovery, ...],
 ) -> dict[str, Journal]:
-    """从仍持有的 operation/journal 句柄重读本轮关联事实。"""
-    refreshed: dict[str, Journal] = {}
-    for candidate_entry in entries:
-        candidate_entry.verify()
-        candidate = read_unlocked_operation_journal_fd(candidate_entry)
-        if candidate is not None:
-            refreshed[candidate_entry.name] = candidate
-    return refreshed
+    """把 current/pending 只读解析为关系分类输入，不发布任何 pending。
+
+    严格空 allocation residue 不属于 journal 图；任何非空无 current/pending journal 的
+    operation 目录都是无法证明完整关系授权的状态错误，不能由 relation reader 跳过。
+    """
+    journals: dict[str, Journal] = {}
+    transitions: list[tuple[_UnlockedRecoveryDiscovery, Journal | None, Journal]] = []
+
+    # The effective snapshot is not an authorization union.  Before selecting it, classify
+    # every current/pending node in complete priority phases so a pending journal cannot hide
+    # a current raw/type or Restore forward-plan failure.
+    snapshots = tuple(
+        (discovery, snapshot)
+        for discovery in discoveries
+        for snapshot in (discovery.journal, discovery.pending_journal)
+        if snapshot is not None
+    )
+    for discovery, snapshot in snapshots:
+        if snapshot.operation_id != discovery.operation_id:
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, discovery.display)
+    for discovery in discoveries:
+        if (
+            discovery.journal is not None
+            and discovery.pending_journal is not None
+            and discovery.journal.kind is not discovery.pending_journal.kind
+        ):
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, discovery.display)
+    for _, snapshot in snapshots:
+        if any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in cast(Mapping[object, object], snapshot.metadata).items()
+        ):
+            raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, snapshot.directory)
+    for _, snapshot in snapshots:
+        if (
+            snapshot.kind is OperationKind.RESTORE
+            and not _is_restore_id(_restore_forward_id(snapshot))
+        ):
+            raise DraftError(OPERATION_PLAN_INVALID, snapshot.directory)
+
+    for discovery in discoveries:
+        current = discovery.journal
+        pending = discovery.pending_journal
+        if current is None:
+            if pending is not None:
+                # A create-only bootstrap pending is a valid lock-bound snapshot.  It remains
+                # pending until the caller has classified the complete relation graph while
+                # holding the matching lock.
+                journals[discovery.operation_id] = pending
+                transitions.append((discovery, None, pending))
+                continue
+            if discovery.member_names:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, discovery.display)
+            continue
+        if pending is not None:
+            journals[discovery.operation_id] = pending
+            transitions.append((discovery, current, pending))
+        else:
+            journals[discovery.operation_id] = current
+
+    # An effective journal is selected before the graph is classified, but a pending
+    # transition is not allowed to mask raw metadata, R forward-plan, or R/T graph errors
+    # elsewhere. The shared relation validator performs those complete graph phases first.
+    validate_restore_trash_relations(journals)
+    for discovery, current, pending in transitions:
+        validate_journal_transition(
+            current,
+            pending,
+            path=discovery.display / "journal.json",
+        )
+    return journals
+
+
+def _read_effective_recovery_journals(
+    root: Path,
+) -> dict[str, Journal]:
+    """在当前根上重读全部可解析 operation journal/pending，供关系分类器使用。
+
+    全图关系是锁内动作的授权证明。因此只跳过严格空 allocation residue；非空无 journal
+    operation 目录必须阻止当前 resolver，不能在本目录尚未处理时被解释成无关事实。
+    """
+    with open_recovery_operation_directories(root) as entries:
+        discoveries: list[_UnlockedRecoveryDiscovery] = []
+        for entry in entries:
+            try:
+                discoveries.append(_discover_unlocked_operation_fd(entry))
+            except DraftError:
+                # The relation graph is an authorization proof.  An unreadable unrelated
+                # operation can change ownership, so it must never be treated as absent.
+                raise
+        return _effective_recovery_journals(tuple(discoveries))
+
+
+def _restore_trash_relation_facts(
+    journals: Mapping[str, Journal],
+) -> dict[str, RestoreTrashRelationFacts]:
+    ownership = classify_restore_trash_ownership(journals)
+    facts: dict[str, RestoreTrashRelationFacts] = {}
+    for operation_id, classification in ownership.items():
+        restore: Journal | None = None
+        trash: Journal | None = None
+        if classification.participant_ids:
+            restore_id, trash_id = classification.participant_ids
+            restore = journals[restore_id]
+            trash = journals[trash_id]
+        facts[operation_id] = RestoreTrashRelationFacts(
+            operation_id=operation_id,
+            relation=classification.relation,
+            restore=restore,
+            trash=trash,
+            owner_id=classification.owner_id,
+            participant_ids=classification.participant_ids,
+            action=classification.action,
+        )
+    return facts
+
+
+def read_restore_trash_relation(
+    root: Path,
+    operation_id: str,
+) -> RestoreTrashRelationFacts:
+    """锁内/生命周期边界读取当前全图并验证指定 operation 的关系所有权。"""
+    facts = read_restore_trash_relations(root)
+    fact = facts.get(operation_id)
+    if fact is None:
+        raise DraftError(
+            CheckCode.OPERATION_INCONSISTENT_STATE.value,
+            root / OPERATIONS_RELATIVE / operation_id,
+        )
+    return fact
+
+
+def read_restore_trash_relations(root: Path) -> dict[str, RestoreTrashRelationFacts]:
+    """只读读取当前完整 effective graph 的全部 R/T relation facts。"""
+    return _restore_trash_relation_facts(_read_effective_recovery_journals(root))
+
+
+def _classify_unlocked_recovery_candidates(
+    discoveries: tuple[_UnlockedRecoveryDiscovery, ...],
+) -> tuple[_UnlockedRecoveryCandidate, ...]:
+    """仅从 discovery 事实分类；结果不携带可用于写入的 journal 快照。"""
+    effective = _effective_recovery_journals(discoveries)
+    relation_statuses = validate_restore_trash_relations(effective)
+    candidates: list[_UnlockedRecoveryCandidate] = []
+    for discovery in discoveries:
+        journal = effective.get(discovery.operation_id)
+        pending_present = "journal.json.pending" in discovery.member_names
+        if journal is None:
+            if is_empty_allocation_residue(discovery.member_names, journal):
+                action = _UnlockedRecoveryAction.LOCK_AND_EMPTY_CLEANUP
+            elif pending_present:
+                action = _UnlockedRecoveryAction.LOCK_AND_RECOVER
+            else:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, discovery.display)
+        elif pending_present:
+            action = _UnlockedRecoveryAction.LOCK_AND_RECOVER
+        elif journal.kind is OperationKind.RESTORE:
+            relation = relation_statuses[discovery.operation_id]
+            if relation is RestoreTrashRelation.PRECLAIM:
+                action = _UnlockedRecoveryAction.LOCK_AND_RECOVER
+            elif relation is RestoreTrashRelation.POST_UNCLAIM_CLEANUP:
+                target_id = _restore_forward_id(journal)
+                target_discovery = next(
+                    (
+                        candidate
+                        for candidate in discoveries
+                        if candidate.operation_id == cast(str, target_id)
+                    ),
+                    None,
+                )
+                if (
+                    journal.phase is OperationPhase.ROLLED_BACK
+                    and target_discovery is not None
+                    and not (discovery.member_names - {"journal.json"})
+                    and not (target_discovery.member_names - {"journal.json"})
+                ):
+                    action = _UnlockedRecoveryAction.RETAIN
+                else:
+                    action = _UnlockedRecoveryAction.LOCK_AND_RECOVER
+            elif relation is RestoreTrashRelation.MATCHED:
+                # A committed R/T pair intentionally retains T's reverse claim as audit
+                # evidence.  It is already terminal and has no recovery authorization once
+                # both operation directories contain only their journals; only residual
+                # package/copies/evidence require the restore owner to reacquire the lock.
+                target_id = _restore_forward_id(journal)
+                target = (
+                    effective.get(cast(str, target_id)) if _is_restore_id(target_id) else None
+                )
+                target_discovery = next(
+                    (
+                        candidate
+                        for candidate in discoveries
+                        if candidate.operation_id == cast(str, target_id)
+                    ),
+                    None,
+                )
+                own_residue = discovery.member_names - {"journal.json"}
+                target_residue = (
+                    target_discovery.member_names - frozenset({"journal.json"})
+                    if target_discovery is not None
+                    else frozenset[str]()
+                )
+                if (
+                    target is not None
+                    and journal.phase is OperationPhase.COMPLETED
+                    and target.phase is OperationPhase.ROLLED_BACK
+                    and not own_residue
+                    and not target_residue
+                    and target_discovery is not None
+                    and target_discovery.package_kind is EntryKind.MISSING
+                ):
+                    action = _UnlockedRecoveryAction.RETAIN
+                else:
+                    action = _UnlockedRecoveryAction.LOCK_AND_RECOVER
+            else:
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+        elif journal.phase is OperationPhase.ALLOCATING or (
+            journal.kind is OperationKind.TRASH
+            and journal.phase
+            in (OperationPhase.TRASH_HANDOFF_SUCCEEDED, OperationPhase.TRASH_PURGE_COMMITTED)
+        ):
+            action = _UnlockedRecoveryAction.LOCK_AND_RECOVER
+        elif journal.phase in (OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK):
+            if discovery.member_names - {"journal.json"}:
+                action = _UnlockedRecoveryAction.LOCK_AND_RECOVER
+            else:
+                action = _UnlockedRecoveryAction.RETAIN
+        elif journal.phase is OperationPhase.TRASH_RETAINED:
+            action = _UnlockedRecoveryAction.RETAIN
+        elif journal.phase is OperationPhase.TRASH_HANDOFF_PENDING:
+            if not has_handoff_failure(journal.metadata):
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+            action = _UnlockedRecoveryAction.RETAIN
+        else:
+            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+        candidates.append(_UnlockedRecoveryCandidate(discovery.operation_id, action))
+    return tuple(candidates)
+
+
+def _discover_unlocked_recovery_candidates(
+    root: Path,
+) -> tuple[_UnlockedRecoveryCandidate, ...]:
+    with open_recovery_operation_directories(root) as entries:
+        discoveries = tuple(_discover_unlocked_operation_fd(entry) for entry in entries)
+        return _classify_unlocked_recovery_candidates(discoveries)
+
+
+def _recover_unlocked_candidate_locked(
+    root: Path,
+    operation_id: str,
+    *,
+    action: _UnlockedRecoveryAction,
+    now: datetime | None = None,
+    handoff: Callable[[str], None] | None = None,
+) -> OperationResult | TrashResult | None:
+    """丢弃初扫快照，在 matching lock 内重新读取、分类并收敛一个候选。"""
+    if action is _UnlockedRecoveryAction.LOCK_AND_EMPTY_CLEANUP:
+        # Empty candidates must be confirmed from names alone: a writer-created journal or
+        # pending file is a changed residue, not authorization to enter generic recovery.
+        _recover_empty_allocation_residue_locked(root, operation_id)
+        return None
+    current, pending = read_locked_recovery_snapshot(root, operation_id)
+    journal = current if current is not None else pending
+    if journal is None:
+        raise DraftError(
+            CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+            operation_journal_path(root, operation_id),
+        )
+    # A matching lock invalidates discovery snapshots. Classify the complete graph before
+    # dispatching this candidate to a resolver.
+    read_restore_trash_relation(root, operation_id)
+    if journal.kind is OperationKind.TRASH and journal.phase in (
+        OperationPhase.TRASH_HANDOFF_SUCCEEDED,
+        OperationPhase.TRASH_PURGE_COMMITTED,
+    ):
+        # Committed Trash cleanup is a lifecycle responsibility even when the original lock was
+        # lost.  It never calls the external handoff again; the callback only supplies the
+        # already-committed branch's unused handoff argument.
+        from draft.trash_lifecycle import (  # pyright: ignore[reportPrivateUsage]
+            _default_handoff,  # pyright: ignore[reportPrivateUsage]
+            _recover_locked_trash,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        return _recover_locked_trash(
+            root,
+            journal,
+            now=normalize_utc(now),
+            handoff=handoff if handoff is not None else _default_handoff,
+        )
+    # The first post-lock read is performed by _recover_locked itself. In particular, do not
+    # resolve journal.json.pending here: restore/T relationship ownership must be validated
+    # against the same current snapshot before any pending publication.
+    return _recover_locked(root, operation_id)
 
 
 def recover_unlocked_operations(
     root: Path,
     *,
     skip_operation_id: str | None = None,
-) -> tuple[OperationResult, ...]:
-    """两个公开恢复入口共用的已锚定无锁扫描与分派。"""
-    results: list[OperationResult] = []
-    with open_recovery_operation_directories(root) as entries:
-        journals_by_name: dict[str, Journal] = {}
-        # 先完整读取并锚定本轮候选，restore 分类不得在扫描不完整时产生副作用。
-        for entry in entries:
-            journal = read_unlocked_operation_journal_fd(entry)
-            if journal is None:
-                continue
-            else:
-                journals_by_name[entry.name] = journal
-        for entry in entries:
-            if entry.name == skip_operation_id:
-                continue
-            journal = journals_by_name.get(entry.name)
-            if journal is None:
-                continue
-            result = _recover_unlocked_operation_fd(entry, journal, journals_by_name, entries)
-            if result is not None:
-                results.append(result)
-        # Empty operation directories are retained: rmdir cannot atomically gate the
-        # name against the authenticated inode in the no-lock protocol.
+    now: datetime | None = None,
+    handoff: Callable[[str], None] | None = None,
+) -> tuple[OperationResult | TrashResult, ...]:
+    """两个公开恢复入口共用的只读 discovery 与锁内收敛边界。"""
+    results: list[OperationResult | TrashResult] = []
+    for candidate in _discover_unlocked_recovery_candidates(root):
+        if candidate.operation_id == skip_operation_id:
+            continue
+        if candidate.action is _UnlockedRecoveryAction.RETAIN:
+            continue
+        # 成功取得 lock 后，初扫的 journal、关系和目录成员全部作废；后续只由锁内重读授权。
+        acquire_lock(root, candidate.operation_id)
+        result = _recover_unlocked_candidate_locked(
+            root,
+            candidate.operation_id,
+            action=candidate.action,
+            now=now,
+            handoff=handoff,
+        )
+        if result is not None:
+            results.append(result)
     return tuple(results)
 
 
@@ -5787,6 +7391,13 @@ def recover(root_path: Path) -> OperationResult:
     root = resolve_draft_root(root_path)
     operation_id = read_lock(root)
     if operation_id is not None:
+        if _try_cleanup_matching_empty_allocation_residue(root, operation_id):
+            return OperationResult(
+                operation_id=operation_id,
+                kind="recover",
+                phase=OperationPhase.COMPLETED,
+                changed_paths=(),
+            )
         return _recover_locked(root, operation_id)
 
     recover_unlocked_operations(root)

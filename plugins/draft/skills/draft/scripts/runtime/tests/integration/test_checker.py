@@ -101,6 +101,34 @@ def test_journal_operation_id_mismatch_is_corrupt_without_mutation(
     assert journal_path.read_bytes() == before
 
 
+def test_empty_operation_residue_is_not_reported_as_corrupt(
+    draft_factory: DraftFactory,
+) -> None:
+    root = draft_factory(healthy())
+    residue = root / ".draft/operations" / ("9" * 32)
+    residue.mkdir(parents=True)
+
+    report = check_draft(root)
+
+    assert CheckCode.OPERATION_JOURNAL_CORRUPT.value not in codes(report)
+    assert report.errors == ()
+
+
+def test_checker_classifies_locked_empty_operation_residue_as_recovery_required(
+    draft_factory: DraftFactory,
+) -> None:
+    root = draft_factory(healthy())
+    operation_id = "a" * 32
+    residue = root / ".draft/operations" / operation_id
+    residue.mkdir(parents=True)
+    acquire_lock(root, operation_id)
+
+    report = check_draft(root)
+
+    assert CheckCode.OPERATION_JOURNAL_CORRUPT.value not in codes(report)
+    assert CheckCode.OPERATION_RECOVERY_REQUIRED.value in codes(report)
+
+
 def test_confirmed_page_without_output_is_valid(draft_factory: DraftFactory) -> None:
     """已确认页面不再要求产出声明；确认状态本身决定结论归属。"""
     root = draft_factory(healthy())
@@ -2046,7 +2074,7 @@ def test_checker_lock_still_scans_other_subtrees(
     report = check_draft(root)
 
     assert CheckCode.OPERATION_RECOVERY_REQUIRED.value in codes(report)
-    assert CheckCode.OPERATION_JOURNAL_CORRUPT.value in codes(report)
+    assert CheckCode.OPERATION_INCONSISTENT_STATE.value in codes(report)
     assert CheckCode.INTERNAL_UNEXPECTED_ENTRY.value in codes(report)
     assert snapshot_tree(root) == before
 

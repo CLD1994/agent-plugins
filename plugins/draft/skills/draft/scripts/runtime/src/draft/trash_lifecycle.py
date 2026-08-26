@@ -27,17 +27,26 @@ from draft.operations import (
     HANDOFF_ERROR_TYPE_KEY,
     HANDOFF_RETRY_INTERVAL,
     Journal,
+    RecoveryPreflight,
     TrashDeadlines,
+    _try_cleanup_matching_empty_allocation_residue,  # pyright: ignore[reportPrivateUsage]
+    _validate_locked_recovery_material,  # pyright: ignore[reportPrivateUsage]
     acquire_lock,
+    build_recovery_preflight,
     durable_write,
     format_utc,
     fsync_directory,
+    has_handoff_failure,
     normalize_utc,
     operation_journal_path,
     read_journal,
     read_lock,
+    read_locked_recovery_snapshot,
+    read_restore_trash_relation,
+    read_restore_trash_relations,
     recover,
     recover_digest_pending,
+    recover_empty_allocation_residues,
     recover_locked_operation,
     recover_quarantine,
     recover_unlocked_operations,
@@ -145,7 +154,13 @@ def _attempt_authorized_from_journal(journal: Journal, attempt: Path) -> list[tu
     ]
 
 
-def _clean_attempt_tree(attempt: Path, authorized: list[tuple[Path, str]], code_path: Path) -> None:
+def _clean_attempt_tree(
+    attempt: Path,
+    authorized: list[tuple[Path, str]],
+    code_path: Path,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> None:
     """attempt 精确树形协议清理：只删授权叶节点与空父目录，未知内容/符号链接拒绝。
 
     attempt 是可重建副本，但"可重建"只授权覆盖本操作记录的精确快照文件，不授权
@@ -154,6 +169,25 @@ def _clean_attempt_tree(attempt: Path, authorized: list[tuple[Path, str]], code_
     授权叶节点部分缺失（提交点后已移走）幂等容忍。
     """
     import os
+
+    owner_id = preflight.owner_id if preflight is not None else None
+    next_preflight = preflight
+
+    def take_preflight() -> RecoveryPreflight | None:
+        nonlocal next_preflight
+        from draft.operations import build_recovery_preflight
+
+        if next_preflight is not None:
+            next_preflight.require_effect("material_cleanup")
+            capability = next_preflight
+        elif owner_id is not None:
+            capability = build_recovery_preflight(
+                attempt.parents[3], owner_id, effect="material_cleanup"
+            ).consume()
+        else:
+            capability = None
+        next_preflight = None
+        return capability
 
     from draft.observations import EntryKind
     from draft.operations import anchored_leaf, classify_node_or_error
@@ -180,19 +214,23 @@ def _clean_attempt_tree(attempt: Path, authorized: list[tuple[Path, str]], code_
     # 未知成员检查，否则 .pending/.quarantine 会被当作未知内容拒绝且无法重建投递副本。
     for leaf, digest in authorized:
         relative = leaf.relative_to(attempt)
+        pending_preflight = take_preflight()
         recover_digest_pending(
             attempt,
             relative,
             digest,
             code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
             code_path=code_path,
+            preflight=pending_preflight,
         )
+        quarantine_preflight = take_preflight()
         recover_quarantine(
             attempt,
             relative,
             digest,
             code=CheckCode.OPERATION_INCONSISTENT_STATE.value,
             code_path=code_path,
+            preflight=quarantine_preflight,
         )
     for dirpath, dirnames, filenames in os.walk(attempt, followlinks=False):
         directory = Path(dirpath)
@@ -225,6 +263,7 @@ def _clean_attempt_tree(attempt: Path, authorized: list[tuple[Path, str]], code_
             if sha256_bytes(anchor.read()) != digest:
                 raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
             # 隔离→验证→删除：验证与删除同一锚定句柄（回归 H3）。
+            take_preflight()
             anchor.quarantine_delete(digest)
     for directory in sorted(
         allowed_dirs - {attempt}, key=lambda path: len(path.parts), reverse=True
@@ -241,15 +280,21 @@ def _clean_attempt_tree(attempt: Path, authorized: list[tuple[Path, str]], code_
                 continue
             if node is not EntryKind.DIRECTORY:
                 raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path)
+            take_preflight()
             anchor.rmdir()
     # 最后清理 attempt 根：已分类为 DIRECTORY，预检通过后应已空。
+    take_preflight()
     try:
         attempt.rmdir()
     except OSError as exc:
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, code_path) from exc
 
 
-def make_attempt_copy(package: VerifiedTrashPackage) -> Path:
+def make_attempt_copy(
+    package: VerifiedTrashPackage,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> Path:
     """从已验证快照制作操作内一次性副本。
 
     只使用 load_verified_package 验证时刻的不可变字节（manifest_bytes、page_bytes）
@@ -261,6 +306,25 @@ def make_attempt_copy(package: VerifiedTrashPackage) -> Path:
     from draft.operations import classify_node_or_error
 
     root = _root_from_package(package)
+    owner_id = preflight.owner_id if preflight is not None else None
+    next_preflight = preflight
+
+    def take_preflight() -> RecoveryPreflight | None:
+        nonlocal next_preflight
+        from draft.operations import build_recovery_preflight
+
+        if next_preflight is not None:
+            next_preflight.require_effect("material_cleanup")
+            capability = next_preflight
+        elif owner_id is not None:
+            capability = build_recovery_preflight(
+                root, owner_id, effect="material_cleanup"
+            ).consume()
+        else:
+            capability = None
+        next_preflight = None
+        return capability
+
     reject_symlink_components(root, OUTGOING_RELATIVE)
     attempt_relative = OPERATIONS_RELATIVE / package.operation_id / "attempt"
     reject_symlink_components(root, attempt_relative.parent)
@@ -273,21 +337,36 @@ def make_attempt_copy(package: VerifiedTrashPackage) -> Path:
         code_path=attempt,
     )
     if attempt_node is EntryKind.DIRECTORY:
-        _clean_attempt_tree(attempt, _attempt_authorized(package, attempt), attempt)
+        _clean_attempt_tree(
+            attempt,
+            _attempt_authorized(package, attempt),
+            attempt,
+            preflight=take_preflight(),
+        )
     elif attempt_node is not EntryKind.MISSING:
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, attempt)
+    # The attempt tree cleanup, when present, consumed its capability.  Creating the directory
+    # and each durable leaf are separate named actions and receive fresh authorization.
+    take_preflight()
     attempt.mkdir(parents=True, exist_ok=False)
     # 目录链从 attempt 逐层 no-follow 创建/同步（回归 M2）：嵌套 payload 的父目录
     # 逐层 mkdirat + fsync，绝不按绝对路径重新解析祖先。
+    take_preflight()
     durable_write(attempt, Path("package.json"), package.manifest_bytes)
+    take_preflight()
     durable_write(attempt, package.payload_relative, package.page_bytes)
     fsync_directory(attempt)
     return attempt
 
 
-def remove_attempt_copy(package: VerifiedTrashPackage, path: Path) -> None:
+def remove_attempt_copy(
+    package: VerifiedTrashPackage,
+    path: Path,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> None:
     """幂等清理一次性副本：按精确树形协议清理，不递归删除未知内容。"""
-    _clean_attempt_tree(path, _attempt_authorized(package, path), path)
+    _clean_attempt_tree(path, _attempt_authorized(package, path), path, preflight=preflight)
 
 
 def with_disposition(journal: Journal, disposition: str, phase: OperationPhase) -> Journal:
@@ -336,8 +415,7 @@ def require_no_restore_claim_for_expiry(root: Path, journal: Journal) -> None:
 
 
 def reread_matching_trash_journal(root: Path, operation_id: str) -> Journal:
-    # 先发布崩溃遗留的 journal pending（回归 H2）：持锁推进从最新日志状态继续。
-    resolve_journal_pending(operation_journal_path(root, operation_id))
+    """读取 matching lock 下的当前 T journal；pending 必须由调用方单独授权发布。"""
     journal = read_journal(operation_journal_path(root, operation_id))
     if journal.operation_id != operation_id or journal.kind is not OperationKind.TRASH:
         raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
@@ -355,7 +433,16 @@ def _attempt_handoff_locked(
     """持锁投递：成功沿 succeeded->completed；明确 OSError 在清理期限前后分别节流或最终清理。"""
     operation_id = journal.operation_id
     deadlines = TrashDeadlines.parse(journal.metadata)
-    attempt = make_attempt_copy(verified_package)
+    attempt_preflight = build_recovery_preflight(
+        root,
+        operation_id,
+        effect="material_cleanup",
+        validate_retained_package=True,
+    ).consume()
+    # Re-read the package after the capability is obtained.  The argument is a convenience
+    # value from the caller, never the authorization source for the external handoff.
+    verified_package = load_verified_package(root, journal)
+    attempt = make_attempt_copy(verified_package, preflight=attempt_preflight)
     # 调用外部 handoff 前用已验证快照复核权威包：验证后发生的摘要/成员变化必须阻止
     # 适配器读取未验证内容，保留权威包与可诊断状态（回归 H4）。
     from draft.observations import FilesystemObservationProbe, verify_observations
@@ -363,30 +450,72 @@ def _attempt_handoff_locked(
     changed = verify_observations(FilesystemObservationProbe(root), verified_package.observations)
     if changed:
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, verified_package.directory)
+    # The callback is an external side effect.  Re-read the complete closure immediately before
+    # handing the attempt to it; package/attempt changes after the first preflight must stop the
+    # operation instead of being consumed by the adapter.
+    handoff_preflight = build_recovery_preflight(
+        root,
+        operation_id,
+        effect="handoff",
+        validate_retained_package=True,
+    ).consume()
+    handoff_preflight.require_effect("handoff")
     try:
         handoff(str(attempt))
     except OSError as error:
+        current = read_journal(operation_journal_path(root, operation_id))
+        if current != journal:
+            raise DraftError(
+                CheckCode.OPERATION_INCONSISTENT_STATE.value, current.directory
+            ) from error
         if now >= deadlines.purge_eligible_at:
             failed = with_handoff_failure(
-                journal,
+                current,
                 error,
                 attempted_at=now,
                 next_attempt_at=now + HANDOFF_RETRY_INTERVAL,
                 phase=OperationPhase.TRASH_PURGE_COMMITTED,
             )
-            write_journal(failed)
+            write_preflight = build_recovery_preflight(
+                root, operation_id, effect="journal_write"
+            ).consume()
+            write_journal(failed, preflight=write_preflight)
+            current = read_journal(operation_journal_path(root, operation_id))
             # M1：清理授权从锁内重读的已提交 journal 派生（purge_committed 已耐久写入）。
+            cleanup_preflight = build_recovery_preflight(
+                root, operation_id, effect="material_cleanup"
+            ).consume()
             clean_authoritative_package(
                 root,
                 cleanup_authorization(
                     root, journal.operation_id, lock_operation_id=journal.operation_id
                 ),
+                preflight=cleanup_preflight,
             )
-            remove_attempt_copy(verified_package, attempt)
+            current = read_journal(operation_journal_path(root, operation_id))
+            attempt_cleanup_preflight = build_recovery_preflight(
+                root, operation_id, effect="material_cleanup"
+            ).consume()
+            _clean_attempt_tree(
+                attempt,
+                _attempt_authorized_from_journal(current, attempt),
+                attempt,
+                preflight=attempt_cleanup_preflight,
+            )
+            current = read_journal(operation_journal_path(root, operation_id))
+            terminal_preflight = build_recovery_preflight(
+                root, operation_id, effect="journal_write"
+            ).consume()
             write_journal(
-                with_disposition(failed, EXPIRED_PURGE_DISPOSITION, OperationPhase.COMPLETED)
+                with_disposition(
+                    current, EXPIRED_PURGE_DISPOSITION, OperationPhase.COMPLETED
+                ),
+                preflight=terminal_preflight,
             )
-            release_lock(root, operation_id)
+            release_preflight = build_recovery_preflight(
+                root, operation_id, effect="release"
+            ).consume()
+            release_lock(root, operation_id, preflight=release_preflight)
             return TrashResult(
                 operation_id=operation_id,
                 phase=OperationPhase.COMPLETED,
@@ -394,15 +523,30 @@ def _attempt_handoff_locked(
             )
         next_attempt_at = now + HANDOFF_RETRY_INTERVAL
         failed = with_handoff_failure(
-            journal,
+            current,
             error,
             attempted_at=now,
             next_attempt_at=next_attempt_at,
             phase=OperationPhase.TRASH_HANDOFF_PENDING,
         )
-        write_journal(failed)
-        remove_attempt_copy(verified_package, attempt)
-        release_lock(root, operation_id)
+        write_preflight = build_recovery_preflight(
+            root, operation_id, effect="journal_write"
+        ).consume()
+        write_journal(failed, preflight=write_preflight)
+        current = read_journal(operation_journal_path(root, operation_id))
+        attempt_cleanup_preflight = build_recovery_preflight(
+            root, operation_id, effect="material_cleanup"
+        ).consume()
+        _clean_attempt_tree(
+            attempt,
+            _attempt_authorized_from_journal(current, attempt),
+            attempt,
+            preflight=attempt_cleanup_preflight,
+        )
+        release_preflight = build_recovery_preflight(
+            root, operation_id, effect="release"
+        ).consume()
+        release_lock(root, operation_id, preflight=release_preflight)
         return TrashResult(
             operation_id=operation_id,
             phase=OperationPhase.TRASH_HANDOFF_PENDING,
@@ -416,16 +560,48 @@ def _attempt_handoff_locked(
             ),
         )
     # 成功：先耐久 succeeded，再清权威包与副本，最后 completed+disposition。
-    succeeded = with_phase(journal, OperationPhase.TRASH_HANDOFF_SUCCEEDED)
-    write_journal(succeeded)
+    current = read_journal(operation_journal_path(root, operation_id))
+    if current != journal:
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, current.directory)
+    succeeded = with_phase(current, OperationPhase.TRASH_HANDOFF_SUCCEEDED)
+    write_preflight = build_recovery_preflight(
+        root, operation_id, effect="journal_write"
+    ).consume()
+    write_journal(succeeded, preflight=write_preflight)
+    current = read_journal(operation_journal_path(root, operation_id))
     # M1：清理授权从锁内重读的已提交 journal 派生（handoff_succeeded 已耐久写入）。
+    cleanup_preflight = build_recovery_preflight(
+        root, operation_id, effect="material_cleanup"
+    ).consume()
     clean_authoritative_package(
         root,
-        cleanup_authorization(root, journal.operation_id, lock_operation_id=journal.operation_id),
+        cleanup_authorization(
+            root, current.operation_id, lock_operation_id=current.operation_id
+        ),
+        preflight=cleanup_preflight,
     )
-    remove_attempt_copy(verified_package, attempt)
-    write_journal(with_disposition(succeeded, SYSTEM_TRASH_DISPOSITION, OperationPhase.COMPLETED))
-    release_lock(root, operation_id)
+    current = read_journal(operation_journal_path(root, operation_id))
+    attempt_cleanup_preflight = build_recovery_preflight(
+        root, operation_id, effect="material_cleanup"
+    ).consume()
+    _clean_attempt_tree(
+        attempt,
+        _attempt_authorized_from_journal(current, attempt),
+        attempt,
+        preflight=attempt_cleanup_preflight,
+    )
+    current = read_journal(operation_journal_path(root, operation_id))
+    terminal_preflight = build_recovery_preflight(
+        root, operation_id, effect="journal_write"
+    ).consume()
+    write_journal(
+        with_disposition(current, SYSTEM_TRASH_DISPOSITION, OperationPhase.COMPLETED),
+        preflight=terminal_preflight,
+    )
+    release_preflight = build_recovery_preflight(
+        root, operation_id, effect="release"
+    ).consume()
+    release_lock(root, operation_id, preflight=release_preflight)
     return TrashResult(
         operation_id=operation_id,
         phase=OperationPhase.COMPLETED,
@@ -442,8 +618,19 @@ def _advance_one(
 ) -> TrashResult | None:
     """无锁扫描入口：未到期直接返回；到期则取得锁后委托持锁推进。"""
     scan_deadlines = TrashDeadlines.parse(journal.metadata)
+    if journal.phase is OperationPhase.TRASH_HANDOFF_PENDING and not has_handoff_failure(
+        journal.metadata
+    ):
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     if journal.phase is OperationPhase.TRASH_RETAINED and now < scan_deadlines.restore_expires_at:
         return None
+
+    relation = read_restore_trash_relation(
+        root,
+        journal.operation_id,
+    )
+    if relation.owner_id is not None and relation.owner_id != journal.operation_id:
+        raise DraftError(CheckCode.OPERATION_RECOVERY_REQUIRED.value, journal.directory)
 
     acquire_lock(root, journal.operation_id)
     return _advance_one_locked(root, journal.operation_id, now=now, handoff=handoff)
@@ -457,21 +644,79 @@ def _advance_one_locked(
     handoff: Handoff,
 ) -> TrashResult | None:
     """持锁推进单项：调用方必须已经持有 operation_id 的写锁。"""
+    relation = read_restore_trash_relation(
+        root,
+        operation_id,
+    )
+    if relation.owner_id is not None and relation.owner_id != operation_id:
+        raise DraftError(
+            CheckCode.OPERATION_RECOVERY_REQUIRED.value,
+            relation.trash.directory if relation.trash else root,
+        )
+    current_snapshot, pending_snapshot = read_locked_recovery_snapshot(root, operation_id)
+    _validate_locked_recovery_material(
+        root,
+        operation_id,
+        current_snapshot,
+        pending_snapshot,
+    )
+    # Publishing a pending journal is itself a durable side effect.  Obtain the capability
+    # immediately before the helper that may publish it; the post-publish snapshot below is
+    # intentionally a new authorization round.
+    pending_preflight = build_recovery_preflight(
+        root, operation_id, effect="pending_publish"
+    ).consume()
+    resolve_journal_pending(
+        operation_journal_path(root, operation_id),
+        preflight=pending_preflight,
+    )
     current = reread_matching_trash_journal(root, operation_id)
+    refreshed_current, refreshed_pending = read_locked_recovery_snapshot(root, operation_id)
+    _validate_locked_recovery_material(
+        root, operation_id, refreshed_current, refreshed_pending
+    )
+    if current.phase is OperationPhase.TRASH_HANDOFF_PENDING and not has_handoff_failure(
+        current.metadata
+    ):
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, current.directory)
     deadlines = TrashDeadlines.parse(current.metadata)
     if current.phase is OperationPhase.TRASH_RETAINED:
         if now < deadlines.restore_expires_at:
-            release_lock(root, current.operation_id)
+            release_preflight = build_recovery_preflight(
+                root, operation_id, effect="release"
+            ).consume()
+            release_lock(root, current.operation_id, preflight=release_preflight)
             return None
         require_no_restore_claim_for_expiry(root, current)
+        # The outgoing package is part of the retained T action's material closure.  Prove
+        # its journal authorization and complete tree before publishing the first lifecycle
+        # phase; the package is deliberately reloaded after that transition rather than
+        # carrying a pre-transition snapshot into handoff.
+        phase_preflight = build_recovery_preflight(
+            root,
+            operation_id,
+            effect="journal_write",
+            validate_retained_package=True,
+        ).consume()
         current = with_phase(current, OperationPhase.TRASH_HANDOFF_PENDING)
-        write_journal(current)
+        write_journal(current, preflight=phase_preflight)
+        refreshed_current, refreshed_pending = read_locked_recovery_snapshot(root, operation_id)
+        _validate_locked_recovery_material(
+            root, operation_id, refreshed_current, refreshed_pending
+        )
+        current = reread_matching_trash_journal(root, operation_id)
     elif current.phase is not OperationPhase.TRASH_HANDOFF_PENDING:
-        release_lock(root, current.operation_id)
+        release_preflight = build_recovery_preflight(
+            root, operation_id, effect="release"
+        ).consume()
+        release_lock(root, current.operation_id, preflight=release_preflight)
         return None
 
     if now < deadlines.next_handoff_attempt_at and now < deadlines.purge_eligible_at:
-        release_lock(root, current.operation_id)
+        release_preflight = build_recovery_preflight(
+            root, operation_id, effect="release"
+        ).consume()
+        release_lock(root, current.operation_id, preflight=release_preflight)
         return None
     verified_package = load_verified_package(root, current)
     return _attempt_handoff_locked(
@@ -519,7 +764,33 @@ def advance_trash_lifecycle(
     normalized_now = normalize_utc(now)
     active_handoff = handoff if handoff is not None else _default_handoff
     results: list[LifecycleResult] = []
-    for journal_path in _iter_trash_journals(resolved):
+    # Enumerate candidate names before the graph read so a graph-wide failure still has a
+    # stable report attribution.  This is a path-only discovery; no journal is consumed.
+    try:
+        trash_paths = _iter_trash_journals(resolved)
+    except DraftError as error:
+        operation_id = error.paths[0].parent.name if error.paths else ""
+        try:
+            validate_operation_id(operation_id, code=CheckCode.OPERATION_INCONSISTENT_STATE.value)
+        except DraftError:
+            operation_id = ""
+        if not operation_id:
+            raise
+        return LifecycleAdvanceReport(results=(), error=_to_failure(operation_id, error))
+    operation_id = trash_paths[0].parent.name if trash_paths else ""
+    try:
+        # Handoff is externally visible. Reject an invalid complete graph before advancing the
+        # first sorted Trash candidate so a later relation cannot leave prior handoff side effects.
+        read_restore_trash_relations(resolved)
+        # Lifecycle advancement owns only its trash work; nevertheless it shares the
+        # lock-bound empty allocation residue closure with the recovery entry points.
+        locked = read_lock(resolved)
+        if locked is not None and _try_cleanup_matching_empty_allocation_residue(resolved, locked):
+            locked = None
+        recover_empty_allocation_residues(resolved)
+    except DraftError as error:
+        return LifecycleAdvanceReport(results=(), error=_to_failure(operation_id, error))
+    for journal_path in trash_paths:
         operation_id = journal_path.parent.name
         try:
             journal = read_journal(journal_path)
@@ -544,21 +815,79 @@ def _recover_locked_trash(
     root: Path, journal: Journal, *, now: datetime, handoff: Handoff
 ) -> TrashResult | None:
     """按 journal phase 收敛持锁 trash 现场。"""
+    current_snapshot, pending_snapshot = read_locked_recovery_snapshot(root, journal.operation_id)
+    relation = read_restore_trash_relation(root, journal.operation_id)
+    if relation.owner_id is not None and relation.owner_id != journal.operation_id:
+        raise DraftError(
+            CheckCode.OPERATION_RECOVERY_REQUIRED.value,
+            relation.trash.directory if relation.trash else journal.directory,
+        )
+    _validate_locked_recovery_material(
+        root,
+        journal.operation_id,
+        current_snapshot,
+        pending_snapshot,
+    )
+    if current_snapshot is None or pending_snapshot is not None:
+        # The relation was validated against the effective pending snapshot first.  Only then
+        # publish it and continue from a current journal, including bootstrap pending-only scenes.
+        pending_preflight = build_recovery_preflight(
+            root, journal.operation_id, effect="pending_publish"
+        ).consume()
+        resolve_journal_pending(
+            operation_journal_path(root, journal.operation_id),
+            preflight=pending_preflight,
+        )
+        journal = reread_matching_trash_journal(root, journal.operation_id)
+    else:
+        journal = current_snapshot
+    refreshed_current, refreshed_pending = read_locked_recovery_snapshot(root, journal.operation_id)
+    _validate_locked_recovery_material(
+        root, journal.operation_id, refreshed_current, refreshed_pending
+    )
+    pending_preflight = build_recovery_preflight(
+        root, journal.operation_id, effect="pending_publish"
+    ).consume()
+    resolve_journal_pending(
+        operation_journal_path(root, journal.operation_id),
+        preflight=pending_preflight,
+    )
+    journal = reread_matching_trash_journal(root, journal.operation_id)
     operation_id = journal.operation_id
+    if journal.phase is OperationPhase.TRASH_HANDOFF_PENDING and not has_handoff_failure(
+        journal.metadata
+    ):
+        raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
     if journal.phase in (
         OperationPhase.TRASH_HANDOFF_SUCCEEDED,
         OperationPhase.TRASH_PURGE_COMMITTED,
     ):
         # 提交点已耐久：只完成清理，绝不再调用适配器。清理走统一权威包原语，
         # 从 T 日志派生授权条目逐个复核删除，未知内容使清理拒绝并保留现场。
+        cleanup_preflight = build_recovery_preflight(
+            root,
+            journal.operation_id,
+            effect="material_cleanup",
+        ).consume()
         clean_authoritative_package(
             root,
             cleanup_authorization(
                 root, journal.operation_id, lock_operation_id=journal.operation_id
             ),
+            preflight=cleanup_preflight,
         )
+        journal = read_journal(operation_journal_path(root, operation_id))
         attempt = root / OPERATIONS_RELATIVE / operation_id / "attempt"
-        _clean_attempt_tree(attempt, _attempt_authorized_from_journal(journal, attempt), attempt)
+        attempt_preflight = build_recovery_preflight(
+            root, operation_id, effect="material_cleanup"
+        ).consume()
+        _clean_attempt_tree(
+            attempt,
+            _attempt_authorized_from_journal(journal, attempt),
+            attempt,
+            preflight=attempt_preflight,
+        )
+        journal = read_journal(operation_journal_path(root, operation_id))
         terminal = with_disposition(
             journal,
             EXPIRED_PURGE_DISPOSITION
@@ -566,22 +895,33 @@ def _recover_locked_trash(
             else SYSTEM_TRASH_DISPOSITION,
             OperationPhase.COMPLETED,
         )
-        write_journal(terminal)
-        release_lock(root, operation_id)
+        terminal_preflight = build_recovery_preflight(
+            root, operation_id, effect="journal_write"
+        ).consume()
+        write_journal(terminal, preflight=terminal_preflight)
+        release_preflight = build_recovery_preflight(
+            root, operation_id, effect="release"
+        ).consume()
+        release_lock(root, operation_id, preflight=release_preflight)
         package_dir = root / OUTGOING_RELATIVE / operation_id
         return TrashResult(
             operation_id=operation_id, phase=OperationPhase.COMPLETED, package=package_dir
         )
     if journal.phase is OperationPhase.TRASH_RETAINED:
         # retained 只代表崩溃残留锁；恢复不得读取 handoff 副本、写 phase 或删除权威包。
-        release_lock(root, operation_id)
+        release_preflight = build_recovery_preflight(
+            root, operation_id, effect="release"
+        ).consume()
+        release_lock(root, operation_id, preflight=release_preflight)
         return None
     if journal.phase is OperationPhase.TRASH_HANDOFF_PENDING:
         # pending 已耐久记录移交意图，恢复可以继续同一次生命周期尝试。
         return _advance_one_locked(root, operation_id, now=now, handoff=handoff)
     # read_journal 已按 OperationKind.TRASH 的权威 phase 表验证输入；其余 mutation、
     # 链接索引和终态 phase 都委托原 operation recovery，不在这里复制 phase 清单。
-    result = recover(root)
+    # Generic operation phases still use the common locked resolver, but must not re-enter the
+    # top-level recovery dispatcher while this Trash owner holds the lock.
+    result = recover_locked_operation(root, operation_id)
     return TrashResult(
         operation_id=result.operation_id,
         phase=result.phase,
@@ -602,33 +942,22 @@ def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleRe
     """
     from draft.trash import (
         RestoreRecoveryAction,
-        RestoreRecoveryFacts,
-        is_restore_preclaim_bootstrap,
         load_restore_recovery_facts,
-        restore_recovery_decision,
-        restore_unapplied_fact,
+        restore_recovery_decision_from_facts,
     )
-
-    def unapplied_proof(facts: RestoreRecoveryFacts) -> bool:
-        """按 R phase 门控未应用证明；其他 phase 固定 false，不读取目标（round-12 M1）。"""
-        if facts.restore.phase not in (OperationPhase.ALLOCATING, OperationPhase.PREPARED):
-            return False
-        return restore_unapplied_fact(root, facts.restore)
-
-    def bootstrap_fact(facts: RestoreRecoveryFacts) -> bool:
-        """严格前认领初始日志事实，从同一份 facts 计算，不额外重读文件（round-13 H1）。"""
-        return is_restore_preclaim_bootstrap(facts.restore, facts.trash.operation_id)
 
     # 恢复专用关联读取：接受 R→T 正确而 T claim 缺失的 ABANDON 耐久中间状态，不把
     # 程序自己写出的 TRASH_UNCLAIMED 拒绝为 plan_invalid（第十二轮 H1）。
     facts = load_restore_recovery_facts(root, restore_journal.operation_id)
-    action = restore_recovery_decision(
-        restore_phase=facts.restore.phase,
-        trash_phase=facts.trash.phase,
-        link_state=facts.link_state,
-        preclaim_bootstrap=bootstrap_fact(facts),
-        proven_unapplied=unapplied_proof(facts),
-    )
+    for participant_id in facts.participant_ids:
+        current_snapshot, pending_snapshot = read_locked_recovery_snapshot(root, participant_id)
+        _validate_locked_recovery_material(
+            root,
+            participant_id,
+            current_snapshot,
+            pending_snapshot,
+        )
+    action = restore_recovery_decision_from_facts(root, facts)
     if action in (
         RestoreRecoveryAction.RESUME_FORWARD,
         RestoreRecoveryAction.RESUME_ROLLBACK,
@@ -639,13 +968,15 @@ def _recover_locked_restore(root: Path, restore_journal: Journal) -> LifecycleRe
             retain_terminal_lock=True,
         )
         facts = load_restore_recovery_facts(root, facts.restore.operation_id)
-        action = restore_recovery_decision(
-            restore_phase=facts.restore.phase,
-            trash_phase=facts.trash.phase,
-            link_state=facts.link_state,
-            preclaim_bootstrap=bootstrap_fact(facts),
-            proven_unapplied=unapplied_proof(facts),
-        )
+        for participant_id in facts.participant_ids:
+            current_snapshot, pending_snapshot = read_locked_recovery_snapshot(root, participant_id)
+            _validate_locked_recovery_material(
+                root,
+                participant_id,
+                current_snapshot,
+                pending_snapshot,
+            )
+        action = restore_recovery_decision_from_facts(root, facts)
     if action in (
         RestoreRecoveryAction.RESUME_FORWARD,
         RestoreRecoveryAction.RESUME_ROLLBACK,
@@ -733,10 +1064,19 @@ def recover_interrupted_operations(
     results: list[LifecycleResult] = []
 
     locked = read_lock(resolved)
+    if locked is not None and _try_cleanup_matching_empty_allocation_residue(resolved, locked):
+        locked = None
     if locked is not None:
-        journal = read_journal(operation_journal_path(resolved, locked))
-        if journal.operation_id != locked:
-            raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
+        current_snapshot, pending_snapshot = read_locked_recovery_snapshot(resolved, locked)
+        journal = current_snapshot if current_snapshot is not None else pending_snapshot
+        if journal is None:
+            raise DraftError(
+                CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+                operation_journal_path(resolved, locked),
+            )
+        # Snapshot parsing only establishes the locked operation's raw existence; graph
+        # classification still precedes every relation/material decision below.
+        read_restore_trash_relation(resolved, locked)
         if journal.kind is OperationKind.RESTORE:
             results.append(_recover_locked_restore(resolved, journal))
         elif journal.kind is OperationKind.TRASH:
@@ -748,6 +1088,13 @@ def recover_interrupted_operations(
         else:
             results.append(recover(resolved))
 
-    results.extend(recover_unlocked_operations(resolved, skip_operation_id=locked))
+    results.extend(
+        recover_unlocked_operations(
+            resolved,
+            skip_operation_id=locked,
+            now=normalized_now,
+            handoff=active_handoff,
+        )
+    )
 
     return tuple(results)

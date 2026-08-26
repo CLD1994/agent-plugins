@@ -9,6 +9,7 @@ from urllib.parse import quote
 from draft.diagnostic_codes import (
     OPERATION_EXTERNAL_CHANGE,
     OPERATION_INDEX_UPDATE_FAILED,
+    OPERATION_PLAN_INVALID,
     CheckCode,
 )
 from draft.errors import DraftError
@@ -908,7 +909,7 @@ def _assert_link_extractable(path: Path, text: str) -> None:
     try:
         extract_body_links(text)
     except DraftError as error:
-        raise DraftError("operation.plan_invalid", path, details=(error.code,)) from error
+        raise DraftError(OPERATION_PLAN_INVALID, path, details=(error.code,)) from error
 
 
 def _plan_unmanaged(

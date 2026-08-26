@@ -46,6 +46,7 @@ from draft.observations import EMPTY_OBSERVATIONS, EntryKind
 from draft.operations import (
     OPERATIONS_RELATIVE,
     Journal,
+    RecoveryPreflight,
     _pending_name,  # pyright: ignore[reportPrivateUsage]
     acquire_lock,
     classify_node_or_error,
@@ -469,7 +470,12 @@ def _regular_flag_identity(parent_fd: int, name: str, path: Path) -> tuple[int, 
     return (st.st_ino, st.st_dev)
 
 
-def stage_link_index(journal: Journal, index: LinkIndex) -> str:
+def stage_link_index(
+    journal: Journal,
+    index: LinkIndex,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> str:
     """把 ``index`` 确定序列化耐久写入 operation 专属 staging（spec §10）。
 
     staging 精确位于 ``journal.directory / "link-index.staged.json"``。流程 create-only
@@ -479,6 +485,8 @@ def stage_link_index(journal: Journal, index: LinkIndex) -> str:
     不是 journal 耐久失败）；``operation.external_change``（pending/target 瞬时出现）
     原样传播，不折叠为可降级码。
     """
+    if preflight is not None:
+        preflight.require_effect("material_cleanup", participant_id=journal.operation_id)
     raw = index.to_json()
     digest = sha256_bytes(raw)
     staging = journal.directory / LINK_INDEX_STAGED_FILE_NAME
@@ -514,7 +522,13 @@ def stage_link_index(journal: Journal, index: LinkIndex) -> str:
     return digest
 
 
-def publish_staged_link_index(root: Path, journal: Journal, expected_sha256: str) -> None:
+def publish_staged_link_index(
+    root: Path,
+    journal: Journal,
+    expected_sha256: str,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> None:
     """把 staging 原子发布为 ``.draft/link-index.json``（spec §10 决策表）。
 
     发布目标分类以最新权威状态（``read_link_index_authority``）为准：absent 只允许
@@ -527,6 +541,8 @@ def publish_staged_link_index(root: Path, journal: Journal, expected_sha256: str
     替换使用同文件系统原子 ``os.replace``（消费 staging），成功后分别同步目标父目录
     ``.draft/`` 与 operation 目录；替换或同步失败映射 ``operation.index_update_failed``。
     """
+    if preflight is not None:
+        preflight.require_effect("material_cleanup", participant_id=journal.operation_id)
     _reject_ancestor_symlinks(root, INDEX_RELATIVE_PATH, code=_INCONSISTENT)
     target = root / INDEX_RELATIVE_PATH
     target_node = classify_node_or_error(target, code=_INCONSISTENT, code_path=target)
@@ -596,7 +612,11 @@ def publish_staged_link_index(root: Path, journal: Journal, expected_sha256: str
         raise DraftError(OPERATION_INDEX_UPDATE_FAILED, target) from exc
 
 
-def ensure_rebuild_flag(root: Path) -> ResultWarning | None:
+def ensure_rebuild_flag(
+    root: Path,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> ResultWarning | None:
     """尽力耐久创建零字节 rebuild-required flag（spec §10/§11）。
 
     flag 只表达存在性，不写 JSON 或原因文本。已存在普通文件视为幂等成功；叶节点为
@@ -605,6 +625,8 @@ def ensure_rebuild_flag(root: Path) -> ResultWarning | None:
     ``path.symlink_escape``。普通 I/O 失败（创建、目录同步）转换为
     ``link_index.rebuild_flag_update_failed`` warning 返回，不改变 journal 结果。
     """
+    if preflight is not None:
+        preflight.require_effect("material_cleanup")
     flag = root / REBUILD_FLAG_RELATIVE_PATH
     node = classify_node_or_error(flag, code=_INCONSISTENT, code_path=flag)
     if node is EntryKind.FILE:
@@ -650,7 +672,11 @@ def ensure_rebuild_flag(root: Path) -> ResultWarning | None:
     return None
 
 
-def remove_rebuild_flag(root: Path) -> ResultWarning | None:
+def remove_rebuild_flag(
+    root: Path,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> ResultWarning | None:
     """尽力耐久删除 rebuild-required flag（spec §10/§11）。
 
     删除前先 lstat 分类，只删除普通文件并同步 ``.draft/``；缺失视为幂等成功。叶节点
@@ -661,6 +687,8 @@ def remove_rebuild_flag(root: Path) -> ResultWarning | None:
     绝不按名字删除未知节点。普通 I/O 失败（删除、目录同步）转换为
     ``link_index.rebuild_flag_update_failed`` warning 返回。
     """
+    if preflight is not None:
+        preflight.require_effect("material_cleanup")
     flag = root / REBUILD_FLAG_RELATIVE_PATH
     node = classify_node_or_error(flag, code=_INCONSISTENT, code_path=flag)
     if node is EntryKind.MISSING:
@@ -726,13 +754,19 @@ def _unlink_protocol_file(
         raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, path) from exc
 
 
-def cleanup_link_index_staging(journal: Journal) -> None:
+def cleanup_link_index_staging(
+    journal: Journal,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> None:
     """幂等清理当前 operation 的 ``link-index.staged.json`` 及其 ``.pending``（spec §12）。
 
     只处理精确 staging 路径（及 durable_write 中间态 ``.pending``）；缺失视为已经
     收敛。符号链接、目录或其他异常节点是内部状态错误，保留现场不按文件名删除未知
     节点。
     """
+    if preflight is not None:
+        preflight.require_effect("material_cleanup", participant_id=journal.operation_id)
     _unlink_protocol_file(
         journal.directory / LINK_INDEX_STAGED_FILE_NAME,
         durability_step=operation_io.DurabilityStep.STAGING_DIRECTORY_FSYNC,

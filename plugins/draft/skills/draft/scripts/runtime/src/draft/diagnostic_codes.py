@@ -73,6 +73,7 @@ class CheckCode(StrEnum):
 # 替换要求；本文件是它们唯一的定义处，消费方从这里导入。
 OPERATION_INDEX_UPDATE_FAILED = "operation.index_update_failed"
 OPERATION_EXTERNAL_CHANGE = "operation.external_change"
+OPERATION_PLAN_INVALID = "operation.plan_invalid"
 LINK_INDEX_REBUILD_REQUIRED = "link_index.rebuild_required"
 LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED = "link_index.rebuild_flag_update_failed"
 

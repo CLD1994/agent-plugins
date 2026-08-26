@@ -19,6 +19,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from draft.diagnostic_codes import OPERATION_PLAN_INVALID
 from draft.errors import DraftError
 
 if TYPE_CHECKING:
@@ -110,7 +111,7 @@ def merge_observations(*manifests: ObservationManifest) -> ObservationManifest:
                 ):
                     by_path[entry.path] = entry if entry.member_types else previous
                     continue
-                raise DraftError("operation.plan_invalid", entry.path)
+                raise DraftError(OPERATION_PLAN_INVALID, entry.path)
             by_path[entry.path] = entry
     return ObservationManifest(
         entries=tuple(by_path[path] for path in sorted(by_path, key=lambda item: item.as_posix()))

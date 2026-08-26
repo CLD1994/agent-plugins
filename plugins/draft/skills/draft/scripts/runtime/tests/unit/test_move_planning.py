@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from draft.diagnostic_codes import OPERATION_PLAN_INVALID
 from draft.errors import DraftError
 from draft.graph import DraftGraph, MarkerSnapshot, MarkerState, resolve_local_destination
 from draft.markdown import parse_page
@@ -239,7 +240,7 @@ def test_plan_move_request_rejects_rendered_text_that_lost_extractability(
             graph, closure, request, marker=_CANDIDATE_SNAPSHOT, observations=EMPTY_OBSERVATIONS
         )
 
-    assert caught.value.code == "operation.plan_invalid"
+    assert caught.value.code == OPERATION_PLAN_INVALID
 
 
 # ---------------------------------------------------------------------------

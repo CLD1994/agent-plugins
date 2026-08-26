@@ -14,6 +14,7 @@ from draft.cli_results import CheckSlice, project_check
 from draft.diagnostic_codes import (
     OPERATION_EXTERNAL_CHANGE,
     OPERATION_INDEX_UPDATE_FAILED,
+    OPERATION_PLAN_INVALID,
     CheckCode,
     RootCode,
 )
@@ -999,6 +1000,6 @@ def test_is_expected_link_index_maintenance_error_absorbs_classified_codes() -> 
 
 
 def test_is_expected_link_index_maintenance_error_rejects_program_contract_errors() -> None:
-    assert not cli.is_expected_link_index_maintenance_error(DraftError("operation.plan_invalid"))
+    assert not cli.is_expected_link_index_maintenance_error(DraftError(OPERATION_PLAN_INVALID))
     assert not cli.is_expected_link_index_maintenance_error(DraftError("cli.unknown_command"))
     assert not cli.is_expected_link_index_maintenance_error(DraftError(RootCode.NOT_FOUND.value))

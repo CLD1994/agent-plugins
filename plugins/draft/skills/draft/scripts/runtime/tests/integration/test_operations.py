@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from draft.diagnostic_codes import CheckCode
+from draft.diagnostic_codes import OPERATION_PLAN_INVALID, CheckCode
 from draft.errors import DraftError
 from draft.graph import load_graph, read_marker_snapshot
 from draft.models import (
@@ -38,6 +38,7 @@ from draft.operations import (
 from draft.operations import (
     write_journal as write_journal_durable,
 )
+from draft.trash_lifecycle import recover_interrupted_operations
 from draft.vocabulary import ConclusionsState
 from tests.integration.support import FailingDurability, managed_marker_text, write_raw_journal
 
@@ -273,6 +274,91 @@ def write_restore_phase_journal(
     return journal_dir
 
 
+def _write_locked_restore_material_scene(
+    root: Path,
+    *,
+    restore_id: str,
+    trash_id: str,
+    pending_only: bool,
+    subdirectory: str,
+    material_kind: str,
+) -> tuple[Path, Path, Path, Path]:
+    """构造带 R/T 关系和恢复副本的锁内恢复现场。
+
+    current R 携带一个未应用 WRITE mutation，pending-only R 保持合法 bootstrap 形状；
+    后者的副本因此全部是未授权成员，专门证明 pending 发布前也必须经过材料门禁。
+    """
+    import shutil
+
+    operations = root / ".draft/operations"
+    restore_dir = operations / restore_id
+    trash_dir = operations / trash_id
+    restore_dir.mkdir(parents=True)
+    trash_dir.mkdir(parents=True)
+    before = (root / "pages/a.md").read_bytes()
+    after = before + b"\nrestore-after\n"
+    mutation = {
+        "path": "pages/a.md",
+        "kind": "write",
+        "before_sha256": sha256_bytes(before),
+        "after_sha256": sha256_bytes(after),
+        "original": "originals/0000.bin",
+        "staged": "staged/0000.bin",
+        "applied": False,
+    }
+    restore_payload: dict[str, object] = {
+        "journal_version": JOURNAL_VERSION,
+        "operation_id": restore_id,
+        "kind": OperationKind.RESTORE.value,
+        "phase": OperationPhase.ALLOCATING.value,
+        "root_state": "registered",
+        "observations": [],
+        "mutations": [] if pending_only else [mutation],
+        "remove_empty_directories": [],
+        "metadata": {"restores_trash_operation": trash_id},
+    }
+    restore_path = restore_dir / "journal.json"
+    pending_path = restore_dir / "journal.json.pending"
+    if pending_only:
+        pending_path.write_text(json.dumps(restore_payload) + "\n", encoding="utf-8")
+    else:
+        restore_path.write_text(json.dumps(restore_payload) + "\n", encoding="utf-8")
+    trash_payload = {
+        "journal_version": JOURNAL_VERSION,
+        "operation_id": trash_id,
+        "kind": OperationKind.TRASH.value,
+        "phase": OperationPhase.TRASH_RETAINED.value,
+        "root_state": "registered",
+        "observations": [],
+        "mutations": [],
+        "remove_empty_directories": [],
+        "metadata": {"restore_operation_id": restore_id},
+    }
+    trash_path = trash_dir / "journal.json"
+    trash_path.write_text(json.dumps(trash_payload) + "\n", encoding="utf-8")
+
+    for name in ("originals", "staged"):
+        (restore_dir / name).mkdir()
+    material = restore_dir / subdirectory
+    if pending_only:
+        material_file = material / "unlisted.bin"
+        material_file.write_bytes(b"pending-unauthorized")
+    else:
+        (restore_dir / "originals" / "0000.bin").write_bytes(before)
+        (restore_dir / "staged" / "0000.bin").write_bytes(after)
+        if material_kind in {"unknown", "unauthorized"}:
+            (material / "unlisted.bin").write_bytes(b"unauthorized")
+        elif material_kind == "digest":
+            (material / "0000.bin").write_bytes(b"wrong-digest")
+    if material_kind == "symlink":
+        external = root.parent / f"restore-material-{restore_id}"
+        external.mkdir()
+        (external / "sentinel.bin").write_bytes(b"outside")
+        shutil.rmtree(material)
+        material.symlink_to(external, target_is_directory=True)
+    return restore_dir, trash_dir, restore_path, pending_path
+
+
 def test_version_one_journal_is_explicitly_unsupported(operation_draft: Path) -> None:
     path = write_raw_journal(operation_draft, version=1)
     with pytest.raises(DraftError, match=CheckCode.OPERATION_JOURNAL_VERSION_UNSUPPORTED.value):
@@ -424,14 +510,242 @@ def test_recover_unlocked_operation_directory_identity_is_no_follow(
         assert sentinel.read_bytes() == sentinel_before
 
 
-def test_recover_preserves_proven_empty_operation_directory(operation_draft: Path) -> None:
+def test_recover_journal_symlink_reports_path_escape(
+    operation_draft: Path,
+    tmp_path: Path,
+) -> None:
+    root = operation_draft
+    operation_id = "c" * 32
+    entry = root / ".draft/operations" / operation_id
+    entry.mkdir()
+    outside = tmp_path / "journal"
+    outside.write_bytes(b"outside")
+    (entry / "journal.json").symlink_to(outside)
+
+    with pytest.raises(DraftError, match=CheckCode.PATH_SYMLINK_ESCAPE.value):
+        recover(root)
+
+    assert (entry / "journal.json").is_symlink()
+    assert outside.read_bytes() == b"outside"
+
+
+def test_recover_closes_empty_operation_residue_and_is_idempotent(operation_draft: Path) -> None:
     root = operation_draft
     entry = root / ".draft/operations" / ("b" * 32)
     entry.mkdir()
 
     recover(root)
+    recover(root)
 
+    assert not entry.exists()
+    assert not (root / ".draft/operation.lock").exists()
+    from draft.checker import check_draft
+
+    assert CheckCode.OPERATION_JOURNAL_CORRUPT.value not in {
+        issue.code for issue in check_draft(root).errors
+    }
+
+
+@pytest.mark.parametrize("recovery_entry", [recover, recover_interrupted_operations])
+def test_matching_lock_empty_residue_is_removed_by_recovery_entry(
+    operation_draft: Path,
+    recovery_entry: object,
+) -> None:
+    root = operation_draft
+    operation_id = "e" * 32
+    entry = root / ".draft/operations" / operation_id
+    entry.mkdir()
+    acquire_lock(root, operation_id)
+
+    recovery_entry(root)  # type: ignore[operator]
+
+    assert not entry.exists()
+    assert read_lock(root) is None
+
+
+@pytest.mark.parametrize(
+    ("change", "expected_code"),
+    [
+        ("member", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+        ("journal", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+        ("pending", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+        ("symlink", CheckCode.PATH_SYMLINK_ESCAPE.value),
+        ("identity", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+    ],
+)
+@pytest.mark.parametrize("recovery_entry", [recover, recover_interrupted_operations])
+def test_matching_lock_empty_residue_rejects_change_during_reread(
+    operation_draft: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery_entry: object,
+    change: str,
+    expected_code: str,
+) -> None:
+    import draft.operations as operations_module
+
+    root = operation_draft
+    operation_id = "f" * 32
+    entry = root / ".draft/operations" / operation_id
+    entry.mkdir()
+    acquire_lock(root, operation_id)
+    real_scandir = operations_module.os.scandir
+    state = {"calls": 0}
+
+    def add_member_after_first_scan(path: Any, *args: Any, **kwargs: Any) -> Any:
+        iterator = real_scandir(path, *args, **kwargs)
+        if isinstance(path, int):
+            members = tuple(iterator)
+            state["calls"] += 1
+            if state["calls"] == 1:
+                if change == "identity":
+                    entry.rmdir()
+                    entry.mkdir()
+                elif change == "symlink":
+                    outside = tmp_path / "outside"
+                    outside.write_bytes(b"must remain untouched")
+                    entry.rmdir()
+                    entry.symlink_to(outside)
+                else:
+                    member_name = {
+                        "member": "unknown",
+                        "journal": "journal.json",
+                        "pending": "journal.json.pending",
+                    }[change]
+                    (entry / member_name).write_bytes(b"changed during lock reread")
+            return iter(members)
+        return iterator
+
+    monkeypatch.setattr(operations_module.os, "scandir", add_member_after_first_scan)
+
+    with pytest.raises(DraftError) as caught:
+        recovery_entry(root)  # type: ignore[operator]
+
+    assert caught.value.code == expected_code
+    if change == "symlink":
+        assert entry.is_symlink()
+    else:
+        assert entry.is_dir()
+        member_name = {
+            "member": "unknown",
+            "journal": "journal.json",
+            "pending": "journal.json.pending",
+        }.get(change)
+        if member_name is not None:
+            assert (entry / member_name).read_bytes() == b"changed during lock reread"
+    assert read_lock(root) == operation_id
+
+
+@pytest.mark.parametrize("member", ["journal.json", "journal.json.pending", "unknown"])
+def test_recover_empty_residue_rejects_member_added_after_lock(
+    operation_draft: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    member: str,
+) -> None:
+    import draft.operations as operations_module
+
+    root = operation_draft
+    operation_id = "9" * 32
+    entry = root / ".draft/operations" / operation_id
+    entry.mkdir()
+    original_acquire = operations_module.acquire_lock
+
+    def acquire_then_add(root_arg: Path, candidate_id: str) -> None:
+        original_acquire(root_arg, candidate_id)
+        (entry / member).write_bytes(b"changed after discovery")
+
+    monkeypatch.setattr(operations_module, "acquire_lock", acquire_then_add)
+
+    with pytest.raises(DraftError) as caught:
+        recover(root)
+
+    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
     assert entry.is_dir()
+    assert (entry / member).read_bytes() == b"changed after discovery"
+    assert read_lock(root) == operation_id
+
+
+def test_recover_empty_residue_rejects_symlink_added_after_lock(
+    operation_draft: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import draft.operations as operations_module
+
+    root = operation_draft
+    operation_id = "a" * 32
+    entry = root / ".draft/operations" / operation_id
+    entry.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"must remain untouched")
+    original_acquire = operations_module.acquire_lock
+
+    def acquire_then_add_symlink(root_arg: Path, candidate_id: str) -> None:
+        original_acquire(root_arg, candidate_id)
+        (entry / "unknown").symlink_to(outside)
+
+    monkeypatch.setattr(operations_module, "acquire_lock", acquire_then_add_symlink)
+
+    with pytest.raises(DraftError) as caught:
+        recover(root)
+
+    assert caught.value.code == CheckCode.PATH_SYMLINK_ESCAPE.value
+    assert entry.is_dir()
+    assert (entry / "unknown").is_symlink()
+    assert outside.read_bytes() == b"must remain untouched"
+    assert read_lock(root) == operation_id
+
+
+def test_recover_empty_residue_keeps_directory_on_lock_competition(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import draft.operations as operations_module
+
+    root = operation_draft
+    operation_id = "b" * 32
+    active_id = "c" * 32
+    entry = root / ".draft/operations" / operation_id
+    entry.mkdir()
+    original_acquire = operations_module.acquire_lock
+
+    def active_writer_wins(root_arg: Path, candidate_id: str) -> None:
+        assert candidate_id == operation_id
+        original_acquire(root_arg, active_id)
+        original_acquire(root_arg, candidate_id)
+
+    monkeypatch.setattr(operations_module, "acquire_lock", active_writer_wins)
+
+    with pytest.raises(DraftError) as caught:
+        recover(root)
+
+    assert caught.value.code == CheckCode.OPERATION_RECOVERY_REQUIRED.value
+    assert entry.is_dir()
+    assert not tuple(entry.iterdir())
+    assert read_lock(root) == active_id
+
+
+def test_recover_empty_residue_syncs_operations_parent(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import draft.operations as operations_module
+
+    root = operation_draft
+    operation_id = "d" * 32
+    entry = root / ".draft/operations" / operation_id
+    entry.mkdir()
+    calls: list[Path] = []
+    original_fsync = operations_module._fsync_dir_fd  # pyright: ignore[reportPrivateUsage]
+
+    def record_fsync(parent_fd: int, code_path: Path, **kwargs: Any) -> None:
+        calls.append(code_path)
+        original_fsync(parent_fd, code_path, **kwargs)
+
+    monkeypatch.setattr(operations_module, "_fsync_dir_fd", record_fsync)
+
+    recover(root)
+
+    assert root / ".draft/operations" in calls
+    assert not entry.exists()
 
 
 def test_recover_rechecks_operation_directory_after_enumeration(
@@ -717,7 +1031,7 @@ def test_preallocated_restore_requires_reverse_reference(
 ) -> None:
     root = operation_draft
     restore_id = "3" * 32
-    with pytest.raises(DraftError, match="operation.plan_invalid"):
+    with pytest.raises(DraftError) as caught:
         preallocate_journal(
             root,
             kind=OperationKind.RESTORE,
@@ -726,6 +1040,7 @@ def test_preallocated_restore_requires_reverse_reference(
             observations=EMPTY_OBSERVATIONS,
             metadata={},
         )
+    assert caught.value.code == OPERATION_PLAN_INVALID
 
     assert not (root / ".draft" / "operations" / restore_id).exists()
 
@@ -736,7 +1051,7 @@ def test_preallocated_restore_rejects_invalid_back_reference(
 ) -> None:
     root = operation_draft
     restore_id = "7" * 32
-    with pytest.raises(DraftError, match="operation.plan_invalid"):
+    with pytest.raises(DraftError) as caught:
         preallocate_journal(
             root,
             kind=OperationKind.RESTORE,
@@ -745,6 +1060,7 @@ def test_preallocated_restore_rejects_invalid_back_reference(
             observations=EMPTY_OBSERVATIONS,
             metadata={"restores_trash_operation": bad_reference},
         )
+    assert caught.value.code == OPERATION_PLAN_INVALID
 
     assert not (root / ".draft" / "operations" / restore_id).exists()
 
@@ -773,8 +1089,9 @@ def test_preallocated_restore_requires_forward_reference_before_execution(
         metadata={"operation_id": restore_id},
     )
 
-    with pytest.raises(DraftError, match="operation.plan_invalid"):
+    with pytest.raises(DraftError) as caught:
         execute_plan(plan)
+    assert caught.value.code == OPERATION_PLAN_INVALID
 
 
 def test_preallocate_never_reuses_existing_operation_directory(
@@ -1166,7 +1483,7 @@ def test_second_writer_rejected_before_markdown_scan(operation_draft: Path) -> N
         execute_plan(plan)
 
 
-def test_no_lock_allocating_orphan_is_cleaned(operation_draft: Path) -> None:
+def test_no_lock_allocating_orphan_converges_under_its_own_lock(operation_draft: Path) -> None:
     root = operation_draft
     journal_dir = write_journal(root, "b" * 32, "allocating")
 
@@ -1174,7 +1491,227 @@ def test_no_lock_allocating_orphan_is_cleaned(operation_draft: Path) -> None:
 
     assert result.phase == "completed"
     assert journal_dir.is_dir()
-    assert not (journal_dir / "journal.json").exists()
+    assert read_journal(journal_dir / "journal.json").phase is OperationPhase.ROLLED_BACK
+    assert not (root / ".draft/operation.lock").exists()
+
+
+def test_recover_discards_unlocked_allocating_snapshot_when_writer_wins_lock(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """扫描结束后失去 matching lock 时，recover 不得消费任一 writer 的现场。"""
+    import draft.operations as operations_module
+
+    root = operation_draft
+    recovered_id = "a" * 32
+    active_id = "b" * 32
+    recovered_directory = write_journal(root, recovered_id, "allocating")
+    recovered_before = _recovery_tree_bytes(recovered_directory)
+    original_acquire_lock = operations_module.acquire_lock
+
+    def let_active_writer_win(root_arg: Path, operation_id: str) -> None:
+        assert root_arg == root
+        assert operation_id == recovered_id
+        active_directory = write_journal(root, active_id, "allocating")
+        (active_directory / "originals").mkdir()
+        (active_directory / "originals/0000.bin").write_bytes(b"active original")
+        original_acquire_lock(root, active_id)
+        original_acquire_lock(root_arg, operation_id)
+
+    monkeypatch.setattr(operations_module, "acquire_lock", let_active_writer_win)
+
+    with pytest.raises(DraftError) as caught:
+        recover(root)
+
+    assert caught.value.code == CheckCode.OPERATION_RECOVERY_REQUIRED.value
+    assert read_lock(root) == active_id
+    assert _recovery_tree_bytes(recovered_directory) == recovered_before
+    active_tree = root / ".draft/operations" / active_id
+    assert _recovery_tree_bytes(active_tree) == {
+        Path("journal.json"): (active_tree / "journal.json").read_bytes(),
+        Path("originals/0000.bin"): b"active original",
+    }
+
+
+def test_recover_interrupted_operations_discards_unlocked_snapshot_when_writer_wins_lock(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Trash/restore recovery 入口共享同一锁竞争边界。"""
+    import draft.operations as operations_module
+
+    root = operation_draft
+    recovered_id = "c" * 32
+    active_id = "d" * 32
+    recovered_directory = write_journal(root, recovered_id, "allocating")
+    recovered_before = _recovery_tree_bytes(recovered_directory)
+    original_acquire_lock = operations_module.acquire_lock
+
+    def let_active_writer_win(root_arg: Path, operation_id: str) -> None:
+        assert root_arg == root
+        assert operation_id == recovered_id
+        active_directory = write_journal(root, active_id, "allocating")
+        (active_directory / "staged").mkdir()
+        (active_directory / "staged/0000.bin").write_bytes(b"active staged")
+        original_acquire_lock(root, active_id)
+        original_acquire_lock(root_arg, operation_id)
+
+    monkeypatch.setattr(operations_module, "acquire_lock", let_active_writer_win)
+
+    with pytest.raises(DraftError) as caught:
+        recover_interrupted_operations(root)
+
+    assert caught.value.code == CheckCode.OPERATION_RECOVERY_REQUIRED.value
+    assert read_lock(root) == active_id
+    assert _recovery_tree_bytes(recovered_directory) == recovered_before
+    active_tree = root / ".draft/operations" / active_id
+    assert _recovery_tree_bytes(active_tree) == {
+        Path("journal.json"): (active_tree / "journal.json").read_bytes(),
+        Path("staged/0000.bin"): b"active staged",
+    }
+
+
+def test_recover_leaves_pending_unchanged_when_writer_wins_lock(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """未持锁 discovery 不得发布另一 writer 的 journal pending。"""
+    import draft.operations as operations_module
+
+    root = operation_draft
+    recovered_id = "e" * 32
+    active_id = "f" * 32
+    recovered_directory = write_journal(root, recovered_id, "allocating")
+    pending = recovered_directory / "journal.json.pending"
+    pending.write_bytes(_valid_journal_bytes(recovered_id, "rolled_back"))
+    recovered_before = _recovery_tree_bytes(recovered_directory)
+    original_acquire_lock = operations_module.acquire_lock
+
+    def let_active_writer_win(root_arg: Path, operation_id: str) -> None:
+        assert root_arg == root
+        assert operation_id == recovered_id
+        write_journal(root, active_id, "allocating")
+        original_acquire_lock(root, active_id)
+        original_acquire_lock(root_arg, operation_id)
+
+    monkeypatch.setattr(operations_module, "acquire_lock", let_active_writer_win)
+
+    with pytest.raises(DraftError) as caught:
+        recover(root)
+
+    assert caught.value.code == CheckCode.OPERATION_RECOVERY_REQUIRED.value
+    assert read_lock(root) == active_id
+    assert _recovery_tree_bytes(recovered_directory) == recovered_before
+
+
+@pytest.mark.parametrize("recovery_entry", ["recover", "recover_interrupted_operations"])
+def test_recovery_discards_unlocked_bidirectional_restore_snapshot_when_writer_wins_lock(
+    operation_draft: Path, monkeypatch: pytest.MonkeyPatch, recovery_entry: str
+) -> None:
+    """R/T 双向现场在扫描后失去 matching lock 时必须完整保留。"""
+    import draft.operations as operations_module
+    from draft.operations import with_metadata
+    from draft.trash import trash_page
+
+    root = operation_draft
+    restore_id = "1" * 32
+    trash = trash_page(root, Path("pages/a.md"))
+    trash_id = trash.operation_id
+    restore = preallocate_journal(
+        root,
+        kind=OperationKind.RESTORE,
+        operation_id=restore_id,
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
+        metadata={"restores_trash_operation": trash_id},
+    )
+    trash_journal = read_journal(operation_journal_path(root, trash_id))
+    write_journal_durable(with_metadata(trash_journal, {"restore_operation_id": restore_id}))
+
+    before_index = (root / "index.md").read_bytes()
+    after_index = before_index + b"\nrestore race candidate\n"
+    (restore.directory / "originals").mkdir()
+    (restore.directory / "staged").mkdir()
+    (restore.directory / "originals/0000.bin").write_bytes(before_index)
+    (restore.directory / "staged/0000.bin").write_bytes(after_index)
+    pending = restore.directory / "journal.json.pending"
+    pending.write_text(
+        json.dumps(
+            {
+                "journal_version": JOURNAL_VERSION,
+                "operation_id": restore_id,
+                "kind": OperationKind.RESTORE.value,
+                "phase": OperationPhase.PREPARED.value,
+                "root_state": RootState.REGISTERED.value,
+                "observations": [],
+                "mutations": [
+                    {
+                        "path": "index.md",
+                        "kind": MutationKind.WRITE.value,
+                        "before_sha256": sha256_bytes(before_index),
+                        "after_sha256": sha256_bytes(after_index),
+                        "original": "originals/0000.bin",
+                        "staged": "staged/0000.bin",
+                        "applied": False,
+                    }
+                ],
+                "remove_empty_directories": [],
+                "metadata": {"restores_trash_operation": trash_id},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    restore_before = _recovery_tree_bytes(restore.directory)
+    trash_directory = root / ".draft/operations" / trash_id
+    trash_before = _recovery_tree_bytes(trash_directory)
+    package = root / ".draft/trash/outgoing" / trash_id
+    package_before = _recovery_tree_bytes(package)
+
+    def claims() -> tuple[object, object, object]:
+        restore_payload = json.loads(
+            (restore.directory / "journal.json").read_text(encoding="utf-8")
+        )
+        pending_payload = json.loads(pending.read_text(encoding="utf-8"))
+        trash_payload = json.loads((trash_directory / "journal.json").read_text(encoding="utf-8"))
+        return (
+            restore_payload["metadata"].get("restores_trash_operation"),
+            pending_payload["metadata"].get("restores_trash_operation"),
+            trash_payload["metadata"].get("restore_operation_id"),
+        )
+
+    claims_before = claims()
+    assert claims_before == (trash_id, trash_id, restore_id)
+
+    lock_path = root / ".draft/operation.lock"
+    original_acquire_lock = operations_module.acquire_lock
+    active_lock_bytes: bytes | None = None
+
+    def writer_wins(root_arg: Path, operation_id: str) -> None:
+        nonlocal active_lock_bytes
+        assert root_arg == root
+        assert operation_id == restore_id
+        assert not lock_path.exists()
+        original_acquire_lock(root_arg, operation_id)
+        active_lock_bytes = lock_path.read_bytes()
+        original_acquire_lock(root_arg, operation_id)
+
+    monkeypatch.setattr(operations_module, "acquire_lock", writer_wins)
+    handoff_calls: list[str] = []
+
+    with pytest.raises(DraftError) as caught:
+        if recovery_entry == "recover":
+            recover(root)
+        else:
+            recover_interrupted_operations(root, handoff=handoff_calls.append)
+
+    assert caught.value.code == CheckCode.OPERATION_RECOVERY_REQUIRED.value
+    assert active_lock_bytes is not None
+    assert lock_path.read_bytes() == active_lock_bytes
+    assert handoff_calls == []
+    assert _recovery_tree_bytes(restore.directory) == restore_before
+    assert _recovery_tree_bytes(trash_directory) == trash_before
+    assert _recovery_tree_bytes(package) == package_before
+    assert claims() == claims_before
+    assert claims() == (trash_id, trash_id, restore_id)
 
 
 @pytest.mark.parametrize(
@@ -1189,7 +1726,7 @@ def test_no_lock_allocating_orphan_is_cleaned(operation_draft: Path) -> None:
         OperationPhase.LINK_INDEX_REBUILD_REQUIRED,
     ],
 )
-def test_no_lock_restore_nonterminal_phase_is_inconsistent(
+def test_no_lock_restore_without_forward_trash_link_is_plan_invalid(
     operation_draft: Path, phase: OperationPhase
 ) -> None:
     root = operation_draft
@@ -1203,7 +1740,7 @@ def test_no_lock_restore_nonterminal_phase_is_inconsistent(
     with pytest.raises(DraftError) as caught:
         recover(root)
 
-    assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+    assert caught.value.code == OPERATION_PLAN_INVALID
     after = {
         path.relative_to(journal_dir): path.read_bytes()
         for path in journal_dir.rglob("*")
@@ -1212,16 +1749,213 @@ def test_no_lock_restore_nonterminal_phase_is_inconsistent(
     assert after == before
 
 
-def test_no_lock_unlinked_restore_allocating_is_cleaned(operation_draft: Path) -> None:
-    journal_dir = write_restore_phase_journal(operation_draft, "3" * 32, OperationPhase.ALLOCATING)
+@pytest.mark.parametrize("recovery_entry", [recover, recover_interrupted_operations])
+@pytest.mark.parametrize("phase", [OperationPhase.ALLOCATING, OperationPhase.COMPLETED])
+def test_recovery_entry_rejects_restore_without_forward_trash_link(
+    operation_draft: Path,
+    recovery_entry: object,
+    phase: OperationPhase,
+) -> None:
+    """无 R→T 的 allocating 和 terminal restore 都不是可降格的通用候选。"""
+    journal_dir = write_restore_phase_journal(operation_draft, "3" * 32, phase)
+    before = _recovery_tree_bytes(journal_dir)
 
-    recover(operation_draft)
+    with pytest.raises(DraftError) as caught:
+        recovery_entry(operation_draft)  # type: ignore[operator]
 
-    assert journal_dir.exists()
-    assert read_journal(journal_dir / "journal.json").phase is OperationPhase.ROLLED_BACK
+    assert caught.value.code == OPERATION_PLAN_INVALID
+    assert not (operation_draft / ".draft/operation.lock").exists()
+    assert _recovery_tree_bytes(journal_dir) == before
 
 
-def test_recover_preserves_bidirectionally_linked_unlocked_restore(
+@pytest.mark.parametrize("recovery_entry", [recover, recover_interrupted_operations])
+def test_recovery_entry_rejects_locked_restore_without_forward_trash_link(
+    operation_draft: Path, recovery_entry: object
+) -> None:
+    """已有 matching lock 时仍失败关闭，并由调用者保留 lock 与恢复现场。"""
+    operation_id = "4" * 32
+    journal_dir = write_restore_phase_journal(
+        operation_draft, operation_id, OperationPhase.ALLOCATING
+    )
+    (journal_dir / "originals").mkdir()
+    (journal_dir / "originals/0000.bin").write_bytes(b"restore original")
+    before = _recovery_tree_bytes(journal_dir)
+    acquire_lock(operation_draft, operation_id)
+
+    with pytest.raises(DraftError) as caught:
+        recovery_entry(operation_draft)  # type: ignore[operator]
+
+    assert caught.value.code == OPERATION_PLAN_INVALID
+    assert read_lock(operation_draft) == operation_id
+    assert _recovery_tree_bytes(journal_dir) == before
+
+
+@pytest.mark.parametrize("recovery_entry", [recover, recover_interrupted_operations])
+def test_recovery_entry_rejects_trash_only_restore_claim(
+    operation_draft: Path, recovery_entry: object
+) -> None:
+    """T→R 单向 claim 不能反推或补写缺失的 R→T 关系。"""
+    restore_id = "5" * 32
+    trash_id = "6" * 32
+    restore_dir = write_restore_phase_journal(
+        operation_draft, restore_id, OperationPhase.ALLOCATING
+    )
+    trash_dir = write_trash_journal(
+        operation_draft,
+        trash_id,
+        phase=OperationPhase.TRASH_RETAINED.value,
+        metadata={"restore_operation_id": restore_id},
+    )
+    restore_before = _recovery_tree_bytes(restore_dir)
+    trash_before = _recovery_tree_bytes(trash_dir)
+
+    with pytest.raises(DraftError) as caught:
+        recovery_entry(operation_draft)  # type: ignore[operator]
+
+    assert caught.value.code == OPERATION_PLAN_INVALID
+    assert not (operation_draft / ".draft/operation.lock").exists()
+    assert _recovery_tree_bytes(restore_dir) == restore_before
+    assert _recovery_tree_bytes(trash_dir) == trash_before
+
+
+@pytest.mark.parametrize("recovery_entry", [recover, recover_interrupted_operations])
+def test_recovery_entry_preserves_invalid_restore_pending_before_lock_resolution(
+    operation_draft: Path, recovery_entry: object
+) -> None:
+    """无 R→T 的 restore pending 必须在 publish 前失败关闭。"""
+    operation_id = "7" * 32
+    journal_dir = write_restore_phase_journal(
+        operation_draft,
+        operation_id,
+        OperationPhase.ALLOCATING,
+    )
+    pending = journal_dir / "journal.json.pending"
+    pending_bytes = _valid_journal_bytes(operation_id, "rolled_back").replace(
+        b'"create"', b'"restore"'
+    )
+    pending.write_bytes(pending_bytes)
+    (journal_dir / "originals").mkdir()
+    (journal_dir / "originals/0000.bin").write_bytes(b"restore original")
+    before = _recovery_tree_bytes(journal_dir)
+
+    with pytest.raises(DraftError) as caught:
+        recovery_entry(operation_draft)  # type: ignore[operator]
+
+    assert caught.value.code == OPERATION_PLAN_INVALID
+    assert not (operation_draft / ".draft/operation.lock").exists()
+    assert _recovery_tree_bytes(journal_dir) == before
+
+
+@pytest.mark.parametrize("recovery_entry", ["recover", "recover_interrupted_operations"])
+@pytest.mark.parametrize(
+    ("pending_claim", "expected_code"),
+    [
+        ("missing", OPERATION_PLAN_INVALID),
+        ("invalid", OPERATION_PLAN_INVALID),
+        ("raw-type", CheckCode.OPERATION_JOURNAL_CORRUPT.value),
+    ],
+    ids=["missing-forward", "invalid-forward", "raw-forward-type"],
+)
+def test_locked_restore_preflights_pending_forward_before_resolving_trash(
+    operation_draft: Path,
+    recovery_entry: str,
+    pending_claim: str,
+    expected_code: str,
+) -> None:
+    """R pending 自身无效时，任何入口都不得先发布 T pending。"""
+    from draft.operations import with_metadata
+    from draft.trash import trash_page
+
+    root = operation_draft
+    trash = trash_page(root, Path("pages/a.md"))
+    trash_id = trash.operation_id
+    restore_id = "a" * 32
+    restore_directory = preallocate_journal(
+        root,
+        kind=OperationKind.RESTORE,
+        operation_id=restore_id,
+        root_state=RootState.REGISTERED,
+        observations=EMPTY_OBSERVATIONS,
+        metadata={"restores_trash_operation": trash_id},
+    ).directory
+
+    # Current R/T are valid and bidirectional. The pending T is itself a valid
+    # unclaim successor, making an early T resolver observable.
+    trash_journal = read_journal(operation_journal_path(root, trash_id))
+    write_journal_durable(with_metadata(trash_journal, {"restore_operation_id": restore_id}))
+    trash_pending = operation_journal_path(root, trash_id).with_name("journal.json.pending")
+    trash_pending_payload = json.loads(
+        operation_journal_path(root, trash_id).read_text(encoding="utf-8")
+    )
+    del trash_pending_payload["metadata"]["restore_operation_id"]
+    trash_pending_bytes = (json.dumps(trash_pending_payload) + "\n").encode("utf-8")
+    trash_pending.write_bytes(trash_pending_bytes)
+
+    restore_path = operation_journal_path(root, restore_id)
+    restore_payload = json.loads(restore_path.read_text(encoding="utf-8"))
+    restore_payload["phase"] = OperationPhase.PREPARED.value
+    restore_payload["mutations"] = [
+        {
+            "path": "pages/a.md",
+            "kind": MutationKind.WRITE.value,
+            "before_sha256": None,
+            "after_sha256": sha256_bytes(b"restored page"),
+            "original": None,
+            "staged": "staged/0000.bin",
+            "applied": False,
+        }
+    ]
+    restore_path.write_bytes((json.dumps(restore_payload) + "\n").encode("utf-8"))
+    (restore_directory / "staged").mkdir()
+    (restore_directory / "staged/0000.bin").write_bytes(b"restored page")
+
+    restore_pending = restore_path.with_name("journal.json.pending")
+    pending_payload = dict(restore_payload)
+    pending_payload["phase"] = OperationPhase.APPLYING.value
+    pending_metadata = dict(restore_payload["metadata"])
+    if pending_claim == "missing":
+        del pending_metadata["restores_trash_operation"]
+    elif pending_claim == "invalid":
+        pending_metadata["restores_trash_operation"] = "not-an-operation-id"
+    else:
+        pending_metadata["restores_trash_operation"] = [trash_id]
+    pending_payload["metadata"] = pending_metadata
+    restore_pending_bytes = (json.dumps(pending_payload) + "\n").encode("utf-8")
+    restore_pending.write_bytes(restore_pending_bytes)
+
+    assert read_journal(restore_path).metadata["restores_trash_operation"] == trash_id
+    assert (
+        read_journal(operation_journal_path(root, trash_id)).metadata["restore_operation_id"]
+        == restore_id
+    )
+    trash_directory = operation_journal_path(root, trash_id).parent
+    package = root / ".draft/trash/outgoing" / trash_id
+    restore_before = _recovery_tree_bytes(restore_directory)
+    trash_before = _recovery_tree_bytes(trash_directory)
+    package_before = _recovery_tree_bytes(package)
+    lock_path = root / ".draft/operation.lock"
+    acquire_lock(root, restore_id)
+    lock_before = lock_path.read_bytes()
+    handoff_calls: list[str] = []
+
+    with pytest.raises(DraftError) as caught:
+        if recovery_entry == "recover":
+            recover(root)
+        else:
+            recover_interrupted_operations(root, handoff=handoff_calls.append)
+
+    assert caught.value.code == expected_code
+    assert read_lock(root) == restore_id
+    assert lock_path.read_bytes() == lock_before
+    assert _recovery_tree_bytes(restore_directory) == restore_before
+    assert _recovery_tree_bytes(trash_directory) == trash_before
+    assert _recovery_tree_bytes(package) == package_before
+    assert restore_pending.read_bytes() == restore_pending_bytes
+    assert trash_pending.read_bytes() == trash_pending_bytes
+    assert handoff_calls == []
+
+
+def test_recover_converges_bidirectionally_linked_unlocked_restore(
     operation_draft: Path,
 ) -> None:
     root = operation_draft
@@ -1239,14 +1973,21 @@ def test_recover_preserves_bidirectionally_linked_unlocked_restore(
         phase=OperationPhase.TRASH_RETAINED.value,
         metadata={"restore_operation_id": restore_id},
     )
-    restore_before = (restore_dir / "journal.json").read_bytes()
-    trash_before = (trash_dir / "journal.json").read_bytes()
+    recover(root)
 
-    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
-        recover(root)
+    assert read_journal(restore_dir / "journal.json").phase is OperationPhase.ROLLED_BACK
+    trash_after = read_journal(trash_dir / "journal.json")
+    assert trash_after.phase is OperationPhase.TRASH_RETAINED
+    assert "restore_operation_id" not in trash_after.metadata
+    assert read_lock(root) is None
 
-    assert (restore_dir / "journal.json").read_bytes() == restore_before
-    assert (trash_dir / "journal.json").read_bytes() == trash_before
+    # R owns the matched relation; once it has safely abandoned the unapplied plan, a retry is
+    # an audit-only no-op and cannot widen the cleanup scope.
+    restore_after = (restore_dir / "journal.json").read_bytes()
+    trash_bytes_after = (trash_dir / "journal.json").read_bytes()
+    assert recover(root).operation_id == ""
+    assert (restore_dir / "journal.json").read_bytes() == restore_after
+    assert (trash_dir / "journal.json").read_bytes() == trash_bytes_after
 
 
 @pytest.mark.parametrize("phase", [OperationPhase.COMPLETED, OperationPhase.ROLLED_BACK])
@@ -1259,7 +2000,8 @@ def test_no_lock_restore_terminal_journal_is_preserved(
     journal_path = journal_dir / "journal.json"
     before = journal_path.read_bytes()
 
-    recover(operation_draft)
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        recover(operation_draft)
 
     assert journal_path.read_bytes() == before
 
@@ -1283,11 +2025,13 @@ def test_no_lock_prepared_journal_is_inconsistent(operation_draft: Path) -> None
         recover(root)
 
 
-def test_no_lock_succeeded_journal_is_inconsistent(operation_draft: Path) -> None:
+def test_no_lock_succeeded_journal_with_missing_package_is_corrupt(
+    operation_draft: Path,
+) -> None:
     root = operation_draft
     write_trash_phase_journal(root, "e" * 32, "trash_handoff_succeeded")
 
-    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+    with pytest.raises(DraftError, match=CheckCode.TRASH_PACKAGE_CORRUPT.value):
         recover(root)
 
 
@@ -1296,6 +2040,15 @@ def test_no_lock_terminal_and_pending_journals_are_accepted(operation_draft: Pat
     completed = write_journal(root, "f" * 32, "completed")
     rolled_back = write_journal(root, "0" * 32, "rolled_back")
     pending = write_trash_phase_journal(root, "1" * 32, "trash_handoff_pending")
+    pending_payload = json.loads((pending / "journal.json").read_text(encoding="utf-8"))
+    pending_payload["metadata"] = {
+        "handoff_error_type": "OSError",
+        "handoff_error_message": "handoff failed",
+        "handoff_attempted_at": "2026-01-01T00:00:00+00:00",
+    }
+    (pending / "journal.json").write_text(
+        json.dumps(pending_payload) + "\n", encoding="utf-8"
+    )
 
     result = recover(root)
 
@@ -1303,6 +2056,20 @@ def test_no_lock_terminal_and_pending_journals_are_accepted(operation_draft: Pat
     assert completed.exists()
     assert rolled_back.exists()
     assert pending.exists()
+
+
+def test_no_lock_handoff_pending_without_failure_record_is_inconsistent(
+    operation_draft: Path,
+) -> None:
+    root = operation_draft
+    pending = write_trash_phase_journal(root, "2" * 32, "trash_handoff_pending")
+    before = (pending / "journal.json").read_bytes()
+
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        recover(root)
+
+    assert (pending / "journal.json").read_bytes() == before
+    assert not (root / ".draft/operation.lock").exists()
 
 
 def test_missing_staged_bytes_roll_back_from_originals(
@@ -1780,10 +2547,10 @@ def test_recover_link_index_published_verifies_target_before_terminal(
     assert target.read_bytes() == tampered
 
 
-def test_recover_link_index_cleans_only_current_operation_staging(
+def test_recover_rejects_nonempty_unjournaled_operation_before_current_cleanup(
     operation_draft: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """恢复只清理当前 operation 的 staging/.pending，不删除其他 operation 或未知文件。"""
+    """全图授权不完整时，持锁恢复不得清理当前或其他 operation。"""
     root = operation_draft
     operation_id = _persist_interrupted_operation(
         root, monkeypatch, OperationPhase.LINK_INDEX_UPDATING
@@ -1796,9 +2563,13 @@ def test_recover_link_index_cleans_only_current_operation_staging(
     (other_dir / "link-index.staged.json").write_text("other", encoding="utf-8")
     (other_dir / "stray.txt").write_text("unknown", encoding="utf-8")
 
-    recover(root)
+    journal_before = read_journal(operation_journal_path(root, operation_id))
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        recover(root)
 
-    assert not (op_dir / "link-index.staged.json").exists()
+    assert read_lock(root) == operation_id
+    assert read_journal(operation_journal_path(root, operation_id)) == journal_before
+    assert (op_dir / "link-index.staged.json").read_text(encoding="utf-8") == "{}"
     assert not (op_dir / "link-index.staged.json.pending").exists()
     assert (other_dir / "link-index.staged.json").read_text(encoding="utf-8") == "other"
     assert (other_dir / "stray.txt").read_text(encoding="utf-8") == "unknown"
@@ -2876,6 +3647,169 @@ def test_no_lock_allocating_with_unknown_content_is_inconsistent(
     assert unknown.is_file()
 
 
+@pytest.mark.parametrize(
+    ("subdirectory", "material_kind"),
+    [
+        ("originals", "symlink"),
+        ("staged", "symlink"),
+        ("originals", "unknown"),
+        ("staged", "unknown"),
+    ],
+)
+def test_locked_allocating_rejects_unsafe_recovery_material_before_terminal_write(
+    operation_draft: Path,
+    tmp_path: Path,
+    subdirectory: str,
+    material_kind: str,
+) -> None:
+    """allocating 材料未完成 no-follow/授权验证时不得写 rolled_back。"""
+    root = operation_draft
+    operation_id = "d" * 32
+    journal_dir = write_journal(root, operation_id, "allocating")
+    material = journal_dir / subdirectory
+    external = tmp_path / "outside"
+    sentinel = external / "sentinel.bin"
+    if material_kind == "symlink":
+        external.mkdir()
+        sentinel.write_bytes(b"outside")
+        material.symlink_to(external, target_is_directory=True)
+    else:
+        material.mkdir()
+        unknown = material / "unknown.bin"
+        unknown.write_bytes(b"unauthorized")
+
+    journal_path = journal_dir / "journal.json"
+    lock_path = root / ".draft/operation.lock"
+    journal_before = journal_path.read_bytes()
+    acquire_lock(root, operation_id)
+    lock_before = lock_path.read_bytes()
+
+    with pytest.raises(DraftError) as caught:
+        recover(root)
+
+    expected_code = (
+        CheckCode.PATH_SYMLINK_ESCAPE.value
+        if material_kind == "symlink"
+        else CheckCode.OPERATION_INCONSISTENT_STATE.value
+    )
+    assert caught.value.code == expected_code
+    assert journal_path.read_bytes() == journal_before
+    assert lock_path.read_bytes() == lock_before
+    if material_kind == "symlink":
+        assert material.is_symlink()
+        assert material.readlink() == external
+        assert sentinel.read_bytes() == b"outside"
+    else:
+        assert (material / "unknown.bin").read_bytes() == b"unauthorized"
+
+
+@pytest.mark.parametrize("entry", ["recover", "recover_interrupted"])
+@pytest.mark.parametrize(
+    ("subdirectory", "material_kind", "expected_code"),
+    [
+        ("originals", "symlink", CheckCode.PATH_SYMLINK_ESCAPE.value),
+        ("staged", "unknown", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+        ("originals", "unauthorized", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+        ("staged", "digest", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+    ],
+)
+def test_locked_restore_rejects_unsafe_material_before_any_persistence(
+    operation_draft: Path,
+    entry: str,
+    subdirectory: str,
+    material_kind: str,
+    expected_code: str,
+) -> None:
+    """R/T 恢复 owner 在终态写入、清理或解锁前必须先证明恢复副本。"""
+    root = operation_draft
+    restore_id = "e" * 32
+    trash_id = "f" * 32
+    restore_dir, trash_dir, restore_path, _ = _write_locked_restore_material_scene(
+        root,
+        restore_id=restore_id,
+        trash_id=trash_id,
+        pending_only=False,
+        subdirectory=subdirectory,
+        material_kind=material_kind,
+    )
+    acquire_lock(root, restore_id)
+    lock_path = root / ".draft/operation.lock"
+    before_restore = restore_path.read_bytes()
+    before_trash = (trash_dir / "journal.json").read_bytes()
+    before_lock = lock_path.read_bytes()
+    before_members = tuple(sorted(path.name for path in restore_dir.iterdir()))
+
+    with pytest.raises(DraftError) as caught:
+        recover(root) if entry == "recover" else recover_interrupted_operations(root)
+
+    assert caught.value.code == expected_code
+    assert restore_path.read_bytes() == before_restore
+    assert (trash_dir / "journal.json").read_bytes() == before_trash
+    assert lock_path.read_bytes() == before_lock
+    assert read_lock(root) == restore_id
+    assert tuple(sorted(path.name for path in restore_dir.iterdir())) == before_members
+    material = restore_dir / subdirectory
+    if material_kind == "symlink":
+        assert material.is_symlink()
+        assert (material / "sentinel.bin").read_bytes() == b"outside"
+    elif material_kind == "digest":
+        assert (material / "0000.bin").read_bytes() == b"wrong-digest"
+    else:
+        assert (material / "unlisted.bin").read_bytes() == b"unauthorized"
+
+
+@pytest.mark.parametrize("entry", ["recover", "recover_interrupted"])
+@pytest.mark.parametrize(
+    ("subdirectory", "material_kind", "expected_code"),
+    [
+        ("originals", "symlink", CheckCode.PATH_SYMLINK_ESCAPE.value),
+        ("staged", "unknown", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+    ],
+)
+def test_pending_only_restore_rejects_unsafe_material_before_publish(
+    operation_draft: Path,
+    entry: str,
+    subdirectory: str,
+    material_kind: str,
+    expected_code: str,
+) -> None:
+    """bootstrap pending 的 R 也不得先发布 current 再检查副本。"""
+    root = operation_draft
+    restore_id = "1" * 32
+    trash_id = "2" * 32
+    restore_dir, trash_dir, restore_path, pending_path = _write_locked_restore_material_scene(
+        root,
+        restore_id=restore_id,
+        trash_id=trash_id,
+        pending_only=True,
+        subdirectory=subdirectory,
+        material_kind=material_kind,
+    )
+    acquire_lock(root, restore_id)
+    lock_path = root / ".draft/operation.lock"
+    before_pending = pending_path.read_bytes()
+    before_trash = (trash_dir / "journal.json").read_bytes()
+    before_lock = lock_path.read_bytes()
+    before_members = tuple(sorted(path.name for path in restore_dir.iterdir()))
+
+    with pytest.raises(DraftError) as caught:
+        recover(root) if entry == "recover" else recover_interrupted_operations(root)
+
+    assert caught.value.code == expected_code
+    assert not restore_path.exists()
+    assert pending_path.read_bytes() == before_pending
+    assert (trash_dir / "journal.json").read_bytes() == before_trash
+    assert lock_path.read_bytes() == before_lock
+    assert read_lock(root) == restore_id
+    assert tuple(sorted(path.name for path in restore_dir.iterdir())) == before_members
+    material = restore_dir / subdirectory
+    if material_kind == "symlink":
+        assert material.is_symlink()
+        assert (material / "sentinel.bin").read_bytes() == b"outside"
+    else:
+        assert (material / "unlisted.bin").read_bytes() == b"pending-unauthorized"
+
+
 # ---------------------------------------------------------------------------
 # 第八轮 H1/H2：严格耐久发布状态机（确定名 pending + 不吞同步失败）
 # ---------------------------------------------------------------------------
@@ -3007,10 +3941,10 @@ def test_resolve_journal_pending_invalid_preserves_scene(operation_draft: Path) 
     assert not target.exists()
 
 
-def test_recover_publishes_bootstrap_pending_and_cleans_allocating(
+def test_recover_publishes_bootstrap_pending_and_rolls_back_allocating(
     operation_draft: Path,
 ) -> None:
-    """仅剩崩溃遗留的 bootstrap pending：recover 发布后按 allocating 放弃并清理目录（回归 H2）。"""
+    """仅剩 bootstrap pending：matching lock 内发布后耐久收敛为 rolled_back。"""
     from draft.operations import recover
 
     root = operation_draft
@@ -3022,7 +3956,25 @@ def test_recover_publishes_bootstrap_pending_and_cleans_allocating(
     recover(root)
 
     assert journal_dir.is_dir()
-    assert not (journal_dir / "journal.json").exists()
+    assert read_journal(journal_dir / "journal.json").phase is OperationPhase.ROLLED_BACK
+    assert not (root / ".draft/operation.lock").exists()
+
+
+def test_locked_recover_publishes_bootstrap_pending_after_relation_check(
+    operation_draft: Path,
+) -> None:
+    """已有 matching lock 的 bootstrap pending 也先做关系校验，再发布并回滚。"""
+    root = operation_draft
+    op_id = "1" * 32
+    journal_dir = root / ".draft/operations" / op_id
+    journal_dir.mkdir(parents=True)
+    (journal_dir / "journal.json.pending").write_bytes(_valid_journal_bytes(op_id, "allocating"))
+    acquire_lock(root, op_id)
+
+    recover(root)
+
+    assert read_journal(journal_dir / "journal.json").phase is OperationPhase.ROLLED_BACK
+    assert not (root / ".draft/operation.lock").exists()
 
 
 def test_clean_recovery_copies_converges_with_copy_pending(

@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from draft.diagnostic_codes import CheckCode
+import draft.operations as operations_module
+from draft.diagnostic_codes import OPERATION_PLAN_INVALID, CheckCode
 from draft.errors import DraftError
 from draft.models import (
     LinkIndexResult,
@@ -33,12 +34,16 @@ from draft.operations import (
     JOURNAL_VERSION,
     Journal,
     JournalMutation,
+    RestoreTrashAction,
+    RestoreTrashRelation,
     TrashDeadlines,
     _journal_to_json,  # pyright: ignore[reportPrivateUsage]
     _parse_journal,  # pyright: ignore[reportPrivateUsage]
     _verify_observations_for_recovery,  # pyright: ignore[reportPrivateUsage]
     _write_recovery_decision,  # pyright: ignore[reportPrivateUsage]
     adjusted_observation_manifest,
+    classify_restore_trash_ownership,
+    classify_restore_trash_relations,
     explained_directory_deltas,
     format_utc,
     handoff_failure_metadata,
@@ -50,6 +55,7 @@ from draft.operations import (
     validate_journal_transition,
     validate_link_index_revision,
     validate_operation_id,
+    validate_restore_trash_relations,
     with_metadata,
     with_phase,
     without_metadata,
@@ -606,8 +612,9 @@ def test_validate_operation_id_rejects_invalid(bad: str) -> None:
 
 
 def test_validate_operation_id_uses_custom_code() -> None:
-    with pytest.raises(DraftError, match="operation.plan_invalid"):
-        validate_operation_id("bad", code="operation.plan_invalid")
+    with pytest.raises(DraftError) as caught:
+        validate_operation_id("bad", code=OPERATION_PLAN_INVALID)
+    assert caught.value.code == OPERATION_PLAN_INVALID
 
 
 # ---------------------------------------------------------------------------
@@ -1593,6 +1600,334 @@ def _m(
     applied: bool = False,
 ) -> JournalMutation:
     return JournalMutation(Path(path), kind, before, after, original, staged, applied)
+
+
+def _restore_trash_pair(
+    *,
+    restore_phase: OperationPhase = OperationPhase.ALLOCATING,
+    trash_phase: OperationPhase = OperationPhase.TRASH_RETAINED,
+    restore_id: str = "a" * 32,
+    trash_id: str = "b" * 32,
+    restore_metadata: dict[str, str] | None = None,
+    trash_metadata: dict[str, str] | None = None,
+    restore_mutations: tuple[JournalMutation, ...] = (),
+    restore_observations: ObservationManifest = EMPTY_OBSERVATIONS,
+    restore_remove_empty: tuple[Path, ...] = (),
+) -> dict[str, Journal]:
+    return {
+        restore_id: _j(
+            restore_phase,
+            kind=OperationKind.RESTORE,
+            op_id=restore_id,
+            metadata=(
+                {"restores_trash_operation": trash_id}
+                if restore_metadata is None
+                else restore_metadata
+            ),
+            mutations=restore_mutations,
+            observations=restore_observations,
+            remove_empty=restore_remove_empty,
+        ),
+        trash_id: _j(
+            trash_phase,
+            kind=OperationKind.TRASH,
+            op_id=trash_id,
+            metadata={} if trash_metadata is None else trash_metadata,
+        ),
+    }
+
+
+def test_restore_trash_relation_classifier_covers_approved_windows_and_unrelated() -> None:
+    preclaim = _restore_trash_pair()
+    assert classify_restore_trash_relations(preclaim) == {
+        "a" * 32: RestoreTrashRelation.PRECLAIM,
+        "b" * 32: RestoreTrashRelation.PRECLAIM,
+    }
+    validate_restore_trash_relations(preclaim)
+
+    post_unclaim = _restore_trash_pair(restore_phase=OperationPhase.ROLLED_BACK)
+    assert classify_restore_trash_relations(post_unclaim) == {
+        "a" * 32: RestoreTrashRelation.POST_UNCLAIM_CLEANUP,
+        "b" * 32: RestoreTrashRelation.POST_UNCLAIM_CLEANUP,
+    }
+    validate_restore_trash_relations(post_unclaim)
+
+    matched = _restore_trash_pair(
+        restore_phase=OperationPhase.APPLYING,
+        trash_metadata={"restore_operation_id": "a" * 32},
+        restore_mutations=(_m(),),
+    )
+    assert classify_restore_trash_relations(matched) == {
+        "a" * 32: RestoreTrashRelation.MATCHED,
+        "b" * 32: RestoreTrashRelation.MATCHED,
+    }
+    validate_restore_trash_relations(matched)
+
+    unrelated = {"c" * 32: _j(op_id="c" * 32)}
+    assert classify_restore_trash_relations(unrelated) == {
+        "c" * 32: RestoreTrashRelation.UNRELATED,
+    }
+    validate_restore_trash_relations(unrelated)
+
+
+@pytest.mark.parametrize(
+    ("journals", "expected_relation", "expected_action"),
+    [
+        (
+            _restore_trash_pair(),
+            RestoreTrashRelation.PRECLAIM,
+            RestoreTrashAction.RECOVER_PRECLAIM,
+        ),
+        (
+            _restore_trash_pair(restore_phase=OperationPhase.ROLLED_BACK),
+            RestoreTrashRelation.POST_UNCLAIM_CLEANUP,
+            RestoreTrashAction.CLEANUP_POST_UNCLAIM,
+        ),
+        (
+            _restore_trash_pair(
+                restore_phase=OperationPhase.APPLYING,
+                restore_mutations=(_m(),),
+                trash_metadata={"restore_operation_id": "a" * 32},
+            ),
+            RestoreTrashRelation.MATCHED,
+            RestoreTrashAction.RECOVER_MATCHED,
+        ),
+    ],
+)
+def test_restore_trash_ownership_uses_restore_for_all_approved_relations(
+    journals: dict[str, Journal],
+    expected_relation: RestoreTrashRelation,
+    expected_action: RestoreTrashAction,
+) -> None:
+    ownership = classify_restore_trash_ownership(journals)
+    restore_id = "a" * 32
+    trash_id = "b" * 32
+
+    for operation_id in (restore_id, trash_id):
+        result = ownership[operation_id]
+        assert result.relation is expected_relation
+        assert result.owner_id == restore_id
+        assert result.participant_ids == (restore_id, trash_id)
+        assert result.action is expected_action
+
+
+def test_restore_trash_ownership_does_not_grant_unrelated_or_invalid_graphs() -> None:
+    unrelated = {"c" * 32: _j(op_id="c" * 32)}
+    ownership = classify_restore_trash_ownership(unrelated)
+    assert ownership["c" * 32].relation is RestoreTrashRelation.UNRELATED
+    assert ownership["c" * 32].owner_id is None
+    assert ownership["c" * 32].participant_ids == ()
+    assert ownership["c" * 32].action is None
+
+    invalid = _restore_trash_pair(restore_metadata={"restores_trash_operation": "c" * 32})
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        classify_restore_trash_ownership(invalid)
+
+
+@pytest.mark.parametrize(("restore_id", "other_id"), [("a" * 32, "b" * 32), ("b" * 32, "a" * 32)])
+def test_restore_trash_validation_prioritizes_all_raw_metadata_before_restore_plan(
+    restore_id: str,
+    other_id: str,
+) -> None:
+    journals = {
+        restore_id: _j(
+            kind=OperationKind.RESTORE,
+            op_id=restore_id,
+            metadata={},
+        ),
+        other_id: _j(op_id=other_id, metadata={"invalid": 1}),  # type: ignore[arg-type]
+    }
+
+    with pytest.raises(DraftError) as caught:
+        validate_restore_trash_relations(journals)
+
+    assert caught.value.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
+
+
+@pytest.mark.parametrize(("restore_id", "trash_id"), [("a" * 32, "b" * 32), ("b" * 32, "a" * 32)])
+def test_restore_trash_validation_prioritizes_all_restore_plans_before_reverse_graph_errors(
+    restore_id: str,
+    trash_id: str,
+) -> None:
+    journals = {
+        restore_id: _j(
+            kind=OperationKind.RESTORE,
+            op_id=restore_id,
+            metadata={},
+        ),
+        trash_id: _j(
+            kind=OperationKind.TRASH,
+            op_id=trash_id,
+            metadata={"restore_operation_id": "not-an-operation-id"},
+        ),
+    }
+
+    with pytest.raises(DraftError) as caught:
+        validate_restore_trash_relations(journals)
+
+    assert caught.value.code == OPERATION_PLAN_INVALID
+
+
+def test_effective_reader_checks_current_and_pending_raw_metadata_before_selection() -> None:
+    """pending 不能掩盖 current 的 raw/type 损坏。"""
+    restore_id = "a" * 32
+    trash_id = "b" * 32
+    current = _j(
+        kind=OperationKind.RESTORE,
+        op_id=restore_id,
+        metadata={"invalid": 1},  # type: ignore[arg-type]
+    )
+    pending = _j(
+        kind=OperationKind.RESTORE,
+        op_id=restore_id,
+        metadata={"restores_trash_operation": trash_id},
+    )
+    trash = _j(
+        OperationPhase.TRASH_RETAINED,
+        kind=OperationKind.TRASH,
+        op_id=trash_id,
+    )
+    discoveries = (
+        operations_module._UnlockedRecoveryDiscovery(  # pyright: ignore[reportPrivateUsage]
+            restore_id,
+            current,
+            pending,
+            frozenset({"journal.json", "journal.json.pending"}),
+            current.directory,
+        ),
+        operations_module._UnlockedRecoveryDiscovery(  # pyright: ignore[reportPrivateUsage]
+            trash_id,
+            trash,
+            None,
+            frozenset({"journal.json"}),
+            trash.directory,
+        ),
+    )
+
+    with pytest.raises(DraftError) as caught:
+        operations_module._effective_recovery_journals(  # pyright: ignore[reportPrivateUsage]
+            discoveries
+        )
+
+    assert caught.value.code == CheckCode.OPERATION_JOURNAL_CORRUPT.value
+
+
+def test_effective_reader_checks_current_restore_plan_before_pending_selection() -> None:
+    """pending 不能掩盖 current 缺失的 R forward plan。"""
+    restore_id = "a" * 32
+    trash_id = "b" * 32
+    current = _j(kind=OperationKind.RESTORE, op_id=restore_id, metadata={})
+    pending = _j(
+        kind=OperationKind.RESTORE,
+        op_id=restore_id,
+        metadata={"restores_trash_operation": trash_id},
+    )
+    trash = _j(
+        OperationPhase.TRASH_RETAINED,
+        kind=OperationKind.TRASH,
+        op_id=trash_id,
+    )
+    discoveries = (
+        operations_module._UnlockedRecoveryDiscovery(  # pyright: ignore[reportPrivateUsage]
+            restore_id,
+            current,
+            pending,
+            frozenset({"journal.json", "journal.json.pending"}),
+            current.directory,
+        ),
+        operations_module._UnlockedRecoveryDiscovery(  # pyright: ignore[reportPrivateUsage]
+            trash_id,
+            trash,
+            None,
+            frozenset({"journal.json"}),
+            trash.directory,
+        ),
+    )
+
+    with pytest.raises(DraftError) as caught:
+        operations_module._effective_recovery_journals(  # pyright: ignore[reportPrivateUsage]
+            discoveries
+        )
+
+    assert caught.value.code == OPERATION_PLAN_INVALID
+
+
+@pytest.mark.parametrize(
+    ("journals", "expected_status", "expected_code"),
+    [
+        (
+            _restore_trash_pair(restore_metadata={}),
+            RestoreTrashRelation.FORWARD_ONLY,
+            OPERATION_PLAN_INVALID,
+        ),
+        (
+            _restore_trash_pair(restore_metadata={"restores_trash_operation": "not-an-id"}),
+            RestoreTrashRelation.FORWARD_ONLY,
+            OPERATION_PLAN_INVALID,
+        ),
+        (
+            _restore_trash_pair(restore_metadata={"restores_trash_operation": "c" * 32}),
+            RestoreTrashRelation.DANGLING_TARGET,
+            CheckCode.OPERATION_INCONSISTENT_STATE.value,
+        ),
+            (
+                {
+                    **_restore_trash_pair(
+                        trash_metadata={"restore_operation_id": "c" * 32},
+                    ),
+                    "c" * 32: _j(
+                        OperationPhase.ALLOCATING,
+                        kind=OperationKind.RESTORE,
+                        op_id="c" * 32,
+                        metadata={"restores_trash_operation": "d" * 32},
+                    ),
+                },
+                RestoreTrashRelation.MISMATCHED,
+                CheckCode.OPERATION_INCONSISTENT_STATE.value,
+            ),
+        (
+            {
+                **_restore_trash_pair(
+                    restore_id="a" * 32,
+                    trash_id="b" * 32,
+                    restore_phase=OperationPhase.APPLYING,
+                    restore_mutations=(_m(),),
+                    trash_metadata={"restore_operation_id": "a" * 32},
+                ),
+                "c" * 32: _j(
+                    OperationPhase.APPLYING,
+                    kind=OperationKind.RESTORE,
+                    op_id="c" * 32,
+                    metadata={"restores_trash_operation": "b" * 32},
+                    mutations=(_m(path="pages/b.md"),),
+                ),
+            },
+            RestoreTrashRelation.MULTIPLE,
+            CheckCode.OPERATION_INCONSISTENT_STATE.value,
+        ),
+    ],
+)
+def test_restore_trash_relation_classifier_rejects_graph_errors(
+    journals: dict[str, Journal],
+    expected_status: RestoreTrashRelation,
+    expected_code: str,
+) -> None:
+    statuses = classify_restore_trash_relations(journals)
+    assert statuses["a" * 32] is expected_status
+    with pytest.raises(DraftError, match=expected_code):
+        validate_restore_trash_relations(journals)
+
+
+def test_restore_trash_relation_classifier_rejects_invalid_phase_after_matching_graph() -> None:
+    journals = _restore_trash_pair(
+        restore_phase=OperationPhase.COMPLETED,
+        trash_phase=OperationPhase.TRASH_HANDOFF_PENDING,
+        restore_mutations=(_m(),),
+        trash_metadata={"restore_operation_id": "a" * 32},
+    )
+    assert classify_restore_trash_relations(journals)["a" * 32] is RestoreTrashRelation.MATCHED
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
+        validate_restore_trash_relations(journals)
 
 
 def test_journal_transition_bootstrap_accepts_allocating_empty() -> None:

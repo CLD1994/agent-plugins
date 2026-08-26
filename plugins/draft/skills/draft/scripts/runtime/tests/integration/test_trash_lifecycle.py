@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -5,10 +6,10 @@ from typing import Any, cast
 
 import pytest
 
-from draft.diagnostic_codes import CheckCode
+from draft.diagnostic_codes import OPERATION_PLAN_INVALID, CheckCode
 from draft.errors import DraftError
 from draft.models import OperationKind, OperationPhase
-from draft.operations import JOURNAL_VERSION, TrashDeadlines
+from draft.operations import JOURNAL_VERSION, Journal, RecoveryPreflight, TrashDeadlines
 from draft.trash import trash_page
 from draft.trash_lifecycle import (
     advance_trash_lifecycle,
@@ -384,10 +385,10 @@ def test_crash_during_final_attempt_never_commits_purge(
     assert len(accepted) == 1
 
 
-def test_no_lock_trash_allocating_orphan_is_cleaned(
+def test_no_lock_trash_allocating_orphan_rolls_back_under_lock(
     draft_factory: DraftFactory,
 ) -> None:
-    """无锁 trash allocating 只清理本 operation 已授权的预分配材料。"""
+    """无锁 Trash allocating 取得 matching lock 后耐久收敛为 rolled_back。"""
     from draft.models import RootState
     from draft.observations import EMPTY_OBSERVATIONS
     from draft.operations import preallocate_journal
@@ -407,7 +408,41 @@ def test_no_lock_trash_allocating_orphan_is_cleaned(
     recover_interrupted_operations(root, now=CREATED)
 
     assert journal.directory.is_dir()
-    assert not (journal.directory / "journal.json").exists()
+    assert _phase(root, journal.operation_id) == OperationPhase.ROLLED_BACK.value
+    assert not (root / ".draft/operation.lock").exists()
+
+
+def test_advance_lifecycle_discards_scan_when_writer_wins_lock(
+    draft_factory: DraftFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """到期扫描后 writer 抢到 matching lock 时，不得移交或消费回收包。"""
+    import draft.trash_lifecycle as lifecycle_module
+    from draft.operations import acquire_lock as acquire_operation_lock
+    from draft.operations import read_lock
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    package_before = _lifecycle_tree_bytes(package)
+    accepted: list[str] = []
+    original_acquire_lock = lifecycle_module.acquire_lock
+
+    def writer_wins(root_arg: Path, operation_id: str) -> None:
+        assert root_arg == root
+        assert operation_id == pending.operation_id
+        acquire_operation_lock(root, operation_id)
+        original_acquire_lock(root_arg, operation_id)
+
+    monkeypatch.setattr(lifecycle_module, "acquire_lock", writer_wins)
+
+    report = advance_trash_lifecycle(root, now=EXPIRY, handoff=accepted.append)
+
+    assert report.results == ()
+    assert report.error is not None
+    assert report.error.code == CheckCode.OPERATION_RECOVERY_REQUIRED.value
+    assert accepted == []
+    assert read_lock(root) == pending.operation_id
+    assert _lifecycle_tree_bytes(package) == package_before
 
 
 def _write_unlinked_restore_allocating(root: Path, operation_id: str) -> Path:
@@ -440,7 +475,201 @@ def _lifecycle_tree_bytes(directory: Path) -> dict[Path, bytes]:
     }
 
 
-def test_unlinked_restore_cleanup_failure_preserves_allocating_scene(
+def _lifecycle_tree_nodes(directory: Path) -> dict[Path, tuple[str, bytes | str | None]]:
+    """Capture node kind and bytes without following injected links."""
+    nodes: dict[Path, tuple[str, bytes | str | None]] = {}
+    for path in sorted(directory.rglob("*")):
+        relative = path.relative_to(directory)
+        if path.is_symlink():
+            nodes[relative] = ("symlink", path.readlink().as_posix())
+        elif path.is_dir():
+            nodes[relative] = ("directory", None)
+        elif path.is_file():
+            nodes[relative] = ("file", path.read_bytes())
+        else:
+            nodes[relative] = ("other", None)
+    return nodes
+
+
+def _tamper_attempt(attempt: Path, kind: str, root: Path) -> None:
+    if kind == "unknown":
+        (attempt / "unknown.bin").write_bytes(b"unauthorized")
+    elif kind == "symlink":
+        target = attempt / "package.json"
+        target.unlink()
+        external = root / "attempt-external.txt"
+        external.write_bytes(b"outside")
+        target.symlink_to(external)
+    elif kind == "nested":
+        (attempt / "unlisted").mkdir()
+    elif kind == "digest":
+        (attempt / "package.json").write_bytes(b"wrong digest")
+    else:  # pragma: no cover
+        raise AssertionError(kind)
+
+
+@pytest.mark.parametrize("tamper", ["unknown", "symlink", "nested", "digest"])
+def test_lifecycle_rejects_unsafe_attempt_before_phase_publish(
+    draft_factory: DraftFactory,
+    tamper: str,
+) -> None:
+    """到期生命周期在写 handoff pending 前证明 attempt 的完整树形协议。"""
+    from draft.operations import read_journal
+    from draft.trash_lifecycle import make_attempt_copy
+    from draft.trash_package import load_verified_package
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    journal_path = _journal_path(root, pending.operation_id)
+    journal = read_journal(journal_path)
+    attempt = make_attempt_copy(load_verified_package(root, journal))
+    _tamper_attempt(attempt, tamper, root)
+    before_journal = journal_path.read_bytes()
+    before_attempt = _lifecycle_tree_nodes(attempt)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    before_package = _lifecycle_tree_nodes(package)
+    calls: list[str] = []
+
+    report = advance_trash_lifecycle(root, now=EXPIRY, handoff=calls.append)
+
+    assert report.error is not None
+    expected_code = (
+        CheckCode.PATH_SYMLINK_ESCAPE.value
+        if tamper == "symlink"
+        else CheckCode.OPERATION_INCONSISTENT_STATE.value
+    )
+    assert report.error.code == expected_code
+    assert journal_path.read_bytes() == before_journal
+    assert _phase(root, pending.operation_id) == OperationPhase.TRASH_RETAINED.value
+    assert _lifecycle_tree_nodes(attempt) == before_attempt
+    assert _lifecycle_tree_nodes(package) == before_package
+    assert calls == []
+    assert (root / ".draft/operation.lock").read_text(encoding="utf-8").find(
+        pending.operation_id
+    ) >= 0
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["cleanup-evidence.json", "cleanup-evidence.json.pending", "cleanup-evidence.json.quarantine"],
+)
+def test_lifecycle_rejects_invalid_cleanup_evidence_before_phase_publish(
+    draft_factory: DraftFactory,
+    name: str,
+) -> None:
+    """cleanup evidence 的三种协议名均须在 handoff pending 前完整解析。"""
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    journal_path = _journal_path(root, pending.operation_id)
+    evidence = journal_path.parent / name
+    evidence.write_bytes(b"{invalid evidence")
+    before_journal = journal_path.read_bytes()
+    before_operation = _lifecycle_tree_nodes(journal_path.parent)
+    calls: list[str] = []
+
+    report = advance_trash_lifecycle(root, now=EXPIRY, handoff=calls.append)
+
+    assert report.error is not None
+    assert report.error.code == CheckCode.TRASH_PACKAGE_CORRUPT.value
+    assert journal_path.read_bytes() == before_journal
+    assert _phase(root, pending.operation_id) == OperationPhase.TRASH_RETAINED.value
+    assert _lifecycle_tree_nodes(journal_path.parent) == before_operation
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [OperationPhase.TRASH_HANDOFF_SUCCEEDED, OperationPhase.TRASH_PURGE_COMMITTED],
+)
+@pytest.mark.parametrize("tamper", ["unknown", "symlink", "nested", "digest"])
+@pytest.mark.parametrize("entry", ["recover_interrupted", "recover"])
+def test_terminal_trash_recovery_rejects_unsafe_attempt_before_package_cleanup(
+    draft_factory: DraftFactory,
+    phase: OperationPhase,
+    tamper: str,
+    entry: str,
+) -> None:
+    """已提交 Trash 清理先证明 attempt，不能先删除 outgoing package。"""
+    from draft.operations import acquire_lock, read_journal, recover
+    from draft.trash_lifecycle import make_attempt_copy
+    from draft.trash_package import load_verified_package
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    _force_phase(root, pending.operation_id, phase)
+    acquire_lock(root, pending.operation_id)
+    journal_path = _journal_path(root, pending.operation_id)
+    journal = read_journal(journal_path)
+    attempt = make_attempt_copy(load_verified_package(root, journal))
+    _tamper_attempt(attempt, tamper, root)
+    before_journal = journal_path.read_bytes()
+    before_lock = (root / ".draft/operation.lock").read_bytes()
+    before_attempt = _lifecycle_tree_nodes(attempt)
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    before_package = _lifecycle_tree_nodes(package)
+    calls: list[str] = []
+
+    with pytest.raises(DraftError) as caught:
+        if entry == "recover":
+            recover(root)
+        else:
+            recover_interrupted_operations(root, now=PURGE, handoff=calls.append)
+
+    expected_code = (
+        CheckCode.PATH_SYMLINK_ESCAPE.value
+        if tamper == "symlink"
+        else CheckCode.OPERATION_INCONSISTENT_STATE.value
+    )
+    assert caught.value.code == expected_code
+    assert journal_path.read_bytes() == before_journal
+    assert (root / ".draft/operation.lock").read_bytes() == before_lock
+    assert _lifecycle_tree_nodes(attempt) == before_attempt
+    assert _lifecycle_tree_nodes(package) == before_package
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [OperationPhase.TRASH_HANDOFF_SUCCEEDED, OperationPhase.TRASH_PURGE_COMMITTED],
+)
+@pytest.mark.parametrize(
+    "name",
+    ["cleanup-evidence.json", "cleanup-evidence.json.pending", "cleanup-evidence.json.quarantine"],
+)
+def test_terminal_trash_recovery_rejects_invalid_cleanup_evidence_before_package_cleanup(
+    draft_factory: DraftFactory,
+    phase: OperationPhase,
+    name: str,
+) -> None:
+    """已提交 Trash 清理先完整解析 cleanup evidence 三种协议名。"""
+    from draft.operations import acquire_lock, recover
+
+    root = build_trashable_draft(draft_factory)
+    pending = trash_page(root, Path("pages/obsolete.md"), now=CREATED)
+    _force_phase(root, pending.operation_id, phase)
+    acquire_lock(root, pending.operation_id)
+    journal_path = _journal_path(root, pending.operation_id)
+    evidence = journal_path.parent / name
+    evidence.write_bytes(b"{invalid evidence")
+    before_journal = journal_path.read_bytes()
+    before_lock = (root / ".draft/operation.lock").read_bytes()
+    package = root / ".draft/trash/outgoing" / pending.operation_id
+    before_package = _lifecycle_tree_nodes(package)
+
+    with pytest.raises(DraftError) as caught:
+        recover(root)
+
+    assert caught.value.code == CheckCode.TRASH_PACKAGE_CORRUPT.value
+    assert journal_path.read_bytes() == before_journal
+    assert (root / ".draft/operation.lock").read_bytes() == before_lock
+    assert _lifecycle_tree_nodes(journal_path.parent)[Path(name)] == (
+        "file",
+        b"{invalid evidence",
+    )
+    assert _lifecycle_tree_nodes(package) == before_package
+
+
+def test_unlinked_restore_with_unknown_copy_is_plan_invalid_and_preserved(
     draft_factory: DraftFactory,
 ) -> None:
     root = build_trashable_draft(draft_factory)
@@ -453,26 +682,27 @@ def test_unlinked_restore_cleanup_failure_preserves_allocating_scene(
     for _ in range(2):
         with pytest.raises(DraftError) as caught:
             recover_interrupted_operations(root)
-        assert caught.value.code == CheckCode.OPERATION_INCONSISTENT_STATE.value
+        assert caught.value.code == OPERATION_PLAN_INVALID
         assert _phase(root, "0" * 32) == OperationPhase.ALLOCATING.value
         assert _lifecycle_tree_bytes(journal_path.parent) == before
 
 
-def test_unlinked_restore_without_copies_rolls_back_idempotently(
+def test_unlinked_restore_without_copies_is_plan_invalid_idempotently(
     draft_factory: DraftFactory,
 ) -> None:
     root = build_trashable_draft(draft_factory)
     journal_path = _write_unlinked_restore_allocating(root, "1" * 32)
 
-    recover_interrupted_operations(root)
+    before = _lifecycle_tree_bytes(journal_path.parent)
 
-    assert _phase(root, "1" * 32) == OperationPhase.ROLLED_BACK.value
-    rolled_back = journal_path.read_bytes()
-    recover_interrupted_operations(root)
-    assert journal_path.read_bytes() == rolled_back
+    for _ in range(2):
+        with pytest.raises(DraftError) as caught:
+            recover_interrupted_operations(root)
+        assert caught.value.code == OPERATION_PLAN_INVALID
+        assert _lifecycle_tree_bytes(journal_path.parent) == before
 
 
-def test_lifecycle_preserves_bidirectionally_linked_unlocked_restore(
+def test_lifecycle_converges_bidirectionally_linked_unlocked_restore(
     draft_factory: DraftFactory,
 ) -> None:
     import json
@@ -518,42 +748,34 @@ def test_lifecycle_preserves_bidirectionally_linked_unlocked_restore(
         OperationPhase.TRASH_RETAINED.value,
         {"restore_operation_id": restore_id},
     )
-    restore_before = restore_path.read_bytes()
-    trash_before = trash_path.read_bytes()
+    first = recover_interrupted_operations(root)
+    assert len(first) == 1
+    assert first[0].phase is OperationPhase.ROLLED_BACK
+    restore_after = json.loads(restore_path.read_text(encoding="utf-8"))
+    trash_after = json.loads(trash_path.read_text(encoding="utf-8"))
+    assert restore_after["phase"] == OperationPhase.ROLLED_BACK.value
+    assert trash_after["phase"] == OperationPhase.TRASH_RETAINED.value
+    assert "restore_operation_id" not in trash_after["metadata"]
 
-    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
-        recover_interrupted_operations(root)
+    restore_bytes = restore_path.read_bytes()
+    trash_bytes = trash_path.read_bytes()
+    assert recover_interrupted_operations(root) == ()
+    assert restore_path.read_bytes() == restore_bytes
+    assert trash_path.read_bytes() == trash_bytes
 
-    assert restore_path.read_bytes() == restore_before
-    assert trash_path.read_bytes() == trash_before
 
-
-def test_unlinked_restore_retries_terminal_write_after_cleanup(
+def test_unlinked_restore_never_attempts_terminal_write(
     draft_factory: DraftFactory,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import draft.operations as operations_module
-
     root = build_trashable_draft(draft_factory)
     journal_path = _write_unlinked_restore_allocating(root, "2" * 32)
-    real_replace = operations_module._replace_publish  # pyright: ignore[reportPrivateUsage]
-    state = {"failed": False}
+    before = _lifecycle_tree_bytes(journal_path.parent)
 
-    def fail_once(*args: object, **kwargs: object) -> None:
-        if not state["failed"]:
-            state["failed"] = True
-            raise DraftError(CheckCode.OPERATION_DURABILITY_FAILED.value, journal_path)
-        real_replace(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(operations_module, "_replace_publish", fail_once)
-    with pytest.raises(DraftError) as caught:
-        recover_interrupted_operations(root)
-    assert caught.value.code == CheckCode.OPERATION_DURABILITY_FAILED.value
-    assert _phase(root, "2" * 32) == OperationPhase.ALLOCATING.value
-    monkeypatch.undo()
-
-    recover_interrupted_operations(root)
-    assert _phase(root, "2" * 32) == OperationPhase.ROLLED_BACK.value
+    for _ in range(2):
+        with pytest.raises(DraftError) as caught:
+            recover_interrupted_operations(root)
+        assert caught.value.code == OPERATION_PLAN_INVALID
+        assert _lifecycle_tree_bytes(journal_path.parent) == before
 
 
 @pytest.mark.parametrize(
@@ -690,7 +912,7 @@ def test_lifecycle_maps_journal_eacces_to_stable_error(
     assert journal_path.is_file()
 
 
-def test_lifecycle_recovery_preserves_only_empty_valid_operation_directory(
+def test_lifecycle_recovery_closes_empty_operation_residue(
     draft_factory: DraftFactory,
 ) -> None:
     root = build_trashable_draft(draft_factory)
@@ -699,8 +921,134 @@ def test_lifecycle_recovery_preserves_only_empty_valid_operation_directory(
     entry.mkdir()
 
     recover_interrupted_operations(root)
+    recover_interrupted_operations(root)
 
-    assert entry.is_dir()
+    assert not entry.exists()
+    assert not (root / ".draft/operation.lock").exists()
+
+
+def test_advance_lifecycle_closes_empty_operation_residue(
+    draft_factory: DraftFactory,
+) -> None:
+    root = build_trashable_draft(draft_factory)
+    entry = root / ".draft/operations" / ("6" * 32)
+    entry.mkdir(parents=True)
+
+    report = advance_trash_lifecycle(root, now=CREATED)
+
+    assert report.error is None
+    assert not entry.exists()
+    assert not (root / ".draft/operation.lock").exists()
+
+
+def test_advance_lifecycle_closes_matching_locked_empty_residue(
+    draft_factory: DraftFactory,
+) -> None:
+    root = build_trashable_draft(draft_factory)
+    operation_id = "7" * 32
+    entry = root / ".draft/operations" / operation_id
+    entry.mkdir(parents=True)
+    from draft.operations import acquire_lock, read_lock
+
+    acquire_lock(root, operation_id)
+
+    report = advance_trash_lifecycle(root, now=CREATED)
+
+    assert report.error is None
+    assert not entry.exists()
+    assert read_lock(root) is None
+
+
+@pytest.mark.parametrize(
+    ("change", "expected_code"),
+    [
+        ("member", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+        ("journal", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+        ("pending", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+        ("symlink", CheckCode.PATH_SYMLINK_ESCAPE.value),
+        ("identity", CheckCode.OPERATION_INCONSISTENT_STATE.value),
+    ],
+)
+def test_advance_lifecycle_matching_empty_residue_rejects_change_during_reread(
+    draft_factory: DraftFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+    expected_code: str,
+) -> None:
+    import draft.operations as operations_module
+    from draft.operations import acquire_lock, read_lock
+
+    root = build_trashable_draft(draft_factory)
+    operation_id = "8" * 32
+    entry = root / ".draft/operations" / operation_id
+    entry.mkdir(parents=True)
+    acquire_lock(root, operation_id)
+    real_scandir = operations_module.os.scandir
+    state = {"calls": 0}
+
+    class ScandirFake:
+        """FD scandir 替身必须保留真实 ScandirIterator 的上下文管理接口。"""
+
+        def __init__(self, members: tuple[os.DirEntry[str], ...]) -> None:
+            self._members = members
+
+        def __enter__(self) -> "ScandirFake":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def __iter__(self) -> Any:
+            return iter(self._members)
+
+    def add_member_after_first_scan(path: Any, *args: Any, **kwargs: Any) -> Any:
+        iterator = real_scandir(path, *args, **kwargs)
+        if isinstance(path, int):
+            members = tuple(iterator)
+            iterator.close()
+            state["calls"] += 1
+            # The first two FD scans belong to lifecycle's full-graph discovery.  Inject at
+            # the matching-lock residue reread so the fake continues to test the freshness
+            # gate rather than the unrelated discovery pass.
+            if state["calls"] == 4:
+                if change == "identity":
+                    entry.rmdir()
+                    entry.mkdir()
+                elif change == "symlink":
+                    outside = tmp_path / "outside"
+                    outside.write_bytes(b"must remain untouched")
+                    entry.rmdir()
+                    entry.symlink_to(outside)
+                else:
+                    member_name = {
+                        "member": "unknown",
+                        "journal": "journal.json",
+                        "pending": "journal.json.pending",
+                    }[change]
+                    (entry / member_name).write_bytes(b"changed during lock reread")
+            return ScandirFake(members)
+        return iterator
+
+    monkeypatch.setattr(operations_module.os, "scandir", add_member_after_first_scan)
+
+    report = advance_trash_lifecycle(root, now=CREATED)
+
+    assert report.results == ()
+    assert report.error is not None
+    assert report.error.code == expected_code
+    if change == "symlink":
+        assert entry.is_symlink()
+    else:
+        assert entry.is_dir()
+        member_name = {
+            "member": "unknown",
+            "journal": "journal.json",
+            "pending": "journal.json.pending",
+        }.get(change)
+        if member_name is not None:
+            assert (entry / member_name).read_bytes() == b"changed during lock reread"
+    assert read_lock(root) == operation_id
 
 
 def test_lifecycle_recovery_preserves_nonempty_operation_directory_without_journal(
@@ -747,9 +1095,11 @@ def test_no_lock_trash_mid_write_phase_is_inconsistent(
     real_write = operations_module.write_journal
     fired = False
 
-    def write_then_crash(journal: Journal) -> None:
+    def write_then_crash(
+        journal: Journal, *, preflight: RecoveryPreflight | None = None
+    ) -> None:
         nonlocal fired
-        real_write(journal)
+        real_write(journal, preflight=preflight)
         if not fired and journal.kind is OperationKind.TRASH and journal.phase is phase:
             fired = True
             raise ProcessExit
@@ -1289,10 +1639,10 @@ def test_terminal_cleanup_rejects_symlinked_outgoing(
     assert (external / pending.operation_id / "package.json").read_bytes() == external_payload
 
 
-def test_batch_corrupt_journal_preserves_prior_results(
+def test_batch_corrupt_journal_stops_before_any_handoff(
     draft_factory: DraftFactory, tmp_path: Path
 ) -> None:
-    """批量推进中后项日志 JSON 损坏时，前项结果必须保留在公开信封，不得向外抛。"""
+    """全图关系不可读时必须失败关闭，不得先对排序靠前的 T 执行 handoff。"""
     root = draft_factory(
         {
             "index.md": TRASH_INDEX.replace(
@@ -1317,8 +1667,9 @@ def test_batch_corrupt_journal_preserves_prior_results(
     report = advance_trash_lifecycle(root, now=EXPIRY, handoff=_accept_into(bin_dir, accepted))
 
     assert report.error is not None
-    assert report.error.operation_id == second
-    assert [result.operation_id for result in report.results] == [first]
+    assert report.error.operation_id == first
+    assert report.results == ()
+    assert accepted == []
 
 
 def test_orphan_restore_scan_stops_on_unreadable_sibling_journal(
@@ -1495,9 +1846,11 @@ def test_no_lock_trash_at_index_phase_is_inconsistent(
     real_write = operations_module.write_journal
     fired = False
 
-    def write_then_crash(journal: Journal) -> None:
+    def write_then_crash(
+        journal: Journal, *, preflight: RecoveryPreflight | None = None
+    ) -> None:
         nonlocal fired
-        real_write(journal)
+        real_write(journal, preflight=preflight)
         if (
             not fired
             and journal.kind is OperationKind.TRASH

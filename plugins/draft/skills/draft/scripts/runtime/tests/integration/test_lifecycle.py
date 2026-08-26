@@ -5,6 +5,7 @@ import pytest
 
 import draft.lifecycle as lifecycle_module
 from draft.checker import check_draft
+from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
 from draft.lifecycle import adopt, initialize
 from draft.models import OperationPhase, RootState
@@ -615,7 +616,7 @@ def test_adopt_recover_with_observation_change_raises_external_change(
 def test_adopt_recover_rejects_intruder_in_created_operations_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """adopt 首次创建 .draft/operations 后，目录内混入未指定条目时恢复必须拒绝。
+    """adopt 首次创建 .draft/operations 后，目录内混入未指定条目时恢复必须失败关闭。
 
     回归 P1：计划期 .draft/operations 不存在、没有观察基线；若恢复不验证该新
     目录内部，外部文件会被静默吸收并前向完成登记（规格 §12.2 外部变化分区）。
@@ -634,17 +635,17 @@ def test_adopt_recover_rejects_intruder_in_created_operations_directory(
     # 外部向本操作新建的内部协议目录注入未指定文件。
     (root / ".draft/operations/intruder.json").write_text("x", encoding="utf-8")
 
-    with pytest.raises(DraftError, match="operation.external_change"):
+    with pytest.raises(DraftError, match=CheckCode.OPERATION_INCONSISTENT_STATE.value):
         recover_interrupted_operations(root)
 
-    # 已安全放弃：外部文件保留、marker 仍 candidate、日志终态化、锁释放。
+    # 分类失败关闭：外部文件、marker、journal 和锁全部保留。
     assert (root / ".draft/operations/intruder.json").is_file()
     assert (root / ".draft/draft.json").read_text(encoding="utf-8") == managed_marker_text(
         root_state=RootState.CANDIDATE
     )
     journal = read_journal(operation_journal_path(root, adopt_id))
-    assert journal.phase is OperationPhase.ROLLED_BACK
-    assert read_lock(root) is None
+    assert journal.phase is OperationPhase.APPLYING
+    assert read_lock(root) == adopt_id
 
 
 def test_adopt_crash_after_marker_never_rolls_back(

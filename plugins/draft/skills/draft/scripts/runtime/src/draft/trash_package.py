@@ -12,7 +12,10 @@ import os
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
+
+if TYPE_CHECKING:
+    from draft.operations import RecoveryPreflight
 
 from draft.diagnostic_codes import CheckCode
 from draft.errors import DraftError
@@ -780,6 +783,24 @@ def cleanup_authorization(
     raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal.directory)
 
 
+def _consume_cleanup_preflight(
+    root: Path,
+    *,
+    owner_id: str | None,
+    participant_id: str,
+    current: RecoveryPreflight | None,
+) -> RecoveryPreflight | None:
+    """Obtain the one capability for the next package/evidence action."""
+    from draft.operations import build_recovery_preflight
+
+    if current is not None:
+        current.require_effect("material_cleanup", participant_id=participant_id)
+        return current
+    if owner_id is None:
+        return None
+    return build_recovery_preflight(root, owner_id, effect="material_cleanup").consume()
+
+
 def _cleanup_evidence_path(journal: Journal) -> Path:
     """清理证据路径：锁所属操作目录内，包目录全部成功移除前不得清理。"""
     return journal.directory / _CLEANUP_EVIDENCE_NAME
@@ -879,6 +900,8 @@ def _write_cleanup_evidence(
     journal: Journal,
     auth: PackageAuthorization,
     leaves_bytes: dict[Path, bytes],
+    *,
+    preflight: RecoveryPreflight | None = None,
 ) -> None:
     """删除第一个权威叶节点前，把两个授权叶（present/already_missing）耐久记录在锁所属操作目录。
 
@@ -888,6 +911,9 @@ def _write_cleanup_evidence(
     绝不只剩未知内容（回归 H2/H4）。
     """
     import base64
+
+    if preflight is not None:
+        preflight.require_effect("material_cleanup", participant_id=journal.operation_id)
 
     expected_digest = {
         auth.package_json_path: auth.package_json_digest,
@@ -1110,7 +1136,12 @@ def _publish_cleanup_evidence_name(journal: Journal, source: str, *, code_path: 
         _fsync_dir_fd(final_leaf.parent_fd, code_path)
 
 
-def converge_cleanup_evidence(journal: Journal, *, intent: CleanupEvidenceIntent) -> None:
+def converge_cleanup_evidence(
+    journal: Journal,
+    *,
+    intent: CleanupEvidenceIntent,
+    preflight: RecoveryPreflight | None = None,
+) -> None:
     """cleanup evidence final/pending/quarantine 的共享收敛边界（第十轮 H1）。
 
     KEEP：任何包叶删除前把证据收敛为就绪（发布合法 pending / 恢复 quarantine /
@@ -1119,24 +1150,34 @@ def converge_cleanup_evidence(journal: Journal, *, intent: CleanupEvidenceIntent
     副作用前报 trash.package_corrupt 并保留现场。checker 只调用只读分类与纯决策，
     不进入本边界。
     """
-    classified = classify_cleanup_evidence_artifacts(journal)
-    if classified is None:
-        return  # 操作目录缺失：证据必然缺失，无动作。
-    final, pending, quarantine, same_pending, same_quarantine = classified
-    actions = cleanup_evidence_actions(
-        intent=intent,
-        final=final,
-        pending=pending,
-        quarantine=quarantine,
-        final_pending_same_node=same_pending,
-        final_quarantine_same_node=same_quarantine,
-    )
-    if CleanupEvidenceAction.CORRUPT in actions:
-        raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, _cleanup_evidence_path(journal))
-    code_path = _cleanup_evidence_path(journal)
-    for action in actions:
-        if action is CleanupEvidenceAction.READY or action is CleanupEvidenceAction.DONE:
-            continue
+    root = journal.directory.parent.parent.parent
+    owner_id = preflight.owner_id if preflight is not None else None
+    next_preflight = preflight
+    while True:
+        classified = classify_cleanup_evidence_artifacts(journal)
+        if classified is None:
+            return  # 操作目录缺失：证据必然缺失，无动作。
+        final, pending, quarantine, same_pending, same_quarantine = classified
+        actions = cleanup_evidence_actions(
+            intent=intent,
+            final=final,
+            pending=pending,
+            quarantine=quarantine,
+            final_pending_same_node=same_pending,
+            final_quarantine_same_node=same_quarantine,
+        )
+        action = actions[0]
+        if action in (CleanupEvidenceAction.READY, CleanupEvidenceAction.DONE):
+            return
+        if action is CleanupEvidenceAction.CORRUPT:
+            raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, _cleanup_evidence_path(journal))
+        _consume_cleanup_preflight(
+            root,
+            owner_id=owner_id,
+            participant_id=journal.operation_id,
+            current=next_preflight,
+        )
+        code_path = _cleanup_evidence_path(journal)
         if action is CleanupEvidenceAction.PUBLISH_PENDING:
             _publish_cleanup_evidence_name(
                 journal, _pending_name(_CLEANUP_EVIDENCE_NAME), code_path=code_path
@@ -1151,9 +1192,18 @@ def converge_cleanup_evidence(journal: Journal, *, intent: CleanupEvidenceIntent
             _consume_cleanup_evidence_name(journal, Path(_CLEANUP_EVIDENCE_NAME))
         elif action is CleanupEvidenceAction.CONSUME_QUARANTINE:
             _consume_cleanup_evidence_name(journal, Path(_quarantine_name(_CLEANUP_EVIDENCE_NAME)))
+        else:
+            raise AssertionError(f"unexpected cleanup evidence action: {action}")
+        next_preflight = None
 
 
-def _restore_missing_leaves_from_evidence(root: Path, journal: Journal, code_path: Path) -> None:
+def _restore_missing_leaves_from_evidence(
+    root: Path,
+    journal: Journal,
+    code_path: Path,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> None:
     """从证据恢复缺失授权叶：上次清理中途失败后使合法包完整可重建。
 
     先以 ``parse_cleanup_evidence`` 完整解析并验证整个证据（任何条目损坏都在首次受管
@@ -1163,6 +1213,8 @@ def _restore_missing_leaves_from_evidence(root: Path, journal: Journal, code_pat
     from draft.operations import recover_digest_pending, recover_quarantine
 
     evidence_path = _cleanup_evidence_path(journal)
+    owner_id = preflight.owner_id if preflight is not None else None
+    next_preflight = preflight
     from draft.operations import _AnchoredLeaf  # pyright: ignore[reportPrivateUsage]
 
     with anchored_leaf(
@@ -1193,12 +1245,26 @@ def _restore_missing_leaves_from_evidence(root: Path, journal: Journal, code_pat
         assert content is not None
         # 先收敛崩溃遗留 pending/quarantine（发布待发布叶/完成被中断的删除），再补写
         # 仍缺失的叶（回归 H2/H3）。
+        pending_preflight = _consume_cleanup_preflight(
+            root,
+            owner_id=owner_id,
+            participant_id=journal.operation_id,
+            current=next_preflight,
+        )
         recover_digest_pending(
             root,
             relative,
             leaf_state.sha256,
             code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
             code_path=code_path,
+            preflight=pending_preflight,
+        )
+        next_preflight = None
+        quarantine_preflight = _consume_cleanup_preflight(
+            root,
+            owner_id=owner_id,
+            participant_id=journal.operation_id,
+            current=next_preflight,
         )
         recover_quarantine(
             root,
@@ -1206,15 +1272,29 @@ def _restore_missing_leaves_from_evidence(root: Path, journal: Journal, code_pat
             leaf_state.sha256,
             code=CheckCode.TRASH_PACKAGE_CORRUPT.value,
             code_path=code_path,
+            preflight=quarantine_preflight,
         )
+        next_preflight = None
         with anchored_leaf(
             root, relative, code=CheckCode.TRASH_PACKAGE_CORRUPT.value, code_path=code_path
         ) as leaf:
             if leaf.classify() is EntryKind.MISSING:
+                _consume_cleanup_preflight(
+                    root,
+                    owner_id=owner_id,
+                    participant_id=journal.operation_id,
+                    current=next_preflight,
+                )
                 leaf.write(content)
+                next_preflight = None
 
 
-def clean_authoritative_package(root: Path, authorization: CleanupAuthorization) -> None:
+def clean_authoritative_package(
+    root: Path,
+    authorization: CleanupAuthorization,
+    *,
+    preflight: RecoveryPreflight | None = None,
+) -> None:
     """唯一权威包清理原语：已提交授权门 → 日志协议 → 节点分类 → 证据事务 → 锚定删除。
 
     清理授权必须是已提交阶段（rolled_back / handoff_succeeded / purge_committed）的
@@ -1228,10 +1308,43 @@ def clean_authoritative_package(root: Path, authorization: CleanupAuthorization)
     restore、handoff、purge 与终态恢复全部经此原语清理，不再各自直接 remove_tree。
     """
     journal = authorization.journal
+    owner_id = preflight.owner_id if preflight is not None else None
+    next_preflight = preflight
+
+    def take_preflight() -> RecoveryPreflight | None:
+        """Consume the next package-cleanup capability and reject stale T authorization."""
+        nonlocal next_preflight
+        capability = _consume_cleanup_preflight(
+            root,
+            owner_id=owner_id,
+            participant_id=journal.operation_id,
+            current=next_preflight,
+        )
+        next_preflight = None
+        if capability is not None:
+            live = next(
+                (
+                    candidate
+                    for participant_id, candidate in capability.current
+                    if participant_id == journal.operation_id
+                ),
+                None,
+            )
+            if live != journal:
+                raise DraftError(
+                    CheckCode.OPERATION_INCONSISTENT_STATE.value,
+                    operation_journal_path(root, journal.operation_id),
+                )
+        return capability
+
     reject_symlink_components(root, OUTGOING_RELATIVE)
     # 任何包叶删除前把 evidence 收敛为 KEEP-ready（发布合法 pending / 恢复 quarantine
     # / 消费同一次隔离的陈旧名；回归 H1/H5）：完整验证 T 授权后才允许继续。
-    converge_cleanup_evidence(journal, intent=CleanupEvidenceIntent.KEEP)
+    converge_cleanup_evidence(
+        journal,
+        intent=CleanupEvidenceIntent.KEEP,
+        preflight=take_preflight(),
+    )
     package_dir = root / OUTGOING_RELATIVE / journal.operation_id
     # 先验证日志协议再碰包：物理包缺失只是文件系统状态，不能跳过日志语义验证
     # （回归 H6）——空 mutation、缺 package write、第三个包内 WRITE 都必须报损坏。
@@ -1244,7 +1357,11 @@ def clean_authoritative_package(root: Path, authorization: CleanupAuthorization)
     if package_node is EntryKind.MISSING:
         # 已提交阶段：包缺失 = 清理已删除全部叶（幂等）。evidence 必须按 REMOVE
         # 意图收敛为空（只消费验证过的精确名）；类型/内容损坏保留现场（回归 H4）。
-        converge_cleanup_evidence(journal, intent=CleanupEvidenceIntent.REMOVE)
+        converge_cleanup_evidence(
+            journal,
+            intent=CleanupEvidenceIntent.REMOVE,
+            preflight=take_preflight(),
+        )
         return
     if package_node is not EntryKind.DIRECTORY:
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, package_dir)
@@ -1257,7 +1374,12 @@ def clean_authoritative_package(root: Path, authorization: CleanupAuthorization)
         raise DraftError(CheckCode.TRASH_PACKAGE_CORRUPT.value, evidence_path)
     if evidence_node is EntryKind.FILE:
         # 上次清理中途失败：先从证据恢复缺失叶，使合法包完整可重建。
-        _restore_missing_leaves_from_evidence(root, journal, package_dir)
+        _restore_missing_leaves_from_evidence(
+            root,
+            journal,
+            package_dir,
+            preflight=take_preflight(),
+        )
     _precheck_package_tree(root, package_dir, authorized, package_dir)
     if evidence_node is EntryKind.MISSING:
         # 首次删除前：用锚定句柄读取存在的授权叶已验证字节，耐久写入证据；
@@ -1272,14 +1394,28 @@ def clean_authoritative_package(root: Path, authorization: CleanupAuthorization)
             ) as leaf:
                 if leaf.classify() is EntryKind.FILE:
                     leaves_bytes[relative] = leaf.read()
-        _write_cleanup_evidence(journal, auth, leaves_bytes)
+        evidence_preflight = take_preflight()
+        _write_cleanup_evidence(
+            journal,
+            auth,
+            leaves_bytes,
+            preflight=evidence_preflight,
+        )
     for relative, digest in sorted(authorized):
+        take_preflight()
+        _precheck_package_tree(root, package_dir, authorized, package_dir)
         _remove_verified_leaf(root, relative, digest, package_dir)
     for directory in sorted(
         _package_directories(root, package_dir, authorized),
         key=lambda path: len(path.parts),
         reverse=True,
     ):
+        take_preflight()
+        _precheck_package_tree(root, package_dir, authorized, package_dir)
         _remove_verified_dir(root, directory.relative_to(root), package_dir)
     # 包目录全部成功移除后：evidence 按 REMOVE 意图收敛为空。
-    converge_cleanup_evidence(journal, intent=CleanupEvidenceIntent.REMOVE)
+    converge_cleanup_evidence(
+        journal,
+        intent=CleanupEvidenceIntent.REMOVE,
+        preflight=take_preflight(),
+    )

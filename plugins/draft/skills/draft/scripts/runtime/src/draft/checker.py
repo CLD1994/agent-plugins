@@ -38,7 +38,10 @@ from draft.operations import (
     Journal,
     TrashDeadlines,
     has_handoff_failure,
+    is_empty_allocation_residue,
     operation_journal_path,
+    validate_journal_transition,
+    validate_restore_trash_relations,
 )
 from draft.paths import physical_parent, resolve_draft_root
 from draft.trash_package import OUTGOING_RELATIVE, load_verified_package
@@ -529,6 +532,7 @@ class OperationCheckIndex:
     unresolved_ids: frozenset[str]
     locked_operation: str | None
     lock_known: bool
+    empty_residue_ids: frozenset[str] = frozenset()
 
 
 class PackageOwnership(StrEnum):
@@ -862,10 +866,11 @@ def _build_operation_index(
     tree 复用，不再二次 read_journal 建立第二份不一致事实（round-13 M1）。
     """
     from draft.observations import EntryKind
-    from draft.operations import classify_node_or_error, read_journal
+    from draft.operations import classify_node_or_error, read_optional_journal
 
     journals: dict[str, Journal] = {}
     unresolved: set[str] = set()
+    empty_residues: set[str] = set()
     if listing.state is not InternalDirectoryState.COMPLETE:
         return OperationCheckIndex(
             listing_state=listing.state,
@@ -873,6 +878,7 @@ def _build_operation_index(
             unresolved_ids=frozenset(),
             locked_operation=locked_operation,
             lock_known=lock_known,
+            empty_residue_ids=frozenset(),
         )
     for entry in listing.entries:
         relative = entry.relative_to(root)
@@ -895,23 +901,79 @@ def _build_operation_index(
             issues.append(_error(CheckCode.INTERNAL_UNEXPECTED_ENTRY, relative))
             continue
         journal_path = operation_journal_path(root, entry.name)
+        pending_path = journal_path.with_name("journal.json.pending")
         try:
-            journal = read_journal(journal_path)
-        except DraftError:
-            # 日志缺失/损坏/身份不匹配：稳定诊断 + 合法 id 记录为未知 owner 事实。
+            journal = read_optional_journal(journal_path)
+            pending = read_optional_journal(pending_path)
+            if journal is None and pending is None:
+                try:
+                    with os.scandir(entry) as iterator:
+                        member_names = tuple(item.name for item in iterator)
+                except OSError:
+                    member_names = ("<unavailable>",)
+                is_empty_residue = is_empty_allocation_residue(set(member_names), None)
+                if is_empty_residue and _is_valid_operation_id_name(entry.name):
+                    empty_residues.add(entry.name)
+                    continue
+                raise DraftError(CheckCode.OPERATION_INCONSISTENT_STATE.value, journal_path)
+            if pending is not None:
+                validate_journal_transition(journal, pending, path=journal_path)
+            # A pending journal is the effective read-only snapshot.  It is retained in the
+            # directory facts below, but checker never resolves or removes it.
+            effective = pending if pending is not None else journal
+            assert effective is not None
+            if effective.operation_id != entry.name:
+                raise DraftError(CheckCode.OPERATION_JOURNAL_CORRUPT.value, journal_path)
+        except DraftError as error:
+            # 空 allocation residue 已在正常缺 journal 分支被识别。其余读取/解析错误
+            # 保持 raw journal 的稳定诊断，不能被目录成员分类覆盖。
             issues.append(
-                _error(CheckCode.OPERATION_JOURNAL_CORRUPT, journal_path.relative_to(root))
+                CheckIssue(
+                    code=error.code,
+                    severity=IssueSeverity.ERROR,
+                    path=(error.paths[0] if error.paths else journal_path).relative_to(root),
+                    line=None,
+                    details=error.details,
+                )
             )
+            # Pending is an observable directory fact even when its bytes are invalid or its
+            # node kind is wrong.  The effective index error must not hide the residual entry.
+            try:
+                pending_kind = classify_node_or_error(
+                    pending_path,
+                    code=CheckCode.OPERATION_JOURNAL_CORRUPT.value,
+                    code_path=pending_path,
+                )
+            except DraftError as pending_error:
+                issues.append(
+                    CheckIssue(
+                        code=pending_error.code,
+                        severity=IssueSeverity.ERROR,
+                        path=(
+                            pending_error.paths[0] if pending_error.paths else pending_path
+                        ).relative_to(root),
+                        line=None,
+                    )
+                )
+            else:
+                if pending_kind is not EntryKind.MISSING:
+                    issues.append(
+                        _error(
+                            CheckCode.INTERNAL_UNEXPECTED_ENTRY,
+                            pending_path.relative_to(root),
+                        )
+                    )
             if _is_valid_operation_id_name(entry.name):
                 unresolved.add(entry.name)
             continue
-        journals[entry.name] = journal
+        journals[entry.name] = effective
     return OperationCheckIndex(
         listing_state=listing.state,
         journals=journals,
         unresolved_ids=frozenset(unresolved),
         locked_operation=locked_operation,
         lock_known=lock_known,
+        empty_residue_ids=frozenset(empty_residues),
     )
 
 
@@ -940,13 +1002,36 @@ def _check_operation_state(root: Path) -> list[CheckIssue]:
     index = _build_operation_index(
         root, listing, issues, locked_operation=locked_operation, lock_known=lock_known
     )
+    # R/T 图与 recovery 共用同一份全图分类优先级；checker 只投影稳定错误，不产生副作用。
+    for operation_id, journal in sorted(index.journals.items()):
+        if journal.kind not in (OperationKind.RESTORE, OperationKind.TRASH):
+            continue
+        try:
+            validate_restore_trash_relations(index.journals, operation_id=operation_id)
+        except DraftError as exc:
+            issues.append(
+                CheckIssue(
+                    code=exc.code,
+                    severity=IssueSeverity.ERROR,
+                    path=operation_journal_path(root, operation_id).relative_to(root),
+                    line=None,
+                    details=exc.details,
+                )
+            )
     if locked_operation is not None:
         locked_journal = index.journals.get(locked_operation)
         if locked_journal is None:
-            if locked_operation not in index.unresolved_ids:
+            if (
+                locked_operation not in index.unresolved_ids
+                and locked_operation not in index.empty_residue_ids
+            ):
                 # 锁指向的操作目录是已知非法形状（普通文件/链接/无 journal 目录）；
                 # 不可读 journal 已在索引构建时按 journal 路径报告。
                 issues.append(_error(CheckCode.OPERATION_JOURNAL_CORRUPT, lock_path))
+            if locked_operation in index.empty_residue_ids:
+                issues.append(
+                    _error(CheckCode.OPERATION_RECOVERY_REQUIRED, lock_path, None, locked_operation)
+                )
         else:
             # 有锁操作目录仍校验内部条目形状（回归 H4）：持锁时完成清理前可能有
             # originals/staged/attempt/evidence；锁持有者角色 ACTIVE 使用完整允许集，

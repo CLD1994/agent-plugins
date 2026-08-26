@@ -16,6 +16,7 @@ from draft.cli import main
 from draft.diagnostic_codes import (
     LINK_INDEX_REBUILD_FLAG_UPDATE_FAILED,
     LINK_INDEX_REBUILD_REQUIRED,
+    OPERATION_PLAN_INVALID,
     CheckCode,
 )
 from draft.errors import DraftError
@@ -733,15 +734,6 @@ def _trash_journal_path(root: Path, operation_id: str) -> Path:
     return root / ".draft/operations" / operation_id / "journal.json"
 
 
-def _rewrite_journal_phase(root: Path, operation_id: str, phase: str) -> None:
-    import json as json_module
-
-    path = _trash_journal_path(root, operation_id)
-    data = json_module.loads(path.read_text(encoding="utf-8"))
-    data["phase"] = phase
-    path.write_text(json_module.dumps(data), encoding="utf-8")
-
-
 def test_restore_cli_completed(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     root = tmp_path / "topic"
     build_draft(root)
@@ -808,8 +800,18 @@ def test_restore_cli_expired_is_exit_two(
     _, trash_payload = run_json(["trash", "--root", str(root), "pages/a.md", "--json"], capsys)
     operation_id = trash_payload["operation_id"]
     assert isinstance(operation_id, str)
-    # 模拟到期推进已把 T 转为 trash_handoff_pending。
-    _rewrite_journal_phase(root, operation_id, "trash_handoff_pending")
+    # 模拟到期推进已把 T 转为 trash_handoff_pending，并保留完整失败记录。
+    path = _trash_journal_path(root, operation_id)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["phase"] = "trash_handoff_pending"
+    data["metadata"].update(
+        {
+            "handoff_error_type": "OSError",
+            "handoff_error_message": "injected failure",
+            "handoff_attempted_at": "2026-07-21T00:00:00Z",
+        }
+    )
+    path.write_text(json.dumps(data), encoding="utf-8")
 
     code, payload = run_json(["restore", "--root", str(root), operation_id, "--json"], capsys)
 
@@ -1136,12 +1138,12 @@ def test_check_json_separates_errors_warnings_infos_and_reviews(
             assert set(issue) == {"code", "severity", "path", "line", "details"}
 
 
-def test_recover_ignores_due_retained_package_corruption_and_reports_pending_only(
+def test_recover_reports_due_retained_claim_corruption_without_side_effects(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = _trashable_cli_root(tmp_path)
     capsys.readouterr()
-    # 造两个到期 retained 包：第二个破坏恢复认领字段，但 recover 不推进生命周期。
+    # 造两个到期 retained 包：第二个破坏恢复认领字段，recover 保留现场并报告损坏。
     import json as json_module
 
     from draft.operations import TrashDeadlines
@@ -1180,8 +1182,12 @@ def test_recover_ignores_due_retained_package_corruption_and_reports_pending_onl
 
     code, payload = run_json(["recover", "--root", str(root), "--json"], capsys)
 
-    assert code == 0
-    assert payload == {"result_type": "recover", "fixed_count": 0, "paths": []}
+    assert code == 3
+    assert payload["ok"] is False
+    assert payload["result_type"] == "error"
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == CheckCode.OPERATION_INCONSISTENT_STATE.value
     assert snapshot_tree(root) == before
     broken_after = json_module.loads(broken_path.read_text(encoding="utf-8"))
     assert broken_after["metadata"]["restore_operation_id"] == "0" * 32
@@ -1363,10 +1369,10 @@ def test_init_and_check_do_not_preflight(
     assert calls == []
 
 
-def test_check_does_not_preflight_corrupted_journal(
+def test_check_reports_corrupted_restore_claim_without_lifecycle_preflight(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """check 不执行前置推进：损坏的恢复关联只作为回收事实原样报告，不产生推进错误信封。"""
+    """check 不执行生命周期前置推进，但报告损坏的恢复关联。"""
     root = _trashable_cli_root(tmp_path)
     capsys.readouterr()
     import json as json_module
@@ -1388,8 +1394,12 @@ def test_check_does_not_preflight_corrupted_journal(
 
     code, payload = run_json(["check", "--root", str(root), "--json"], capsys)
 
-    assert code == 0
-    assert payload["ok"] is True
+    assert code == 1
+    assert payload["ok"] is False
+    errors = as_dicts(payload["errors"])
+    assert any(
+        issue["code"] == CheckCode.OPERATION_INCONSISTENT_STATE.value for issue in errors
+    )
     assert "lifecycle_results" not in payload
 
 
@@ -2648,7 +2658,7 @@ def test_notify_program_contract_error_is_not_absorbed(
     import draft.link_index_maintenance as maintenance
 
     def fail_prepare(root: Path, *, known_documents: object = ()) -> object:
-        raise DraftError("operation.plan_invalid", root)
+        raise DraftError(OPERATION_PLAN_INVALID, root)
 
     monkeypatch.setattr(maintenance, "prepare_link_index_update", fail_prepare)
 
@@ -2659,7 +2669,7 @@ def test_notify_program_contract_error_is_not_absorbed(
     assert payload["ok"] is False
     error = payload["error"]
     assert isinstance(error, dict)
-    assert error["code"] == "operation.plan_invalid"
+    assert error["code"] == OPERATION_PLAN_INVALID
 
 
 def test_notify_missing_root_is_domain_error(
