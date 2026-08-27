@@ -9,3 +9,9 @@ Blocked by: None
 ## Question
 
 怎样从仍有效的已批准设计中形成一个只表达当前目标状态的领域行为合同，完整定义页面、状态、关系、create、move、promote、collapse、generate-conclusions、adopt、Trash、Restore 与 read 的输入、输出、不变量、状态转换和失败分类，同时排除旧 marker、journal、index 与恢复协议？哪些术语需要同步进入 `CONTEXT.md`，哪些行为必须留在领域合同？
+
+## Comments
+
+### 已确认的工作决策
+
+- runtime v1 的 `move` 接受未受管理 Markdown 与目录来源，使其通过路径移动进入受管理页面命名空间；领域合同必须闭合该能力的跨命令链接责任、页面协议欠账、目录中非 Markdown 内容和根状态门禁。
