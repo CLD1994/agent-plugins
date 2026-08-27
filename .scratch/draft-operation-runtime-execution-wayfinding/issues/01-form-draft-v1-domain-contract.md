@@ -26,3 +26,4 @@ Blocked by: None
 - candidate 根中的未受管理 Markdown 是检查 error；页面纳管后改由具体页面协议 error 表达欠账。完整检查仍有任一 error 时 `adopt` 不可达，registered 根中的相同事实在业务写前阻止操作。
 - Links 接受受管理页面或未受管理 Markdown；Backlinks 返回两类 Markdown 来源并区分 source kind，Page 的 backlink count 与该完整集合一致。Relations 仍只读取受管理页面的正式关系。
 - `promote` 只选择与待升格叶页面拥有同一当前父页面的 child；跨父级重组先由批量 `move` 完成。
+- 页面或页面子树不因目录位置拥有非 Markdown 本地资源；结构命令、Trash、Restore 与 handoff 只处理受管理 Markdown，本地资源保持原位并由链接重新基址到同一资源身份。
