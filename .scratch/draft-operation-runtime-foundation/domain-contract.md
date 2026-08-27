@@ -212,7 +212,7 @@ target 采用确定性词法分类：
 
 promote 执行枢纽升格。输入是一个现有叶页面和至少一个明确指定的受管理子页面或子枢纽根。
 
-所有选定 child 必须能够完整解析、互不重叠，并可无碰撞地改挂到新枢纽下；相同 basename、目标占用或闭包不完整均拒绝。未选定页面保持原位。
+所有选定 child 必须与待升格叶页面拥有同一个当前父页面，能够完整解析、互不重叠，并可无碰撞地改挂到新枢纽下；相同 basename、目标占用或闭包不完整均拒绝。未选定的同级页面保持原位。跨父级重组先通过 move 完成，不由 promote 合并执行。
 
 成功后：
 
@@ -325,23 +325,23 @@ read 是以下封闭成员：Page、Links、Backlinks、Relations、Status、Rec
 
 | 读取 | 领域结果 | 所需范围 |
 | --- | --- | --- |
-| Page | 路径、标题、状态、父页面及 child/link/backlink/relation 计数 | 目标页加完整全根计数 |
-| Links | 目标页面去重后的正文资源事实 | 仅目标页面 |
-| Backlinks | 指向目标 `ResourceIdentity` 的来源页面 | 全根 Markdown 链接事实 |
+| Page | 路径、标题、状态、父页面及 child/link/backlink/relation 计数；backlink 计数包含受管理页面与未受管理 Markdown 来源 | 目标页加完整全根计数 |
+| Links | 指定受管理页面或未受管理 Markdown 中去重后的正文资源事实 | 仅指定 Markdown source |
+| Backlinks | 指向目标 `ResourceIdentity` 的来源 Markdown，并区分 `managed_page` 与 `unmanaged_markdown` | 全根 Markdown 链接事实 |
 | Relations(outgoing) | 目标页面声明的正式关系 | 仅目标页面 |
 | Relations(incoming) | 其他页面指向目标页面的正式关系 | 全部受管理页面 |
 | Status | 具有指定页面状态的页面集合 | 全部受管理页面 |
 | Recoverable | 当前仍可建立 Restore 的 retained Trash | Trash authority 与同一次 `as_of` |
 | Check | 当前根的完整诊断报告 | 完整领域事实与 runtime 提供的可检查事实 |
 
-Links 中 missing、unavailable、unchecked 或 invalid 是资源事实，不自动使读取失败。Backlinks 的目标是宽松资源身份，不要求目标当前存在；其他要求页面操作数的读取必须指向现有受管理页面。
+Links 中 missing、unavailable、unchecked 或 invalid 是资源事实，不自动使读取失败。Links 的 source 必须是当前存在的受管理页面或未受管理普通 Markdown；Backlinks 的 target 是宽松资源身份，不要求目标当前存在。Page、Relations 和其他要求页面操作数的读取仍必须指向现有受管理页面。正式关系只从受管理页面读取，未受管理 Markdown 中相似的文本不产生 Relations 结果。
 
 ### 10.2 candidate 与 registered 的完整性
 
 | 读取 | candidate 遇到无关页面不可解析 | registered 遇到相同事实 |
 | --- | --- | --- |
 | Page | 拒绝不可靠计数，并返回有界阻碍事实 | 根损坏失败 |
-| Links | 无关页面不影响；目标页可解析则 `complete=true` | 相同 |
+| Links | 无关页面不影响；指定 Markdown source 可解析则 `complete=true` | 相同；registered 根不存在合法的未受管理 source |
 | Backlinks | 返回已证明来源与 `complete=false` | 根损坏失败 |
 | Relations(outgoing) | 无关页面不影响；目标页可解析则 `complete=true` | 相同 |
 | Relations(incoming) | 返回已证明关系与 `complete=false` | 根损坏失败 |

@@ -24,3 +24,5 @@ Blocked by: None
 - 正文链接统一通过 CommonMark 提取和 `ResourceIdentity` 判定：移动成员的本地相对出站链接重新基址，指向移动集合的入站本地链接映射到最终路径，同批交叉链接直接映射，锚点保留；无法分类、无法对齐源码或无法证明无关的文件成为闭包阻碍。
 - 单次 `move` 可以混合受管理页面、未受管理 Markdown、文件和目录，并作为一个原子计划提交；重复、重叠、重复枚举、目标碰撞、目标位于来源内部或最终父页面无人占据时整批拒绝。
 - candidate 根中的未受管理 Markdown 是检查 error；页面纳管后改由具体页面协议 error 表达欠账。完整检查仍有任一 error 时 `adopt` 不可达，registered 根中的相同事实在业务写前阻止操作。
+- Links 接受受管理页面或未受管理 Markdown；Backlinks 返回两类 Markdown 来源并区分 source kind，Page 的 backlink count 与该完整集合一致。Relations 仍只读取受管理页面的正式关系。
+- `promote` 只选择与待升格叶页面拥有同一当前父页面的 child；跨父级重组先由批量 `move` 完成。
