@@ -20,7 +20,7 @@ description: 详细地指导了如何使用 harness 提供的 subagent 能力. �
 - subagent 的计划、规格、任务单和评审结论由完成该项工作的 subagent 直接写入项目既有约定的位置；Main Agent 不得让另一名 subagent 转写主体内容
 - 并行任务必须彼此独立。读取、探索、测试和日志分析可以优先并行；多个 subagent 会写入相同文件、共享可变状态或依赖彼此前序结论时，应改为使用隔离工作区(`git worktree`)。
 - 负责的评审 subagent 必须独立于负责的执行 subagent，固定并声明基线、范围、规格来源和标准来源。
-- Main Agent 必须维护调度 subagent 的可复核记录，包括任务概述、起始基线、有效尝试次数。该记录存放在 `<workspace>/tmp/<session>/subagent/dispatch_record.md`，这是模型层次升级的依据之一
+- Main Agent 必须维护调度 subagent 的可复核记录，包括任务概述、起始基线、有效尝试次数。该记录存放在 `/tmp/agents/<session>/subagent/dispatch_record.md`，这是模型层次升级的依据之一
 - 不得将调度 subagent 产生的元数据传递给 subagent。
 
 ### 经验沉淀
