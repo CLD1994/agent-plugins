@@ -53,9 +53,9 @@ candidate -- adopt             --> registered
 普通页面有两种结构角色：
 
 - 叶页面：`pages/<name>.md`；
-- 枢纽页面：`pages/<name>/index.md`，拥有零个或多个直接子页面。
+- 枢纽页面：`pages/<name>/index.md`，为直接子页面提供命名空间。
 
-根页面是页面树的唯一根，不使用普通枢纽的升降级命令。
+路径可以识别一个尚未满足协议的空枢纽，但有效的非根枢纽至少拥有一个直接子页面。根页面是页面树的唯一根，不使用普通枢纽的升降级命令。
 
 ### 2.4 页面状态
 
@@ -69,7 +69,7 @@ candidate -- adopt             --> registered
 | `superseded` | `已取代` | 已由其他页面正式取代 |
 | `closed` | `已关闭` | 讨论结束且没有当前有效结论 |
 
-状态后的说明是自由文本，不属于机器状态。页面状态不是固定单向流程；只要最终不变量成立，页面可以在 `pending`、`proposed`、`confirmed` 与 `closed` 间转换。
+状态后的说明是非空单行自由文本，不属于机器状态。页面状态描述页面自身，不汇总后代；路径角色不自动决定状态。页面状态不是固定单向流程；只要最终不变量成立，页面可以在 `pending`、`proposed`、`confirmed` 与 `closed` 间转换。`confirmed` 与 `challenged_by` 可以共存，质疑关系本身不自动改变状态。
 
 `superseded` 与 `superseded_by` 必须双向成立：页面状态为 `superseded` 当且仅当它至少声明一条 `superseded_by`。状态修改不能自行猜测或增删正式关系。
 
@@ -92,7 +92,7 @@ candidate -- adopt             --> registered
 
 ### 2.6 页面机器区域与导航
 
-每个页面恰好有一个一级标题。一级标题之后、普通正文之前是唯一连续机器引用块：
+每个页面恰好有一个一级标题。一级标题之后、普通正文之前是唯一连续 Markdown 引用块形式的机器区域：
 
 - 每页恰好一个状态；
 - 除根页面外，每页恰好一个父主题；
@@ -100,7 +100,9 @@ candidate -- adopt             --> registered
 - 正式关系按第 2.5 节表达；
 - 未知机器标签、重复单值字段或非法关系目标使页面无效。
 
-父主题与路径树必须一致。父页面的 `## 子主题` 导航恰好一次链接每个直接子页面。生成器拥有结论页时，根导航中的结论链接唯一且始终位于子主题列表末尾。
+状态行编码稳定状态标签，并可在同一 code span 内以全角冒号追加说明；说明为空、包含换行或控制字符时非法。父主题和正式关系行各含一个 Markdown 链接。每次由程序写入标题、说明或链接标签时，编码后的 Markdown 必须重新解析为完全相同的文本值，不能因语法字符丢失信息。
+
+父主题与路径树必须一致。父页面的 `## 子主题` 导航恰好一次链接每个直接子页面，链接标签为该子页面的解析后标题。生成器拥有结论页时，根导航中的结论链接唯一且始终位于子主题列表末尾。
 
 ## 3. 正文资源与链接闭包
 
@@ -114,7 +116,20 @@ Draft Markdown 使用 UTF-8。命令不检测、猜测或转换其他编码；�
 - `scope`：`draft`、`outside`、`unknown`；
 - `target_state`：`present`、`missing`、`unavailable`、`unchecked`、`invalid`。
 
-资源身份由词法位置决定，不因文件出现或消失在 `page` 与 `local` 之间切换。锚点不参与资源身份；同一页面中指向同一资源的多个链接按首次出现去重。外部 URI 不联网检查。
+资源事实按以下分区形成：
+
+| 词法目标与观察事实 | `kind` | `scope` | `target_state` |
+| --- | --- | --- | --- |
+| 解析到页面命名空间，目标是普通文件 | `page` | `draft` | `present` |
+| 解析到页面命名空间，目标缺失 | `page` | `draft` | `missing` |
+| 解析到页面命名空间，但路径含符号链接或目标不是普通文件 | `page` | `draft` | `invalid` |
+| 可解释的本地目标，目标普通文件或目录存在 | `local` | `draft` 或 `outside` | `present` |
+| 可解释的本地目标，目标缺失 | `local` | `draft` 或 `outside` | `missing` |
+| 本地目标因权限或平台语义无法可靠观察 | `local` | `draft`、`outside` 或 `unknown` | `unavailable` |
+| 写法不能形成合法本地目标 | `local` | `unknown` | `invalid` |
+| 外部 URI | `external` | `unknown` | `unchecked` |
+
+资源身份由词法位置决定，不因文件出现或消失在 `page` 与 `local` 之间切换，也不通过 `realpath`、符号链接目标或文件内容合并身份。锚点不参与资源身份；同一 Markdown source 中指向同一资源的多个链接按首次出现去重，并保留第一次出现的规范展示事实。外部 URI 不联网检查。
 
 ### 3.2 根内 Markdown 链接闭包
 
@@ -123,7 +138,7 @@ Draft Markdown 使用 UTF-8。命令不检测、猜测或转换其他编码；�
 1. 枚举 `.draft/` 外全部普通 Markdown，包括受管理页面与未受管理 Markdown；
 2. 使用同一 CommonMark 提取器识别普通链接、图片和引用式链接，忽略代码围栏；
 3. 把每个本地链接解析为 `ResourceIdentity`，或证明它属于不受本次映射影响的类别；
-4. 无法安全解码、提取、对齐源码、分类或证明无关的文件进入阻碍集合；
+4. 无法安全解码、提取、对齐源码、分类或证明无关的文件，以及 Markdown 路径上的符号链接或其他异常节点，进入阻碍集合；
 5. 任一阻碍存在时，操作零写失败，并返回稳定排序的有界阻碍事实。
 
 missing 目标仍可具有可证明的词法身份，不自动构成闭包失败。未受管理 Markdown 中看似机器标签的文字只作为普通正文链接；只有受管理页面的机器区域产生正式关系和父导航事实。
@@ -138,6 +153,7 @@ missing 目标仍可具有可证明的词法身份，不自动构成闭包失败
 - 指向移动集合的入站本地链接改指对应 after-path；
 - 同批成员之间的交叉链接直接映射到各自 after-path；
 - 锚点保留，纯页内锚点与外部 URI 不变；
+- 绝对本地链接在目标身份不变时保持原文；若其可证明指向移动集合，则按同一映射改指 after-path；
 - 正式关系目标、父关系和父导航使用同一映射，但按各自机器结构更新；
 - 仅文本相似、文件名相同或搜索命中不能作为重写依据。
 
@@ -173,7 +189,7 @@ create、move、promote、collapse、status.set、relation.add/remove、generate
 
 create 的输入语义是目标页面路径、不含换行或控制字符的非空单行标题和初始状态。初始状态只允许 `pending` 或 `proposed`。
 
-目标必须是 `pages/` 下不存在的叶页面；父页面必须已经存在。create 不创建缺失枢纽，不覆盖节点，也不接受根页面、结论页面或 `.draft/` 内路径。
+目标必须是 `pages/` 下不存在的叶页面；父页面必须已经存在，且其标题、机器区域和子主题导航可判定、可编辑。create 不创建缺失枢纽，不覆盖节点，也不接受根页面、结论页面或 `.draft/` 内路径。标题在新页面一级标题与父导航链接标签中的编码都必须往返为调用方提供的同一文本。
 
 成功后：
 
@@ -235,7 +251,16 @@ collapse 只接受非根、没有直接子页面的枢纽。成功时把 `pages/
 
 status.set 接受一个现有受管理页面、目标状态，以及以下互斥说明动作之一：保留现有说明、替换说明、清除说明。
 
-命令只改变目标页面的状态和说明，不推断关系。若最终状态与 `superseded_by` 不变量冲突，操作拒绝。生成器拥有的结论页面可以由 Agent 显式设为 `confirmed`；下一次 generate-conclusions 仍会把它重置为 `proposed`。
+替换说明只接受不含换行或控制字符的非空单行文本；清除说明与空字符串不是同一个输入。命令只改变目标页面的状态和说明，不推断关系。若最终状态与 `superseded_by` 不变量冲突，操作拒绝。生成器拥有的结论页面可以由 Agent 显式设为 `confirmed`；下一次 generate-conclusions 仍会把它重置为 `proposed`。
+
+最终状态有效性使用同一决策表：
+
+| 最终状态 | 最终 `superseded_by` 数量 | 结果 |
+| --- | --- | --- |
+| `superseded` | 至少一条 | 有效 |
+| `superseded` | 零 | 拒绝 |
+| 其他四种状态 | 零 | 有效 |
+| 其他四种状态 | 至少一条 | 拒绝 |
 
 ### 6.2 relation.add/remove
 
@@ -256,10 +281,11 @@ generate-conclusions 读取全部受管理页面的标题、状态和唯一导�
 | `not_generated` | 无 | `conclusions.md` 不存在 | 幂等成功；不创建文件、不改变所有权 |
 | `not_generated` | 任意 | `conclusions.md` 意外存在 | 冲突；不覆盖、不取得所有权 |
 | `not_generated` | 有 | 文件不存在 | 创建结论页、增加根导航末尾链接、所有权变为 `generated` |
-| `generated` | 有或无 | 生成物可认证或缺失 | 重建确定内容并修复根导航；所有权保持 `generated` |
+| `generated` | 有或无 | 文件缺失，或目标仍是可安全替换的普通文件 | 重建确定内容并修复根导航；语法或形状漂移被覆盖，所有权保持 `generated` |
+| `generated` | 任意 | 目标是符号链接、非普通节点或无法安全替换 | 整体失败；保留现场 |
 | `generated` | 任意 | 无法认证必要页面或导航 | 整体失败；不返回近似列表 |
 
-每次实际生成都把结论页面状态设为 `proposed`。条目只含页面标题和链接，不复制正文或生成摘要。`generated` 下没有 confirmed 页面时仍保留空列表页面和根导航。
+每次实际生成都完整覆盖以下固定机器产物形状，并把结论页面状态设为 `proposed`：唯一一级标题“结论汇总”、指向根页面的父主题、唯一二级标题“已确认结论”，以及其后的扁平列表。条目只含页面解析后标题和页面链接，不复制正文或生成摘要；所有标题和链接标签必须往返保持原文本。`generated` 下没有 confirmed 页面时仍保留无条目的列表页面和根导航。
 
 生成物不是实时索引。create、move、promote、collapse、status、relation、Trash、Restore 与正文编辑不维护其条目；旧标题、旧路径、已移除页面或遗漏新页面允许暂时存在，并由下一次显式生成覆盖。Check 只验证生成物的基本形状和所有权一致性，不比较条目与当前 confirmed 集合。
 
@@ -336,6 +362,8 @@ read 是以下封闭成员：Page、Links、Backlinks、Relations、Status、Rec
 
 Links 中 missing、unavailable、unchecked 或 invalid 是资源事实，不自动使读取失败。Links 的 source 必须是当前存在的受管理页面或未受管理普通 Markdown；Backlinks 的 target 是宽松资源身份，不要求目标当前存在。Page、Relations 和其他要求页面操作数的读取仍必须指向现有受管理页面。正式关系只从受管理页面读取，未受管理 Markdown 中相似的文本不产生 Relations 结果。
 
+Page 的 `child_count` 等于直接子页面数量，`link_count` 等于相同 source 的 Links 去重总数，`backlink_count` 等于 Backlinks 的完整两类来源总数，两个 relation count 分别等于对应方向 Relations 的总数；根页面的父页面为空。计数不能使用与对应集合不同的事实范围或去重规则。
+
 ### 10.2 candidate 与 registered 的完整性
 
 | 读取 | candidate 遇到无关页面不可解析 | registered 遇到相同事实 |
@@ -347,6 +375,7 @@ Links 中 missing、unavailable、unchecked 或 invalid 是资源事实，不自
 | Relations(incoming) | 返回已证明关系与 `complete=false` | 根损坏失败 |
 | Status | 返回已证明页面与 `complete=false` | 根损坏失败 |
 | Recoverable | 页面解析错误无关；Trash 证据损坏则整体失败 | 相同 |
+| Check | 完整扫描形成含所有可诊断领域错误的报告；无法稳定读取必要事实则不形成报告 | 相同 |
 
 `complete=false` 是成功但不完整的事实，不等于空集合，也不能用于证明不存在引用、关系、环或冲突。写命令不能把不完整读取当作授权。
 
