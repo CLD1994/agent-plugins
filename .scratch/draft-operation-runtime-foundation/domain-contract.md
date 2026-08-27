@@ -106,6 +106,8 @@ candidate -- adopt             --> registered
 
 ### 3.1 资源事实
 
+Draft Markdown 使用 UTF-8。命令不检测、猜测或转换其他编码；无法按 UTF-8 解释的 Markdown 是不可判定事实。
+
 正文链接与正式关系是不同事实。正文资源由 `ResourceIdentity` 标识，至少区分：
 
 - `kind`：`page`、`local`、`external`；
@@ -143,6 +145,8 @@ missing 目标仍可具有可证明的词法身份，不自动构成闭包失败
 
 ### 4.1 根状态与事实门禁
 
+所有页面、结构和 Trash 操作数都是所选 Draft 根内的规范相对路径或领域 identity。命令不接受、读取或修改 Draft 根外的迁移来源；Agent 在调用命令前自行把需要整理的内容放入 candidate 根，并保持外部来源不变。
+
 | 根状态 | 请求类别 | 开始业务动作所需领域事实 |
 | --- | --- | --- |
 | `candidate` | create、status.set、relation.add/remove | 本请求拥有的可证明局部闭包 |
@@ -157,7 +161,7 @@ missing 目标仍可具有可证明的词法身份，不自动构成闭包失败
 
 ### 4.2 计划、执行与结果
 
-支持 DryRun 的命令与 Execute 使用同一个领域计划。DryRun 返回当前稳定事实下的语义效果，但不改变页面、关系、根状态、Trash 或结论所有权；它不授权以后执行同一计划。
+create、move、promote、collapse、status.set、relation.add/remove、generate-conclusions 与 Trash 支持 DryRun，并与 Execute 使用同一个领域计划。initialize、adopt、Restore、recover 和 notification 不支持 DryRun。DryRun 返回当前稳定事实下的语义效果，但不改变页面、关系、根状态、Trash 或结论所有权；它不授权以后执行同一计划。
 
 公开效果只有 create、modify、move 与 remove 四种语义。正式成功结果的 changed paths 从这些公开效果派生，不从 runtime artifact 过滤得出。幂等成功可以产生空效果。
 
@@ -167,7 +171,7 @@ missing 目标仍可具有可证明的词法身份，不自动构成闭包失败
 
 ### 5.1 create
 
-create 的输入语义是目标页面路径、非空单行标题和初始状态。初始状态只允许 `pending` 或 `proposed`。
+create 的输入语义是目标页面路径、不含换行或控制字符的非空单行标题和初始状态。初始状态只允许 `pending` 或 `proposed`。
 
 目标必须是 `pages/` 下不存在的叶页面；父页面必须已经存在。create 不创建缺失枢纽，不覆盖节点，也不接受根页面、结论页面或 `.draft/` 内路径。
 
@@ -187,7 +191,7 @@ move 接受一个或多个 source 和一个 target。source 可以是：
 - `candidate` 根中的未受管理 Markdown；
 - 包含可移动 Markdown 的目录。
 
-`index.md`、`conclusions.md`、根级 `pages/`、`.draft/`、符号链接、非 Markdown 文件和空枚举目录不能作为 source。
+`index.md`、`conclusions.md`、根级 `pages/`、`.draft/`、符号链接、非 Markdown 文件和空枚举目录不能作为 source。目录枚举不跟随符号链接；遇到任一符号链接成员时整批拒绝。
 
 target 采用确定性词法分类：
 
@@ -352,7 +356,7 @@ Links 中 missing、unavailable、unchecked 或 invalid 是资源事实，不自
 
 集合读取和 Check 必须有界分页。count-only 只隐藏当前 items，不改变 total、窗口或 complete 事实。Check 始终完整扫描后再过滤和分页；过滤不能改变完整扫描的 `ok`，空的当前页不能伪装成根已通过。
 
-Check 不改变页面、根状态、结论所有权或 Trash 生命周期，不执行 Restore 或 recovery。runtime 可以按 foundation 规格使用同一次最终完整扫描维护非权威派生投影；该行为不能改变 Check 的领域报告。
+Check 只在 runtime admission 成功后形成报告；busy、recovery required、corrupt 或其他 fatal admission 结果不产生部分报告。成功 Check 不改变页面、根状态、结论所有权或 Trash 生命周期，不执行 Restore 或 recovery。runtime 可以按 foundation 规格使用同一次最终完整扫描维护非权威派生投影；该行为不能改变 Check 的领域报告。
 
 未受管理 Markdown 在 candidate 中是检查 error，但不使根身份无效。页面纳管后，该路径不再产生 unmanaged error，而由缺少标题、机器区域、状态、父主题或导航等具体页面 error 表达欠账。adopt 只有在全部 error 清零后才可达。
 
