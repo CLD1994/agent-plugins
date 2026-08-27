@@ -2,6 +2,8 @@
 
 Type: prototype
 
+Status: claimed
+
 Blocked by: None
 
 ## Question
