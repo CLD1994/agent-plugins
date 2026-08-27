@@ -1,6 +1,6 @@
 # 03 普通内容提交、能力与派生闭合
 
-Status: ready-for-agent
+Status: ready-for-human
 
 Blocked by: 01, 02
 

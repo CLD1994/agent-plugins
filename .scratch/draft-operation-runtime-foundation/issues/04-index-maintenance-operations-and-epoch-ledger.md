@@ -1,6 +1,6 @@
 # 04 索引 ledger、同次扫描与 ExternalFilesChanged
 
-Status: ready-for-agent
+Status: ready-for-human
 
 Blocked by: 01, 02, 03
 

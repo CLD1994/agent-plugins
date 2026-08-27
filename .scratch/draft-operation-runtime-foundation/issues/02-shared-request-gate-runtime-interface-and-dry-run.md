@@ -1,6 +1,6 @@
 # 02 Root-bound Interface、admission 与 DryRun
 
-Status: ready-for-agent
+Status: ready-for-human
 
 Blocked by: 01
 

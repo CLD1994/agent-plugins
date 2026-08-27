@@ -1,6 +1,6 @@
 # 06 锁内恢复收敛
 
-Status: ready-for-agent
+Status: ready-for-human
 
 Blocked by: 01, 03, 04, 05
 

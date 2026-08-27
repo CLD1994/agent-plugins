@@ -1,6 +1,6 @@
 # 01 Init、平台能力、根锁与 runtime v1 记录
 
-Status: ready-for-agent
+Status: ready-for-human
 
 Blocked by: 无
 

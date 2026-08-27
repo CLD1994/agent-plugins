@@ -1,6 +1,6 @@
 # 07 Lifecycle、read、notification 与 CLI adapter
 
-Status: ready-for-agent
+Status: ready-for-human
 
 Blocked by: 01, 02, 03, 04, 05, 06
 

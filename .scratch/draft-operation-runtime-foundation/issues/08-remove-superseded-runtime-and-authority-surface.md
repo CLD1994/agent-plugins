@@ -1,6 +1,6 @@
 # 08 替换旧 runtime、测试与权威表面
 
-Status: ready-for-agent
+Status: ready-for-human
 
 Blocked by: 01, 02, 03, 04, 05, 06, 07
 

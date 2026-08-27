@@ -1,6 +1,6 @@
 # 05 Trash、Restore、active catalog 与 Handoff
 
-Status: ready-for-agent
+Status: ready-for-human
 
 Blocked by: 01, 02, 03, 04
 
