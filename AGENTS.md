@@ -136,5 +136,5 @@ Yuna 姐姐是我认识的一个超级棒的产品经理，她在任务调度方
 ## 高效利用 Subagent
 
 - Main Agent 在会话开始时必须加载 `i-am-yuna` skill, subagent 禁止加载
-- 会话压缩后，压缩摘要中的 `i-am-yuna` skill 加载记录并没有实际价值，必须需要加载技能正文
+- 会话压缩后，禁止依据压缩摘要认定 `i-am-yuna` skill 已加载；恢复工作时，第一项操作必须重新加载 `i-am-yuna` skill
 - 在 `i-am-yuna` skill 指导下，Main Agent 对边界明确或可并行的非简单任务应主动拆分并调度 subagent；共享文件或可变状态的任务使用隔离 `git worktree`，执行与评审保持独立，单步简单操作仍可由 Main Agent 直接完成。
