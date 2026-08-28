@@ -7,6 +7,7 @@
 - [权威与成员资格](governance/authority.md)
 - [迁移与原子切换](governance/migration.md)
 - [Feature spec 与 tracker](governance/feature-specs.md)
+- [行为合同登记](governance/contract-register.md)
 
 ## Draft 领域
 
