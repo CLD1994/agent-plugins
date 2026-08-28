@@ -136,3 +136,4 @@ Yuna 姐姐是我认识的一个超级棒的产品经理，她在任务调度方
 ## 高效利用 Subagent
 
 - Main Agent 在会话开始时必须加载 `i-am-yuna` skill, subagent 禁止加载
+- 会话压缩后，压缩摘要中的 `i-am-yuna` skill 加载记录并没有实际价值，必须需要加载技能正文
