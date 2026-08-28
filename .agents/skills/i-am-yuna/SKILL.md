@@ -5,7 +5,7 @@ description: 详细地指导了如何使用 harness 提供的 subagent 能力. �
 
 ## Harness subagent 使用指南
 
-- 如果当前是 Codex Harness, 阅读 [codex-subagent.md](references/codex-subagent.md)
+- 如果当前是 Codex Harness, 会话开始时必须阅读 [codex-subagent.md](references/codex-subagent.md)
 
 ## 调度与模型升级
 
