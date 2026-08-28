@@ -357,8 +357,9 @@ Authority: none; 本文件仅保存 provenance（来源追溯）与分类证据�
 
 | ID | Target | Current contract scope | Control input | Status |
 | --- | --- | --- | --- | --- |
+| `G-ROUTING` | `CONTEXT-MAP.md` + `plugins/draft/docs/spec/index.md` | 根路由、Draft 插件规格网络唯一入口、作用域边界和无工具读取路径 | Q10、Q19、Q22 | `discovered` |
 | `G-AUTH` | `governance/authority.md` | 当前树成员资格、signer、来源资格、局部取代、ADR 边界、工具独立读取 | Q1、Q2、Q8–Q10、Q15、Q18–Q20、Q23、Q24、Q28 | `discovered` |
-| `G-MIGRATE` | `governance/migration.md` | Draft confirmed 到正式 Wiki 的 packet、签署与原子切换 | Q3、Q4、Q13、Q16、Q21、Q22 | `discovered` |
+| `G-MIGRATE` | `governance/migration.md` | Draft confirmed 到正式 Wiki 的 packet、签署与原子切换，以及 `docs/design.md` 的退役处理 | Q3、Q4、Q11、Q13、Q14、Q16、Q21、Q22 | `discovered` |
 | `G-FEATURE` | `governance/feature-specs.md` | feature delta、Base-Spec/Affects、tracker close/resolution、Agent Brief 层级 | Q25–Q27、Q32 | `discovered` |
 | `D-LIFECYCLE` | `draft/lifecycle.md` | candidate/registered 根、marker、初始化、adopt 与 Draft/正式规范边界 | 08-12、Q4、Q17 | `discovered` |
 | `D-PAGES` | `draft/pages-and-navigation.md` | 页面命名空间、根/叶/hub、父关系、导航、唯一空子主题、非法 pages/index.md | 08-10、08-12、Q7、Q35 | `discovered` |
@@ -384,9 +385,34 @@ Authority: none; 本文件仅保存 provenance（来源追溯）与分类证据�
 | `R-RECOVERY` | `runtime/recovery.md` | 崩溃窗口、阻塞、recover、前向/回滚/清理 | runtime foundation、Q32 | `discovered` |
 | `R-ERRORS` | `runtime/errors-and-observability.md` | 稳定错误、notification、公开结果和恢复要求 | runtime foundation、Q32 | `discovered` |
 
+## 目标页覆盖核对
+
+签署清单中的 16 个计划目标页均已映射到至少一个迁移单元；其中 `MAP` 与 `INDEX` 共同由 `G-ROUTING` 覆盖，因为它们描述同一条“从仓库根路由到 Draft 插件规格唯一入口”的可验证行为合同，而不是两个独立行为。
+
+| 目标简称 | 计划路径 | 覆盖迁移单元 |
+| --- | --- | --- |
+| `MAP` | `CONTEXT-MAP.md` | `G-ROUTING` |
+| `INDEX` | `plugins/draft/docs/spec/index.md` | `G-ROUTING` |
+| `AUTH` | `plugins/draft/docs/spec/governance/authority.md` | `G-AUTH` |
+| `MIG` | `plugins/draft/docs/spec/governance/migration.md` | `G-MIGRATE` |
+| `FEATURE` | `plugins/draft/docs/spec/governance/feature-specs.md` | `G-FEATURE` |
+| `LIFE` | `plugins/draft/docs/spec/draft/lifecycle.md` | `D-LIFECYCLE` |
+| `PAGE` | `plugins/draft/docs/spec/draft/pages-and-navigation.md` | `D-PAGES` |
+| `REL` | `plugins/draft/docs/spec/draft/status-and-relations.md` | `D-STATUS` |
+| `CONC` | `plugins/draft/docs/spec/draft/conclusions.md` | `D-CONCLUSIONS` |
+| `RESOURCE` | `plugins/draft/docs/spec/draft/resources-and-links.md` | `D-RESOURCES`、`D-RESOURCE-OWNERSHIP` |
+| `EDIT` | `plugins/draft/docs/spec/draft/page-edits.md` | `D-CREATE-EDIT` |
+| `STRUCT` | `plugins/draft/docs/spec/draft/structure.md` | `D-MOVE`、`D-MOVE-OUTPUT`、`D-PROMOTE`、`D-COLLAPSE` |
+| `TRASH` | `plugins/draft/docs/spec/draft/trash-and-restore.md` | `D-TRASH-RESTORE` |
+| `QUERY` | `plugins/draft/docs/spec/draft/query-check-and-output.md` | `D-QUERY`、`P-DIAGNOSTICS` |
+| `DELIVERY` | `plugins/draft/docs/spec/delivery/plugin-and-entrypoints.md` | `P-IDENTITY`、`P-BOUNDARY` |
+| `RUNTIME` | `plugins/draft/docs/spec/runtime/` | `R-INTERFACE`、`R-INIT`、`R-ADMISSION`、`R-AUTHORITY`、`R-LIFECYCLE`、`R-RECOVERY`、`R-ERRORS` |
+
 ## 未决门禁
 
-当前表中登记了 `25` 个唯一 Contract-ID，而形式合同第 13 节声称应有 `27` 项；缺少的两个迁移单元尚未定位，状态为 `unresolved`。在补齐或由 signer 明确修订总数前，不得宣称 M1 完成，也不得进行 authority cutover。
+当前表中登记了 `27` 个唯一 Contract-ID，与形式合同第 13 节声称的数量一致。此前缺失的是 `G-ROUTING`：它闭合了签署清单中 `MAP` 与 `INDEX` 两个目标页的根路由行为。目标页覆盖核对未发现未映射的计划目标或孤立的 Contract-ID。
+
+签署决定覆盖核对：Q1–Q35 均至少出现在一个迁移单元的控制输入中（范围记法如 `Q8–Q10`、`Q25–Q27` 按连续编号展开），编号外合同 S1 由 `D-STATUS`、`D-CONCLUSIONS` 和 `D-CREATE-EDIT` 覆盖。Q11 与 Q14 明确归入 `G-MIGRATE`，因为它们描述旧 `docs/design.md` 的 authority 退役和原子删除动作，而不是新的 Wiki 行为。
 
 只要仍有路径角色、来源资格、provenance locator、supersession scope 或消费者映射处于 unresolved，就不得进行 authority cutover。eligible 来源之间确实冲突，或所有 eligible 来源都沉默且不同选择会改变可观察行为时，必须提交 signer 裁决；实现和测试可以报告 conformance gap，但不能替规格选择语义。
 
