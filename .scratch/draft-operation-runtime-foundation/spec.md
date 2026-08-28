@@ -1,6 +1,11 @@
 # Draft operation runtime 基础规格
 
 Status: ready-for-agent
+Status-Schema: triage
+Tracker-State: open
+Base-Spec: b297f33
+Affects:
+  - plugins/draft/docs/spec/runtime/
 
 ## 1. 范围与权威性
 

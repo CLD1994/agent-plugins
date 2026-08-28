@@ -1,4 +1,7 @@
-Status: ready-for-agent
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/recovery.md
 
 当前实施依赖为 Issue 03 的全图 relation/owner/participant/action 分类，随后由 Issue 01
 对 participant closure 执行副作用前材料 preflight，最后由 Issue 05 验收完整恢复链的 FD

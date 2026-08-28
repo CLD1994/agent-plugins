@@ -1,6 +1,9 @@
 # Draft 链接索引耐久维护规格
 
-Status: ready-for-agent
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
 
 ## 问题陈述
 
