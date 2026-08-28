@@ -1,23 +1,27 @@
 # 领域文档
 
-本仓库采用 single-context 领域文档布局。工程 skills 在探索代码前按本文件读取领域术语和架构决策。
+本仓库采用多上下文领域文档布局。工程 skills 在探索代码前按本文件读取领域术语和架构决策。
 
 ## 探索前读取
 
-- 根目录 `CONTEXT.md`：领域词汇、对象边界和关键不变量
-- `docs/adr/`：与当前工作范围有关的架构决策记录
+- 根目录 `CONTEXT-MAP.md`：上下文路由
+- 目标插件的 `CONTEXT.md`：领域词汇和对象边界
+- 目标插件的 `docs/spec/index.md`：当前行为规格唯一入口
+- 目标插件的 `docs/adr/`：与当前工作范围有关的架构决策记录
 
-文件不存在时继续当前工作，不把缺少文件本身作为问题，也不预先创建空文档。领域术语或决策实际形成后，由 `/domain-modeling` 按需创建或更新。
+路由或目标文件不存在时停止当前 authority 读取，不把其他上下文或历史文件当 fallback。领域术语或决策实际形成后，由 `/domain-modeling` 按目标插件上下文按需创建或更新。
 
 ## 文件布局
 
 ```text
 /
-├── CONTEXT.md
-├── docs/
-│   └── adr/
-│       ├── 0001-<decision>.md
-│       └── 0002-<decision>.md
+├── CONTEXT-MAP.md
+├── plugins/
+│   └── <plugin>/
+│       ├── CONTEXT.md
+│       └── docs/
+│           ├── spec/index.md
+│           └── adr/
 └── ...
 ```
 

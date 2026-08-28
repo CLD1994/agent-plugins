@@ -45,7 +45,7 @@
 
 ### Domain docs
 
-本仓库采用 single-context 领域文档布局；探索领域术语或架构决策前，读取根目录 `CONTEXT.md` 和相关 ADR。详见 `docs/agents/domain.md`。
+本仓库采用多上下文布局；探索领域术语或架构决策前，先读取根目录 `CONTEXT-MAP.md`，再读取目标插件的 `CONTEXT.md`、规格入口和相关 ADR。详见 `docs/agents/domain.md`。
 
 ### I Am Yuna
 

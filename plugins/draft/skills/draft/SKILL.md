@@ -7,6 +7,8 @@ description: Use when a design or protocol discussion is becoming long, recursiv
 
 把长期、递归、分叉的设计讨论维护成一个自包含的 Markdown 草稿。
 
+当前 Draft 插件行为以 [规格唯一入口](../../docs/spec/index.md) 为准；本 skill 只提供操作说明，不复制另一套行为合同。
+
 Draft 是 [LLM-WIKI](references/llm-wiki.md) 的一种具体实现, 如果上下文中没有该文章内容的记忆, 则必须进行阅读
 
 如果上下文中没有关于 Draft 目录布局、机器区域语法、状态与关系基数的认知，则必须阅读 [draft-format.md](references/draft-format.md)。
