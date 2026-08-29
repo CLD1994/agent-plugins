@@ -8,7 +8,8 @@
 ### 输入与输出
 
 - 输入是根状态、规范相对路径、页面当前树、创建或页面纳管请求，以及受影响父页面的
-  导航事实。
+  导航事实；`move` 的页面纳管还必须先通过 `structure.md#来源决策矩阵` 的
+  source/managedness/target 分类和完整链接闭包门禁。
 - 输出是路径角色、唯一物理父页、相应导航 after-state，或可诊断的拒绝；公开字段名
   和诊断码尚未获批。
 - 结构操作成功时，路径、父关系和导航必须从同一已证明 mapping 派生，不能分别按
@@ -35,12 +36,18 @@
 | --- | --- | --- | --- |
 | 合法根、叶或 hub | 可认证且三者一致 | 可写根且无 pending | 可纳入完整计划；在同一领域提交中更新路径、`parent` 和必要导航。 |
 | 合法根、叶或 hub | 缺失、重复、错指或双表示 | 任意 | 拒绝；零写。 |
-| `pages/index.md` | 任意 | 任意 | 拒绝或由 Check 报错；零写。 |
-| 未受管理 Markdown 进入页面命名空间 | mapping、父关系与导航均可证明，且满足 move 的 candidate 门槛 | 由 move 合同认证 | 只允许按 `D-MOVE` 的页面纳管分支提交；不凭路径自动补齐标题、机器区、状态或关系。 |
+| `pages/index.md` | 任意 | 任意 | 拒绝、零写，并由 Check 报告路径角色错误。 |
+| 未受管理 Markdown 进入页面命名空间 | mapping、父关系、导航与完整闭包均可证明，且满足 move 的 candidate 门槛 | 由 move 合同认证 | 只允许按 `D-MOVE` 的页面纳管分支提交；不凭路径自动补齐标题、机器区、状态或关系。 |
+| registered 根中的未受管理 source（包括 directory 的 `file`/`prefix` target） | 任意 | 已认证根但不满足 candidate 纳管 | 拒绝，零写；不得借页面角色或 parent/nav 规则创建所有权。 |
 | 非 Markdown、`.draft` 内节点或路径逃逸 | 任意 | 任意 | 不是页面输入；拒绝，零写。 |
+| 文件 source 含附件/非 Markdown/无法分类节点，或目录 retained 节点未能认证 | 任意 | 任意 | 不是页面输入；按 `D-MOVE` 矩阵外门禁拒绝，零写。 |
+| root state 为 unknown、mixed 或不可认证，或 mapping/链接闭包不可认证 | 任意 | 任意 | 写前拒绝，零写并保留诊断；不得把未知根、不完整闭包或 lower-bound mapping 解释为合法页面树。 |
 | 任一需要恢复的根 | 任意 | pending | 阻止转换，保留现场，等待显式 recovery。 |
 
-提交点在所有受影响页面、关系和必要导航都已进入同一个完整计划之后。具体导航元素的
+提交点在所有受影响页面、关系和必要导航都已进入同一个完整计划之后。candidate 的
+Check 或协议欠账只表示可观察的现有事实，不反向拒绝已经满足 `D-MOVE` candidate
+纳管门槛的 Markdown；若欠账使 mapping、parent、nav 或闭包无法证明，则按上表写前失败。
+具体导航元素的
 机器区/正文边界、序列化格式和 runtime durable record 为 `unresolved`；实现不得借此
 省略三者一致性，也不得拆成多个可见成功。
 
@@ -58,7 +65,9 @@
 - 覆盖根、叶、hub、空根、`pages/index.md`、重复导航、错指导航与叶/hub 双表示。
 - 对一个多路径结构变更，证明路径、parent 和导航从同一 mapping 同时变化；任一事实
   缺失时验证零写。
-- 验证 candidate 页面纳管后仅获得路径角色，协议欠账仍可由 Check 观察。
+- 验证 candidate 页面纳管后仅获得路径角色，协议欠账仍可由 Check 观察；registered
+  unmanaged source、unknown/mixed/unverifiable root、非 Markdown/附件 source 和不完整
+  闭包均验证写前拒绝零写。
 
 ## 来源
 

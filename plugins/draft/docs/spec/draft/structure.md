@@ -19,13 +19,17 @@
 
 ### 来源决策矩阵
 
-先按 source 集合分类：`single-file` 表示恰好一个文件 source，`file-set` 表示两个或更多
-文件 source，`directory` 表示单个目录 source；文件/目录混合、多个目录或无法确定 source
-形状的集合不进入下表。`managed`
-表示 source 的页面所有权已经存在，`unmanaged` 表示尚未取得页面所有权；管理状态必须对本次
-source 集合可认证，混合或未知状态按矩阵外门禁处理。`candidate` 与 `registered` 是根状态，
-`file` target 当且仅当以 `.md` 结尾，其他 target 均为 `prefix`。因此每行都是四个维度的一个
-互斥组合；所有允许行还必须满足无 recovery pending、路径/闭包/before-tree/mapping 可认证，
+先按 source 集合的形状和节点可认证性分类：`single-file` 表示恰好一个、类型和内容均可
+认证为 Markdown 的文件 source，`file-set` 表示两个或更多、每一个都可认证为 Markdown 的
+文件 source，`directory` 表示单个、类型可认证的目录 source。Markdown 身份与
+`managed`/`unmanaged` 是两个独立维度；未受管理的 Markdown 仍可能在 candidate 根按本矩阵
+纳管。非 Markdown、附件、无法分类或无法认证的文件节点不能借用 `single-file`/`file-set`
+形状进入下表，目录子节点则必须再按 [目录来源](#目录来源) 的内容分区判断。文件/目录混合、
+多个目录或无法确定 source 形状的集合不进入下表。`managed` 表示 source 的页面所有权已经
+存在，`unmanaged` 表示尚未取得页面所有权；管理状态必须对本次 source 集合统一可认证，
+混合、未知或不可认证状态按矩阵外门禁处理。`candidate` 与 `registered` 是根状态，`file`
+target 当且仅当以 `.md` 结尾，其他 target 均为 `prefix`。因此每行都是四个维度的一个互斥
+组合；所有允许行还必须满足无 recovery pending、路径/闭包/before-tree/mapping 可认证，
 以及目录节点分类和边界可认证。
 
 | source 形状 | 管理状态 | 根状态 | target 形状 | 结果（满足共同前置事实时） |
@@ -55,12 +59,26 @@ source 集合可认证，混合或未知状态按矩阵外门禁处理。`candid
 | directory | unmanaged | registered | file | 拒绝，零写；不得创建或改写页面、导航、catalog/head，也不得产生日志副作用。 |
 | directory | unmanaged | registered | prefix | 拒绝，零写；不得创建或改写页面、导航、catalog/head，也不得产生日志副作用。 |
 
-下列门禁不属于上述 24 个组合，统一在写入前拒绝并保持零写：文件/目录混合 source、
-多个目录 source、管理状态混合或未知、`.draft` 或非规范路径、路径逃逸、重复 source、
-目标碰撞、保留 `pages/index.md`、任一 source/闭包节点/mapping 不可认证，以及 recovery
-pending。目录 candidate 纳管只有在可移动 Markdown 的 mapping 完整时成立；无 Markdown、
-无法分类的节点或目录边界/空性无法认证时，按 [目录来源](#目录来源) 的 fail-closed 规则处理，
-不得伪造成功或扩张输出。
+### 矩阵外门禁（统一结果）
+
+下列事实不属于上述 24 个合法键。无论 target 是 `file` 还是 `prefix`，也无论 source
+形状或管理状态如何，均必须在任何结构写前拒绝、保持零写并保留可诊断事实；不得以“没有
+匹配到矩阵行”代替这些结果。
+
+| 矩阵外事实 | 覆盖范围 | 唯一结果与边界 |
+| --- | --- | --- |
+| 文件 source 含非 Markdown、附件、`unknown`、无法分类或无法认证的节点 | `single-file`、`file-set` 的任意 managed/root/target 组合 | 拒绝，零写；节点不得取得页面所有权、进入 mapping 或 `changed_paths`，保留诊断。 |
+| source 集合为文件/目录混合、多个目录、重复 source 或 source 形状无法认证 | 任意 managed/root/target | 拒绝，零写；不猜测 source 形状或 owner。 |
+| root state 为 `unknown`、`mixed` 或不可认证（unverifiable） | 任意已认证 source 形状、managedness、target 形状 | 拒绝，零写；不得把未知根解释为 `candidate` 或 `registered`。 |
+| managedness 为 mixed、unknown 或不可认证 | 任意已认证 source 形状、root、target | 拒绝，零写；不得部分纳管或部分移动 source 集合。 |
+| target 形状、规范路径、`.draft` 保留边界、路径角色或碰撞无法认证 | 任意 source/managedness/root | 拒绝，零写；不得用 basename、目录枚举或文本相似度补全目标。 |
+| recovery pending，或 recovery/authority snapshot 不可认证 | 任意 source/managedness/root/target | 阻止本次结构写，零写并保留 recovery 诊断；待显式 recovery 收敛后重新认证。 |
+| 任一 source、闭包节点、before/after tree、mapping 或链接/导航事实不可认证 | 任意合法键或目录内容分区 | 拒绝，零写；不返回可见结构成功，不从 lower-bound 或缓存事实继续。 |
+| 目录边界、节点分类或物理空性无法认证 | `directory` source 的任意 managed/root/target | 拒绝，零写；不得先移动 Markdown 再决定是否保留/清理目录，保留目录及诊断。 |
+
+candidate 纳管仅适用于已认证的 Markdown source；目录 candidate 纳管还必须满足 [目录来源](#目录来源)
+的可移动 Markdown mapping 和 retained 节点边界。任何矩阵外事实都不能通过辅助章节的页面
+所有权、parent/nav 或链接规则反向放宽。
 
 ### mapping、提交与副作用
 
@@ -103,28 +121,42 @@ pending。目录 candidate 纳管只有在可移动 Markdown 的 mapping 完整�
 
 ### 输入、输出与不变量
 
-- 输入是一个已经通过 `D-MOVE` source/target 门槛的目录、其中的节点类型、可移动
-  Markdown mapping 和目录的物理空性证明。
-- 目录 source 只移动 Markdown。非 Markdown 内容、附件、未知节点和它们所在的非空目录
-  原地保留，不取得页面所有权。
-- 成功输出只含当前命令必要的业务事实和公开 `changed_paths`。它不得枚举、计数、摘要
-  留置内容，也不得加入 retained facts、截断标志或续读协议。
+- 输入是一个已经通过 `D-MOVE` source/target 门槛、目录节点类型和边界均可认证的目录，
+  以及其中每个节点的分类、可移动 Markdown mapping 和移动后物理状态证明。节点可分为：
+  可移动 Markdown；可认证为 retained 的非 Markdown/附件；可认证存在但类型未知、因而只能
+  retained 的 unknown；或无法分类/事实不可信。最后一类不能取得页面所有权，也不能进入
+  mapping。
+- 目录 source 只移动可认证的 Markdown。retained 非 Markdown、附件和可认证 unknown 及其
+  所在的非空目录原地保留，不取得页面所有权。目录清理是独立的物理空性与 owner 证明，
+  不是页面 mapping 的推论。
+- 成功输出只含当前命令必要的业务事实和由可移动 Markdown mapping 派生的公开
+  `changed_paths`。它不得枚举、计数、摘要 retained 内容，也不得加入 retained facts、
+  截断标志或续读协议。
 
-| 目录内容与证明 | mapping / 物理状态 | 领域结果与输出边界 |
+下表按“节点分类 -> mapping -> 移动后物理状态”判定；前四行的内容分区互斥，后三行是
+证明失败的覆盖门禁并优先于前四行。因而不会出现“先移动再决定”的第二结果。
+
+| 目录内容与证明（互斥分区） | mapping / 物理状态 | 唯一领域结果与输出边界 |
 | --- | --- | --- |
-| 仅有可移动 Markdown | mapping 完整，移动后目录可证明为空 | 移动 Markdown；目录可按结构清理规则移除；输出仍只含必要事实与 `changed_paths`。 |
-| Markdown 与非 Markdown 混合 | Markdown mapping 完整，目录非空 | 只移动 Markdown；所有非 Markdown 原位保留；输出不描述留置集合。 |
-| 无 Markdown，或非 Markdown / 未知节点无法分类 | 无可认证 mapping | 拒绝或无可执行结构变化，具体 no-op ABI 为 `unresolved`；不得伪造成功输出。 |
-| 目录空性无法认证 | 任意 | 保留物理目录；不以页面 mapping 推断可删除。 |
+| 仅有可移动 Markdown，且所有节点可认证 | mapping 完整；根据 before-tree 和完整 mapping 已在写前证明移动后目录物理为空 | 只移动 Markdown；仅在独立 owner 清理规则也获证明时移除目录；输出只含必要事实与 mapping 派生的 `changed_paths`。 |
+| 可移动 Markdown 与 retained 非 Markdown/附件混合，且无 retained unknown | Markdown mapping 完整；根据 retained 节点已在写前证明移动后目录物理非空 | 只移动 Markdown；retained 节点原位保留，不进入 ownership、mapping、`changed_paths` 或成功输出。 |
+| 可移动 Markdown 与可认证 retained unknown 混合（可同时含 retained 非 Markdown/附件） | Markdown mapping 完整；根据 retained 节点已在写前证明移动后目录物理非空 | 只移动 Markdown；unknown 及其他 retained 节点原位保留，不进入 ownership、mapping、`changed_paths` 或成功输出。 |
+| 无可移动 Markdown，且目录为空或仅含事实可认证的 retained 非 Markdown/附件/unknown | 空 mapping；目录物理状态已在写前认证 | 不发生结构写；no-op 的公开 ABI 仍为 `unresolved`，不得返回可见 move 成功、`changed_paths` 或 retained 摘要；只保留必要诊断。 |
+| 上述任一可分类分区，但 Markdown mapping 不完整 | mapping 不可认证 | 写前拒绝、零写并保留诊断；不移动任何节点，不进行目录清理。 |
+| 上述任一可分类分区，但移动后目录空性或非空性无法认证 | 物理状态不可认证 | 写前拒绝、零写并保留目录及诊断；不得先移动 Markdown 再决定保留或清理。 |
+| 存在无法分类节点或任一节点/目录事实不可信 | 无可认证分区或证明 | 写前拒绝、零写并保留诊断；不得把该节点降级为 retained，也不得伪造 no-op 成功。 |
 
-目录 source 的 before-to-after mapping 参与同一个 `move` 提交和任何自动 collapse。恢复或
-重试也不得扩张输出边界：即使保留现场，也不能把目录残留变成新的结果字段。
+目录 source 的 before-to-after mapping 参与同一个 `move` 提交和任何自动 collapse；retained
+节点不生成 mapping 项。恢复或重试也不得扩张输出边界：即使保留现场，也不能把目录残留变成
+新的结果字段。目录清理只有在独立物理空性和 owner 证明同时成立时才可发生。
 
 ### 失败、恢复与验证
 
-任一节点类型、路径、mapping 或目录空性不可信时，写前失败并保留现场；耐久不确定时由
-runtime 的 explicit recovery 处理。验证纯 Markdown、混合目录、仅非 Markdown、未知节点
-和空目录，确认非 Markdown 从不移动且成功输出从不泄露 retained facts。
+任一节点类型、路径、mapping、闭包或目录物理状态不可信时，写前失败并保留现场；耐久不确定
+时由 runtime 的 explicit recovery 处理。验证纯 Markdown、Markdown+非 Markdown、
+Markdown+可认证 unknown、仅 retained/空目录（事实可认证）、无法分类节点和空性不可认证
+反例，确认非 Markdown/unknown 从不移动、不取得所有权，成功输出从不泄露 retained facts；并
+验证 registered unmanaged directory 的 `file` 与 `prefix` target 均在矩阵行中拒绝零写。
 
 ## promote
 

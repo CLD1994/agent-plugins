@@ -64,14 +64,21 @@ fragment 和 mapping 后目标一一对应。可证明 mapping 时，结构操�
 - 输出只说明受管理 Markdown 的领域所有权、可证明的目录清理决定或拒绝；不得借此输出
   附件清单、retained facts、计数、摘要或续读协议。
 - 页面子树只拥有受管理 Markdown。图片、附件、普通文件、未知节点和目录不会因物理
-  邻接而转移到页面所有权；非 Markdown 一律原位保留。
+  邻接而转移到页面所有权；已认证为 retained 的目录节点一律原位保留。这里的 retained 规则仅适用于
+  `structure.md#目录来源` 已将目录节点认证为 retained 的分区；非 Markdown、附件或无法
+  分类节点若作为 file source operand，属于 `D-MOVE` 矩阵外输入，必须写前拒绝、零写。
 
 | 物理事实 | 操作 | 领域结果 / 副作用 |
 | --- | --- | --- |
 | 受管理 Markdown 且 mapping 可证明 | 结构移动、Trash、Restore | 只处理该 Markdown 和已授权的机器区、身份/摘要、关系/导航事实。 |
-| 非 Markdown、附件或未知节点 | 任一页面操作 | 原位保留；不得纳入页面包、取得所有权或出现在成功输出中。 |
+| 目录中已由 `D-MOVE` 认证为 retained 的非 Markdown、附件或 unknown 节点 | 目录 move 或页面所有权操作 | 原位保留；不得纳入页面包、取得所有权、mapping、`changed_paths` 或成功输出。 |
+| 非 Markdown、附件或无法分类节点作为 file source，或目录节点事实不可信 | `D-MOVE` source 分类 | 写前拒绝、零写；不得将节点降级为 retained 或创建页面所有权。 |
+| candidate 根中的 unmanaged Markdown | `D-MOVE` candidate 纳管分支，且 mapping/闭包/parent/nav 可证明 | 只按同一 `move` mapping 取得页面所有权；不由本节补齐页面协议字段。 |
+| registered 根中的 unmanaged source（directory 的 `file`/`prefix` target 均包括） | `D-MOVE` | 拒绝、零写；不得创建或改写页面、导航、catalog/head 或日志副作用。 |
+| root state 为 unknown、mixed 或不可认证，或 mapping/链接闭包不可认证 | `D-MOVE` 结构/所有权路径 | 写前拒绝、零写并保留诊断；不得把未知根或不完整闭包解释为 candidate、registered 或空集合。 |
 | 目录可证明物理为空 | 结构或恢复后清理 | 可按已证明的结构清理规则移除目录；具体平台调用由 runtime 处理。 |
-| 目录非空或节点类型不可认证 | 目录清理 | 保留目录；不以“页面已移动”推断可删除。 |
+| 目录非空，或节点已认证为 retained/unknown | 目录清理 | 保留目录；不以“页面已移动”推断可删除。 |
+| 目录边界、节点分类或物理空性无法认证 | `D-MOVE` 的目录 move 或其目录清理路径 | 写前拒绝、零写并保留诊断；不得先移动页面再决定是否保留目录。 |
 | `.draft` 内部路径 | 任一页面所有权操作 | 不属于页面子树；不能作为页面 source/target 或被纳入页面所有权。 |
 
 目录移除、Trash/Restore 的授权清单、handoff 和 durable cleanup 只有在对应 owner 证明后才
