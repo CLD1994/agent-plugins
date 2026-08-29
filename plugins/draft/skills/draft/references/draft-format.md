@@ -1,141 +1,19 @@
 # 草稿格式参考
 
-本参考描述 draft 管理的草稿目录、机器区域语法、状态与关系规则
+本文件是 skill 的使用导航，不是 Draft 行为合同。遇到格式、状态、关系、资源或结论
+语义时，以以下正式 owner 为唯一依据：
 
-## 目录布局
+- [根生命周期](../../../docs/spec/draft/lifecycle.md#根生命周期)
+- [页面角色与导航](../../../docs/spec/draft/pages-and-navigation.md#页面角色与导航)
+- [页面状态与关系](../../../docs/spec/draft/status-and-relations.md#页面状态与关系)
+- [资源身份与链接](../../../docs/spec/draft/resources-and-links.md#资源身份与链接)
+- [结论快照](../../../docs/spec/draft/conclusions.md#结论快照)
 
-一个受管理草稿是自包含目录：
+使用结构命令时另读 [结构操作](../../../docs/spec/draft/structure.md)：只有在 before-to-after
+mapping 可证明时，`move`、`promote`、`collapse` 才在同一提交中改写 `conclusions.md` 既有
+条目的链接目标。它们不改变成员、顺序、标签、质疑来源或语义；这些只由
+`generate-conclusions` 重算。
 
-```text
-topic/
-├── index.md            # 唯一根索引
-├── pages/              # 普通讨论页和递归枢纽
-│   ├── question.md
-│   └── hub/
-│       ├── index.md    # 枢纽页：目录名与页面主干名一致
-│       └── child.md
-└── .draft/
-    ├── draft.json   # 唯一根身份 marker：format_version + root_state + conclusions_state
-    ├── operation.lock  # 仅结构操作期间存在
-    ├── operations/     # 操作日志（含根状态与观察清单）、恢复副本和暂存内容
-    └── trash/outgoing/ # 尚未成功移交系统回收站的删除包
-```
-
-`conclusions.md` 不是初始布局的一部分：它在 `generate-conclusions` 显式生成后才出现，
-所有权状态保存在登记标记中。
-
-- 只管理根 `index.md`、根 `conclusions.md`（生成后）、`pages/**/*.md`；根下其他 Markdown 属于未管理路径错误。
-- `.draft/` 是工具内部区域：普通页面不得链接或写入其中，也不要手工编辑。
-- 叶子页面是 `pages/.../name.md`；枢纽是 `pages/.../name/index.md`。非根空枢纽是客观错误。
-- 物理父匹配是强约束：`父主题` 必须指向物理父页。`pages/x.md` → 根索引；`pages/hub/index.md` → 其上级索引；`pages/hub/child.md` → `pages/hub/index.md`。
-
-## 登记标记
-
-`.draft/draft.json` 是正式登记标记，键集合精确为 `{"format_version","conclusions_state"}`：
-
-```json
-{"format_version":1,"conclusions_state":"not_generated"}
-```
-
-- `conclusions_state` 只取 `not_generated` 或 `generated`，只从前者前进到后者。
-- 接管中的临时标记键集合精确为
-  `{"format_version","conclusions_state","adopt_state","candidate_manifest"}`，
-  其中 `conclusions_state` 只能是 `not_generated`。
-- 旧 `{"format_version":1}` 标记会被 `format.invalid` 拒绝；没有迁移命令或双读兼容。
-
-## 机器区域
-
-每个页面在唯一一级标题之后、正文之前提供一个连续的引用块
-
-- 顶部引用块是**封闭解析区**：任何形如"标签：值"的行都会进入解析。
-- 程序只解析这个顶部引用块；正文标题、章节和例子不是机器协议。
-- 形如“标签：值”的行必须使用已知标签和全角冒号 `：`；未知标签和错误冒号是解析错误。
-- 允许的标签只有 `状态`、`父主题`、`依赖`、`取代`、`被取代`、`质疑`、`被质疑`。
-- 普通引用句（不带“标签：值”形状）允许存在并被忽略。
-- 关系行每行必须恰好一个 Markdown 链接，同一标签可以重复多行。
-  例如`依赖` 若含多个目标（`依赖：[A](a.md)、[B](b.md)、[C](c.md)`）须拆成多行，每行一个链接。
-- 结构标签的链接目标必须解析到同一草稿根内的受管理页面，不能指向草稿根外。
-- 代码块内的链接不参与检查，无需改写。
-
-### 索引页(父页)示例
-
-```markdown
-# 页面标题
-
-> 状态：`当前提案`
-
-## 子主题
-
-- [问题背景与外部启发](pages/00-background-and-evidence.md) — `已确认`
-- [结论汇总](conclusions.md) — `已确认`
-```
-
-**注意:** 父页正文必须含返回子页的普通链接（机器区域的关系链接不算）
-
-### 子页示例
-
-```markdown
-# 页面标题
-
-> 状态：`已确认`
->
-> 父主题：[根索引](../index.md)
->
-> 依赖：[另一页面](other.md)
-```
-
-## 状态
-
-`状态` 值是单个反引号包裹的前缀，前缀后可用全角冒号加非空说明：
-
-```markdown
-> 状态：`已关闭：历史候选，第一版不采用`
-```
-
-五个前缀：`待讨论`、`当前提案`、`已确认`、`已取代`、`已关闭`。其他值是解析错误。
-
-### 状态决策表
-
-每个页面恰好一个状态前缀，前缀后可加全角冒号和非空说明：
-
-| 前缀       | 何时使用                                                                                       |
-| ---------- | ---------------------------------------------------------------------------------------------- |
-| `待讨论`   | 问题已记录，尚无当前方案                                                                       |
-| `当前提案` | 方案正在评审，尚未确认                                                                         |
-| `已确认`   | 已接受，属于当前有效结论；结论归属由该状态决定                                                 |
-| `已取代`   | 已被另一页面正式取代，只保留历史；必须声明 `被取代`                                            |
-| `已关闭`   | 讨论结束但没有当前有效结论；纯导航的根索引和枢纽页也用它（`已关闭：纯导航页，不表达独立结论`） |
-
-- 状态描述页面自身，不汇总后代；不要因为子页已确认就把导航页标为已确认。
-- `已确认` 与 `被质疑` 可以共存；若质疑使结论失效，把页面改回 `当前提案`。
-
-## 关系语义与基数
-
-- `父主题`：除根 `index.md` 外每页恰好一个，指向物理父页（`pages/x.md` → 根索引；`pages/hub/index.md` → 其上级索引；`pages/hub/child.md` → `pages/hub/index.md`）。父页正文必须含一个返回子页的可见普通链接。所有页面形成以根索引为唯一根的一棵树。
-- `依赖`：禁止自依赖和依赖环。
-- `取代` / `被取代`：必须双向成对；带 `被取代` 的页面必须是 `已取代` 状态，`已取代` 页面必须至少一个 `被取代`；取代链禁止成环。
-- `质疑` / `被质疑`：必须双向成对；`已确认 + 被质疑` 合法。
-- 不再有 `产出` 标签；页面是否进入结论汇总只由 `已确认` 状态决定。
-
-## 结论页
-
-`generate-conclusions` 按需生成固定形状的 `conclusions.md`：
-
-```markdown
-# 结论汇总
-
-> 状态：`当前提案`
->
-> 父主题：[根索引](index.md)
-
-## 已确认结论
-
-- [页面标题](pages/example.md)
-```
-
-- 条目按导航深度优先顺序，只含标题和链接，不复制正文。
-- 每次显式生成都把页面状态写为 `当前提案`；生成后 Agent 产出设计文档，再用
-  `status set ROOT conclusions.md confirmed` 确认。
-- 结论列表允许过时：create、move、trash、状态、关系等结构命令不改写列表中的旧链接，
-  旧目标也不阻碍回收；下一次显式生成统一覆盖为当前事实。
-- 所有权为 `not_generated` 时意外出现的 `conclusions.md` 是错误，生成命令拒绝覆盖。
+不要把 `产出` 写入机器区作为关系或结论成员条件。其精确 parser 行为仍为
+`unresolved`；需要该判断时停止并转到 [结论快照](../../../docs/spec/draft/conclusions.md#未决-parser-边界)，
+不得在本 reference 中选择兼容或迁移格式。
