@@ -47,4 +47,4 @@
 ## 来源
 
 - `33aeaec60a34833ce8b686bfdd7e50b8dc9932d0:.scratch/draft-authority-spec-migration/signed-decisions-transcript.md#已签署决定迁移摘要`（signed-Q3、signed-Q4、signed-Q11、signed-Q13、signed-Q14、signed-Q16、signed-Q21、signed-Q22）
-- `80508340458f393435ae67669656141ec411ba1b:docs/design.md#Draft 正式设计`（signed-Q11、signed-Q14 的精确退役对象）
+- `80508340458f393435ae67669656141ec411ba1b:docs/design.md#draft-正式设计`（signed-Q11、signed-Q14 的精确退役对象）
