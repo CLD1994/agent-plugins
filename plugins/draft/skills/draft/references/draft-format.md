@@ -7,7 +7,7 @@
 - [页面角色与导航](../../../docs/spec/draft/pages-and-navigation.md#页面角色与导航)
 - [页面状态与关系](../../../docs/spec/draft/status-and-relations.md#页面状态与关系)
 - [资源身份与链接](../../../docs/spec/draft/resources-and-links.md#资源身份与链接)
-- [结论快照](../../../docs/spec/draft/conclusions.md#结论快照)
+- [结论快照](../../../docs/spec/draft/conclusions.md#结论快照行为合同)
 
 使用结构命令时另读 [结构操作](../../../docs/spec/draft/structure.md)：只有在 before-to-after
 mapping 可证明时，`move`、`promote`、`collapse` 才在同一提交中改写 `conclusions.md` 既有

@@ -1,6 +1,6 @@
 # Trash 与 Restore
 
-## Trash 与 Restore
+## Trash 与 Restore 行为合同
 
 `D-TRASH-RESTORE` 定义受管理 Markdown 的回收包、7 天恢复窗口、活动成员资格和恢复
 冲突边界。它不复制 runtime 的 receipt、handoff、durability record 或清理算法。
