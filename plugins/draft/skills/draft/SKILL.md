@@ -112,7 +112,13 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 
 - 语义触发为主：子问题获得独立状态生命周期（需要单独确认/否定/关闭）就拆成子页面；
 - 容量红线为辅：页面约 600 行或 60 KB 时检查器发出审查提醒--提醒只是提醒，由你判断是否拆；
-- 讨论页派生出多个子主题时升格为枢纽（`promote`）；枢纽失去最后子页时移动/回收命令会自动降级，不留空枢纽。
+- 讨论页派生出多个子主题时升格为枢纽（`promote`）。仅当 `move` 或 `promote` 的
+  after-tree 可证明出现空的非根 hub 时，自动 `collapse` 才作为同一结构操作的子阶段
+  执行；候选集合、处理顺序或 after-tree 无法认证时整项零写（见
+  [结构操作](../../docs/spec/draft/structure.md#collapse)）。`trash`/`restore` 涉及的
+  reverse-collapse 不是已签署的自动降级保证：只有记录的 mapping 与 after-state 可证明
+  时才可继续，算法和公共 ABI 仍为 `unresolved`；无法证明时按
+  [Trash 与 Restore](../../docs/spec/draft/trash-and-restore.md#trash-与-restore) 的冲突/损坏边界停止并保留现场，不猜测恢复路径。
 
 ## 回收与恢复
 
