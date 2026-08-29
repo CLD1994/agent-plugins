@@ -4,7 +4,19 @@
 
 **Blocked by:** 03: 将 R/T 分类和 Trash 恢复接入锁内所有权。
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/recovery.md
+Base-Spec: a694d1458335ed38900e31067b5f370ffe2c7e6a
+Affects:
+  - plugins/draft/docs/spec/runtime/recovery.md
+Parent: .scratch/draft-coordinated-recovery-ownership/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/recovery.md
+Dispatch: blocked
+Dispatch-Diagnostic: this Trash lifecycle lock-refresh brief is retained history; the signed Q32 runtime recovery owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] 生命周期路径释放旧 lock 后不得继续使用旧 journal、operation ID、package 或 R/T 快照执行清理、终态写入或 handoff。
 - [ ] 释放后若另一受协调 writer 取得 lock，生命周期调用方丢弃旧快照并返回稳定恢复未决分类；新 writer 的 journal、材料、目录与关系保持不变。

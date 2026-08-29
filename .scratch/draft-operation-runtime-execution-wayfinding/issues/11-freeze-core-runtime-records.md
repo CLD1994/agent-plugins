@@ -1,6 +1,21 @@
 # 冻结 init、root lock 与 operation records
 
 Type: prototype
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/initialization-and-platform.md
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/runtime/recovery.md
+Parent: .scratch/draft-operation-runtime-execution-wayfinding/map.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/runtime/recovery.md
+Dispatch: blocked
+Dispatch-Diagnostic: this record-schema prototype overlaps the runtime foundation and recovery owners; correlation, ownership and completion fields remain unresolved.
 
 Blocked by: 03 建立 durable authority 与恢复所有权模型；10 冻结 canonical encoding 与共享标量
 

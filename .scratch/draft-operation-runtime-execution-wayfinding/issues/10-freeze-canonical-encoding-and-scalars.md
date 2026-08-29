@@ -1,6 +1,21 @@
 # 冻结 canonical encoding 与共享标量
 
 Type: prototype
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/runtime/errors-and-observability.md
+Parent: .scratch/draft-operation-runtime-execution-wayfinding/map.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/runtime/errors-and-observability.md
+Dispatch: blocked
+Dispatch-Diagnostic: this prototype asks for canonical encoding and unknown-field ABI choices; no signer-approved scalar contract permits dispatch.
 
 Blocked by: 07 冻结公共 request/result 与 CLI 机器协议；08 综合 PlatformAdapter 可观察合同；09 冻结时间、ID 与确定性排序
 

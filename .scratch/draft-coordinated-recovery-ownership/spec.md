@@ -1,7 +1,16 @@
 Status: needs-triage
+Status-Schema: triage
 Tracker-State: closed
 Resolution: superseded
 Promoted-to: plugins/draft/docs/spec/runtime/recovery.md
+Base-Spec: a694d1458335ed38900e31067b5f370ffe2c7e6a
+Affects:
+  - plugins/draft/docs/spec/runtime/recovery.md
+Parent: none
+Scope: feature-delta
+Current-Owner: plugins/draft/docs/spec/runtime/recovery.md
+Dispatch: blocked
+Dispatch-Diagnostic: signed Q32 fully superseded this feature by the runtime recovery owner; retain the directory as historical evidence and do not dispatch its child briefs.
 
 当前实施依赖为 Issue 03 的全图 relation/owner/participant/action 分类，随后由 Issue 01
 对 participant closure 执行副作用前材料 preflight，最后由 Issue 05 验收完整恢复链的 FD

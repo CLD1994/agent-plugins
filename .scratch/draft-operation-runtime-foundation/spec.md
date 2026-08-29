@@ -3,9 +3,21 @@
 Status: ready-for-agent
 Status-Schema: triage
 Tracker-State: open
-Base-Spec: b297f33
+Base-Spec: b297f331fe0a3bc19b5832d6521c34a6c25e1c76
 Affects:
   - plugins/draft/docs/spec/runtime/
+Parent: none
+Scope: feature-delta
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/initialization-and-platform.md
+  - plugins/draft/docs/spec/runtime/admission-and-effects.md
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/runtime/lifecycle-and-handoff.md
+  - plugins/draft/docs/spec/runtime/recovery.md
+  - plugins/draft/docs/spec/runtime/errors-and-observability.md
+Dispatch: eligible
+Dispatch-Diagnostic: signed Q32 runtime-v1 foundation delta; page-level ABI and cross-page unresolved seams remain blocked by their owner pages.
 
 ## 1. 范围与权威性
 

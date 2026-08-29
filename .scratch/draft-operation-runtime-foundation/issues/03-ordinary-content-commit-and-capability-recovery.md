@@ -1,6 +1,21 @@
 # 03 普通内容提交、能力与派生闭合
 
-Status: ready-for-human
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/admission-and-effects.md
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/runtime/recovery.md
+Parent: .scratch/draft-operation-runtime-foundation/spec.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/admission-and-effects.md
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/runtime/recovery.md
+Dispatch: blocked
+Dispatch-Diagnostic: content commit, capability lifetime and recovery ownership cross three runtime owners; the operation correlation and public outcome seam remain unresolved, so this ticket is not dispatchable.
 
 Blocked by: 01, 02
 

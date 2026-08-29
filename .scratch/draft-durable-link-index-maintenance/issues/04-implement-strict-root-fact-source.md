@@ -4,7 +4,19 @@
 
 **Blocked by:** 03: 建立纯链接索引领域引擎.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: this strict root-fact-source brief is retained history; the signed Q32 authority/projections owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] 遍历完整 Draft 根并排除整个 `.draft` 内部目录，记录每个遍历目录的直接成员名称和节点类型。
 - [ ] 只读取普通 `.md` 文件，不跟随或读取符号链接；非 Markdown 节点只影响目录事实，不读取其正文。

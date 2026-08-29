@@ -4,7 +4,19 @@
 
 **Blocked by:** 01: 固定链接索引维护的领域状态与依赖端口.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: this journal-v4 state-model brief is retained history; the signed Q32 authority/projections owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] operation journal 只接受 v4；其他版本返回 `operation.journal_version_unsupported`，不进行迁移、双读或默认值填补。raw JSON/v4 字段 shape/type 及 metadata key/value 非 string 的错误优先按协调恢复 spec 归类为 `operation.journal_corrupt`（包括 null/number/list），不要让 link-index phase 规则覆盖该优先级。
 - [ ] 状态模型包含 `link_index_updating`、`link_index_published`、`link_index_rebuild_required` 和 `link-index.update` kind，并从一个权威定义派生 kind 所有权与允许后继边。

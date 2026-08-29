@@ -4,7 +4,21 @@
 
 **Blocked by:** 10: 实现独立 `link-index.update` maintenance 协调器.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/draft/query-check-and-output.md
+Dispatch: blocked
+Dispatch-Diagnostic: this backlink-query index brief is retained history; source-domain and projection scope are unresolved under the current owners, so it cannot be dispatched.
 
 - [ ] `query backlinks` 在 fresh、absent、stale 和 rebuild-required 状态下都返回与当前根完整事实相同的 backlink 结果。
 - [ ] 只有通过 authority、schema、revision、制品摘要、反向表、全部 Markdown SHA-256 和目录事实验证后，查询才能用索引证明不存在其他 backlink。

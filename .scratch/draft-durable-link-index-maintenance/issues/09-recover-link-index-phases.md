@@ -4,7 +4,19 @@
 
 **Blocked by:** 08: 实现已持有 operation 的索引前向提交内核.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: this index-phase recovery brief is retained history; the signed Q32 authority/projections owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] `link_index_updating` 恢复为同一 revision 的 `link_index_rebuild_required`，不根据 staging 或目标外观猜测发布成功，也不重新执行增量发布。
 - [ ] `link_index_published` 必须验证索引目标的 revision 和 SHA-256；一致时允许补原 operation 终态，不一致时停止并保留现场。

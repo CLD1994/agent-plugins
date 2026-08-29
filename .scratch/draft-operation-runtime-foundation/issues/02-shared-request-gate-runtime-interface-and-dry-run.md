@@ -1,6 +1,19 @@
 # 02 Root-bound Interface、admission 与 DryRun
 
-Status: ready-for-human
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/admission-and-effects.md
+Parent: .scratch/draft-operation-runtime-foundation/spec.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/admission-and-effects.md
+Dispatch: blocked
+Dispatch-Diagnostic: request-gate and DryRun rules are split between interface and admission owners; unresolved request/result ABI and cross-page projection seams prevent dispatch without maintainer triage.
 
 Blocked by: 01
 

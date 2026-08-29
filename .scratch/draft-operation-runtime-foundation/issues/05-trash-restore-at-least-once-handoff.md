@@ -1,6 +1,22 @@
 # 05 Trash、Restore、active catalog 与 Handoff
 
-Status: ready-for-human
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/lifecycle-and-handoff.md
+  - plugins/draft/docs/spec/runtime/recovery.md
+  - plugins/draft/docs/spec/runtime/errors-and-observability.md
+Parent: .scratch/draft-operation-runtime-foundation/spec.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/draft/trash-and-restore.md
+  - plugins/draft/docs/spec/runtime/lifecycle-and-handoff.md
+  - plugins/draft/docs/spec/runtime/recovery.md
+  - plugins/draft/docs/spec/runtime/errors-and-observability.md
+Dispatch: blocked
+Dispatch-Diagnostic: Trash/Restore domain, handoff lifecycle and recovery output are separate owners; package membership, cleanup authorization and public ABI remain unresolved.
 
 Blocked by: 01, 02, 03, 04
 

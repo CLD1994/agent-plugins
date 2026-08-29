@@ -1,6 +1,21 @@
 # 冻结公共 request/result 与 CLI 机器协议
 
 Type: prototype
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/admission-and-effects.md
+  - plugins/draft/docs/spec/runtime/errors-and-observability.md
+Parent: .scratch/draft-operation-runtime-execution-wayfinding/map.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/errors-and-observability.md
+Dispatch: blocked
+Dispatch-Diagnostic: this prototype asks for request/result and CLI ABI fields that are explicitly unresolved; it cannot freeze protocol or be dispatched as behavior.
 
 Blocked by: 01 形成 Draft v1 领域行为合同；02 确定 v1 隔离开发与一次性切换边界
 

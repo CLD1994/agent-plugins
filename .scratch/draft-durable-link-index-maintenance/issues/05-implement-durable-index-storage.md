@@ -4,7 +4,19 @@
 
 **Blocked by:** 02: 建立 operation journal v4 状态模型; 03: 建立纯链接索引领域引擎.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: this durable index-storage brief is retained history; the signed Q32 authority/projections owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] staging 只属于一个 operation，使用确定名称；首次写入是 create-only，幂等续写必须先证明现有普通文件的摘要与预期完全一致。
 - [ ] staging 写入、文件同步、目标原子替换、目标父目录同步和 staging 父目录同步形成明确耐久顺序，发布摘要针对最终完整制品 bytes 计算。

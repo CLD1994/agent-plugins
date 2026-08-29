@@ -1,6 +1,22 @@
 # 冻结时间、ID 与确定性排序
 
 Type: prototype
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/runtime/lifecycle-and-handoff.md
+  - plugins/draft/docs/spec/runtime/recovery.md
+Parent: .scratch/draft-operation-runtime-execution-wayfinding/map.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/lifecycle-and-handoff.md
+Dispatch: blocked
+Dispatch-Diagnostic: this prototype proposes time/ID/order encoding across four owners; the required public and durable ABI is unresolved and cannot be chosen here.
 
 Blocked by: 01 形成 Draft v1 领域行为合同；03 建立 durable authority 与恢复所有权模型
 

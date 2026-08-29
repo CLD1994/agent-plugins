@@ -1,6 +1,21 @@
 # 建立 durable authority 与恢复所有权模型
 
 Type: prototype
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/runtime/recovery.md
+  - plugins/draft/docs/spec/runtime/lifecycle-and-handoff.md
+Parent: .scratch/draft-operation-runtime-execution-wayfinding/map.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/runtime/recovery.md
+Dispatch: blocked
+Dispatch-Diagnostic: this prototype spans authority, recovery and lifecycle ownership; its writer/recovery choices are not a signed page-level delta and remain unresolved.
 
 Blocked by: None
 

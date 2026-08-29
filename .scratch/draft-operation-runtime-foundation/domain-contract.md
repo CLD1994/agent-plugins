@@ -1,6 +1,25 @@
 # Draft v1 领域行为合同
 
-Status: proposed
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: b4e03ed67cbc81c56a91851658dbec59b840fbfa
+Affects:
+  - plugins/draft/docs/spec/draft/
+Parent: none
+Scope: feature-delta
+Current-Owner:
+  - plugins/draft/docs/spec/draft/pages-and-navigation.md
+  - plugins/draft/docs/spec/draft/status-and-relations.md
+  - plugins/draft/docs/spec/draft/page-edits.md
+  - plugins/draft/docs/spec/draft/structure.md
+  - plugins/draft/docs/spec/draft/resources-and-links.md
+  - plugins/draft/docs/spec/draft/lifecycle.md
+  - plugins/draft/docs/spec/draft/query-check-and-output.md
+  - plugins/draft/docs/spec/draft/conclusions.md
+  - plugins/draft/docs/spec/draft/trash-and-restore.md
+Dispatch: blocked
+Dispatch-Diagnostic: proposed domain contract has no approved feature status and its candidate query source-domain wording conflicts with the eligible D-QUERY scope; signer/page-owner reconciliation is unresolved.
 
 ## 1. 范围与权威边界
 

@@ -1,6 +1,20 @@
 # 确定 v1 隔离开发与一次性切换边界
 
 Type: prototype
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/admission-and-effects.md
+Parent: .scratch/draft-operation-runtime-execution-wayfinding/map.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/admission-and-effects.md
+Dispatch: blocked
+Dispatch-Diagnostic: this prototype proposes implementation namespace and cutover boundaries, but no approved child delta or current owner contract authorizes those choices.
 
 Blocked by: None
 

@@ -1,6 +1,21 @@
 # 07 Lifecycle、read、notification 与 CLI adapter
 
-Status: ready-for-human
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/lifecycle-and-handoff.md
+  - plugins/draft/docs/spec/runtime/errors-and-observability.md
+Parent: .scratch/draft-operation-runtime-foundation/spec.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/lifecycle-and-handoff.md
+  - plugins/draft/docs/spec/runtime/errors-and-observability.md
+Dispatch: blocked
+Dispatch-Diagnostic: lifecycle, read/notification and CLI projection span three owners; delivered/error/result field seams are unresolved and cannot be selected by this child.
 
 Blocked by: 01, 02, 03, 04, 05, 06
 

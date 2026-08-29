@@ -4,7 +4,19 @@
 
 **Blocked by:** 07: 实现无副作用的索引候选准备服务.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: this forward index-commit brief is retained history; the signed Q32 authority/projections owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] 在产生 staging、目标替换或 flag 副作用前，先耐久写入 `link_index_updating` 和本 operation 使用的下一 revision。
 - [ ] 可发布候选严格按 staging、目标发布、journal `link_index_published`、尽力删除 rebuild flag 的顺序提交，journal 摘要与最终制品 bytes 一致。

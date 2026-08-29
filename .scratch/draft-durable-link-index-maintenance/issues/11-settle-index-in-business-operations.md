@@ -4,7 +4,19 @@
 
 **Blocked by:** 09: 实现链接索引 phase 的恢复解释器.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: this business-operation index settlement brief is retained history; the signed Q32 authority/projections owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] 是否进入索引阶段由 journal 中实际 Markdown 内容/路径 mutation 和目录成员/节点类型变化决定，不维护一份按命令名称判断的完整白名单。
 - [ ] create、move、promote、collapse、status set、relation add/remove 和 generate-conclusions 的实际 mutation 都经过共同收敛边界；没有相关 mutation 的 operation 不产生索引 revision。

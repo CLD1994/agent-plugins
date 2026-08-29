@@ -4,7 +4,19 @@
 
 **Blocked by:** 09: 实现链接索引 phase 的恢复解释器.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: this independent maintenance-coordinator brief is retained history; the signed Q32 authority/projections owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] 严格扫描和候选准备发生在 operation 分配之前；根事实无变化时不取得写锁、不创建 journal、不产生 revision。
 - [ ] 已有 operation 持锁时，独立维护不读取正在变化的根、不创建 maintenance operation，并向调用方返回明确的未发布结果。

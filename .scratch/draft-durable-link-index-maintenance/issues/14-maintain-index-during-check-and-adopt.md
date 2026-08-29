@@ -4,7 +4,21 @@
 
 **Blocked by:** 10: 实现独立 `link-index.update` maintenance 协调器.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/draft/lifecycle.md
+Dispatch: blocked
+Dispatch-Diagnostic: this check/adopt maintenance brief contains a legacy independent-operation contract; the signed Q32 owner supersedes it and the conflict cannot be dispatched.
 
 - [ ] `check` 对 absent、fresh、stale、rebuild-required、flag 降级、制品不一致、journal 损坏和 recovery pending 使用规格中的完整状态决策表。
 - [ ] `check` 已经解析的 Markdown 只有在严格扫描重新读取正文并验证 SHA-256 后才能复用链接提取结果。

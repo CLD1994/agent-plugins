@@ -4,7 +4,19 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-human
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/recovery.md
+Base-Spec: a694d1458335ed38900e31067b5f370ffe2c7e6a
+Affects:
+  - plugins/draft/docs/spec/runtime/recovery.md
+Parent: .scratch/draft-coordinated-recovery-ownership/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/recovery.md
+Dispatch: blocked
+Dispatch-Diagnostic: this R/T ownership brief is retained history; the signed Q32 runtime recovery owner supersedes the parent feature and this child cannot be dispatched.
 
 - [x] 锁内重读按协调恢复 spec 的完整优先级分类 raw journal shape/type、metadata 类型、符号链接、R forward ID、缺失/错误 T、单向、错配、多重关系和合法图后的非法 phase，并返回对应稳定错误。
 - [x] R -> T only 仅允许 PRECLAIM 和 POST_UNCLAIM_CLEANUP；其他单向关系失败关闭。T-only、R 缺失/错指向和 MULTIPLE 均基于全图分类，不从反向 claim 推断所有权。

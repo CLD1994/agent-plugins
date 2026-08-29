@@ -4,7 +4,19 @@
 
 **Blocked by:** 04: 实现严格 Draft 根事实来源; 06: 实现链接索引 authority repository.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: this link-index candidate-preparation brief is retained history; the signed Q32 authority/projections owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] 准备开始时读取当前 authority，并把 absent 或观察到的 revision 作为提交时必须重新验证的并发令牌。
 - [ ] absent 从当前根完整构建候选；合法 published 使用严格验证后的制品作为增量基线；rebuild-required 从当前根完整构建。

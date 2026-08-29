@@ -4,7 +4,19 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: this link-index domain-port brief is retained history; the signed Q32 authority/projections owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] 链接索引修订号使用规范十进制字符串表示单调正整数，从 `"1"` 开始；解析、比较和递增支持任意精度，并拒绝零、前导零、符号、小数、指数、空白和 JSON 数字。
 - [ ] authority 明确区分从未产生结果、已发布、要求重建和内部不一致；候选准备明确区分无变化、可以发布、要求重建和无法继续，不用 `None`、空集合或布尔值折叠这些状态。

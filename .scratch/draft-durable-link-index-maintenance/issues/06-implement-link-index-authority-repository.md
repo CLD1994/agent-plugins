@@ -4,7 +4,19 @@
 
 **Blocked by:** 02: 建立 operation journal v4 状态模型; 03: 建立纯链接索引领域引擎; 05: 实现索引制品和 rebuild flag 的耐久存储.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: this index-authority repository brief is retained history; the signed Q32 authority/projections owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] repository 只读取规范 operation 目录中的 journal v4，并只收集合法索引结果 phase 或经索引阶段到达的合法终态。
 - [ ] revision 按任意精度整数比较，选择数值最大的合法结果；不得使用字符串字典序。

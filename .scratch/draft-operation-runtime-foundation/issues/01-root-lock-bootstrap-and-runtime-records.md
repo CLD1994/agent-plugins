@@ -1,6 +1,23 @@
 # 01 Init、平台能力、根锁与 runtime v1 记录
 
-Status: ready-for-human
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/initialization-and-platform.md
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/runtime/recovery.md
+Parent: .scratch/draft-operation-runtime-foundation/spec.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/initialization-and-platform.md
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/runtime/recovery.md
+Dispatch: blocked
+Dispatch-Diagnostic: init, root-lock and record behavior crosses four runtime owners; the public ABI and cross-page commit boundary are unresolved, so this legacy human ticket cannot be dispatched.
 
 Blocked by: 无
 

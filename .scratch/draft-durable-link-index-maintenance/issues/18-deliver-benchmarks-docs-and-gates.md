@@ -4,7 +4,19 @@
 
 **Blocked by:** 17: 验收耐久故障、恢复、并发和严格新鲜度.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: this benchmark/documentation gate brief is retained history; the signed Q32 authority/projections owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] 基准覆盖 100、1,000、5,000 个 Markdown 和宽目录，并使用固定种子生成可复现数据集。
 - [ ] 场景至少包括首次构建、fresh backlink query、fresh `check`、无变化 notification、单文件变化、1% 文件变化、新增/删除/重命名、目录节点变化、rebuild-required 后恢复、`check` 维护和 journal 数量增长。

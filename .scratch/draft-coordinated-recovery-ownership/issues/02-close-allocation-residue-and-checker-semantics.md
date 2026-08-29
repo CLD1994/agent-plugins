@@ -4,7 +4,19 @@
 
 **Blocked by:** 01: 在锁内收敛通用未持锁恢复候选。
 
-**Status:** ready-for-human
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/recovery.md
+Base-Spec: a694d1458335ed38900e31067b5f370ffe2c7e6a
+Affects:
+  - plugins/draft/docs/spec/runtime/recovery.md
+Parent: .scratch/draft-coordinated-recovery-ownership/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/recovery.md
+Dispatch: blocked
+Dispatch-Diagnostic: this allocation-residue/checker brief is retained history; the signed Q32 runtime recovery owner supersedes the parent feature and this child cannot be dispatched.
 
 - [x] 合法 operation-id 的空目录且没有 journal 或 `.pending`，在 matching operation lock 内再次确认仍为空后才删除，并同步其父级状态；重读发现任一成员、journal、pending 或关系变化时改按当前事实重新分类。
 - [x] 非空但无 journal 的目录、未知成员、非法节点类型、符号链接和目录身份不一致均保留现场并返回稳定诊断，不被解释为可清理 residue。

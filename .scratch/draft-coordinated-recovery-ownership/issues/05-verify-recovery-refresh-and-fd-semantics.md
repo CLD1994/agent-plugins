@@ -4,7 +4,19 @@
 
 **Blocked by:** 01: 在锁内收敛通用未持锁恢复候选。
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/recovery.md
+Base-Spec: a694d1458335ed38900e31067b5f370ffe2c7e6a
+Affects:
+  - plugins/draft/docs/spec/runtime/recovery.md
+Parent: .scratch/draft-coordinated-recovery-ownership/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/recovery.md
+Dispatch: blocked
+Dispatch-Diagnostic: this recovery refresh/FD verification brief is retained history; the signed Q32 runtime recovery owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] `recover`、`recover_interrupted_operations` 和 `advance_trash_lifecycle` 均覆盖扫描后 lock 竞争、锁内重读、当前事实变化、稳定恢复错误及零副作用不变量。
 - [ ] 竞争场景断言 active lock、获胜 writer 的 journal、恢复副本、目录、package 和 R/T 关系不变；释放 retained lock 后的新 writer 材料不会被生命周期路径消费。

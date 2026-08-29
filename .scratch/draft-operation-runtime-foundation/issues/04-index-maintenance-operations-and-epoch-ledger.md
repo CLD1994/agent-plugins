@@ -1,6 +1,21 @@
 # 04 索引 ledger、同次扫描与 ExternalFilesChanged
 
-Status: ready-for-human
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/runtime/lifecycle-and-handoff.md
+  - plugins/draft/docs/spec/runtime/errors-and-observability.md
+Parent: .scratch/draft-operation-runtime-foundation/spec.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/runtime/lifecycle-and-handoff.md
+  - plugins/draft/docs/spec/runtime/errors-and-observability.md
+Dispatch: blocked
+Dispatch-Diagnostic: index maintenance, lifecycle admission and notification projection have separate owners; durable head/cache and delivered/error ABI boundaries are not uniquely closed.
 
 Blocked by: 01, 02, 03
 

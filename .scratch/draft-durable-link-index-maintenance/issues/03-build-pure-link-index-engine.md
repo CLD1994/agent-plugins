@@ -4,7 +4,19 @@
 
 **Blocked by:** 01: 固定链接索引维护的领域状态与依赖端口.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: this pure link-index engine brief is retained history; the signed Q32 authority/projections owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] schema v2 顶层只包含 `schema_version`、`revision`、`files`、`backlinks` 和 `directories`；不保存绝对 Draft 根、inode、size、mtime、完整性状态或解析状态。
 - [ ] 相同逻辑索引产生完全相同的序列化 bytes；解析严格验证 revision、相对路径、SHA-256、span、资源类型、目录成员类型、重复项和未知字段。

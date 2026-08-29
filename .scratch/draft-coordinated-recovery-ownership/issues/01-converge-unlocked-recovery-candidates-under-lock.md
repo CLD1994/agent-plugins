@@ -4,7 +4,19 @@
 
 **Blocked by:** 03: 将 R/T 分类和 Trash 恢复接入锁内所有权。
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/recovery.md
+Base-Spec: a694d1458335ed38900e31067b5f370ffe2c7e6a
+Affects:
+  - plugins/draft/docs/spec/runtime/recovery.md
+Parent: .scratch/draft-coordinated-recovery-ownership/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/recovery.md
+Dispatch: blocked
+Dispatch-Diagnostic: this recovery-candidate brief is retained history; the signed Q32 runtime recovery owner supersedes the parent feature and this child cannot be dispatched.
 
 - [x] 未持锁阶段不发布 `.pending`、不写入或删除 journal、不清理恢复副本或目录、不执行 handoff，也不改变活动写者状态；输出仅为保留、失败或待锁内重读的分类。
 - [x] 所有 pending 发布、journal 写删、copies 清理、operation 目录删除、package 清理和交接终态动作，均在取得 matching operation lock 后重读当前目录成员、journal、pending 与授权关系，再按当前事实决定动作。

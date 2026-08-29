@@ -1,6 +1,18 @@
 # 研究 Windows 平台能力证据
 
 Type: research
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/initialization-and-platform.md
+  - plugins/draft/docs/spec/runtime/interface.md
+Parent: .scratch/draft-operation-runtime-execution-wayfinding/map.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/initialization-and-platform.md
+Dispatch: blocked
+Dispatch-Diagnostic: this platform research brief has no normalized tracker state or approved evidence scope; platform capability conclusions must be triaged before dispatch.
 
 Blocked by: None
 

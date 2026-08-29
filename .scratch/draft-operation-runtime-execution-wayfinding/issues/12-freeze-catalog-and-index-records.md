@@ -1,6 +1,17 @@
 # 冻结 catalog 与 index records
 
 Type: prototype
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-operation-runtime-execution-wayfinding/map.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: this catalog/index schema prototype overlaps the superseded durable feature and current authority owner; its exact transition ABI is not uniquely approved.
 
 Blocked by: 03 建立 durable authority 与恢复所有权模型；10 冻结 canonical encoding 与共享标量
 

@@ -1,6 +1,23 @@
 # 08 替换旧 runtime、测试与权威表面
 
-Status: ready-for-human
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/
+Parent: .scratch/draft-operation-runtime-foundation/spec.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/initialization-and-platform.md
+  - plugins/draft/docs/spec/runtime/admission-and-effects.md
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/runtime/lifecycle-and-handoff.md
+  - plugins/draft/docs/spec/runtime/recovery.md
+  - plugins/draft/docs/spec/runtime/errors-and-observability.md
+Dispatch: blocked
+Dispatch-Diagnostic: this child proposes a cross-owner replacement and retirement surface; its scope is not a single approved owner and the required ABI/cutover boundaries remain unresolved.
 
 Blocked by: 01, 02, 03, 04, 05, 06, 07
 

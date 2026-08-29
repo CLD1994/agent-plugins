@@ -4,7 +4,19 @@
 
 **Blocked by:** 11: 把索引收敛接入通用业务 operation 协调器.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: this Trash/Restore index-lifecycle brief is retained history; the signed Q32 authority/projections owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] trash 的业务 mutation 验证后先耐久形成索引结果，再进入 `trash_retained`；索引发布后不再发生未记录的根目录变化。
 - [ ] restore 的业务 mutation 验证后先耐久形成索引结果，再进入 restore `completed`，随后才执行与 trash journal 的既有解关联和清理。

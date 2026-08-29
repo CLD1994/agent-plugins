@@ -4,7 +4,21 @@
 
 **Blocked by:** 12: 闭合 `trash` 和 `restore` 的链接索引生命周期; 13: 接入外部文件变更 notification; 14: 接入 `check` 和 `adopt` 的机会式索引维护; 15: 接入 backlink 查询的索引消费与机会式维护.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+  - plugins/draft/docs/spec/draft/structure.md
+Dispatch: blocked
+Dispatch-Diagnostic: this entry/namespace verification brief is retained history; the signed Q32 owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] create、move、promote、collapse、status set、relation add、relation remove、generate-conclusions、trash 和 restore 的实际 mutation 都产生下一 revision、匹配的 terminal journal 摘要和当前根 backlink。
 - [ ] 上述十类入口的 no-op 都不产生 revision；发布失败都形成 rebuild-required，同时保留已经验证的业务结果。

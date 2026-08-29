@@ -4,7 +4,19 @@
 
 **Blocked by:** 16: 验收全部入口和 Draft 内部命名空间边界.
 
-**Status:** ready-for-agent
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: closed
+Resolution: superseded
+Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: .scratch/draft-durable-link-index-maintenance/spec.md
+Scope: child-issue-only
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: this durability/concurrency/freshness verification brief is retained history; the signed Q32 authority/projections owner supersedes the parent feature and this child cannot be dispatched.
 
 - [ ] 建立受真实耐久 I/O 端口约束的故障注入器，分别覆盖 staging write/fsync、staging 目录同步、索引替换、索引目录同步、journal write/目录同步、flag create/delete/目录同步。
 - [ ] 每个故障场景同时断言业务文件 before/after 摘要、journal phase 和索引字段、revision、索引制品摘要、flag、staging、锁、CLI 退出码/warning 及下一次命令是否接受索引。

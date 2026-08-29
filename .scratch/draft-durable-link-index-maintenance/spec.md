@@ -1,9 +1,18 @@
 # Draft 链接索引耐久维护规格
 
 Status: needs-triage
+Status-Schema: triage
 Tracker-State: closed
 Resolution: superseded
 Promoted-to: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Base-Spec: 1fb633320e1e692ac6e706d826d88e4ad49e3a68
+Affects:
+  - plugins/draft/docs/spec/runtime/authority-and-projections.md
+Parent: none
+Scope: feature-delta
+Current-Owner: plugins/draft/docs/spec/runtime/authority-and-projections.md
+Dispatch: blocked
+Dispatch-Diagnostic: signed Q32 fully superseded this feature by the runtime authority/projections owner; retain the directory as historical evidence and do not dispatch its child briefs.
 
 ## 问题陈述
 

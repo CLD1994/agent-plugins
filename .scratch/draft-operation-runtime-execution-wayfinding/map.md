@@ -1,6 +1,18 @@
 # Draft operation runtime v1 执行路线图
 
 Label: wayfinder:map
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/runtime/
+  - plugins/draft/docs/spec/draft/
+Parent: none
+Scope: wayfinder-map-only
+Current-Owner: plugins/draft/docs/spec/index.md
+Dispatch: blocked
+Dispatch-Diagnostic: process map records planning dependencies only; its child briefs contain unapproved ABI, platform and cross-page choices and cannot be dispatched as behavior authority.
 
 ## Destination
 

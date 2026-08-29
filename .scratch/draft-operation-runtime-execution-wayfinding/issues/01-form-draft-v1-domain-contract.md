@@ -2,7 +2,27 @@
 
 Type: prototype
 
-Status: claimed
+Status-Schema: triage
+Status: needs-triage
+Tracker-State: open
+Base-Spec: ce64ac30c52ca910fe39fcedd055dd28f0cfbda4
+Affects:
+  - plugins/draft/docs/spec/draft/pages-and-navigation.md
+  - plugins/draft/docs/spec/draft/status-and-relations.md
+  - plugins/draft/docs/spec/draft/page-edits.md
+  - plugins/draft/docs/spec/draft/structure.md
+  - plugins/draft/docs/spec/draft/resources-and-links.md
+  - plugins/draft/docs/spec/draft/lifecycle.md
+  - plugins/draft/docs/spec/draft/query-check-and-output.md
+  - plugins/draft/docs/spec/draft/conclusions.md
+  - plugins/draft/docs/spec/draft/trash-and-restore.md
+Parent: .scratch/draft-operation-runtime-execution-wayfinding/map.md
+Scope: child-issue-only
+Current-Owner:
+  - plugins/draft/docs/spec/draft/pages-and-navigation.md
+  - plugins/draft/docs/spec/draft/query-check-and-output.md
+Dispatch: blocked
+Dispatch-Diagnostic: this claimed brief proposes a broad domain contract and a wide query source domain; current page owners and signer scope do not uniquely approve that delta.
 
 Blocked by: None
 
