@@ -31,7 +31,3 @@
 - [生命周期与 handoff](runtime/lifecycle-and-handoff.md)
 - [恢复](runtime/recovery.md)
 - [错误与可观测性](runtime/errors-and-observability.md)
-
-## 共同规则
-
-每个操作先认证其状态维度和请求闭包；无法证明的事实进入失败分支。写操作必须完整计划后原子提交或零写。实现和测试不能反向改变本页及其子页定义的行为。
