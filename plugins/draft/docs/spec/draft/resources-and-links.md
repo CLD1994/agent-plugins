@@ -9,9 +9,11 @@
 
 - 输入是 UTF-8 Markdown 字节、CommonMark 链接 span、链接所在 source、相对根路径和
   可认证的 before-to-after mapping。
+- 输入中的 mapping 唯一来自 `structure.md` 的 D-MOVE/promote/collapse 领域计划；本页
+  不重新计算或维护第二套 mapping。
 - 输出是 `ResourceIdentity`、独立的存在性 observation、源类型和可证明的入站/出站
-  链接事实，或可诊断失败。identity 与 observation 不能折叠：词法身份可认证时，目标
-  缺失不自动成为闭包错误。
+  链接事实，或可诊断失败。公开结果不提供路径列表。identity 与 observation 不能折叠：
+  词法身份可认证时，目标缺失不自动成为闭包错误。
 - `ResourceIdentity` 的领域类别为 `page`、`local`、`external`；observation 的状态为
   `present`、`missing`、`unavailable`、`unchecked`、`invalid`。公开枚举拼写和输出字段
   尚未获批，以上名称仅表述领域分类，不构成 ABI。
@@ -29,8 +31,13 @@
 结构操作的链接事实闭包覆盖根内全部可判定 Markdown，而不是仅覆盖受管理页面。对每个
 纳入闭包的 CommonMark span，实施者必须能将 source bytes、source kind、原目标、
 fragment 和 mapping 后目标一一对应。可证明 mapping 时，结构操作同一逻辑提交中更新
-出站、入站和同批交叉链接；绝对本地链接的原文保留规则、具体 span 序列化及公开
-`changed_paths` ABI 不在本页补定。
+出站、入站和同批交叉链接；绝对本地链接的原文保留规则、具体 span 序列化及公开字段 ABI
+不在本页补定。
+
+链接改写只接受 mapping 中已认证的 before path。目标 identity 为 `page` 且命中 mapping
+时，更新其路径并保留可认证 fragment；命中缺失目标或非 page identity 时不借 basename、
+文本相似度或目录枚举猜测替代路径。入站、出站和同批交叉链接必须从同一 mapping 派生，
+并与 parent、navigation 和 collision 检查在同一领域提交中完成。
 
 | 链接事实 | mapping / 认证结果 | 允许结果 |
 | --- | --- | --- |
@@ -59,8 +66,9 @@ fragment 和 mapping 后目标一一对应。可证明 mapping 时，结构操�
 
 ### 输入、输出与不变量
 
-- 输入是受管理页面子树、相邻非 Markdown 节点、目录物理状态、操作的页面 mapping 与
-  Trash/Restore 所需的已授权事实。
+- 输入是受管理页面子树、相邻非 Markdown 节点、目录物理状态、结构 owner 已认证的页面
+  mapping 与 Trash/Restore 所需的已授权事实。目录本身不是 ownership 对象；目录成员的
+  managedness 只按 `structure.md#目录来源` 的成员级分类处理。
 - 输出只说明受管理 Markdown 的领域所有权、可证明的目录清理决定或拒绝；不得借此输出
   附件清单、retained facts、计数、摘要或续读协议。
 - 页面子树只拥有受管理 Markdown。图片、附件、普通文件、未知节点和目录不会因物理
@@ -71,7 +79,7 @@ fragment 和 mapping 后目标一一对应。可证明 mapping 时，结构操�
 | 物理事实 | 操作 | 领域结果 / 副作用 |
 | --- | --- | --- |
 | 受管理 Markdown 且 mapping 可证明 | 结构移动、Trash、Restore | 只处理该 Markdown 和已授权的机器区、身份/摘要、关系/导航事实。 |
-| 目录中已由 `D-MOVE` 认证为 retained 的非 Markdown、附件或 unknown 节点 | 目录 move 或页面所有权操作 | 原位保留；不得纳入页面包、取得所有权、mapping、`changed_paths` 或成功输出。 |
+| 目录中已由 `D-MOVE` 认证为 retained 的非 Markdown、附件或可认证存在但类型未知的节点 | 目录 move 或页面所有权操作 | 原位保留；不得纳入页面包、取得所有权、mapping 或成功输出。 |
 | 非 Markdown、附件或无法分类节点作为 file source，或目录节点事实不可信 | `D-MOVE` source 分类 | 写前拒绝、零写；不得将节点降级为 retained 或创建页面所有权。 |
 | candidate 根中的 unmanaged Markdown | `D-MOVE` candidate 纳管分支，且 mapping/闭包/parent/nav 可证明 | 只按同一 `move` mapping 取得页面所有权；不由本节补齐页面协议字段。 |
 | registered 根中的 unmanaged source（directory 的 `file`/`prefix` target 均包括） | `D-MOVE` | 拒绝、零写；不得创建或改写页面、导航、catalog/head 或日志副作用。 |
@@ -87,11 +95,16 @@ fragment 和 mapping 后目标一一对应。可证明 mapping 时，结构操�
 ### 转换、失败、恢复与验证
 
 所有权成功转换的提交点与触发它的结构或 Trash/Restore 逻辑操作相同，不能独立创建第二
-operation。若提交后耐久性不确定，保留现场并等待显式 recovery；重试重新证明物理空目录
-和授权事实。
+operation。D-MOVE 的 forward、partial-after 或授权 cleanup 只有在 snapshot `S` 完整、
+匹配且锁内重认证后才能消费本页的 mapping/closure 事实；明确矛盾、摘要不匹配或事实不一致
+返回 `runtime.corrupt`，单纯缺失或 Q20/Q21 未具资格返回 `unresolved`，两者均零写并保留
+现场、禁止 forward。若提交后耐久性不确定，保留现场并等待显式 recovery；重试重新证明物理
+空目录和授权事实。
 
 验证目录中混有 Markdown、图片、附件、未知节点、空目录和 `.draft` 路径的组合：只有受
-管理 Markdown 可进入领域 after-state，且只有已证明物理为空的目录可被清理。
+管理 Markdown 可进入领域 after-state，且只有已证明物理为空的目录可被清理；成员级
+`uniform-managed`/`uniform-unmanaged` 可进入结构矩阵，`mixed`/`unknown`/`unverifiable`
+写前拒绝，`no-movable` 走既有 no-op 分区。
 
 ## 来源
 
