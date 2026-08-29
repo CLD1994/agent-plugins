@@ -9,10 +9,8 @@
 - [资源身份与链接](../../../docs/spec/draft/resources-and-links.md#资源身份与链接)
 - [结论快照](../../../docs/spec/draft/conclusions.md#结论快照行为合同)
 
-使用结构命令时另读 [结构操作](../../../docs/spec/draft/structure.md)：只有在 before-to-after
-mapping 可证明时，`move`、`promote`、`collapse` 才在同一提交中改写 `conclusions.md` 既有
-条目的链接目标。它们不改变成员、顺序、标签、质疑来源或语义；这些只由
-`generate-conclusions` 重算。
+使用 `move`、`promote` 或 `collapse` 时，只以
+[结构操作](../../../docs/spec/draft/structure.md) 为唯一 owner；本页只提供该导航。
 
 不要把 `产出` 写入机器区作为关系或结论成员条件。其精确 parser 行为仍为
 `unresolved`；需要该判断时停止并转到 [结论快照](../../../docs/spec/draft/conclusions.md#未决-parser-边界)，
