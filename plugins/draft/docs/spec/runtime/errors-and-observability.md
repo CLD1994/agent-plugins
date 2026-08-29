@@ -27,7 +27,7 @@ lifecycle、recovery 与 notification 事实。公开输出为 `Outcome`、`Read
 
 | 结果 | 已固定的公开语义 | 不变量 |
 | --- | --- | --- |
-| `Outcome` | 逻辑操作的稳定 `operation_id`；move/promote 共用 operation identity、`changed_paths`、lifecycle result、warnings 与 errors；`changed_paths` 去重并按规范化路径字典序。 | 相同 intent/authority snapshot 的 retry 复用 operation id、新增 attempt；改变任一者则新操作。未耐久逻辑提交不能投影为成功。 |
+| `Outcome` | 逻辑操作的稳定 `operation_id`；move/promote 共用 operation identity、lifecycle result、warnings 与 errors；不公开内部 mapping 或任何路径列表。 | 相同 intent/authority snapshot 的 retry 复用 operation id、新增 attempt；改变任一者则新操作。未耐久逻辑提交不能投影为成功。 |
 | `ReadOutcome` | 七类 read 共用一个 envelope，语义上包含适用的 snapshot token、projection、分页、warnings、blockers 与 partial。token 覆盖 root、content、active members、head 与相关 projection generation，相关 authority 改变即失效。 | 成功 read 返回 projection 与本次 actionable warnings，不带 routine lifecycle result；fatal 或最终 scan 不稳定时返回 error 且无 projection。 |
 | `RecoveryOutcome` | 必须包含 `result_type`、`operation_id`、`disposition`、前后 phase、最终 authority epoch、cleanup 状态、`warnings`、`errors`；`disposition` 值域为 `forward`、`rollback`、`cleanup`、`already_settled`。 | 不暴露内部路径；已 settled 的重复 recover 不新建 attempt、不重复业务写或 Adapter 调用。 |
 | `InitOutcome` | 表达 `Lifecycle.initialize` 的成功或机器失败，成功不泄露内部路径/中间状态。 | marker 未 durable 或 cleanup 未按合同完成时不得投影为首次初始化成功。 |
@@ -124,7 +124,7 @@ corrupt 或 recovery pending 均不得包装为 partial success。对 recover，
 | S3：snapshot token 编码、`ReadOutcome` token/projection/pagination/warnings/blockers/partial 的字段名、可选性和顺序 | `unresolved` | Q13/Q14 给出统一语义，未给出公共 ABI。 |
 | S4：notification 的外部重试拥有者、warning/lifecycle result 的 envelope 顺序 | `unresolved` | Q8 只禁止 adapter 自行重试；没有唯一调度接口或结果 ABI。 |
 | S5：Trash/Restore package、receipt、attempt、catalog membership 的精确成员、排序与 cleanup 记录字段 | `unresolved` | 已接受包边界/耐久授权谓词，未给出跨 owner record schema。 |
-| S6：manifest mapping、自动 collapse 子阶段和 `changed_paths` 与领域 effects 的完整公共关联字段 | `unresolved` | Q11 固定去重/排序与同 operation，不定义 manifest/Outcome 的完整 schema。 |
+| S6：manifest mapping、自动 collapse 子阶段和领域 effects 的内部关联，以及 `Outcome` 的完整字段集合 | `unresolved` | Q11 固定去重/排序与同 operation，不定义 manifest/Outcome 的完整 schema；公开结果不暴露 mapping 或路径列表。 |
 | S7：`Outcome`/`ReadOutcome` 的完整字段集合、错误 envelope 与普通 JSON 的字段顺序 | `unresolved` | 已接受或已签语义和 code/exit 规则未形成统一 public protocol section。 |
 | S8：`RecoveryOutcome` 前后 phase、epoch、cleanup state 字段和 Q20/Q21 的 orphan/progress 证据分区 | `unresolved` | Q17 只列语义；`accepted-decisions.md` 只有 Q1–Q19 同等级接受元数据，缺少 Q20/Q21 的独立 signer locator。 |
 
