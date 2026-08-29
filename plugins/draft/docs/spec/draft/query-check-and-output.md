@@ -17,18 +17,40 @@
 
 | 读操作 | 领域 source domain | 成功时的领域结果 |
 | --- | --- | --- |
-| `page` | 受管理页面及其可认证页面事实 | 返回被请求页面的可认证事实；不因未受管理 Markdown 自动创建页面。 |
-| `links` | candidate 根内可判定 Markdown，区分 managed 与 unmanaged source kind；registered 对 unmanaged 的包含资格未决 | 返回可认证出站链接事实及 source kind；candidate 中不得把未受管理 source 静默丢弃。 |
-| `backlinks` | candidate 根内可判定 Markdown，区分 managed 与 unmanaged source kind；registered 对 unmanaged 的包含资格未决 | 返回可认证入站链接事实及 source kind；不得用只含 managed 的 lower-bound 替代完整结果。 |
+| `page` | 受管理页面及其可认证页面事实；`backlink_count` 另受下方 source-domain 分区约束 | 返回被请求页面的可认证事实；不因未受管理 Markdown 自动创建页面。计数域未决时不得以任一 source domain 伪装完整计数。 |
+| `links` | source kind 与 root state 的返回域未决；必须区分 managed/unmanaged，不得由结构闭包推定 query 域 | 在 source domain 已获批准前不能选择完整结果或 lower-bound；可认证事实需保留 source kind。 |
+| `backlinks` | source kind 与 root state 的返回域未决；必须区分 managed/unmanaged，不得由结构闭包推定 query 域 | 在 source domain 已获批准前不能选择完整结果或 lower-bound；可认证事实需保留 source kind。 |
 | `relations` | 受管理页面的正式关系 | 返回关系事实，不把普通链接提升为关系。 |
 | `status` | 受管理页面状态 | 返回可认证状态事实。 |
 | `recoverable` | Trash authority 与同一次 `as_of` | 以同一观察时刻完成恢复资格筛选和投影。 |
 | `check` | 根、页面、导航、关系、资源与适用 runtime authority | 返回完整可诊断检查事实；`adopt` 需要无过滤、无分页且无 error 的完整 Check。 |
 
-candidate 根中 managed/unmanaged 的宽来源域是明确要求，不能将 Links/Backlinks 缩窄为
-仅受管理页面。registered 根是否同样包含每一类 unmanaged source 的逐项资格尚未由唯一
-owner/签署决定闭合，故为 `unresolved`。在该未决分区中不能擅自扩张权限，也不能返回
-受管理 lower-bound 作为完整结果。
+candidate 根中 managed/unmanaged 的 Links/Backlinks source domain、registered 根对
+unmanaged source 的资格，以及 `page` 的 `backlink_count` 统计域均未由唯一 owner/签署
+决定闭合。Q31-B 只批准 candidate 的 unmanaged Markdown 可经 `move` 纳管，Q31-C 只
+批准结构命令的全根链接事实闭包；二者都不选择 query 返回域。formal §13 的 managed-only
+最小合同与当前候选宽域表述也未形成逐 section 的取代关系，因此下表每一格都必须保持
+具体 `unresolved`，不能擅自选择宽域、窄域或 managed-only lower-bound。
+
+### query source-domain 未决分区
+
+下表覆盖 `root_state × source_kind × query` 的全部 source-domain 组合。`backlink_count`
+随 `backlinks` 的同一 source domain 判定；它不是可以独立采用另一统计域的例外。
+
+| root_state | source_kind | query | 状态与缺失决定 |
+| --- | --- | --- | --- |
+| `candidate` | `managed` | `links` | `unresolved`：managed source 是否构成 candidate Links 的完整返回域，及与 unmanaged source 的组合规则未获签署；不能返回已选定的窄/宽域。 |
+| `candidate` | `unmanaged` | `links` | `unresolved`：Q31-B/C 的纳管/结构闭包范围未批准 query 返回该 source；正式最小合同与候选宽域冲突，阻塞 source-domain 认证。 |
+| `candidate` | `managed` | `backlinks` | `unresolved`：managed source 是否构成 candidate Backlinks 的完整返回域，及其与 unmanaged source 的组合规则未获签署。 |
+| `candidate` | `unmanaged` | `backlinks` | `unresolved`：结构链接闭包不等于 query 返回资格；formal §13 与候选宽域冲突，不能选择是否纳入该 source。 |
+| `registered` | `managed` | `links` | `unresolved`：registered root 的 managed source 返回资格及其与历史 managed-only 合同的当前 scope 未闭合。 |
+| `registered` | `unmanaged` | `links` | `unresolved`：registered 对 unmanaged source 的资格没有唯一批准，不能从 candidate 纳管事实推定。 |
+| `registered` | `managed` | `backlinks` | `unresolved`：registered managed Backlinks 的完整返回域及与 page count 的一致规则未闭合。 |
+| `registered` | `unmanaged` | `backlinks` | `unresolved`：registered unmanaged Backlinks 的包含资格未获签署，不能返回 managed-only lower-bound。 |
+| `candidate` | `managed` | `page.backlink_count` | `unresolved`：candidate count 是否统计仅 managed source 或与 unmanaged source 合并未获决定；影响页面可观察计数。 |
+| `candidate` | `unmanaged` | `page.backlink_count` | `unresolved`：candidate unmanaged source 是否进入 count 未获决定；不能把 Links/Backlinks 的任一候选域折叠为 count 结果。 |
+| `registered` | `managed` | `page.backlink_count` | `unresolved`：registered managed count 的完整统计域及历史最小合同是否仍适用未闭合。 |
+| `registered` | `unmanaged` | `page.backlink_count` | `unresolved`：registered unmanaged count 的资格未获签署；必须阻塞而不能返回窄域计数。 |
 
 ### 分页、partial 与认证决策表
 
@@ -45,10 +67,13 @@ continuation 语法、total 字段名和 UTC 时刻的编码均为 `unresolved`�
 | 请求的 source 域、root state 或 managed/unmanaged 包含规则本身 `unresolved` | 任意 | 返回可诊断阻塞，不能选择一侧来源域。 |
 | recovery pending 或 runtime 指出读前状态不安全 | 任意 | 不自行 recovery；按 runtime public protocol 报告阻塞。 |
 
-七类读共用 token、projection、分页、warnings、blockers 与 partial 的语义 envelope。精确
-`ReadOutcome` ABI，包括字段存在性、顺序、projection 缺失、index maintenance busy 以及
-成功 read 是否携带 lifecycle result，尚未获统一批准，逐项为 `unresolved`；本页不从
-实现、测试或帮助文本补造。
+七类读共用 token、projection、分页、warnings、blockers 与 partial 的语义 envelope。runtime
+owner 已固定以下跨页事实：成功 read 返回 projection 和本次 actionable warnings，不带
+routine lifecycle result；fatal 或最终 scan 不稳定时返回 error 且不带 projection；自动
+阶段 busy 只在稳定 read 仍成功时成为本次 warning。其余真正未签字段逐项保持
+`unresolved`，包括 snapshot token 的字段名/编码、projection/partial/blockers/warnings
+字段的存在性与顺序、分页 comparator/continuation/total 的字段形状和 error envelope
+排序；本页不从实现、测试或帮助文本补造。详见 [公共结果与错误投影](../runtime/errors-and-observability.md#公共结果与错误投影)。
 
 ### 副作用、失败、恢复与验证
 
@@ -57,9 +82,10 @@ continuation 语法、total 字段名和 UTC 时刻的编码均为 `unresolved`�
 根扫描、节点类型、UTF-8、marker、Trash authority、snapshot 或 `as_of` 不可认证时保留
 可诊断失败。只有显式 `recover()` 能收敛 recovery pending，读操作和重试不清理现场。
 
-验证七类读的 source domain、candidate 的 managed/unmanaged 区分、registered 未决门槛、
-items/blockers 独立排序分页、同一 `as_of`、完整/partial/不可认证失败，以及 authority
-变化导致 snapshot 失效。
+验证七类读的 source domain、上表全部 candidate/registered × managed/unmanaged ×
+links/backlinks/count 分区、items/blockers 独立排序分页、同一 `as_of`、完整/partial/
+不可认证失败，以及 authority 变化导致 snapshot 失效；在 source domain 未决时验证每个
+分区均阻塞而非选取一侧。
 
 ## 诊断
 
@@ -77,20 +103,27 @@ items/blockers 独立排序分页、同一 `as_of`、完整/partial/不可认证
 
 | 检测事实 | 投影请求 | 允许结果 |
 | --- | --- | --- |
-| 所需事实均可认证 | 普通、JSON 或 notification | 从同一机器诊断结果投影对应呈现。 |
-| 任一必需事实不可认证 | 任意 | 产生可诊断失败；不得输出“无问题”、空诊断或伪成功。 |
+| 所需事实均可认证 | 普通、JSON 或 notification | 从同一机器诊断结果投影对应呈现；成功 read 的 projection/presence 与 runtime owner 一致。 |
+| 任一必需事实不可认证 | 任意 | 产生可诊断失败；不得输出“无问题”、空诊断或伪成功。fatal read 不带 projection。 |
 | 同一事实同时请求多种呈现 | 多种 | 机器结论必须一致；文案可不同，但不得改变类别、数量或关联对象。 |
 
-精确机器字段、字段顺序、错误码/退出码、notification 的 delivered/error 矩阵、warning
-投影及其与 runtime 生命周期结果的组合，目前没有统一已批准 ABI，均为 `unresolved`。
-这些缺口由 [runtime public protocol](../runtime/errors-and-observability.md) 闭合；在其未
-闭合前，本节不得以本地 JSON、CLI 或文案样例替代。
+错误码、退出码及 notification 的 `delivered` 存在性由 [公共结果与错误投影](../runtime/errors-and-observability.md#公共结果与错误投影) 的 owner 决定：允许的 delivered 行才含该字段，error 行排除该字段；D-PDIAGNOSTICS 只消费这些事实，不重新选择。仍未签的部分仅是 diagnostics/JSON/notification 的精确字段名、字段顺序、可选性、编码和 warning/lifecycle envelope 排列，逐项为 `unresolved`；不得以本地样例替代。
+
+| 字段级项目 | 状态 | 缺失决定与影响 |
+| --- | --- | --- |
+| diagnostics 普通/JSON 的事实字段名、顺序、可选性和编码 | `unresolved` | 没有统一公共 ABI；不得由文案、实现或测试夹具补造。 |
+| notification error/delivered envelope 的字段顺序与可选性 | `unresolved` | runtime 已固定 `delivered` 的存在性和 code/exit 语义，但未签完整 envelope；不得重新定义错误行。 |
+| warning 与 lifecycle result 的 envelope 字段和排列 | `unresolved` | runtime 已固定何时可观察 warning/result；缺少字段级 schema，不能把高层 presence 再开放为未决。 |
+
+上表不把 runtime 已固定的成功 read、fatal read、错误 code/exit 或 `delivered` 条件列为
+未决；它们是本页必须消费的 authority。source-domain 未决只属于上面的 query 组合表。
 
 ### 失败、恢复与验证
 
 诊断投影不应吞掉不可认证事实，也不安排 notification 重试或 recovery。验证同一机器
 事实在普通、JSON 和 notification 中保持一致，并验证编码、路径、root authority 或
-runtime 认证失败始终成为可诊断失败而非成功的空输出。
+runtime 认证失败始终成为可诊断失败而非成功的空输出；同时逐格核对 runtime owner 的
+success/fatal read projection、error code/exit 和 `delivered` 存在性。
 
 ## 来源
 

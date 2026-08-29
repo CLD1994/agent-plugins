@@ -134,5 +134,5 @@ AdvanceDue、index maintenance 或 cleanup。正常入口不枚举 terminal prog
 
 ## 来源
 
-- `80508340458f393435ae67669656141ec411ba1b:.scratch/draft-operation-runtime-foundation/spec.md#5. 根锁与运行期 admission`
-- `80508340458f393435ae67669656141ec411ba1b:.scratch/draft-operation-runtime-foundation/spec.md#6. 请求与副作用决策表`
+- `ce64ac30c52ca910fe39fcedd055dd28f0cfbda4:.scratch/draft-operation-runtime-foundation/spec.md#5-根锁与运行期-admission`
+- `ce64ac30c52ca910fe39fcedd055dd28f0cfbda4:.scratch/draft-operation-runtime-foundation/spec.md#6-请求与副作用决策表`

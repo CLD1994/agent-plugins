@@ -38,6 +38,11 @@ planner、运行期锁、recovery 或 index 协作者。
 调用方判断或继续操作所需的结果；其字段边界见
 [公共结果与错误投影](errors-and-observability.md#公共结果与错误投影)。
 
+`relation.add/remove` 的 `CODE` 只允许主动方向 `depends_on`、`supersedes`、`challenges`。
+`parent` 由结构 mapping owner 随路径、物理父和导航维护；`superseded_by` 与
+`challenged_by` 由对应主动方向的完整计划维护，均不是关系命令参数。`supersedes` 的
+状态 after-state、最后一条关系的恢复状态和反向行缺失分区由 [页面状态与关系](../draft/status-and-relations.md#页面状态与关系) 与 [页面编辑](../draft/page-edits.md#relation-addremove-的关系与状态分区) 定义。
+
 ### 接口状态维度与模式表
 
 | 调用维度 | 合法值或事实 | 对结果的影响 |
@@ -116,4 +121,4 @@ lifecycle 或 `recover()`。
 
 ## 来源
 
-- `80508340458f393435ae67669656141ec411ba1b:.scratch/draft-operation-runtime-foundation/spec.md#2. 对外接口与所有权`
+- `ce64ac30c52ca910fe39fcedd055dd28f0cfbda4:.scratch/draft-operation-runtime-foundation/spec.md#2-对外接口与所有权`

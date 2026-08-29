@@ -138,4 +138,4 @@ Q1–Q19 有同等级接受元数据，且不存在把 runtime Q20/Q21 细分签
 
 ## 来源
 
-- `80508340458f393435ae67669656141ec411ba1b:.scratch/draft-operation-runtime-foundation/spec.md#10. 崩溃恢复表`
+- `ce64ac30c52ca910fe39fcedd055dd28f0cfbda4:.scratch/draft-operation-runtime-foundation/spec.md#10-崩溃恢复表`

@@ -136,4 +136,4 @@ authority epoch 与 cleanup 状态必须存在但其精确字段名、值域、�
 
 ## 来源
 
-- `80508340458f393435ae67669656141ec411ba1b:.scratch/draft-operation-runtime-foundation/spec.md#11. 输出、错误与验收`
+- `ce64ac30c52ca910fe39fcedd055dd28f0cfbda4:.scratch/draft-operation-runtime-foundation/spec.md#11-输出错误与验收`

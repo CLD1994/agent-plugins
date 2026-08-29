@@ -51,20 +51,27 @@ identity/digest 变化不属于成功变体：stage 后变化为 `runtime.extern
 初始化先取得目标 root 外的临时 OS init gate，并持有到 marker durable。它只接受
 严格空 target、空 `.draft` 或仅空 `.draft/runtime`；其他初始树失败关闭。gate 内按
 descriptor 创建全部 runtime v1、初始内容和 marker，逐项耐久，最后才发布 marker。
-下表按 marker、现场和 descriptor 的完整组合分类；每次调用命中且只命中一行。
+`initialize` 的 `RootState` 是请求的目标状态，只允许 `candidate` 或 `registered`；它
+不会从目标内容、已有 marker 或初始化现场推断另一状态。下表按请求目标、marker、现场和
+descriptor 的完整组合分类；每次调用命中且只命中一行。
 
-| marker | target/runtime 现场 | descriptor 认证 | `initialize` 的唯一动作与公开结果 | 恢复入口 |
-| --- | --- | --- | --- | --- |
-| 不存在 | 严格允许的空形态 | 为本次请求的新 descriptor | 持 gate 完整创建、耐久并发布 marker；随后进入本页 cleanup 路径 | 不处理无 marker 的空现场 |
-| 不存在 | 有初始化现场 | 与请求完全相同，且全部已有成员、字节、摘要匹配 | 持 gate 仅续建缺失的精确成员；随后发布 marker 并进入 cleanup | 不处理无 marker 的初始化现场 |
-| 不存在 | 有初始化现场 | 不同、未知、损坏或外部变化 | `runtime.init_conflict` 或 `runtime.corrupt`，零写 | 不处理 |
-| 存在 | marker/runtime/descriptor 全匹配且 cleanup artifacts 均按清单收敛 | 任意 | 返回已初始化结果，零写 | 正常运行期恢复仅处理其他现场 |
-| 存在 | marker/runtime/descriptor 全匹配，但仍有 descriptor cleanup artifacts | 任意 | `runtime.recovery_required`，零写 | 显式 `recover()` 取得稳定 root lock 后按清单幂等 cleanup |
-| 存在 | runtime schema 标识可认证但为旧版或未知版；其余节点没有认证矛盾 | 任意 | `runtime.schema_unsupported`，零写、零迁移、零双读、零 cleanup | 不处理；需要兼容/迁移合同另行授权 |
-| 存在 | 任一不匹配或节点异常 | 任意 | `runtime.corrupt`，保留现场 | `runtime.corrupt`，保留现场 |
+| 请求目标状态 | marker | target/runtime 现场 | descriptor 认证 | `initialize` 的唯一动作与公开结果 | 恢复入口 |
+| --- | --- | --- | --- | --- | --- |
+| `candidate` 或 `registered` | 不存在 | 严格允许的空形态 | 为本次请求目标的新 descriptor | 持 gate 完整创建、耐久并发布请求目标状态的 marker；随后进入本页 cleanup 路径 | 不处理无 marker 的空现场 |
+| `candidate` 或 `registered` | 不存在 | 有初始化现场 | 与请求完全相同，且全部已有成员、字节、摘要匹配 | 持 gate 仅续建缺失的精确成员，发布请求目标状态的 marker 并进入 cleanup | 不处理无 marker 的初始化现场 |
+| `candidate` 或 `registered` | 不存在 | 有初始化现场 | 不同、未知、损坏或外部变化 | `runtime.init_conflict` 或 `runtime.corrupt`，零写 | 不处理 |
+| `candidate` | 存在 candidate marker | marker/runtime/descriptor 全匹配且 cleanup artifacts 均按清单收敛 | 任意 | 返回 candidate 已初始化结果，零写 | 正常运行期恢复仅处理其他现场 |
+| `registered` | 存在 registered marker | marker/runtime/descriptor 全匹配且 cleanup artifacts 均按清单收敛 | 任意 | 返回 registered 已初始化结果，零写 | 正常运行期恢复仅处理其他现场 |
+| `candidate` 或 `registered` | 存在相同状态 marker | marker/runtime/descriptor 全匹配，但仍有 descriptor cleanup artifacts | 任意 | `runtime.recovery_required`，零写 | 显式 `recover()` 取得稳定 root lock 后按清单幂等 cleanup |
+| `candidate` 或 `registered` | 存在相反状态 marker | marker/runtime/descriptor 可认证但状态与请求目标不同 | 任意 | `runtime.init_conflict`，零写；不把初始化转换为 adopt | 不处理 |
+| `candidate` 或 `registered` | 存在 marker | runtime schema 标识可认证但为旧版或未知版；其余节点没有认证矛盾 | 任意 | `runtime.schema_unsupported`，零写、零迁移、零双读、零 cleanup | 不处理；需要兼容/迁移合同另行授权 |
+| `candidate` 或 `registered` | 存在 marker | 任一不匹配或节点异常 | 任意 | `runtime.corrupt`，保留现场 | `runtime.corrupt`，保留现场 |
+| `candidate` 或 `registered` | 任意可认证 marker | marker/record/cleanup 现场处于 recovery pending | 任意 | `runtime.recovery_required` 或对应 recovery 错误，零写；保持 overlay 之前的根状态 | 只有显式 `recover()` |
 
 同一 target 的 init 由 gate 串行；不同 descriptor 冲突。没有产品清除接口，也没有
-首次 `Execute` 创建 runtime 的转换。普通 `recover()` 不处理无 marker 的初始化现场。
+首次 `Execute` 创建 runtime 的转换。marker 的目标状态只由 `RootState` 请求决定；普通
+`recover()` 不处理无 marker 的初始化现场。公开 `InitOutcome` 的字段和编码仍为
+`unresolved`，但 candidate/registered 的领域分支不再留空。
 
 ### 逻辑提交、副作用与恢复
 
@@ -87,7 +94,7 @@ cleanup 中的 record/fsync/unlink 耐久性失败不返回成功，保留可诊
 
 - 在三平台合格本地卷验证 capability 成功与每种无法证明的能力均在写前返回
   `runtime.platform_unsupported`。
-- 为上表七行构造 target/descriptor/marker 反例，验证每行唯一命中、可读但旧/未知
+- 为上表各请求目标和 marker/现场分区构造反例，验证每行唯一命中、可读但旧/未知
   schema 的 `schema_unsupported` 不与 `init_conflict`/`corrupt` 互相降级，且零写行
   目录字节不变。
 - 在 marker 发布、recovery record 发布、每个 cleanup member、record file fsync、
@@ -105,5 +112,5 @@ cleanup 中的 record/fsync/unlink 耐久性失败不返回成功，保留可诊
 
 ## 来源
 
-- `80508340458f393435ae67669656141ec411ba1b:.scratch/draft-operation-runtime-foundation/spec.md#3. 平台、根与持久布局`
-- `80508340458f393435ae67669656141ec411ba1b:.scratch/draft-operation-runtime-foundation/spec.md#4. Init 状态机`
+- `ce64ac30c52ca910fe39fcedd055dd28f0cfbda4:.scratch/draft-operation-runtime-foundation/spec.md#3-平台根与持久布局`
+- `ce64ac30c52ca910fe39fcedd055dd28f0cfbda4:.scratch/draft-operation-runtime-foundation/spec.md#4-init-状态机`

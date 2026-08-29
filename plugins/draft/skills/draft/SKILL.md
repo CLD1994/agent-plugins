@@ -56,9 +56,11 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 ### CLI 注意事项
 
 - 除 `init` 外，需要草稿根的命令统一使用可选 `--root ROOT`，缺省回退到绝对 `DRAFT_ROOT`，再回退到物理 `pwd` 祖先发现；`init` 只接受位置 `ROOT`。
+- `draft init ROOT` 请求 `registered` 根，`draft init --candidate ROOT` 请求 `candidate` 根；两者的根状态、空现场、冲突、耐久失败和 recovery overlay 均按 [根生命周期](../../docs/spec/draft/lifecycle.md#根生命周期) 与 [运行时初始化与平台](../../docs/spec/runtime/initialization-and-platform.md#初始化与平台前置) 判定，不从目标内容或 marker 缺失猜测另一状态。
+- `adopt` 只接受可认证的 `candidate` 根，并在完整无 error Check 后将其推进为 `registered`；已是 `registered` 的根返回既有已登记领域结果并保持零写，不退回 `candidate`。发生冲突、耐久失败或 recovery pending 时按 owner 阻塞并保留现场。
 - `SOURCE`、`TARGET`、`PAGE`、`CHILD`、`HUB` 是草稿根内规范相对页面路径（如 `pages/a.md`、`pages/hub/index.md`），不接受目录别名。
 - `check` 对 `candidate` 与 `registered` 使用同一检查协议并始终完整扫描；CLI 可以机会式维护内部 link-index journal、制品和 flag，但不修改 Markdown、marker 或回收生命周期。底层纯 checker 的 `maintain_index=False` 只表示内部只读边界，不是 CLI 契约。
-- `notify files-changed --root ROOT` 适用于 candidate 与 registered 根，是外部批量编辑稳定后的可选后置通知，不是索引进入 `fresh` 的必要前置，也不是故障恢复命令；它不接收路径、变更类型、rename map 或 stdin 清单，也不支持 `--dry-run`。成功退出码为 `0`，JSON 固定为 `{"result_type":"files_changed_notification"}`，不返回 revision、warning、变化文件数或消费者状态；已有锁或已分类的索引维护故障仍表示通知送达。
+- `notify files-changed --root ROOT` 适用于 candidate 与 registered 根，是外部批量编辑稳定后的可选后置通知，不是索引进入 `fresh` 的必要前置，也不是故障恢复命令；它不接收路径、变更类型、rename map 或 stdin 清单，也不支持 `--dry-run`。通知只调用 `maintain(ExternalFilesChanged)`；按 [公共结果与错误投影](../../docs/spec/runtime/errors-and-observability.md#公共结果与错误投影) 的决策表，允许的 delivered 行返回最小 `{"result_type": "files_changed_notification", "delivered": true}` 并退出 `0`，错误行按 owner 的机器 code/退出码返回且不含 `delivered`。live busy 与安全 scan-token 行可 delivered；recovery、corrupt、闭包、耐久或不安全外部变化不得被报告为 delivered。
 - 结构写命令的 `--dry-run` 使用相同事实和计划边界，但不创建 journal、revision、索引制品或 flag。
 
 ## 第一性边界
@@ -87,8 +89,10 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 1. 读根索引和当前相关页面，判断受影响的最小页面集合；
 2. 只改普通内容 -> 直接编辑 Markdown（标题、正文、例子都自由）；一次外部批量编辑稳定后可选运行 `draft notify files-changed --root ROOT`，逐文件普通编辑不要求逐次通知；
 3. 改名、移动、升格、降级、回收 -> 调用对应 CLI 命令，一次命令完成，不拆成手工步骤；
-4. 更新受影响的正式关系（父主题、依赖、取代/被取代、质疑/被质疑）和页面状态；
+4. 更新受影响的正式关系（`depends_on`、`supersedes`、`challenges`）和页面状态；`parent` 由结构 mapping owner 随路径、物理父和导航共同维护，不由 relation 命令写入；取代关系的状态 after-state 和零写边界见 [页面状态与关系](../../docs/spec/draft/status-and-relations.md#页面状态与关系)；
 5. 运行 `draft check`；有客观错误立即修复，有语义歧义立即询问用户。后续 `check` 或链接查询会严格比较当前根事实，不依赖是否发送过 notification。
+
+`relation add/remove` 的关系参数只允许 `depends_on`、`supersedes`、`challenges`；反向代码和 `parent` 均不作为修改参数。`supersedes` 添加会在同一计划中维护反向行并将目标状态设为 `superseded`；删除非最后一条取代关系保持该状态，删除最后一条必须携带 `pending`、`proposed`、`confirmed` 或 `closed` 中的合法目标状态，缺失、非法或反向事实不可认证时零写。
 
 `conclusions.md` 是讨论结束时按需生成的机器产物，不实时维护。日常讨论中不手动写入
 或逐条改写结论列表；已确认页面由 `confirmed` 状态标记。只有讨论结束且与用户确认后
@@ -98,11 +102,11 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 
 讨论结束并与用户确认后：
 
-1. 运行 `draft generate-conclusions ROOT`，生成 `proposed` 状态的结论汇总页；
-2. 根据这份最新结论页产出设计文档；
-3. 产出完成后运行 `draft status set ROOT conclusions.md confirmed`，表示已据最新结论完成产出。
+1. 按 [结论快照](../../docs/spec/draft/conclusions.md) 的当前格式显式运行 `draft generate-conclusions ROOT`；
+2. 将快照视为可暂时过时的派生制品。页面的 `confirmed` 状态才是成员资格来源，生成事件之外的状态、关系、正文、Trash 和 Restore 操作不刷新其语义集合；
+3. 生成前无法认证关系、端点、状态或当前格式时零写并保留诊断，不通过另一个格式或兼容分支继续。
 
-查询选择：用 `draft query page ROOT PAGE` 做路由。`query page` 与 `query backlinks` 可以机会式维护全根链接索引；索引不可用时，两者从当前根完整 Markdown 链接事实闭包返回结果。`query links`、`query relations`、`query status` 和 `query recoverable` 不维护全根链接索引。用 `rg` 搜索正文，不要要求代理在普通编辑过程中维护结论页。
+查询选择：用 `draft query page ROOT PAGE` 做路由，并遵循 [读操作与查询](../../docs/spec/draft/query-check-and-output.md#读操作与查询) 的 source-domain 判定。candidate/registered 根中 managed/unmanaged source 对 `links`、`backlinks` 和 `backlink_count` 的组合仍逐项 `unresolved`，不得选择宽域、窄域或 managed-only lower-bound；成功 read、fatal/error、warning 和 notification 的存在性按 [公共结果与错误投影](../../docs/spec/runtime/errors-and-observability.md#公共结果与错误投影) 投影。具体字段、token、顺序和编码仍按 owner 的字段级 `unresolved` 表处理。用 `rg` 搜索正文，不要要求代理在普通编辑过程中维护结论页。
 
 ## 拆分时机
 
@@ -112,10 +116,10 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 
 ## 回收与恢复
 
-- `trash` 把页面和权威删除包落地为 7 天保留态（`trash_retained`），不立即移交系统回收站；有其他入站引用时命令拒绝并列出阻碍，先人工解除或改指再回收。
-- `trash` 后 7 天内可 `draft restore ROOT OPERATION_ID` 恢复页面；到期后的系统回收站移交和最终清理由允许的已登记命令前置推进，Agent 不需要维护计时器。`draft recover ROOT` 只按 journal 证据收敛 recovery pending operation，不推进 retained trash 的到期、移交或清理。普通 stale 或已耐久降级的链接索引由可选 notification、`check`、`query page` 或 `query backlinks` 根据当前根事实机会式维护，不属于 `recover`。索引阶段中，`link_index_updating` 前向进入 `link_index_rebuild_required`；`link_index_published` 验证目标 revision/SHA-256 后补原终态；`link_index_rebuild_required` 尽力补 flag 后补原终态。不分配新 revision，也不因派生缓存故障回滚已验证业务内容。最终清理（`trash_purge_committed`）只在到达清理期限后最后一次投递明确失败时发生，是永久删除授权。
-- `restore` 回滚不是成功：恢复未完成时 `exit 3`、JSON `ok=false`（`result_type=restore`），权威删除包仍保留；JSON 不暴露内部 phase，遇到 `exit 3` 时不要报告"已恢复"。
-- 移交明确失败只产生警告并继续原命令；状态损坏（`operation.inconsistent_state` 等）才停止写入。索引发布失败但已耐久记录 `link_index.rebuild_required` 时，业务结果仍成功，退出码为 `0`，并返回索引 warning；`link_index.rebuild_flag_update_failed` 同样只是 warning。journal 结果无法耐久写入时返回 operation error，退出码为 `3`，保留锁和现场供 `recover` 处理。结构命令提示需要恢复时，先运行 `draft recover ROOT` 做机械恢复，不要删除锁或日志目录；恢复结果无法解释或需要取舍时再停止并询问用户（见硬停止条件）。
+- `trash` 按 [Trash 与 Restore](../../docs/spec/draft/trash-and-restore.md#trash-与-restore) 认证页面、删除包和生命周期；普通链接观察以及 `conclusions.md` 入站链接不阻止 Trash，快照条目也不因此删除或重建。
+- `trash` 后 7 天内可 `draft restore ROOT OPERATION_ID` 恢复页面；到期后的系统回收站移交和最终清理由允许的已登记命令前置推进，Agent 不需要维护计时器。`draft recover ROOT` 只按 journal 证据收敛 recovery pending operation，不推进 retained trash 的到期、移交或清理。普通 stale 或已耐久降级的链接索引由可选 notification、`check`、`query page` 或 `query backlinks` 根据当前根事实机会式维护，不属于 `recover`；其公开维护阶段、重试和缓存字段不由本入口补造。最终清理（`trash_purge_committed`）只在到达清理期限后最后一次投递明确失败时发生，是永久删除授权。
+- `restore` 未完成、冲突、证据不足或运行期现场不安全时按 [Trash 与 Restore](../../docs/spec/draft/trash-and-restore.md#trash-与-restore) 和 runtime owner 返回可诊断错误；不要把错误输出宣称为已恢复，也不要凭未签的成功布尔字段或固定 `result_type` 推断成功。Restore 的领域 code、退出码和公共 envelope 字段仍由对应 owner/ABI 决定，未签字段保持 `unresolved`。
+- 交接、索引、耐久和恢复结果只能按 runtime owner 投影：可安全分类的派生 cache 降级可以保留成功/允许 delivered，authority 或已决定结果的耐久失败必须 error 且不含 `delivered`；notification adapter 不读取投影、不调用自动 lifecycle 或 recovery，也不自行安排重试。结构命令遇到 recovery pending 时先运行 `draft recover ROOT`；不要删除锁、日志或删除包，恢复若无法认证则保留现场并停止。
 - `.draft/` 下的操作日志、权威删除包和锁是工具内部状态，绝不手工编辑。
 
 ## 硬停止条件
@@ -124,8 +128,8 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 
 - 状态、关系或拆分涉及语义判断而非机械修正；
 - `check` 报告你无法解释的客观错误；
-- `recover` 无法完成机械恢复，或其输出提示 `operation.journal_corrupt`、`operation.inconsistent_state`、`operation.external_change`；注意：结构命令首次提示 `operation.recovery_required` 时先按上一节运行 `recover` 做机械恢复，只有恢复本身失败或结果无法解释才到这里停止；
-- `trash` 列出你不确定能否解除的入站阻碍；
+- `recover` 无法完成机械恢复，或其输出为 runtime owner 定义的 corruption/inconsistent/external-change 错误；结构命令首次提示 recovery pending 时先按上一节运行 `recover` 做机械恢复，只有恢复本身失败或结果无法解释才到这里停止；
+- `trash` 无法认证页面、删除包或生命周期事实；
 - uvx 执行失败，且按 uv 自身的诊断处理后仍无法解决。
 
 ## 检查器严重级别
@@ -133,7 +137,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 检查器输出四档：
 
 - `errors`客观结构损坏
-- `warnings`合法但需注意的运行状态，如投递失败；`link_index.rebuild_required` 与 `link_index.rebuild_flag_update_failed` 是只含机器 `code`/`severity` 的索引 warning，不表示业务 operation 失败。`adopt` 的完整预检查中，索引性能降级不阻止登记，页面 errors、journal/制品矛盾、耐久失败或 recovery pending 才阻止登记。
+- `warnings` 合法但需注意的运行状态，只能来自本次 runtime owner 明确允许的 cache/索引派生降级；它们不改变 authority，也不替代错误或恢复阻塞。`adopt` 的完整预检查中，安全分类的派生性能降级不阻止登记，但页面错误、内部制品矛盾、耐久失败或 recovery pending 仍阻止登记。具体 warning code 和字段按 owner 处理，未签 ABI 保持 `unresolved`。
 - `infos`合法未结束的生命周期事实，如 `trash_retained`
 - `reviews`待人类审查提醒。
 
