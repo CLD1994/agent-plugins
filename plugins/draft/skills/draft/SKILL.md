@@ -102,30 +102,27 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 
 讨论结束并与用户确认后：
 
-1. 按 [结论快照](../../docs/spec/draft/conclusions.md) 的当前格式显式运行 `draft generate-conclusions ROOT`；
+1. 按 [结论快照](../../docs/spec/draft/conclusions.md) 的当前格式显式运行 `draft generate-conclusions --root ROOT`；
 2. 将快照视为可暂时过时的派生制品。页面的 `confirmed` 状态才是成员资格来源，生成事件之外的状态、关系、正文、Trash 和 Restore 操作不刷新其语义集合；
 3. 生成前无法认证关系、端点、状态或当前格式时零写并保留诊断，不通过另一个格式或兼容分支继续。
 
-查询选择：用 `draft query page ROOT PAGE` 做路由，并遵循 [读操作与查询](../../docs/spec/draft/query-check-and-output.md#读操作与查询) 的 source-domain 判定。candidate/registered 根中 managed/unmanaged source 对 `links`、`backlinks` 和 `backlink_count` 的组合仍逐项 `unresolved`，不得选择宽域、窄域或 managed-only lower-bound；成功 read、fatal/error、warning 和 notification 的存在性按 [公共结果与错误投影](../../docs/spec/runtime/errors-and-observability.md#公共结果与错误投影) 投影。具体字段、token、顺序和编码仍按 owner 的字段级 `unresolved` 表处理。用 `rg` 搜索正文，不要要求代理在普通编辑过程中维护结论页。
+查询选择：用 `draft query page --root ROOT PAGE` 做路由，并遵循 [读操作与查询](../../docs/spec/draft/query-check-and-output.md#读操作与查询) 的 source-domain 判定。candidate/registered 根中 managed/unmanaged source 对 `links`、`backlinks` 和 `backlink_count` 的组合仍逐项 `unresolved`，不得选择宽域、窄域或 managed-only lower-bound；成功 read、fatal/error、warning 和 notification 的存在性按 [公共结果与错误投影](../../docs/spec/runtime/errors-and-observability.md#公共结果与错误投影) 投影。具体字段、token、顺序和编码仍按 owner 的字段级 `unresolved` 表处理。用 `rg` 搜索正文，不要要求代理在普通编辑过程中维护结论页。
 
 ## 拆分时机
 
 - 语义触发为主：子问题获得独立状态生命周期（需要单独确认/否定/关闭）就拆成子页面；
 - 容量红线为辅：页面约 600 行或 60 KB 时检查器发出审查提醒--提醒只是提醒，由你判断是否拆；
-- 讨论页派生出多个子主题时升格为枢纽（`promote`）。仅当 `move` 或 `promote` 的
-  after-tree 可证明出现空的非根 hub 时，自动 `collapse` 才作为同一结构操作的子阶段
-  执行；候选集合、处理顺序或 after-tree 无法认证时整项零写（见
-  [结构操作](../../docs/spec/draft/structure.md#collapse)）。`trash`/`restore` 涉及的
-  reverse-collapse 不是已签署的自动降级保证：只有记录的 mapping 与 after-state 可证明
-  时才可继续，算法和公共 ABI 仍为 `unresolved`；无法证明时按
-  [Trash 与 Restore](../../docs/spec/draft/trash-and-restore.md#trash-与-restore) 的冲突/损坏边界停止并保留现场，不猜测恢复路径。
+- 多个子主题只是拆分线索，不是 `promote` 的命令触发条件。只有 owner preflight 已证明待升格项为 leaf、所有选定 sibling 与其同一 parent 且不重复，并认证完整保名 mapping、closure、相对 navigation 和 path roles 时，才可建议或执行 `promote`；跨父、重复、非 leaf、未指定页面、recovery pending 或任一事实不可认证时拒绝并零写，跨父先显式 `move`。
+- 仅当 `move` 或 `promote` 的 after-tree 可证明出现空的非根 hub 时，自动 `collapse` 才作为同一结构操作的子阶段执行；候选集合、处理顺序或 after-tree 无法认证时整项零写（见 [结构操作](../../docs/spec/draft/structure.md#collapse)）。`trash`/`restore` 涉及的 reverse-collapse 不是已签署的自动降级保证：只有记录的 mapping 与 after-state 可证明时才可继续，算法和公共 ABI 仍为 `unresolved`；无法证明时按 [Trash 与 Restore](../../docs/spec/draft/trash-and-restore.md#trash-与-restore-行为合同) 的冲突/损坏边界停止并保留现场，不猜测恢复路径。
 
 ## 回收与恢复
 
-- `trash` 按 [Trash 与 Restore](../../docs/spec/draft/trash-and-restore.md#trash-与-restore) 认证页面、删除包和生命周期；普通链接观察以及 `conclusions.md` 入站链接不阻止 Trash，快照条目也不因此删除或重建。
-- `trash` 后 7 天内可 `draft restore ROOT OPERATION_ID` 恢复页面；到期后的系统回收站移交和最终清理由允许的已登记命令前置推进，Agent 不需要维护计时器。`draft recover ROOT` 只按 journal 证据收敛 recovery pending operation，不推进 retained trash 的到期、移交或清理。普通 stale 或已耐久降级的链接索引由可选 notification、`check`、`query page` 或 `query backlinks` 根据当前根事实机会式维护，不属于 `recover`；其公开维护阶段、重试和缓存字段不由本入口补造。最终清理（`trash_purge_committed`）只在到达清理期限后最后一次投递明确失败时发生，是永久删除授权。
-- `restore` 未完成、冲突、证据不足或运行期现场不安全时按 [Trash 与 Restore](../../docs/spec/draft/trash-and-restore.md#trash-与-restore) 和 runtime owner 返回可诊断错误；不要把错误输出宣称为已恢复，也不要凭未签的成功布尔字段或固定 `result_type` 推断成功。Restore 的领域 code、退出码和公共 envelope 字段仍由对应 owner/ABI 决定，未签字段保持 `unresolved`。
-- 交接、索引、耐久和恢复结果只能按 runtime owner 投影：可安全分类的派生 cache 降级可以保留成功/允许 delivered，authority 或已决定结果的耐久失败必须 error 且不含 `delivered`；notification adapter 不读取投影、不调用自动 lifecycle 或 recovery，也不自行安排重试。结构命令遇到 recovery pending 时先运行 `draft recover ROOT`；不要删除锁、日志或删除包，恢复若无法认证则保留现场并停止。
+- `trash` 按 [Trash 与 Restore](../../docs/spec/draft/trash-and-restore.md#trash-与-restore-行为合同) 认证受管理 Markdown 页面/子树、回收包和生命周期；普通链接观察以及 `conclusions.md` 入站链接不阻止 Trash，快照条目也不因此删除或重建。
+- `restore` 使用不透明 `TrashIdentity`，仅在 owner 定义的 7 天有效窗口及同一次可认证观察中验证资格。identity 的格式、窗口起算时刻/时区、命令字段和结果 ABI 均为 `unresolved`；示例中的 `TRASH_IDENTITY` 只是占位符，不定义其编码或字段：`draft restore --root ROOT TRASH_IDENTITY`。
+- `draft recover --root ROOT` 只按 runtime owner 已认证的持久证据收敛 recovery pending operation：不调度或推进 due，不创建 handoff，也不调用 Adapter；对 owner 已授权且证据精确的 cleanup disposition 可以继续收敛。证据缺失或矛盾时零写、保留现场，并保持 owner 定义的错误或 `unresolved`，不猜测清理路径。
+- 普通 stale 或已耐久降级的链接索引由可选 notification、`check`、`query page` 或 `query backlinks` 根据当前根事实机会式维护，不属于 `recover`；其公开维护阶段、重试和缓存字段仍为 `unresolved`，不由本入口补造。
+- `restore` 遇 lexical invalid、missing、expired、consumed、conflict、corrupt、recovery-required、未完成、证据不足或运行期现场不安全时，按 [Trash 与 Restore](../../docs/spec/draft/trash-and-restore.md#trash-与-restore-行为合同) 和 runtime owner 返回可诊断错误；不要把错误输出宣称为已恢复，也不要凭未签的成功布尔字段或固定 `result_type` 推断成功。Restore 的领域 code、退出码和公共 envelope 字段仍由对应 owner/ABI 决定，未签字段保持 `unresolved`。
+- 交接、索引、耐久和恢复结果只能按 runtime owner 投影：可安全分类的派生 cache 降级可以保留成功/允许 delivered，authority 或已决定结果的耐久失败必须 error 且不含 `delivered`；notification adapter 不读取投影、不调用自动 lifecycle 或 recovery，也不自行安排重试。结构命令遇到 recovery pending 时先运行 `draft recover --root ROOT`；不要删除锁、日志或删除包，恢复若无法认证则保留现场并停止。
 - `.draft/` 下的操作日志、权威删除包和锁是工具内部状态，绝不手工编辑。
 
 ## 硬停止条件
@@ -151,7 +148,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 
 | 码  | 含义                                                       |
 | --- | ---------------------------------------------------------- |
-| 0   | 成功；`check` 无客观错误；回收站移交可以处于待移交并带警告 |
+| 0   | 逻辑提交成功或 owner 明确允许的 `delivered`；`check` 无客观错误 |
 | 1   | `check` 完成并发现客观结构错误                             |
 | 2   | 参数、根、路径、版本或领域前置条件无效                     |
 | 3   | 需要恢复、锁/日志损坏、外部修改或不安全恢复冲突            |
