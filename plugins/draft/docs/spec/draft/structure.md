@@ -17,16 +17,50 @@
 - 成功前必须形成唯一的、规范化且去重的有序 `before -> after` mapping。路径、parent、
   导航、可证明链接改写和自动 collapse 都只能从该 mapping 派生。
 
-| source 形状 | target 形状 | 根状态 | 前置事实 | 结果 |
+### 来源决策矩阵
+
+先按 source 集合分类：`single-file` 表示恰好一个文件 source，`file-set` 表示两个或更多
+文件 source，`directory` 表示单个目录 source；文件/目录混合、多个目录或无法确定 source
+形状的集合不进入下表。`managed`
+表示 source 的页面所有权已经存在，`unmanaged` 表示尚未取得页面所有权；管理状态必须对本次
+source 集合可认证，混合或未知状态按矩阵外门禁处理。`candidate` 与 `registered` 是根状态，
+`file` target 当且仅当以 `.md` 结尾，其他 target 均为 `prefix`。因此每行都是四个维度的一个
+互斥组合；所有允许行还必须满足无 recovery pending、路径/闭包/before-tree/mapping 可认证，
+以及目录节点分类和边界可认证。
+
+| source 形状 | 管理状态 | 根状态 | target 形状 | 结果（满足共同前置事实时） |
 | --- | --- | --- | --- | --- |
-| 一个受管理 Markdown 文件 | 单文件 `.md` | candidate 或 registered，且无 pending | source、target、父关系、闭包和 mapping 可认证 | 允许进入完整计划。 |
-| 一个或多个受管理 Markdown 文件 | 前缀 | candidate 或 registered，且无 pending | 每个来源唯一，最终路径无碰撞，闭包和 mapping 可认证 | 允许进入完整计划。 |
-| 目录 source | 前缀 | candidate 或 registered，且无 pending | 仅其中可移动 Markdown、目标路径与目录边界可认证 | 按 [目录来源](#目录来源) 形成 mapping。 |
-| 多个 source 或目录 source | 单文件 `.md` | 任意 | target 形状与 source 集合不匹配 | 拒绝，零写。 |
-| 未受管理 Markdown | 页面命名空间中的合法前缀目标 | candidate，且无 pending | 页面角色、路径、闭包与 mapping 可认证 | 允许页面纳管；可留下标题、机器区、状态、parent 关系和导航协议欠账，Check 必须逐项暴露。 |
-| 未受管理 Markdown | 页面命名空间中的合法目标 | registered | 此分支没有已批准权限 | 拒绝，零写；不得把 candidate 权限扩张到 registered。 |
-| `.draft` 路径、非规范路径、路径逃逸、重复 source、碰撞或保留 `pages/index.md` | 任意 | 任意 | 不成立 | 拒绝，零写。 |
-| 任一 source / 闭包节点 / mapping 不可认证 | 任意 | 任意 | 不成立 | 拒绝，零写。 |
+| single-file | managed | candidate | file | 允许进入完整计划。 |
+| single-file | managed | candidate | prefix | 允许进入完整计划。 |
+| single-file | managed | registered | file | 允许进入完整计划。 |
+| single-file | managed | registered | prefix | 允许进入完整计划。 |
+| single-file | unmanaged | candidate | file | 允许页面纳管并进入完整计划；目标必须是页面命名空间中的合法单文件目标。 |
+| single-file | unmanaged | candidate | prefix | 允许页面纳管并进入完整计划；目标必须是页面命名空间中的合法前缀目标。 |
+| single-file | unmanaged | registered | file | 拒绝，零写；不得把 candidate 的纳管权限扩张到 registered。 |
+| single-file | unmanaged | registered | prefix | 拒绝，零写；不得把 candidate 的纳管权限扩张到 registered。 |
+| file-set | managed | candidate | file | 拒绝，零写；单文件 target 不能接收多个 source。 |
+| file-set | managed | candidate | prefix | 允许进入完整计划。 |
+| file-set | managed | registered | file | 拒绝，零写；单文件 target 不能接收多个 source。 |
+| file-set | managed | registered | prefix | 允许进入完整计划。 |
+| file-set | unmanaged | candidate | file | 拒绝，零写；单文件 target 不能接收多个 source。 |
+| file-set | unmanaged | candidate | prefix | 允许页面纳管并进入完整计划；目标必须是页面命名空间中的合法前缀目标。 |
+| file-set | unmanaged | registered | file | 拒绝，零写；单文件 target 不能接收多个 source，且不得把 candidate 的纳管权限扩张到 registered。 |
+| file-set | unmanaged | registered | prefix | 拒绝，零写；不得把 candidate 的纳管权限扩张到 registered。 |
+| directory | managed | candidate | file | 拒绝，零写；目录 source 不能接收单文件 target。 |
+| directory | managed | candidate | prefix | 按 [目录来源](#目录来源) 形成 mapping，进入同一次完整计划。 |
+| directory | managed | registered | file | 拒绝，零写；目录 source 不能接收单文件 target。 |
+| directory | managed | registered | prefix | 按 [目录来源](#目录来源) 形成 mapping，进入同一次完整计划。 |
+| directory | unmanaged | candidate | file | 拒绝，零写；目录 source 不能接收单文件 target。 |
+| directory | unmanaged | candidate | prefix | 仅纳管其中可移动 Markdown 并按 [目录来源](#目录来源) 形成 mapping；非 Markdown 和可认证的未知节点原地保留，输出不得泄露留置事实。 |
+| directory | unmanaged | registered | file | 拒绝，零写；不得创建或改写页面、导航、catalog/head，也不得产生日志副作用。 |
+| directory | unmanaged | registered | prefix | 拒绝，零写；不得创建或改写页面、导航、catalog/head，也不得产生日志副作用。 |
+
+下列门禁不属于上述 24 个组合，统一在写入前拒绝并保持零写：文件/目录混合 source、
+多个目录 source、管理状态混合或未知、`.draft` 或非规范路径、路径逃逸、重复 source、
+目标碰撞、保留 `pages/index.md`、任一 source/闭包节点/mapping 不可认证，以及 recovery
+pending。目录 candidate 纳管只有在可移动 Markdown 的 mapping 完整时成立；无 Markdown、
+无法分类的节点或目录边界/空性无法认证时，按 [目录来源](#目录来源) 的 fail-closed 规则处理，
+不得伪造成功或扩张输出。
 
 ### mapping、提交与副作用
 
@@ -53,8 +87,11 @@
 
 ### 验证
 
-- 覆盖单文件、多文件、目录、重复 source、文件 target、前缀 target、碰撞、路径逃逸和
-  `pages/index.md`。
+- 逐行覆盖上述 24 个 source 形状、管理状态、根状态和 target 形状分区，并额外覆盖混合
+  source、重复 source、碰撞、路径逃逸和 `pages/index.md` 门禁。
+- 验证 candidate 的 unmanaged directory + prefix 只纳管可移动 Markdown，非 Markdown 和
+  已识别的 unknown 节点原地保留且不泄露留置事实；registered 的 unmanaged directory 在
+  两种 target 形状下均拒绝、零写且没有页面、导航、catalog/head 或日志副作用。
 - 验证 candidate 纳管与 registered 拒绝的分区，及所有路径/parent/导航/链接只由一个
   mapping 派生。
 - 验证自动 collapse 不产生第二 operation，mapping 不可认证和耐久不确定均不产生可见成功。
