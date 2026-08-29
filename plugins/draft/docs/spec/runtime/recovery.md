@@ -12,8 +12,16 @@
 `recover()` 无业务 request 输入，输入是当前 root 的 stable OS lock、运行期根锁记录、
 marker/runtime/descriptor、operation manifest/progress、owner/intent、before/after
 authority、immutable transition/epoch、staging、R/T/handoff 记录与 cleanup artifacts。
+若 pending operation 是 `D-MOVE`，输入还必须包含与该 operation 绑定的 immutable eligibility
+snapshot `S`。`S` 在语义上完整覆盖：source shape 与 member paths、`candidate`/
+`registered` root state、每个可移动 member 的 managed/unmanaged 分类、target kind/path、
+完整 `before -> after` mapping、全根 closure/digest、retained 与目录边界，以及 parent、
+navigation、link、conclusions 的窄改写事实和关联 authority epoch/digest。`S` 的字段编码、
+哈希算法和公开 ABI 尚无 owner 定义，继续保持 `unresolved`；本合同只要求这些语义事实作为
+同一 immutable 认证载荷保存并参与摘要校验。
 公开输出为 `RecoveryOutcome` 或机器错误。`RecoveryOutcome` 必须表达本次 disposition、
-前后 phase、最终 authority epoch、cleanup 状态和 warnings/errors，但不暴露内部路径；
+前后 phase、最终 authority epoch、cleanup 状态和 warnings/errors，但不暴露内部路径或公开
+路径列表；
 字段 ABI 的已知和未决边界见本页末尾及
 [公共结果与错误投影](errors-and-observability.md#公共结果与错误投影)。
 
@@ -24,6 +32,7 @@ authority、immutable transition/epoch、staging、R/T/handoff 记录与 cleanup
 | 运行期记录/lock | 无记录；有效记录且 live owner；有效记录且无 live owner；损坏/无法认证 | live owner 不抢占；损坏记录不删除、不猜 owner。 |
 | init 现场 | 无 marker；marker/runtime/descriptor 匹配且 cleanup remnant；已收敛 | 无 marker 的初始化现场不属于 runtime recover；descriptor cleanup 只能按精确清单处理。 |
 | authority 证据 | 完整 before；完整 durable after；matching partial after；矛盾/不可认证 | 先认证，再分类；不能从 phase 名、mtime、目录或 terminal projection 猜测。 |
+| D-MOVE eligibility snapshot | `S` 完整且 immutable；`S` 缺失/不完整/资格未证明；`S` 摘要不匹配或当前事实漂移；锁内重认证未成功 | 只有 `S` 完整、摘要与关联 epoch/digest 匹配、当前事实无漂移且 stable lock 内重认证成功，才可继续 `forward`、partial-after 或已授权 cleanup。 |
 | 外部副作用 | 无；已授权但未可证明 outcome；durable accepted/receipt | 没有 durable accepted 不得推断接受或 cleanup/purge。 |
 | staging | 已认证且已授权的精确 cleanup material；无法认证/不匹配 staging；需要 Q20 orphan 资格谓词的 staging | 无法认证时 fail-closed；Q20 的 orphan 资格谓词仍无同等级 signer locator。 |
 | progress | matching committed；缺失；伪造/不匹配 | normal/read/Check 不枚举 terminal progress；精确 recovery discovery/补记细则未签。 |
@@ -32,6 +41,16 @@ authority、immutable transition/epoch、staging、R/T/handoff 记录与 cleanup
 
 - 不能认证或彼此矛盾的事实一律 `runtime.corrupt`、零写并保留现场；不得删除、
   降级为成功或生成第二 authority。
+- 对 pending `D-MOVE`，`S` 是 eligibility 的唯一持久快照边界。锁内必须重新读取并认证
+  `S`、关联 authority epoch/digest、当前 source/target/root/成员分类、完整 mapping、
+  closure/digest、retained/目录边界及 parent/navigation/link/conclusions 窄改写事实；
+  只有全部完整、摘要匹配、当前事实无漂移且 stable lock 仍由本次 recovery 持有时，才可
+  继续 `forward`、matching partial-after 或已授权 cleanup。
+- 在其他 runtime record、owner/intent、authority、epoch/digest 与 staging 事实均已认证且
+  无矛盾、并已取得 stable lock 且确认无 live owner 后，`S` 缺失、不完整或 Q20/Q21 资格
+  尚未证明时是 `unresolved`：零 authority、零 projection、零业务写，保留现场，禁止
+  `forward`，也不能从 phase 名、目录存在或 terminal projection 补出资格。`S` 摘要不匹配、
+  关联 epoch/digest 不符或任何已读事实明确矛盾时是 `runtime.corrupt`：同样零写并保留现场。
 - 完整 after authority durable 时仅可 `forward`；matching partial new authority 仅可
   `forward`。仅完整 before 且无外部副作用时，已认证的 durable rollback direction
   唯一决定 `rollback`，已认证且唯一授权 cleanup 的 durable evidence 与精确 material
@@ -42,14 +61,33 @@ authority、immutable transition/epoch、staging、R/T/handoff 记录与 cleanup
 - `recover()` 不推进 due、不新建 handoff、不调用 Adapter；handoff prepared/unknown
   现场只能收敛已写 record，不能借恢复新建 attempt。
 
+### D-MOVE snapshot 重认证门禁与 Q6-B 漂移分类
+
+对 pending `D-MOVE`，必须先尝试取得 stable OS lock；lock admission 成功并在锁内确认记录
+无 live owner 后，重读 `S` 及其关联的 authority epoch/digest、source/target/root、成员
+管理状态、完整 mapping、closure、retained/目录边界和 parent/navigation/link/conclusions
+窄改写事实，再求值下方恢复表。门禁分区如下；
+只有第一行通过后，后续 `forward`、matching partial-after 或已授权 cleanup 行才有资格被
+求值。
+
+| 锁内重读后的事实 | 唯一分类 | 写入与后续动作 |
+| --- | --- | --- |
+| `S` 完整且 immutable，摘要与关联 epoch/digest 匹配，当前事实无漂移，stable lock 仍由本次 recovery 持有 | 通过门禁 | 仅可继续求值下方已认证的 authority/evidence 行；门禁本身不产生 authority、projection 或业务写。 |
+| 其他 runtime record/owner/intent/authority/epoch/digest/staging 均已认证且无矛盾，已取得 stable lock 且无 live owner；但 `S` 缺失、不完整或 Q20/Q21 资格尚未证明 | `unresolved` | 零 authority、projection、cleanup 和业务写，保留现场；禁止 `forward`、partial-after 和授权 cleanup。 |
+| `S` 完整且摘要/关联 epoch/digest 匹配，但 stable lock 内重认证未成功，且没有 live owner 或明确矛盾证据 | `unresolved` | 零 authority、projection、cleanup 和业务写，保留现场；不得继续任何 action 或以 phase/目录推断资格。 |
+| `S` 摘要或关联 epoch/digest 不匹配，或 source/target/root、成员分类、mapping、closure、retained/目录边界、parent/navigation/link/conclusions 事实明确漂移/矛盾 | `runtime.corrupt` | 零 authority、projection、cleanup 和业务写，保留全部现场；不得删除、猜测或继续任何 action。 |
+
 ### 证据优先恢复决策表
 
-下表按从上到下的优先级求值。每行均要求锁内重读；无法落入已接受或已签分区的事实停在
-`unresolved` 行，不能由实现选择语义。
+下表按从上到下的优先级求值。每行均要求 stable lock 内重读；pending `D-MOVE` 还必须
+先通过上述 `S` 门禁。无法落入已接受或已签分区的事实停在 `unresolved` 行，不能由实现
+选择语义。
 
 | 认证后的持久事实 | 外部副作用/进度事实 | 唯一 disposition 或机器结果 | 写入、零写、重试与恢复 |
 | --- | --- | --- | --- |
-| runtime schema 标识可认证，但为旧版或未知版；其余已读节点没有认证矛盾 | 任意 | `runtime.schema_unsupported` | 零写、零迁移、零双读和零 cleanup；不得把可识别的版本不兼容降级为 `runtime.corrupt`。 |
+| pending `D-MOVE` 的 `S` 摘要或关联 epoch/digest 不匹配，或锁内重读发现 source/target/root、成员分类、mapping、closure、retained/目录边界或 parent/navigation/link/conclusions 事实明确矛盾 | 任意 | `runtime.corrupt` | 零 authority、projection、cleanup 和业务写；保留全部现场，不删除、不猜测、不继续 recovery action。 |
+| pending `D-MOVE` 的 `S` 缺失、不完整，或 Q20/Q21 资格尚未证明；且其他 runtime record/owner/intent/authority/epoch/digest/staging 均可认证、无矛盾，stable lock 已取得且无 live owner | 任意 | `unresolved` | 零 authority、projection、cleanup 和业务写；保留现场，禁止 `forward`、partial-after 和授权 cleanup；不得以 phase、目录或 terminal projection 补资格。 |
+| runtime schema 标识可认证，但为旧版或未知版；其余已读节点均可认证且没有矛盾 | 任意 | `runtime.schema_unsupported` | 零写、零迁移、零双读和零 cleanup；不得把可识别的版本不兼容降级为 `runtime.corrupt`。 |
 | 运行期记录损坏、owner/intent/authority/epoch/digest/staging 无法认证，或任何已认证事实互相矛盾 | 任意 | `runtime.corrupt` | 零写、保留所有现场；不得删除、猜 owner、扫描 terminal 或降级成功。 |
 | 有效运行期记录且 stable OS lock live | 任意 | `runtime.busy` | 零写；不得抢占、删除记录或启动另一个 recovery。 |
 | 无 marker 的初始化现场 | 任意 | 不属于此 runtime 恢复合同 | 零创建、零删除、零猜测；不得把它转为运行期现场。 |

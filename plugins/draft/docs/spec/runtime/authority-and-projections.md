@@ -27,11 +27,20 @@ list。一个 `operation_id` 跨 manifest、progress、content、catalog/head �
 改变时创建新操作并关联旧操作；比较字段、关联字段和 `attempt_id` 的公开 ABI 仍为
 `unresolved`。
 
+对 pending `D-MOVE`，authority owner 与 recovery 共用同一个 immutable eligibility
+snapshot `S`。`S` 在语义上必须覆盖 source shape/member paths、`candidate`/`registered`
+root state、每个可移动 member 的 managed/unmanaged 分类、target kind/path、完整
+`before -> after` mapping、全根 closure/digest、retained/目录边界、parent/navigation/
+link/conclusions 窄改写事实以及关联 authority epoch/digest；它的完整性、关联摘要和
+epoch 必须在 stable lock 内重认证后，才可认证下一 authority 或已授权 cleanup。字段编码、
+哈希算法和公开 ABI 未由本 owner 定义，保持 `unresolved`。
+
 ### 状态维度与不变量
 
 | 维度 | 互斥状态 | 不变量 |
 | --- | --- | --- |
 | owner/intent | matching owner、before/after、staged digest；缺失/伪造/重复/不匹配 | 只有 matching intent 可授权下一 authority；不得扫描 terminal record 猜测。 |
+| D-MOVE eligibility snapshot | `S` 完整且 matching、无漂移且锁内重认证成功；缺失/不完整/资格未证明；摘要不匹配或当前事实漂移；锁内重认证未成功 | 只有 recovery 的 S 门禁通过且 stable lock 内重认证成功，才可 replace、`forward` 或已授权 cleanup；缺失/未决为 `unresolved`，矛盾为 `runtime.corrupt`，均零写并保留现场。 |
 | authority | 完整变更前；完整下一版本；缺失、符号链接、目录、identity/digest/generation 矛盾 | `active.json` 与 `index/head.json` 是唯一替换型 authority；第三种状态为 `runtime.corrupt`。 |
 | 物理耐久阶段 | intent、immutable record、staged、replace、父目录 fsync、committed progress | 下一阶段以前一阶段已认证且耐久为前提；内存、mtime、目录枚举不能推断 generation。 |
 | projection | 缺失/旧 generation 或 digest；staged；同代 durable；失败 | `schedule.json` 与 `cache.json` 绝不成为 authority，也不改变 authority。 |
@@ -46,10 +55,11 @@ id、kind、progress digest、due/retry deadline、R -> T 引用或阻塞原因�
 
 `catalog-transition-intent` 与 `catalog-transition-committed` 绑定同一 transition id；
 `index-transition-intent` 与 `index-transition-committed` 绑定 epoch head。结构操作
-使用的 manifest `before -> after` mapping 必须去重、规范化并有序；公开
-`changed_paths` 也去重并按规范化路径字典序排序。自动 collapse 若由该操作触发，属于
-同一 `operation_id` 与逻辑提交，只记录其子阶段 mapping；本页不扩张 mapping 的领域
-准入条件。
+使用的 manifest `before -> after` mapping 必须完整、去重、规范化、有序且确定；它是
+manifest、路径、parent、navigation、链接闭包、collapse 与 recovery 的唯一派生来源，
+并随 immutable record 的认证/持久化关系受到保护。runtime 公开结果不提供路径列表；
+本页不承诺任何公开路径投影。自动 collapse 若由该操作触发，属于同一 `operation_id`
+与逻辑提交，只记录其子阶段 mapping；本页不扩张 mapping 的领域准入条件。
 
 ### Authority 提交与恢复决策表
 
@@ -57,6 +67,14 @@ id、kind、progress digest、due/retry deadline、R -> T 引用或阻塞原因�
 generation/digest；下一 authority 版本是 matching intent 唯一授权的 generation/digest。
 每行都要求 owner、变更前版本、下一版本、staged digest 与 intent 精确匹配；按从上到
 下的优先级命中一行，且每行隐含前面各行均不满足，因此分区互斥。
+
+对 pending `D-MOVE`，还必须先通过 recovery owner 定义的 `S` 门禁：`S` 完整且 immutable、
+关联 epoch/digest 与当前 authority 匹配、当前 source/target/root、成员分类、mapping、
+closure、retained/目录边界及 parent/navigation/link/conclusions 事实无漂移，并在 stable
+lock 内重认证成功。只有其他 runtime record、owner/intent、authority、epoch/digest 与
+staging 事实均可认证且无矛盾、lock admission 已通过时，S 缺失/未决才保持 `unresolved`
+并零写；S 摘要不匹配或事实矛盾为 `runtime.corrupt` 并零写；未通过门禁不得进入下表的
+replace、forward 或 cleanup 行。
 
 | 可认证事实与物理阶段 | authority 观察 | 唯一动作 | 公开结果、release 与重试 |
 | --- | --- | --- | --- |
@@ -120,6 +138,7 @@ terminal progress。显式 `recover()` 才能在已认证 pending 现场上进�
 | manifest/progress/epoch 的精确字段、record 编码与 hash 链字段名 | `unresolved` | 已接受或已签来源固定 immutable/认证性质，未给出字段级 schema。 |
 | `operation_id` 生成、intent/snapshot 比较集合、旧操作关联字段、`attempt_id` 公开性 | `unresolved` | 已接受重试语义未定义这些 ABI。 |
 | snapshot token 的编码、字段名、失效后的 `ReadOutcome` 字段顺序 | `unresolved` | 已接受覆盖/失效语义，未有统一公共协议来源。 |
+| D-MOVE eligibility snapshot `S` 的字段编码、哈希算法、公开 ABI 与资格证明字段 | `unresolved` | 本 owner 只固定语义载荷、完整性和锁内重认证关系，未有字段级 signer-approved schema。 |
 | authority durable 但 progress 未补记时“补记”的精确条件、写入与输出 | `unresolved` | 该 Q21 细分没有同等级接受或 signer locator；它阻断把该现场宣布为 settled。 |
 | orphan/unknown staging 的精确资格谓词、cleanup 清单和 progress 交叉认证 | `unresolved` | 该 Q20 细分没有同等级接受或 signer locator；不得以目录内容自行分类。 |
 
