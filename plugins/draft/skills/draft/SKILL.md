@@ -117,13 +117,69 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 
 ## 回收与恢复
 
-- `trash` 按 [Trash 与 Restore](../../docs/spec/draft/trash-and-restore.md#trash-与-restore-行为合同) 认证受管理 Markdown 页面/子树、回收包和生命周期；普通链接观察以及 `conclusions.md` 入站链接不阻止 Trash，快照条目也不因此删除或重建。
-- `restore` 使用不透明 `TrashIdentity`，仅在 owner 定义的 7 天有效窗口及同一次可认证观察中验证资格。identity 的格式、窗口起算时刻/时区、命令字段和结果 ABI 均为 `unresolved`；示例中的 `TRASH_IDENTITY` 只是占位符，不定义其编码或字段：`draft restore --root ROOT TRASH_IDENTITY`。
-- `draft recover --root ROOT` 只按 runtime owner 已认证的持久证据收敛 recovery pending operation：不调度或推进 due，不创建 handoff，也不调用 Adapter；对 owner 已授权且证据精确的 cleanup disposition 可以继续收敛。证据缺失或矛盾时零写、保留现场，并保持 owner 定义的错误或 `unresolved`，不猜测清理路径。
-- 普通 stale 或已耐久降级的链接索引由可选 notification、`check`、`query page` 或 `query backlinks` 根据当前根事实机会式维护，不属于 `recover`；其公开维护阶段、重试和缓存字段仍为 `unresolved`，不由本入口补造。
-- `restore` 遇 lexical invalid、missing、expired、consumed、conflict、corrupt、recovery-required、未完成、证据不足或运行期现场不安全时，按 [Trash 与 Restore](../../docs/spec/draft/trash-and-restore.md#trash-与-restore-行为合同) 和 runtime owner 返回可诊断错误；不要把错误输出宣称为已恢复，也不要凭未签的成功布尔字段或固定 `result_type` 推断成功。Restore 的领域 code、退出码和公共 envelope 字段仍由对应 owner/ABI 决定，未签字段保持 `unresolved`。
-- 交接、索引、耐久和恢复结果只能按 runtime owner 投影：可安全分类的派生 cache 降级可以保留成功/允许 delivered，authority 或已决定结果的耐久失败必须 error 且不含 `delivered`；notification adapter 不读取投影、不调用自动 lifecycle 或 recovery，也不自行安排重试。结构命令遇到 recovery pending 时先运行 `draft recover --root ROOT`；不要删除锁、日志或删除包，恢复若无法认证则保留现场并停止。
-- `.draft/` 下的操作日志、权威删除包和锁是工具内部状态，绝不手工编辑。
+`trash` 和 `restore` 遵循 [Trash 与 Restore 行为合同](../../docs/spec/draft/trash-and-restore.md#trash-与-restore-行为合同)。Trash 只认证受管理 Markdown 页面/子树、回收包和生命周期；普通链接观察、stale 的 `conclusions.md` 或其入站链接不阻止 Trash，也不删除、重建或改写快照。
+
+### 入口边界与显式 recover
+
+- `draft recover --root ROOT` 是唯一收敛 recovery-pending 的入口。它只在 root-bound stable lock 下重读已持久化的 runtime record、marker/descriptor、manifest/progress、owner/intent、before/after authority、epoch、staging、R/T 或 handoff 证据；不定义新的业务操作。
+- 普通写、普通 read（包括 `page`、`links`、`backlinks`、`relations`、`status`、`recoverable`）、结构命令、`read(Check)`、`initialize`、`adopt`、所有 `DryRun` 和 notification 都不隐式调用 `recover`，不枚举 terminal progress，也不删除 recovery record。遇到 pending 时保持业务零写、保留诊断，并指向显式 `draft recover --root ROOT`；收敛后必须重新认证本次操作的完整事实。
+- `recover` 不推进 due，不创建 handoff，不调用 `HandoffAdapter`，也不因外部“可能已接受”或目录/mtime/terminal projection 猜测结果。有效 record 有 live owner 时保持现场并返回 `runtime.busy`，不得抢占、删除 record 或启动第二次 recovery。
+- 普通 stale 或已耐久降级的链接索引仍可由 notification、`check`、`query page` 或 `query backlinks` 按当前根事实机会式维护；这不属于 `recover`，其公开维护阶段、重试和缓存字段未签时保持 `unresolved`。
+
+### Recovery disposition 决策
+
+下表按 [显式恢复](../../docs/spec/runtime/recovery.md#证据优先恢复决策表) 的优先级求值；每行事实必须在 lock 内重读并互斥认证。未落入已签行的事实保持 `unresolved`，不得凭常见路径补全。
+
+| 已认证的 owner 前置事实 | 唯一结果 | 允许的副作用与零写边界 |
+| --- | --- | --- |
+| runtime schema 可认证但为旧版或未知版 | `runtime.schema_unsupported` | 零写、零迁移、零双读、零 cleanup；不得降级为 `runtime.corrupt`。 |
+| runtime record、owner/intent、authority、epoch、digest、staging 无法认证，或已认证事实互相矛盾 | `runtime.corrupt` | 零写并保留全部现场；不得删除、猜 owner、扫描 terminal 或报告成功。 |
+| 有效 runtime record 且 stable OS lock 有 live owner | `runtime.busy` | 零写；不得抢占、删除 record 或启动另一个 recovery。 |
+| 无 marker 的初始化现场 | 不属于 runtime recover 合同 | 零创建、零删除、零猜测；不得把它转换为 runtime pending。 |
+| marker/runtime/descriptor 匹配、无 runtime record、精确 descriptor cleanup artifacts 尚存 | `cleanup` | 取得 stable lock，锁内确认仍无 record 后发布 durable recovery record；只按 descriptor 精确幂等 cleanup，完成 unlink/fsync/release 后才 settled。 |
+| 无 runtime record、无 descriptor cleanup remnant、无其他可认证 pending 现场 | `already_settled` | 不发布例行 recovery record，不枚举 terminal progress，不产生业务写。 |
+| durable `accepted` 或 `purge-committed` handoff，且 authority/catalog/head/progress/receipt 与精确 cleanup authorization 均匹配、无其他 pending | `cleanup` | 只清理已授权的精确 material；此后绝不调用 Adapter。缺失或矛盾事实落入更高优先级的 `runtime.corrupt` 或后续 `unresolved`。 |
+| matching handoff `prepared` 但无 durable outcome（包括可能已外部接受） | `unresolved` | 仅允许写入 `handoff-outcome-unknown`；本次不调用 Adapter、不新建 attempt，后续按记录的 deadline 由 eligible invocation 重试；公开 disposition 映射仍为 `unresolved`。 |
+| matching handoff `authorized`，但尚无 durable `prepared` 或 outcome | `unresolved` | 不新建 attempt、不调用 Adapter、不 cleanup，也不把它解释为 prepared；精确恢复写入和公开 ABI 未签。 |
+| R/T consumption 或 receipt record 匹配，且唯一缺少已认证的下一 durable proof | `forward` | 仅完成该关系的精确 proof/receipt；保持 T 阻塞，不推进 T、不清理 package。 |
+| R receipt durable，双方 authority 与精确 cleanup authorization 匹配、无其他 pending | `cleanup` | 只清理双方已授权 material；不得 handoff、purge 或重建关系。 |
+| staging 的 cleanup 资格只能由 manifest/owner/intent/epoch/cleanup list 的 Q20 orphan predicate 证明，或 staging 无法认证/不匹配 | `unresolved` | 不自行清理；Q20 的 orphan/unknown-staging 分区、资格和清理范围未签；无法认证的 staging 按 `runtime.corrupt` fail-closed 并保留现场。 |
+| 已认证且已授权的精确 cleanup material，且没有竞争的 authority、R/T 或 handoff pending | `cleanup` | 只按清单幂等 cleanup；清单成员缺失可跳过，类型、路径或摘要变化转为 `runtime.corrupt`。 |
+| 完整 durable after authority，且没有前述 handoff/R-T/cleanup pending | `forward` | 不得回滚或建立第二 authority；缺少 matching progress 的精确补记权限、记录和结果投影保持 `unresolved`，未满足逻辑提交前不得宣布 settled。 |
+| matching partial new authority，已认证且不矛盾，且没有前述 handoff/R-T/cleanup pending | `forward` | 只可向已授权 after-state 收敛；不得推断新的 membership/head 或扫描其他 terminal record。 |
+| 仅完整 before authority、已认证 durable rollback direction 唯一且可证明无外部副作用 | `rollback` | 只按该 direction 及其精确 material 回退；不得凭 applied 位或目录存在猜测。 |
+| 仅完整 before authority，存在已认证且唯一授权 cleanup 的 durable evidence，且精确 material 已获授权、可证明无外部副作用 | `cleanup` | 只清理该清单列举的 material；不得产生新的 authority。 |
+| 任何未被前述行处理的 handoff、R/T、cleanup pending，或存在未覆盖的外部副作用/receipt 证据 | `unresolved` | 保留现场；不得 rollback、cleanup、重试 Adapter 或报告成功。普通入口对此类有效 pending 投影 `runtime.recovery_required` 并阻止业务写；recover 自身的 disposition 仍为 `unresolved`。 |
+
+`forward`、`rollback` 和 `cleanup` 只有在 authority/content/catalog/head/outcome 与不可延期授权 cleanup 全部 durable、projection 已 durable 或安全分类、且没有未认证 staging 或其他 pending 后，才可完成逻辑提交。随后才可 unlink record、fsync `.draft/`、释放 lock 并返回 settled；任一耐久失败都保留现场并返回错误，不投影成功。已完成提交且无剩余现场的重复 `recover` 仅返回确定的 `already_settled` 语义，不新建 attempt、不重复业务写、不调用 Adapter。
+
+`RecoveryOutcome` 必须表达 `result_type`、`operation_id`、`disposition`、前后 phase、最终 authority epoch、cleanup 状态、`warnings` 和 `errors`，且不得暴露内部路径；`disposition` 仅为 `forward`、`rollback`、`cleanup` 或 `already_settled`。除这些已签语义外，字段名、值域、可选性和顺序均为 `unresolved`，不得自行发明 `before_phase`、`after_phase`、`authority_epoch` 或 `cleanup_state` 等 ABI。
+
+### Restore 前置、提交与失败分区
+
+`restore` 使用不透明 `TrashIdentity`，仅在同一可认证观察中同时验证同一根、当前 authority/active membership、记录的 after-state、保留 package、目标路径、共享观察时刻和 7 天有效窗口。identity 编码、窗口起算时刻/时区、命令字段、结果 ABI 以及 reverse-collapse mapping 算法均为 `unresolved`；占位示例为 `draft restore --root ROOT TRASH_IDENTITY`。
+
+| Restore 事实 | 结果与副作用 |
+| --- | --- |
+| lexical invalid | 拒绝；不查找、不写入。 |
+| missing | 拒绝，零写并保留诊断。 |
+| expired | 不恢复；不得解释为 consumed，清理仍受 durable authorization 约束。 |
+| consumed | 拒绝重复恢复，零写。 |
+| conflict（当前 root/after-state 不精确匹配） | 拒绝；不覆盖、不猜测合并，保留 package。 |
+| corrupt（package、identity、摘要、关系/导航或 authority 矛盾/不可认证） | 拒绝并保留现场；不得 cleanup 或重建 package。 |
+| recovery-required、未完成或耐久结果未收敛 | 不做新的 Restore 写；只有显式 `recover` 可收敛。 |
+| valid：package、after-state、时间、目标路径和完整 after-plan 均可认证 | 只做一次完整领域提交；提交完成后才重新加入 active membership，成功前不得消费 package。 |
+
+package 消费、目录清理或交给后续系统的 cleanup 只有在最终 authority、catalog/head 和 matching progress/receipt 均 durable 且获精确授权后才可发生；unknown、failed、冲突或证据不足时保留 package 与现场。Restore 的具体 identity/字段/退出码 ABI 继续按 owner 的 `unresolved` 边界处理。
+
+Trash/Restore 需要 reverse-collapse 时，必须由已记录 mapping 与 after-state 证明，不能从当前目录形状、页面名或缺失文件猜测；无法证明时进入 conflict/corrupt 边界。Trash 仍不受 stale conclusions 快照或链接观察阻止，也不改写快照；Restore 也不以快照替代其 exact after-state 认证。
+
+### Runtime 输出、warning 与停止
+
+- `failed`、`unknown`、`deferred`、自动阶段的 `busy` 只有在本 invocation 新观察且可行动时才能作为 warning；分别遵循 owner 的 `lifecycle.handoff_failed`、`lifecycle.handoff_unknown`、`lifecycle.deferred` 和 `runtime.busy` 语义。历史 record、历史 busy、仅到达 deadline 或 schedule rebuild 不重播 warning。
+- `runtime.schema_unsupported`、`runtime.corrupt`、`runtime.recovery_required`、`runtime.durability_failed` 与未分类 worker/runtime failure 是独立结果；错误 envelope 不得带伪造成功、partial success 或 `delivered`。未分类 worker/runtime failure 返回 owner 的 precise error，不折叠为 delivered；`runtime.corrupt`/durability failure 保留现场，普通入口的有效 pending 明确投影 `runtime.recovery_required`，只阻止并要求显式 recover。自动阶段在稳定 read 上观察到 busy 可作为本次 `runtime.busy` warning；直接写入竞争是 error。Restore 领域错误保持各自独立 machine code，不折叠为 warning 或 delivered。
+- 只有 owner 明确允许的安全 cache/索引降级且 authority/head 已 durable 时，成功 projection 或 notification 才可保留；fatal/error 或最终事实不稳定时无 projection。notification adapter 不读取 projection、不调用 lifecycle/recover，也不自行安排重试。
+- `.draft/` 下的操作日志、runtime record、权威删除包和锁不可手工编辑或删除。在 recovery-pending 现场，只有显式 `recover` 在上表精确授权且逻辑提交条件成立时，才可按清单 cleanup、unlink record 和 fsync；正常 lifecycle 的 owner-authorized cleanup 仍须遵循其自身 durable 授权，consumer 不得绕过 owner 手工清理。
 
 ## 硬停止条件
 
@@ -131,8 +187,8 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 
 - 状态、关系或拆分涉及语义判断而非机械修正；
 - `check` 报告你无法解释的客观错误；
-- `recover` 无法完成机械恢复，或其输出为 runtime owner 定义的 corruption/inconsistent/external-change 错误；结构命令首次提示 recovery pending 时先按上一节运行 `recover` 做机械恢复，只有恢复本身失败或结果无法解释才到这里停止；
-- `trash` 无法认证页面、删除包或生命周期事实；
+- `recover` 返回 `runtime.corrupt`、`runtime.durability_failed`、`runtime.external_change` 或其他未能解释的错误，或其事实只能落入 `unresolved`：保留现场、停止当前流程，不猜测下一步；结构/普通入口遇到 recovery pending 时只指向显式 recover，不在入口内代调用；
+- `trash` 或 `restore` 无法认证页面、package、identity、after-state、生命周期事实或完整 after-plan；
 - uvx 执行失败，且按 uv 自身的诊断处理后仍无法解决。
 
 ## 检查器严重级别
@@ -140,7 +196,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 检查器输出四档：
 
 - `errors`客观结构损坏
-- `warnings` 合法但需注意的运行状态，只能来自本次 runtime owner 明确允许的 cache/索引派生降级；它们不改变 authority，也不替代错误或恢复阻塞。`adopt` 的完整预检查中，安全分类的派生性能降级不阻止登记，但页面错误、内部制品矛盾、耐久失败或 recovery pending 仍阻止登记。具体 warning code 和字段按 owner 处理，未签 ABI 保持 `unresolved`。
+- `warnings` 只投影本 invocation 新产生且可行动的 `failed`、`unknown`、`deferred`、`busy` 或 owner 明确允许的安全 cache/索引降级；它们不改变 authority，也不替代错误或恢复阻塞。`adopt` 的完整预检查中，安全分类的派生性能降级不阻止登记，但页面错误、内部制品矛盾、耐久失败或 recovery pending 仍阻止登记。具体 warning code、字段和顺序按 owner 处理，未签 ABI 保持 `unresolved`。
 - `infos`合法未结束的生命周期事实，如 `trash_retained`
 - `reviews`待人类审查提醒。
 
@@ -151,5 +207,5 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 | 0   | 逻辑提交成功或 owner 明确允许的 `delivered`；`check` 无客观错误 |
 | 1   | `check` 完成并发现客观结构错误                             |
 | 2   | 参数、根、路径、版本或领域前置条件无效                     |
-| 3   | 需要恢复、锁/日志损坏、外部修改或不安全恢复冲突            |
+| 3   | runtime/lifecycle/durability/external state 错误（包括需要显式恢复、schema 不支持、busy、corrupt 或不安全冲突；具体 machine code 按 owner） |
 | 4   | 运行时 OSError（领域操作期间的文件系统错误）               |
