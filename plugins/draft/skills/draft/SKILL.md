@@ -39,7 +39,7 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 - adopt 接管格式完整的未登记目录
 - check 检查草稿一致性
 - notify files-changed 通知根外部批量文件编辑已经稳定
-- move 移动页面或未受管理文件：`TARGET` 以 `.md` 结尾时是文件目标，只允许单个文件 `SOURCE`；否则是前缀目标，来源按基名或目录名落入其下；目录 `SOURCE` 只移动其中的 `.md` 普通文件，其余内容原地留下；未受管理来源提升后由 `check` 报告协议欠账
+- move 移动页面或未受管理文件：`TARGET` 以 `.md` 结尾时是文件目标，只允许单个文件 `SOURCE`；否则是前缀目标。先按 [来源决策矩阵](../../docs/spec/draft/structure.md#来源决策矩阵) 确认 source/target 准入；目录 `SOURCE` 再按 [目录来源](../../docs/spec/draft/structure.md#目录来源) 对可移动 Markdown 成员分类，目录不是 ownership 对象。`mixed`、`unknown`、`unverifiable` 在写前拒绝、零写并保留成员级诊断；`no-movable` 走 owner no-op。可移动成员、retained 边界、mapping 和目录物理清理均由上述 owner 证明；未受管理来源提升后由 `check` 报告协议欠账
 - promote 升格页面为枢纽
 - collapse 降级枢纽为普通页面
 - trash 回收页面为保留态
@@ -128,50 +128,9 @@ uvx --isolated --from "<skill_root>/scripts/runtime" draft COMMAND ...
 
 ### Recovery disposition 与 D-MOVE 门禁
 
-本节只消费 [显式恢复](../../docs/spec/runtime/recovery.md#显式恢复与-recoveryoutcome)、[D-MOVE snapshot 重认证门禁](../../docs/spec/runtime/recovery.md#d-move-snapshot-重认证门禁与-q6-b-漂移分类) 和 [公共结果与错误投影](../../docs/spec/runtime/errors-and-observability.md#公共结果与错误投影) 的当前 owner；它不定义恢复算法、record schema 或公开 ABI。
-
-对 pending `D-MOVE`，先在 stable lock 内重读 immutable eligibility snapshot `S`。`S` 必须作为同一认证载荷覆盖 source shape/member paths、root state、成员级 managedness、target kind/path、完整 `before -> after` mapping、closure/digest、retained/目录边界、parent/navigation/link/conclusions 窄改写事实和关联 authority epoch/digest。其字段编码、哈希算法和公开 ABI 仍为 `unresolved`。
-
-| 锁内重读的 `S` 门禁事实 | 唯一分类 | 不变量 |
-| --- | --- | --- |
-| `S` 完整且 immutable，摘要与关联 epoch/digest 匹配，当前事实无漂移，stable lock 仍由本次 recover 持有 | 通过门禁 | 仅可继续求值下方已认证的 evidence 行。 |
-| 其他 runtime record、owner/intent、authority、epoch/digest 与 staging 均可认证、无矛盾，lock 已取得且无 live owner；但 `S` 缺失、不完整或 Q20/Q21 资格未证明 | `unresolved` | 零 authority、projection、cleanup 和业务写；保留现场，禁止 `forward`、partial-after 和授权 cleanup。 |
-| `S` 完整且摘要/关联 epoch/digest 匹配，但锁内重认证未成功，且没有 live owner 或明确矛盾 | `unresolved` | 零 authority、projection、cleanup 和业务写；不得以 phase、目录或 terminal projection 推断资格。 |
-| `S` 摘要或关联 epoch/digest 不匹配，或 source/target/root、成员分类、mapping、closure、retained/目录边界、parent/navigation/link/conclusions 事实明确漂移或矛盾 | `runtime.corrupt` | 零 authority、projection、cleanup 和业务写，保留全部现场；不得继续 recovery action。 |
-
-只有先通过此门禁，才可进入 `forward`、matching partial-after 或已授权 cleanup 的 evidence 行。门禁不通过时，不得从缓存、目录形状或常见阶段补足 `S`。
-
-### Recovery disposition 决策
-
-下表按 [证据优先恢复决策表](../../docs/spec/runtime/recovery.md#证据优先恢复决策表) 的优先级求值；每行事实必须在 lock 内重读并互斥认证。未落入 owner 明确分区的事实保持 `unresolved`，不得凭常见路径补全。
-
-| 已认证的 owner 前置事实 | 唯一结果 | 允许的副作用与零写边界 |
-| --- | --- | --- |
-| runtime schema 可认证但为旧版或未知版，且其余全部已读节点（包括 runtime record、owner/intent、authority、epoch/digest、staging 与适用的 `S`）均可认证、无矛盾 | `runtime.schema_unsupported` | 零写、零迁移、零双读、零 cleanup；不得降级为 `runtime.corrupt`。 |
-| 任一 runtime record、owner/intent、authority、epoch/digest、staging 或适用的 `S` 无法认证、不匹配，或任意已认证事实互相矛盾 | `runtime.corrupt` | 零写并保留全部现场；不得删除、猜 owner、扫描 terminal 或报告成功。 |
-| 有效 runtime record 且 stable OS lock 有 live owner | `runtime.busy` | 零写；不得抢占、删除 record 或启动另一个 recovery。没有 record、record 损坏或无 marker 时，不得仅凭锁推断 busy。 |
-| 无 marker 的初始化现场 | 不属于 runtime recover 合同 | 零创建、零删除、零猜测；不得把它转换为 runtime pending。 |
-| marker/runtime/descriptor 匹配、无 runtime record、精确 descriptor cleanup artifacts 尚存，且无其他矛盾或竞争 handoff/R-T/staging pending | `cleanup` | 取得 stable lock，锁内确认仍无 record 后发布 durable recovery record；只按 descriptor 精确幂等 cleanup，完成 unlink/fsync/release 后才 settled。 |
-| 无 runtime record、无 descriptor cleanup remnant、无其他可认证 pending 现场 | `already_settled` | 不发布例行 recovery record，不枚举 terminal progress，不产生业务写。 |
-| durable `accepted` 或 `purge-committed` handoff，且 authority/catalog/head/progress/receipt 与精确 cleanup authorization 均匹配、无其他 pending | `cleanup` | 只清理已授权的精确 material；此后绝不调用 Adapter。缺失或矛盾事实落入更高优先级的 `runtime.corrupt` 或后续 `unresolved`。 |
-| matching handoff `prepared` 但无 durable outcome（包括可能已外部接受） | `unresolved` | 仅允许写入 `handoff-outcome-unknown`；本次不调用 Adapter、不新建 attempt，后续按记录的 deadline 由 eligible invocation 重试；公开 disposition 映射仍为 `unresolved`。 |
-| matching handoff `authorized`，但尚无 durable `prepared` 或 outcome | `unresolved` | 不新建 attempt、不调用 Adapter、不 cleanup，也不把它解释为 prepared；精确恢复写入和公开 ABI 未签。 |
-| R/T consumption 或 receipt record 匹配，且唯一缺少已认证的下一 durable proof | `forward` | 仅完成该关系的精确 proof/receipt；保持 T 阻塞，不推进 T、不清理 package。 |
-| R receipt durable，双方 authority 与精确 cleanup authorization 匹配、无其他 pending | `cleanup` | 只清理双方已授权 material；不得 handoff、purge 或重建关系。 |
-| staging 无法认证或不匹配 | `runtime.corrupt` | fail-closed、零写并保留现场；不得将它降级为 `unresolved` 或自行 cleanup。 |
-| staging 可认证，但 cleanup 资格只能由未获 signer-approved 谓词的 Q20 orphan/unknown-staging 分区决定 | `unresolved` | 不自行 cleanup；Q20 的字段级资格、编码和清理范围仍未签。 |
-| 已认证且已授权的精确 cleanup material，且没有竞争的 authority、R/T 或 handoff pending | `cleanup` | 只按清单幂等 cleanup；清单成员缺失可跳过，类型、路径或摘要变化转为 `runtime.corrupt`。 |
-| 完整 durable after authority，且没有前述 handoff/R-T/cleanup pending | `forward` | 不得回滚或建立第二 authority；缺少 matching progress 的精确补记权限、记录和结果投影保持 `unresolved`，未满足逻辑提交前不得宣布 settled。 |
-| matching partial new authority，已认证且不矛盾，且没有前述 handoff/R-T/cleanup pending | `forward` | 只可向已授权 after-state 收敛；不得推断新的 membership/head 或扫描其他 terminal record。 |
-| 仅完整 before authority、已认证 durable rollback direction 唯一且可证明无外部副作用 | `rollback` | 只按该 direction 及其精确 material 回退；不得凭 applied 位或目录存在猜测。 |
-| 仅完整 before authority，存在已认证且唯一授权 cleanup 的 durable evidence，且精确 material 已获授权、可证明无外部副作用 | `cleanup` | 只清理该清单列举的 material；不得产生新的 authority。 |
-| 任何未被前述行处理的 handoff、R/T、cleanup pending，或存在未覆盖的外部副作用/receipt 证据 | `unresolved` | 保留现场；不得 rollback、cleanup、重试 Adapter 或报告成功。普通入口对此类有效 pending 投影 `runtime.recovery_required` 并阻止业务写；recover 自身的 disposition 仍为 `unresolved`。竞争 handoff/R-T/staging 或不可认证事实不得借 descriptor cleanup 发布 recovery record：不可认证/矛盾按前述 `runtime.corrupt`，其余未获规则的可认证 pending 保持 `unresolved`。 |
-
-`forward`、`rollback` 和 `cleanup` 只有在 authority/content/catalog/head/outcome 与不可延期授权 cleanup 全部 durable、projection 已 durable 或安全分类、且没有未认证 staging 或其他 pending 后，才可完成逻辑提交。随后才可 unlink record、fsync `.draft/`、释放 lock 并返回 settled；任一耐久失败都保留现场并返回错误，不投影成功。已完成提交且无剩余现场的重复 `recover` 仅返回确定的 `already_settled` 语义，不新建 attempt、不重复业务写、不调用 Adapter。
-
-公开 `Outcome`、`RecoveryOutcome` 和 notification 不提供 `changed_paths`、内部 mapping 或任何替代路径列表。notification 的 `delivered: true` 只能来自 [错误与可观测性 owner](../../docs/spec/runtime/errors-and-observability.md#错误投影与退出码决策表) 明确允许的最小 delivered 行；所有 error envelope 均不得含 `delivered`。
-
-`RecoveryOutcome` 必须表达 `result_type`、`operation_id`、`disposition`、前后 phase、最终 authority epoch、cleanup 状态、`warnings` 和 `errors`，且不得暴露内部路径；`disposition` 仅为 `forward`、`rollback`、`cleanup` 或 `already_settled`。Q16 的高层 disposition 和 Q17 的 `RecoveryOutcome` 语义是已接受的合同，不是已签署的字段 ABI。字段名、值域、可选性和顺序，以及 Q20/Q21 的字段级资格与编码，均为 `unresolved`；不得自行发明 `before_phase`、`after_phase`、`authority_epoch` 或 `cleanup_state` 等 ABI。
+- 本节只提供 owner 导航：[显式恢复与 RecoveryOutcome](../../docs/spec/runtime/recovery.md#显式恢复与-recoveryoutcome)、[D-MOVE snapshot 重认证门禁](../../docs/spec/runtime/recovery.md#d-move-snapshot-重认证门禁与-q6-b-漂移分类)、[证据优先恢复决策表](../../docs/spec/runtime/recovery.md#证据优先恢复决策表) 和 [公共结果与错误投影](../../docs/spec/runtime/errors-and-observability.md#公共结果与错误投影) 分别拥有恢复入口、D-MOVE 门禁、generic disposition 优先级和公开投影；本 skill 不复制这些规则。
+- 显式 `recover` 按 recovery owner 执行。pending `D-MOVE` 在 stable lock 内先走 `S` 门禁：`S` 缺失、不完整或资格未证明沿 owner 的 `unresolved` 停止；摘要/关联 epoch/digest 不匹配或当前事实明确漂移/矛盾沿 owner 的 `runtime.corrupt` 停止。通过门禁后才继续 owner 证据求值。
+- 其他 pending 不要求 D-MOVE `S`，直接走 owner 的 [证据优先恢复决策表](../../docs/spec/runtime/recovery.md#证据优先恢复决策表)。disposition 分类、优先级、cleanup 授权、record/manifest schema、逻辑提交和 `RecoveryOutcome` ABI 都由 owner 决定；公开结果继续不提供路径列表。
 
 ### Restore 前置、提交与失败分区
 
