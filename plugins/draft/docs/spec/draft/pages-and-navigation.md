@@ -55,16 +55,22 @@ Check 或协议欠账只表示可观察的现有事实，不反向拒绝已经�
 机器区/正文边界、序列化格式和 runtime durable record 为 `unresolved`；实现不得借此
 省略三者一致性。
 
-恢复或 partial-after 继续前，页面 owner 只能消费结构 owner 在锁内重认证通过的完整
-snapshot `S`。S 缺失或 Q20/Q21 尚无资格证明时保持 `unresolved` 并零写；出现矛盾、摘要
-不匹配或 parent/navigation 事实不一致时报告 `runtime.corrupt` 并保留现场，不能 forward。
+对 pending `D-MOVE`，恢复或 partial-after 继续前，页面 owner 只能消费结构 owner 在锁内重
+认证通过的完整 snapshot `S`。pending `D-MOVE` 的 S 缺失或 Q20/Q21 尚无资格证明时保持
+`unresolved` 并零写；
+出现矛盾、摘要不匹配或 parent/navigation 事实不一致时报告 `runtime.corrupt` 并保留现场，
+不能 forward。非 `D-MOVE` operation 的 recovery/partial-after 不适用该 S；页面 owner 直接
+消费 runtime recovery owner 的 generic authority/evidence table（见
+`runtime/recovery.md#证据优先恢复决策表`），不额外要求 S。
 
 ### 失败、零写与恢复
 
 - 导航无法解析、父页不存在、角色冲突、目标碰撞或 mapping 不可证明时，不写任何受
   管理页面、关系或导航。
-- runtime 报告耐久不确定时不返回结构成功；保留 recovery 现场。重试前重新认证整棵
-  受影响树和 S，不能复用过期导航事实。
+- runtime 报告耐久不确定时不返回结构成功；保留 recovery 现场。重试前按 operation 类型
+  重新认证：pending `D-MOVE` 必须重新认证整棵受影响树和 S，不能复用过期导航事实；非
+  `D-MOVE` operation 的 recovery/partial-after 按 runtime 的 generic authority/evidence table
+  重新认证，不额外引入 S。
 - 外部手工移动没有可证明 mapping 时，不能由本合同猜测 parent 或导航；必须失败并由
   Check 诊断。
 
@@ -76,8 +82,10 @@ snapshot `S`。S 缺失或 Q20/Q21 尚无资格证明时保持 `unresolved` 并�
 - 验证 candidate 页面纳管后仅获得路径角色，协议欠账仍可由 Check 观察；registered
   unmanaged source、目录成员 `mixed`/`unknown`/`unverifiable`、unknown/mixed/unverifiable
   root、非 Markdown/附件 source 和不完整闭包均验证写前拒绝零写。验证路径、parent、导航
-  和 collapse 均从一个 mapping 派生，且 S 缺失与 S 矛盾分别落入 `unresolved` 与
-  `runtime.corrupt`。
+  和 collapse 均从一个 mapping 派生。对 pending `D-MOVE`，验证 S 缺失与 S 矛盾分别落入
+  `unresolved` 与 `runtime.corrupt`；对非 `D-MOVE` recovery/partial-after，验证完整 generic
+  evidence 且无 S 时页面层不额外阻断，结果由 runtime 的 generic authority/evidence table
+  决定。
 
 ## 来源
 
