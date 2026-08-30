@@ -60,8 +60,8 @@ Check 或协议欠账只表示可观察的现有事实，不反向拒绝已经�
 `unresolved` 并零写；
 出现矛盾、摘要不匹配或 parent/navigation 事实不一致时报告 `runtime.corrupt` 并保留现场，
 不能 forward。非 `D-MOVE` operation 的 recovery/partial-after 不适用该 S；页面 owner 直接
-消费 runtime recovery owner 的 generic authority/evidence table（见
-`runtime/recovery.md#证据优先恢复决策表`），不额外要求 S。
+消费 runtime recovery owner 的
+[证据优先恢复决策表](../runtime/recovery.md#证据优先恢复决策表)，不额外要求 S。
 
 ### 失败、零写与恢复
 
@@ -69,8 +69,8 @@ Check 或协议欠账只表示可观察的现有事实，不反向拒绝已经�
   管理页面、关系或导航。
 - runtime 报告耐久不确定时不返回结构成功；保留 recovery 现场。重试前按 operation 类型
   重新认证：pending `D-MOVE` 必须重新认证整棵受影响树和 S，不能复用过期导航事实；非
-  `D-MOVE` operation 的 recovery/partial-after 按 runtime 的 generic authority/evidence table
-  重新认证，不额外引入 S。
+  `D-MOVE` operation 的 recovery/partial-after 按 runtime 的
+  [证据优先恢复决策表](../runtime/recovery.md#证据优先恢复决策表) 重新认证，不额外引入 S。
 - 外部手工移动没有可证明 mapping 时，不能由本合同猜测 parent 或导航；必须失败并由
   Check 诊断。
 
