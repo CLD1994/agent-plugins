@@ -1,10 +1,25 @@
-# Codex subagent 使用指南
+# Codex Harness 交互
 
-- Main Agent 手头上没有任务需要执行时，只需要等待 subagent 唤醒，`wait_agent` 的 `timeout_ms` 取最大值，`timeout_ms` 如果不取最大值，会导致不必要的频繁唤醒，会产生大量的调用成本。
-- 每次调用 `spawn_agent` 都必须显式传入 `fork_turns`，通常使用 `"none"`；任务所需上下文应在 message 中用最少的自包含说明和精确文件路径提供，避免默认完整继承造成不必要的 token 消耗
-- `spawn_agent` 的 `model` 参数不可省略, 否则会默认继承 Main Agent 的默认层级，这会产生大量的不必要成本。顾问级模型的 `reasoning_effort` 必须为 `ultra`，其他层级的模型必须为 `max`
-- Main Agent 通过 `send_message` 和 `followup_task` 传递的消息目前在用户视图上不可见, `message` 参数传递的内容必须原样写入 `/tmp/agents/<session>/subagent/<subagent_name>/main-<trun>.md`
-- subagent 通过 `send_message` 传递的消息或完成任务产生的回复目前也在用户视图上不可见， `message` 参数传递的内容和完成任务产生的回复必须原样写入 `/tmp/agents/<session>/subagent/<subagent_name>/subagent-<trun>.md`
-- agent 之间的交互，可以通过引用文件路径的方式传递消息。不必将消息写入文件 `<agent-type>-<trun>.md` 后原样传输，这样会增加 token 消耗
-- 期望目标 agent 阅读具体文件的时候，必须传递具体文件路径，不得简述。比如 "阅读新 issue 17、foundation spec" 需要改成具体的 markdown 链接
-- Main Agent 需要在对 subagent 的指令中明确要求需要将消息写入文件并以文件引用的方式传递，因为不保证 subagent 会阅读该指南
+只在当前环境是 Codex Harness，且 Main Agent 要创建、联系或等待 subagent 时阅读。本文件只定义 Harness 工具参数、消息留档和等待方式；角色、切片、评审和升级决定以 SKILL.md 为准。
+
+## 创建与等待
+
+- 每次调用 spawn_agent 都显式给出 fork_turns 和 model。通常使用 fork_turns: "none"，让任务单和精确绝对路径提供最小完整上下文。
+- 执行级、思考级和顾问级的 model 都从本会话已经记录的模型映射取得，不能省略。顾问级的 reasoning_effort 为 ultra；Harness 支持时其他层级为 max。
+- Main 没有其他工作且仍有 subagent 运行时，只调用 wait_agent，并把 timeout_ms 设为允许的最大值 3600000。
+
+## 消息留档
+
+消息文件按接收该任务的 subagent 目录和该任务自己的回合编号保存。会话名、任务名和回合编号必须保持一致，例如：
+
+- Main 的任务单或第一条指令：/tmp/agents/2026-09-03-api-migration/subagent/schema-audit/main-001.md
+- 该 subagent 的回复：/tmp/agents/2026-09-03-api-migration/subagent/schema-audit/subagent-002.md
+- 同一切片的第二条补充：/tmp/agents/2026-09-03-api-migration/subagent/schema-audit/main-003.md
+
+每个单向消息都占用本切片的下一个本地回合。调用 spawn_agent、send_message 或 followup_task 前，Main 将 message 参数原样写入相应的 main-{回合}.md。任务单要求 subagent 在发送消息或给出最终回复前，将原文写入相应的 subagent-{回合}.md。回合编号使用三位十进制递增格式，例如 001。
+
+大型材料已经写入文件时，消息只引用精确绝对路径，避免重复传输全文。希望目标 agent 阅读材料时，给出该材料的精确绝对路径，而不是只给主题或简称。
+
+## 作用域声明
+
+每份任务单都写明当前作用域明确禁止 subagent 加载的技能。不得一概禁止所有 skill。根目录当前规则只禁止 subagent 加载 i-am-yuna；其他 skill 是否可用，由具体任务和作用域决定。
