@@ -30,7 +30,7 @@
 
 ## 诊断投影
 
-`P-DIAGNOSTICS` 的 owner 是 [查询规格的诊断段](../draft/query-check-and-output.md#诊断)。本页只是该合同的 delivery 消费者：它投影已认证诊断事实，不复制或重新定义 `Outcome`、`ReadOutcome`、`RecoveryOutcome`、错误码、字段顺序或退出码。
+`P-DIAGNOSTICS` 的 owner 是 [Check 诊断合同](../draft/query-check-and-output.md#check-诊断合同)。本页只是该合同的 delivery 消费者：它投影已认证诊断事实，不复制或重新定义 `Outcome`、`ReadOutcome`、`RecoveryOutcome`、错误码、字段 schema 或退出码。
 
 ## 来源
 

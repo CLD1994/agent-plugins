@@ -1,110 +1,173 @@
 # 资源与链接
 
-## 资源身份与链接
+## 资源身份与链接观察
 
-`D-RESOURCES` 定义结构操作和查询可以认证的链接事实。它不把链接观察变成正式关系，
-也不为 runtime、CLI 或 `ReadOutcome` 发明字段 ABI。
+`D-RESOURCES` 定义链接事实的认证、目标分类、存在性观察和结构改写边界。资源身份是
+领域内部用于比较目标的值；独立的 `ResourceIdentity` 对象、索引布局、编码和 span
+存储不属于公共 ABI。查询通过扁平的链接项目公开已认证字段，资源 owner 不为 runtime
+或 `ReadOutcome` 另造对象。
 
-### 输入、输出与状态维度
+### 输入、输出与枚举
 
-- 输入是 UTF-8 Markdown 字节、CommonMark 链接 span、链接所在 source、相对根路径和
-  可认证的 before-to-after mapping。
-- 输入中的 mapping 唯一来自 `structure.md` 的 D-MOVE/promote/collapse 领域计划；本页
-  不重新计算或维护第二套 mapping。
-- 输出是 `ResourceIdentity`、独立的存在性 observation、源类型和可证明的入站/出站
-  链接事实，或可诊断失败。公开结果不提供路径列表。identity 与 observation 不能折叠：
-  词法身份可认证时，目标缺失不自动成为闭包错误。
-- `ResourceIdentity` 的领域类别为 `page`、`local`、`external`；observation 的状态为
-  `present`、`missing`、`unavailable`、`unchecked`、`invalid`。公开枚举拼写和输出字段
-  尚未获批，以上名称仅表述领域分类，不构成 ABI。
+- 输入是 Markdown source bytes、CommonMark 普通链接或图片引用的 span、来源路径和来源
+  类型，以及结构 owner 已认证的 before-to-after mapping；source bytes 是否能稳定解码为
+  UTF-8 是下方资源事实的一部分。
+- 输出是可认证的链接项目、目标身份和存在性 observation，或可诊断失败。链接项目不按
+  目标去重；每个可认证的普通链接或图片引用各形成一项。
+- `source_kind` 只能是 `managed` 或 `unmanaged`；`syntax` 只能是 `link` 或 `image`。
+- `target_kind` 只能是 `page`、`local` 或 `external`；`target_scope` 只能是 `root`、
+  `outside` 或 `unknown`；`target_state` 只能是 `present`、`missing`、`unavailable`、
+  `unchecked` 或 `invalid`。
+- fragment 存在时是 `{value, encoding_valid}` 对象。`value` 保留原始编码，
+  `encoding_valid` 明确百分号编码及 UTF-8 是否合法；fragment 不参与目标 identity。
 
-| 独立维度 | 允许状态 | 对行为的影响 |
+来源文件路径是规范 Draft 根相对 POSIX 路径。链接项目公开 `source`、`source_kind`、
+`syntax`、从 `1` 开始的 `line`/`column`、`target_kind`、规范或原文 `target`、
+`target_scope`、`target_state` 和可选 `fragment`；`column` 按 Unicode 字符计数。
+根内目标用规范根相对路径，根外路径和外部 URI 保留原文。
+
+### 目标分类算法
+
+按以下顺序分类，每一步的结果是下一步的输入：
+
+1. 从 CommonMark destination 分离路径和第一个字面 `#` 后的 fragment；`%23` 仍在路径
+   中。source bytes 已稳定取得但不是合法 UTF-8 时，按下方稳定内容错误表选择
+   `resource.link_invalid`；无法稳定取得 source bytes 或唯一 span 时，事实闭包不完整。
+2. 在百分号解码前识别原始路径：先识别 Unix 绝对路径、Windows 盘符路径和 UNC 路径，
+   它们都是 `local` 并保留原文；再对其余原始 destination 识别 URI scheme。scheme 必须
+   匹配 `^[A-Za-z][A-Za-z0-9+.-]*:`；匹配的目标是 `external`，Draft 不探测或重写其路径。
+   纯 `#fragment` 没有路径，直接指向 source 页面自身。
+3. 对本地路径（外部 URI 不由 Draft 解码）以及所有 fragment 验证百分号转义完整且解码
+   字节为 UTF-8。本地目标路径编码已稳定证明无效时，按下方稳定内容错误表选择
+   `resource.link_invalid`，目标 observation 为 `target_scope: unknown`、
+   `target_state: invalid`；fragment 的编码合法性单独写入 `fragment.encoding_valid`，
+   并按[诊断 code 登记](query-check-and-output.md#诊断-code-登记)中“fragment 的百分号或
+   UTF-8 编码已稳定证明非法”这一认证事实选择 `resource.link_invalid`，但不改写已经认证
+   的目标存在状态。无法把目标归入合法类别时，按同一登记中“编码合法但目标已稳定证明
+   无法归入合法 `page`、`local` 或 `external` 类别”这一事实选择该 code，不能猜成普通
+   本地文件。
+4. 对相对本地路径，以 source Markdown 所在目录为基准；`/` 与 `\` 都是分隔符。消解
+   空段、`.`、`..` 和重复分隔符，得到词法目标；大小写和 Unicode 原样参与 identity，
+   不做大小写折叠或 Unicode normalization。
+5. 对相对目标完成词法规范化后，目标位于 Draft 根内时，`index.md` 或 `pages/` 下的
+   合法页面路径是 `page`；其他根内路径（包括页面命名空间外的 Markdown 和非 Markdown）
+   是 `local`。保留的 `pages/index.md` 仍是 `target_kind: page`、`target_state: invalid`，
+   不得降级为 local。
+6. 规范化后目标的第一个组件若为 `.draft`，分类为受保护内部目标。检查该边界使用最终
+   词法目标：`.draft/../pages/a.md` 先规范化为 `pages/a.md`，而 `./.draft/x` 仍受保护。
+   受保护目标不进入链接项目、backlinks、计数、mapping、资源包、Trash 或 Restore，只
+   形成 `resource.protected_target` Check error。
+7. 移动 source 时保持纯 fragment 原文。fragment 只验证编码，不要求标题或锚点存在。
+
+scheme 识别的可观测例子是：`https://x`、`mailto:a@example.com`、`a:b` 为 external；
+`1a:b`、`./a:b`、`a%3Ab`、`C:\x` 为 local。百分号编码的冒号不创建 scheme。
+
+### 稳定内容错误与事实不完整
+
+下表逐行给出已经稳定认证的资源事实与机器 code/reason 的唯一配对；四个
+`resource.link_invalid` 的 `details.reason` 及其 schema 仍由[诊断 code 登记](query-check-and-output.md#诊断-code-登记)
+唯一拥有。本页不扩展该 reason 值域。
+
+| 已认证事实 | 机器选择 | 领域结果与副作用 |
 | --- | --- | --- |
-| 编码与语法 | UTF-8 且 CommonMark span 可提取、不能提取 | 不能提取时需要该事实的结构写零写。 |
-| source kind | 受管理页面、未受管理 Markdown、其他 Markdown 来源 | 查询和闭包保留 source kind，不把未受管理来源伪装成页面。 |
-| 目标身份 | `page`、`local`、`external`、未决 | 只有可证明身份可参与对应的改写或观察。 |
-| 目标 observation | present、missing、unavailable、unchecked、invalid | 只描述观察结果，不反向改变 identity。 |
-| fragment | 无、可解析 fragment、不可认证 fragment | mapping 改写路径时保留可认证 fragment；不能认证时停止相关写。 |
+| source bytes 已稳定读取，但内容不是合法 UTF-8 | [`resource.link_invalid`](query-check-and-output.md#诊断-code-登记) | 形成资源链接错误；不把内容当作可解析链接，结构写前零写。 |
+| 本地目标路径的百分号或 UTF-8 编码已稳定证明非法 | [`resource.link_invalid`](query-check-and-output.md#诊断-code-登记) | 目标 scope/state 按路径编码错误处理，结构写前零写。 |
+| fragment 的百分号或 UTF-8 编码已稳定证明非法 | [`resource.link_invalid`](query-check-and-output.md#诊断-code-登记) | 保留可认证的目标 identity 与 fragment 原文/合法性事实；结构写前零写。 |
+| 编码合法，但目标已稳定证明无法归入合法 `page`、`local` 或 `external` 类别 | [`resource.link_invalid`](query-check-and-output.md#诊断-code-登记) | 不猜测目标类别，结构写前零写。 |
+| 文件、span、source 对齐、mapping 或安全判断所需事实无法完整、稳定取得 | `runtime.closure_incomplete`；读查询仅在[查询错误与阻塞项](query-check-and-output.md#查询错误与阻塞项)中已认证的 `query.source_unavailable` 或 `query.target_unavailable` 条件满足时表达局部未知 | 不把无法取得的事实当作内容非法；所有依赖该闭包的结构写零写并保留现场。 |
 
-### 链接闭包、转换与副作用
+### target_scope 与 target_state
 
-结构操作的链接事实闭包覆盖根内全部可判定 Markdown，而不是仅覆盖受管理页面。对每个
-纳入闭包的 CommonMark span，实施者必须能将 source bytes、source kind、原目标、
-fragment 和 mapping 后目标一一对应。可证明 mapping 时，结构操作同一逻辑提交中更新
-出站、入站和同批交叉链接；绝对本地链接的原文保留规则、具体 span 序列化及公开字段 ABI
-不在本页补定。
+身份与 observation 是独立维度；目标缺失不会抹掉已认证的 lexical identity，也不单独
+使链接闭包失败。
 
-链接改写只接受 mapping 中已认证的 before path。目标 identity 为 `page` 且命中 mapping
-时，更新其路径并保留可认证 fragment；命中缺失目标或非 page identity 时不借 basename、
-文本相似度或目录枚举猜测替代路径。入站、出站和同批交叉链接必须从同一 mapping 派生，
-并与 parent、navigation 和 collision 检查在同一领域提交中完成。
+| 分类 | `target_scope` | 可用 `target_state` | observation 触发事实 |
+| --- | --- | --- | --- |
+| 根内 `page` 或 `local` | `root` | `present`、`missing`、`unavailable` | 目标存在且类型稳定、已确认不存在、或存在性探测因权限拒绝/普通 I/O/反复变化无法稳定完成。 |
+| 根外相对/绝对/盘符/UNC 本地目标 | `outside` | `unchecked` | 不以当前物理位置探测或改变分类。 |
+| 外部 URI | `unknown` | `unchecked` | Draft 不探测或重写外部目标。 |
+| 路径编码无效 | `unknown` | `invalid` | 百分号转义不完整或解码非 UTF-8，且该非法事实已稳定证明；由[诊断 code 登记](query-check-and-output.md#诊断-code-登记)中的该事实映射。 |
+| 编码合法但目标已稳定证明无法归入合法类别 | `unknown` | `invalid` | 由[诊断 code 登记](query-check-and-output.md#诊断-code-登记)中的该事实映射；不能猜为 `local`。 |
+| 受保护 `.draft` 目标 | 不形成公开链接项目 | 不形成 | 只产生 `resource.protected_target` Check error。 |
 
-| 链接事实 | mapping / 认证结果 | 允许结果 |
-| --- | --- | --- |
-| UTF-8、CommonMark span、source kind 与 target identity 均可认证 | before-to-after mapping 可证明 | 将该 span 的路径目标按 mapping 更新，并保留 fragment；同批事实同时提交。 |
-| identity 可认证，observation 为 missing | mapping 不依赖目标存在性 | 保留可认证 identity；不得把 missing 单独变成闭包失败。 |
-| span、UTF-8、source 对齐、路径分类、fragment 或 mapping 任一项不可认证 | 任意 | 在任何结构写前失败，零写。 |
-| 根内 Markdown 无法判定 | 闭包不完整 | 阻止结构写；不得以 lower-bound 集合继续。 |
+`unavailable` 只在链接身份、来源内容和查询范围都稳定认证，且单次存在性探测因
+`permission_denied`、`io_error` 或 `unstable` 无法稳定得到存在/缺失时使用。来源本身
+无法稳定读取属于查询的 `query.source_unavailable` blocker；根、authority 或 snapshot
+无法认证则整体失败。根内已确认缺失的 `page`/`local` 目标产生 `resource.target_missing`
+warning；外部 URI、根外路径和按规则不检查的目标不产生该诊断。
 
-正文中指向 `.draft/` 的链接 identity 分类是 `unresolved`：尚无唯一签署合同决定它是否
-属于 `local/draft`、独立受保护事实或其他分类。本页既不把它定为 `local/draft`，也不把它
-定为 no-identity；任何操作若必须依赖该分类，必须停止并零写。直接把 `.draft` 内路径作为
-结构操作 operand 的保留路径拒绝规则，与正文链接的 identity 分类是两个问题，不能相互替代。
+### 链接闭包、改写与副作用
 
-### 失败、零写、恢复与验证
+结构操作的链接事实闭包覆盖根内全部可判定 Markdown，而不只覆盖受管理页面。对每个纳入
+闭包的 span，必须能一一对应 source bytes、source kind、原目标、fragment 和 mapping
+后的目标。mapping 只来自结构 owner 的同一逻辑计划；本页不重新计算第二套 mapping。
 
-- 结构写在完整闭包、mapping 和所有需改写 span 均认证前保持零写；不能按 basename、
-  文本相似度或未受管理文件的名称猜目标。
-- 提交后耐久不确定时，由 runtime 保留 recovery 现场；重试前重新读取所有闭包事实，
-  不以缓存、索引或旧 observation 代替认证。
-- 验证 UTF-8、CommonMark、fragment、managed/unmanaged source、missing identity、无法
-  分类的 `.draft` 正文链接，以及任一闭包节点不可判定的零写反例。
+当 before path 已在 mapping 中认证、目标 identity 是 `page` 且命中 mapping 时，按 mapping
+更新路径并保留可认证 fragment；入站、出站和同批交叉链接与 parent、navigation、collision
+检查在同一领域提交中完成。目标 missing、不属于 page、是 local/external 或未命中 mapping
+时，不得使用 basename、文本相似度、目录枚举、当前缺失文件或修改时间猜测替代路径。
+根外本地目标、绝对路径、盘符和 UNC 永不参与页面 mapping。
 
-## 所有权
+| 链接事实 | 允许结果 |
+| --- | --- |
+| source bytes、CommonMark span、source kind、target identity 和 mapping 均可认证 | 产生链接事实；需要移动且 page 命中 mapping 时同一提交更新路径。 |
+| identity 可认证、observation 为 `missing` | 保留 identity；可产生 `resource.target_missing` warning，不把 missing 变成闭包失败。 |
+| 根内目标 observation 为 `unavailable` | links/backlinks 项目保留 `unavailable`；Check 以 `query.target_unavailable` blocker 表示不能确定是否应产生缺失诊断。 |
+| 规范化后进入 `.draft` | 只产生 `resource.protected_target` Check error，不进入 links/backlinks items 或计数，也不参与任何 mapping/ownership。 |
+| source/target/fragment 编码或目标分类已稳定证明非法 | 使用稳定内容错误表中逐项列出的 `resource.link_invalid` 机器 code；任何结构写前失败，零写。 |
+| span、source 对齐、mapping 或安全判断所需事实无法完整稳定取得 | 使用 `runtime.closure_incomplete`；任何结构写前失败，零写并保留现场。 |
+| 根内 Markdown 无法判定 | 闭包不完整，阻止结构写；不得按 lower-bound 集合继续。 |
 
-`D-RESOURCE-OWNERSHIP` 定义页面子树、结构操作和 Trash/Restore 对物理资源的窄边界。
+结构写在完整闭包、mapping 和所有需改写 span 均认证前保持零写。提交后耐久性不确定时
+runtime 保留 recovery 现场；重试重新读取闭包和 observation，不以缓存、索引或旧事实代替
+认证。读操作不会借资源观察修改页面或链接。
 
-### 输入、输出与不变量
+## 资源所有权
 
-- 输入是受管理页面子树、相邻非 Markdown 节点、目录物理状态、结构 owner 已认证的页面
-  mapping 与 Trash/Restore 所需的已授权事实。目录本身不是 ownership 对象；目录成员的
-  managedness 只按 `structure.md#目录来源` 的成员级分类处理。
-- 输出只说明受管理 Markdown 的领域所有权、可证明的目录清理决定或拒绝；不得借此输出
-  附件清单、retained facts、计数、摘要或续读协议。
+`D-RESOURCE-OWNERSHIP` 定义页面子树、结构操作和 Trash/Restore 对物理节点的窄边界；它
+不把邻接关系变成页面所有权。
+
+### 输入、输出与成员分类
+
+- 输入是受管理页面子树、相邻非 Markdown 节点、目录物理状态、结构 owner 已认证的
+  mapping，以及 Trash/Restore 所需的授权事实。
+- 输出只说明受管理 Markdown 的领域所有权、可证明的目录清理决定或拒绝；不输出附件
+  清单、retained facts、计数、摘要或续读协议。
 - 页面子树只拥有受管理 Markdown。图片、附件、普通文件、未知节点和目录不会因物理
-  邻接而转移到页面所有权；已认证为 retained 的目录节点一律原位保留。这里的 retained 规则仅适用于
-  `structure.md#目录来源` 已将目录节点认证为 retained 的分区；非 Markdown、附件或无法
-  分类节点若作为 file source operand，属于 `D-MOVE` 矩阵外输入，必须写前拒绝、零写。
+  邻接转移到页面所有权；目录节点只有在 `D-MOVE` 已认证为 retained 的分区才原位保留。
 
-| 物理事实 | 操作 | 领域结果 / 副作用 |
+| 物理事实 | 操作 | 领域结果与副作用 |
 | --- | --- | --- |
-| 受管理 Markdown 且 mapping 可证明 | 结构移动、Trash、Restore | 只处理该 Markdown 和已授权的机器区、身份/摘要、关系/导航事实。 |
-| 目录中已由 `D-MOVE` 认证为 retained 的非 Markdown、附件或可认证存在但类型未知的节点 | 目录 move 或页面所有权操作 | 原位保留；不得纳入页面包、取得所有权、mapping 或成功输出。 |
-| 非 Markdown、附件或无法分类节点作为 file source，或目录节点事实不可信 | `D-MOVE` source 分类 | 写前拒绝、零写；不得将节点降级为 retained 或创建页面所有权。 |
-| candidate 根中的 unmanaged Markdown | `D-MOVE` candidate 纳管分支，且 mapping/闭包/parent/nav 可证明 | 只按同一 `move` mapping 取得页面所有权；不由本节补齐页面协议字段。 |
-| registered 根中的 unmanaged source（directory 的 `file`/`prefix` target 均包括） | `D-MOVE` | 拒绝、零写；不得创建或改写页面、导航、catalog/head 或日志副作用。 |
-| root state 为 unknown、mixed 或不可认证，或 mapping/链接闭包不可认证 | `D-MOVE` 结构/所有权路径 | 写前拒绝、零写并保留诊断；不得把未知根或不完整闭包解释为 candidate、registered 或空集合。 |
-| 目录可证明物理为空 | 结构或恢复后清理 | 可按已证明的结构清理规则移除目录；具体平台调用由 runtime 处理。 |
-| 目录非空，或节点已认证为 retained/unknown | 目录清理 | 保留目录；不以“页面已移动”推断可删除。 |
-| 目录边界、节点分类或物理空性无法认证 | `D-MOVE` 的目录 move 或其目录清理路径 | 写前拒绝、零写并保留诊断；不得先移动页面再决定是否保留目录。 |
-| `.draft` 内部路径 | 任一页面所有权操作 | 不属于页面子树；不能作为页面 source/target 或被纳入页面所有权。 |
+| 受管理 Markdown 且 mapping 可证明 | 结构移动、Trash、Restore | 只处理该 Markdown 及已授权的页面头部、身份/摘要、关系和导航事实。 |
+| D-MOVE 已认证 retained 的非 Markdown、附件或可认证存在但类型未知节点 | 目录 move 或页面所有权操作 | 原位保留；不进入页面 package、mapping 或成功输出。 |
+| 非 Markdown、附件、无法分类节点作为 file source，或目录事实不可信 | D-MOVE source 分类 | 写前拒绝、零写；不得降级成 retained 或创建页面所有权。 |
+| candidate 根的 unmanaged Markdown | D-MOVE candidate 纳管分支且 mapping/闭包/parent/nav 可证明 | 只按同一 move mapping 取得页面所有权；不由本节补齐页面协议字段。 |
+| registered 根的 unmanaged source（directory 的 `file`/`prefix` target 也包括） | D-MOVE | 拒绝、零写；不得创建/改写页面、导航、catalog/head 或日志副作用。 |
+| root state unknown、mixed 或不可认证，或 mapping/链接闭包不可认证 | D-MOVE 结构/所有权路径 | 写前拒绝、零写并保留诊断；不得解释为 candidate、registered 或空集合。 |
+| 目录可证明物理为空 | 结构或恢复后清理 | 可按已证明的结构清理规则移除目录；平台调用由 runtime 处理。 |
+| 目录非空，或存在 retained/unknown 节点 | 目录清理 | 保留目录；不能因页面已移动推断可删除。 |
+| 目录边界、节点分类或物理空性无法认证 | 目录 move 或清理 | 写前拒绝、零写并保留诊断；不得先移动页面再决定保留。 |
+| `.draft` 内部路径 | 任一页面所有权操作 | 不属于页面子树，不能作为页面 source/target 或被纳入页面所有权。 |
 
-目录移除、Trash/Restore 的授权清单、handoff 和 durable cleanup 只有在对应 owner 证明后才
-能发生；物理目录存在本身不证明 authority。任何不完整事实都在写前拒绝并保留现场。
+目录移除、Trash/Restore 授权清单、handoff 和 durable cleanup 只有对应 owner 完成证明后
+才能发生；物理目录存在本身不证明 authority。所有不完整事实都在写前拒绝并保留现场。
 
-### 转换、失败、恢复与验证
+### 恢复与验证边界
 
-所有权成功转换的提交点与触发它的结构或 Trash/Restore 逻辑操作相同，不能独立创建第二
-operation。D-MOVE 的 forward、partial-after 或授权 cleanup 只有在 snapshot `S` 完整、
-匹配且锁内重认证后才能消费本页的 mapping/closure 事实；明确矛盾、摘要不匹配或事实不一致
-返回 `runtime.corrupt`，单纯缺失或 Q20/Q21 未具资格返回 `unresolved`，两者均零写并保留
-现场、禁止 forward。若提交后耐久性不确定，保留现场并等待显式 recovery；重试重新证明物理
-空目录和授权事实。
+所有权成功转换的提交点与触发它的结构或 Trash/Restore 逻辑操作相同，不能创建第二个可见
+operation。D-MOVE recovery 对 mapping/closure 只消费
+[D-MOVE snapshot S 语义载荷](structure.md#d-move-snapshot-s-语义载荷) 与 runtime
+[恢复门禁与漂移分类](../runtime/recovery.md#d-move-snapshot-s-恢复门禁与-q6-b-漂移分类)；
+本页不独立分类 snapshot 或选择 recovery action。提交后耐久性不确定时保留现场并等待
+显式 recovery；重试重新证明物理空目录和授权事实。
 
 验证目录中混有 Markdown、图片、附件、未知节点、空目录和 `.draft` 路径的组合：只有受
-管理 Markdown 可进入领域 after-state，且只有已证明物理为空的目录可被清理；成员级
+管理 Markdown 可进入领域 after-state，只有已证明物理为空的目录可清理；成员级
 `uniform-managed`/`uniform-unmanaged` 可进入结构矩阵，`mixed`/`unknown`/`unverifiable`
-写前拒绝，`no-movable` 走既有 no-op 分区。
+写前拒绝，`no-movable` 走既有错误分区。还必须验证 UTF-8、CommonMark、fragment、source
+relative base、两种分隔符、dot segment、大小写/Unicode、managed/unmanaged source、
+missing identity、根外/绝对本地目标、URI scheme、目标 invalid/unavailable、规范化前后
+跨越 `.draft` 边界和任一闭包节点不可判定时的零写。
 
 ## 来源
 
