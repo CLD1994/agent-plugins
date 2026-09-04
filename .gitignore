@@ -49,8 +49,9 @@ htmlcov/
 # Local brainstorming mockups
 .superpowers/
 
-# Local fallback git worktrees for parallel plan execution
+# Local agent worktrees and temporary state
 .worktrees/
+/tmp/
 
 # Local Claude Code personal settings (keep shared .claude/ committed)
 .claude/settings.local.json

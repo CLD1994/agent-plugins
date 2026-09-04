@@ -8,21 +8,22 @@
 
 ## 创建与等待
 
-- 每次调用 `spawn_agent` 都显式给出 `fork_turns` 和当前任务调度记录中已经确认的 `model`。通常使用 `fork_turns: "none"`，让任务单和精确绝对路径提供最小完整上下文。
+- 每次调用 `spawn_agent` 都显式给出 `fork_turns` 和当前任务调度记录中已经确认的 `model`。通常使用 `fork_turns: "none"`，让任务单和其中的来源链接提供最小完整上下文。
 - 如果调用接口要求思考强度字段，传入值只能来自当前 Harness 对所选模型实际暴露且已经确认的选项；本适配不预设固定值，也不自行推导未暴露的值。
+- 第一条消息给出任务工作目录，以及任务单相对该工作目录的位置。Codex 工具提供 `workdir` 参数时，将它设为任务工作目录；没有该参数时，使用工具支持的显式目录或路径，不假定进程已经切换目录。
 - 当前层级调度者没有其他工作且仍有 subagent 运行时，只调用 `wait_agent`，并把 `timeout_ms` 设为允许的最大值 `3600000`。
 
 ## 消息留档
 
 消息文件按接收该任务的 subagent 目录和该任务自己的回合编号保存。根级 Main 与每个嵌套调度者都为自己直接管理的任务维护独立消息序列；会话名、任务名和回合编号必须保持一致，例如：
 
-- Main 的任务单或第一条指令：/tmp/agents/2026-09-03-api-migration/subagent/schema-audit/main-001.md
-- 该 subagent 的回复：/tmp/agents/2026-09-03-api-migration/subagent/schema-audit/subagent-002.md
-- 同一切片的第二条补充：/tmp/agents/2026-09-03-api-migration/subagent/schema-audit/main-003.md
+- Main 的第一条消息：`<任务工作区>/tmp/agents/2026-09-03-api-migration/schema-audit/main-001.md`
+- 该 subagent 的回复：`<任务工作区>/tmp/agents/2026-09-03-api-migration/schema-audit/subagent-002.md`
+- 同一切片的第二条补充：`<任务工作区>/tmp/agents/2026-09-03-api-migration/schema-audit/main-003.md`
 
 每个单向消息都占用本切片的下一个本地回合。调用 `spawn_agent`、`send_message` 或 `followup_task` 前，负责该范围的调度者将 `message` 参数原样写入相应的 `main-{回合}.md`。任务单要求 subagent 在发送消息或给出最终回复前，将原文写入相应的 `subagent-{回合}.md`。回合编号使用三位十进制递增格式，例如 001。嵌套调度者只记录自己的子树消息，不读取父级或兄弟切片的过程消息。
 
-大型材料已经写入文件时，消息只引用精确绝对路径，避免重复传输全文。希望目标 agent 阅读材料时，给出该材料的精确绝对路径，而不是只给主题或简称。
+大型材料已经写入文件时，消息只指向任务单，不重复传输全文。需要目标 agent 阅读的材料由任务单使用含义明确、相对任务单文件解析的 Markdown 链接列出，不只给主题或简称。
 
 ## 作用域声明
 
