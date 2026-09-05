@@ -3,6 +3,11 @@
 本文件适用于 `plugins/draft/` 子树。执行本子树任务前，先读取仓库根目录
 `AGENTS.md`，再读取本文件。
 
+## 规格入口
+
+当前行为从根目录 `CONTEXT-MAP.md`、本插件 `CONTEXT.md` 和
+[规格入口](docs/spec/index.md) 定位；`docs/adr/` 解释架构取舍。
+
 ## 测试布局
 
 - 核心测试位于 `skills/draft/scripts/runtime/tests/`，插件适配层测试位于
@@ -47,4 +52,16 @@ uv run --project "$RUNTIME" --locked \
 bash plugins/draft/scripts/check-adapters.sh
 ```
 
-核心 ruff/pyright 使用 git 解析的绝对 RUNTIME 运行，参见实施计划 Task 14 Step 5。
+核心 ruff/pyright 在运行时项目目录中执行，以读取该项目的配置：
+
+```bash
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+RUNTIME="$REPO_ROOT/plugins/draft/skills/draft/scripts/runtime"
+
+(
+  cd "$RUNTIME" || exit
+  uv run --locked ruff check . &&
+    uv run --locked ruff format --check . &&
+    uv run --locked pyright
+)
+```

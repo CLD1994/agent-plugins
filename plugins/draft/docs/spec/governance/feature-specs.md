@@ -21,16 +21,18 @@
 | --- | --- | --- | --- | --- |
 | `ready-for-agent` | `open` | 缺失 | 缺失 | 只有 `Base-Spec` 有效且 `Affects` 非空、可解析时可派遣。 |
 | `needs-triage` / `needs-info` / `ready-for-human` / `wontfix` | `open` | 缺失 | 缺失 | 合法但不可派遣；保留 open 诊断，不能把 triage role 当完成结果。 |
-| 任一合法 triage role（实施已同步） | `closed` | `applied` | 必填且解析到 current-spec Target | 已完成 delta；目录保留，不成为 authority。 |
+| 任一合法 triage role（实施已同步） | `closed` | `applied` | 必填且解析到 current-spec Target | 已完成 delta；不成为 authority。 |
 | `wontfix` | `closed` | `rejected` | 缺失 | 已拒绝；不得迁入 current Wiki。 |
-| 任一合法 triage role | `closed` | `superseded` | 必填且解析到取代它的 current-spec Target | 已被完整取代；目录保留。 |
+| 任一合法 triage role | `closed` | `superseded` | 必填且解析到取代它的 current-spec Target | 已被完整取代；不成为 authority。 |
 | `ready-for-agent` 等任一合法 role | `open` | 非空或非法 | 任意非空 | 非法组合，`unresolved`，不可派遣。 |
 | 任一合法 role | `closed` | 缺失或非法 | 任意 | 非法组合，`unresolved`，不可派遣。 |
 | 任一合法 role | `closed` | `rejected` | 非空，或 `Status` 不是 `wontfix` | 非法组合，`unresolved`，不可派遣。 |
 | 任一合法 role | `closed` | `applied` / `superseded` | 缺失或目标无法解析 | 非法组合，`unresolved`，不可派遣。 |
 | `Status-Schema` 缺失/非法、任一字段缺失/未知、Base-Spec/Affects 无法解析，或父子范围冲突 | 任意 | 任意 | 任意 | `unresolved`：保留字段级诊断，等待人工归一化；不得默认改成 open、applied 或 `needs-triage`。 |
 
-**转换与副作用**：实施完成后才可从 open 转 closed，并同时写入适用 Resolution 和 Promoted-to；拒绝与被取代也保留 feature 目录。runtime foundation 保持 `Tracker-State: open`（尚未实施）；durable-link-index 与 coordinated-recovery 保持 `Tracker-State: closed`、`Resolution: superseded`，各自指向 runtime owner，不能记为 applied 或删除。
+**转换与副作用**：实施完成后才可按 applied 从 open 转 closed，并同时写入适用 Resolution 和 Promoted-to；拒绝和被取代分别使用 rejected 和 superseded。关闭条目默认保留，状态转换本身不触发删除。
+
+用户明确要求清理历史材料时，可将已被当前 owner 覆盖的旧设计、计划和失效 tracker 从当前树移除；仍有效且未完成的实施入口继续保留。清理同时更新当前引用和消费者登记，保留完整 Git locator 供历史来源追溯。Tracker 的实际状态只在对应条目维护，不在正式规格中复制各 feature 的状态清单。
 
 **失败与恢复**：Base-Spec 过期、Affects 为空或解析失败、父子范围冲突、字段非法或 legacy 缺字段时均不可派遣。诊断只能说明缺口；不能用实现、测试、issue 标题或 Agent Brief 填补字段。
 
@@ -39,7 +41,7 @@
 ## 相关规格
 
 - [来源资格与唯一权威](authority.md#来源资格与唯一权威)
-- [迁移与冻结基线](migration.md#迁移与冻结基线)
+- [迁移与原子切换](migration.md#迁移与原子切换)
 
 ## 来源
 

@@ -43,7 +43,7 @@
 
 ### Issue tracker
 
-创建、读取、拆分或更新 issue 与 spec 时，使用 `.scratch/<feature>/` 下的本地 Markdown 文件。详见 `docs/agents/issue-tracker.md`。
+创建、读取、拆分或更新 issue 与增量需求规格时，使用 `.scratch/<feature>/` 下的本地 Markdown 文件；插件当前行为规格通过 `CONTEXT-MAP.md` 定位。详见 `docs/agents/issue-tracker.md`。
 
 ### Triage labels
 

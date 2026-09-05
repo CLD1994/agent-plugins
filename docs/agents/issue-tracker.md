@@ -33,9 +33,9 @@ Dispatch-Diagnostic: <具体、可复核的阻断或资格说明>
 
 只有同时满足 `Status-Schema: triage`、合法字段、`Tracker-State: open`、`Status: ready-for-agent`、有效 `Base-Spec`、非空可解析 `Affects`、无父子范围冲突，并且 `Dispatch: eligible` 时才能派遣。任何字段缺失、未知值、非法组合、无效链接、父子范围扩张或未决语义都输出 `unresolved` 并保持 `Dispatch: blocked`；不能默认成 `open`、`applied`、`ready-for-agent` 或从标题、`Type`、`Blocked by`、代码、测试和 checklist 推断完成。
 
-`Current-Owner`、`Promoted-to` 和 `Affects` 只提供 tracker 导航，不能定义或覆盖 owner 页面行为。Agent Brief 只能收窄 `Parent` 的范围；与父 spec 或 current Wiki 冲突时，child 逐项保持 `Status: needs-triage`、`Tracker-State: open`、`Dispatch: blocked`，并写出冲突入口、影响和 current owner。已完整取代的条目显式使用 `closed` + `Resolution: superseded`，保留文件和逐项诊断，不通过 parent 状态隐式关闭 child。
+`Current-Owner`、`Promoted-to` 和 `Affects` 只提供 tracker 导航，不能定义或覆盖 owner 页面行为。Agent Brief 只能收窄 `Parent` 的范围；与父 spec 或 current Wiki 冲突时，child 逐项保持 `Status: needs-triage`、`Tracker-State: open`、`Dispatch: blocked`，并写出冲突入口、影响和 current owner。已完整取代的条目显式使用 `closed` + `Resolution: superseded`，不通过 parent 状态隐式关闭 child。
 
-Q23 只排除 `docs/design.md`、`docs/discussion/**`、review notes、plan 和明确的过程报告；不能用排除规则批量删除 `.scratch` 历史条目，也不能把 tracker 状态写入正式规格 owner。
+历史材料的保留与清理遵循 [Feature spec 生命周期](../../plugins/draft/docs/spec/governance/feature-specs.md#feature-spec-生命周期)。Tracker 状态在对应条目维护；正式规格登记实施入口时只提供导航。
 
 ## Skill 操作
 

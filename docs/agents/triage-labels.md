@@ -16,6 +16,6 @@
 
 只有 `open` + `ready-for-agent` + 有效 `Base-Spec` + 非空可解析 `Affects` + 合法父子范围的条目才可标记 `Dispatch: eligible`。缺少 schema、任一必需字段、current owner、链接或父子范围证明，或存在冲突/未签署语义时，结果为 `unresolved`、`Dispatch: blocked`；不得默认 open、applied、ready-for-agent，也不得用 Type、标题、实现、测试、checklist 或 parent 状态补全。
 
-Agent Brief 只能缩小父 spec 或 current Wiki owner 的范围。父条目的 `superseded` 不会隐式关闭 child；每个 child 都必须有自己的 tracker 结果、不可派遣诊断和 current owner。已完整取代的条目逐项写 `Tracker-State: closed`、`Resolution: superseded` 和可解析 `Promoted-to`，保留历史文件。
+Agent Brief 只能缩小父 spec 或 current Wiki owner 的范围。父条目的 `superseded` 不会隐式关闭 child；每个 child 都必须有自己的 tracker 结果、不可派遣诊断和 current owner。已完整取代的条目逐项写 `Tracker-State: closed`、`Resolution: superseded` 和可解析 `Promoted-to`。关闭条目默认保留；用户明确要求清理且当前 owner 已覆盖时，按 [Feature spec 生命周期](../../plugins/draft/docs/spec/governance/feature-specs.md#feature-spec-生命周期) 处理历史材料。
 
 当 skill 使用标准角色或要求应用某个分诊标签时，把对应字符串写入 issue 的 `Status:` 字段，并同步完整正交字段；不能把 `claimed` 或 `resolved` 作为 `Status` 值。

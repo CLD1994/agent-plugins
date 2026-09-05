@@ -6,9 +6,8 @@
 `/home/zsm1695/git` 可用，revision 为 `2c3adbb`。该路径属于当前环境，不是仓库依赖，
 后续工作不得假定它一定存在。
 
-找不到源码时，先将 Git 官方源码浅克隆到独立临时目录后再作判断。克隆失败时，立即向
-用户求助，请用户提供或克隆源码；不得以未经核验的记忆替代源码结论。不要把 Git 源码
-加入本仓库、提交为子模块或作为 Draft 运行时依赖。
+找不到源码时，请用户提供 Git 源码，不自行克隆，也不以未经核验的记忆替代源码结论。
+Git 源码只供查证，不是本仓库的子模块或 Draft 运行时依赖。
 
 ## 已核验的 Git 行为
 
@@ -62,52 +61,7 @@ Git 的对象库是内容寻址且大部分对象不可变，`git fsck` 可以�
 
 ## 对 Draft 的适用边界
 
-Draft 不调用 Git，也不要求 Draft 根位于 Git 仓库。本参考只用于选择本地协议原则。
-
-### 可以借鉴
-
-- 用原子创建的 operation lock 串行化遵守 Draft 协议的 writer；不得以一次
-  `read_lock() is None` 作为整轮写入授权。
-- 取得 lock 后重新读取 journal；锁前扫描只发现候选，不能决定 cleanup 或 phase
-  transition。
-- journal phase transition 使用当前状态和目标后继状态做语义验证；当前状态不符合预期时
-  停止并报告，而不是覆盖。
-- lock 已存在时报告恢复待处理或锁冲突；PID、时间等只可作为诊断提示，不能自动证明
-  lock 陈旧。
-- 对可验证的结构异常给稳定错误；对已经判定为可丢弃的私有恢复副本，可把“内容被替换”
-  作为 warning，而不是把它误判成成功或业务状态。
-
-### 不能照搬
-
-- Git 的 lockfile 默认会解析符号链接，除非调用方指定 `LOCK_NO_DEREF`
-  （`lockfile.c:175-180`、`lockfile.h:168-178`）。Draft 的 `.draft/` 属于内部协议边界，
-  仍必须拒绝并且不跟随符号链接。
-- Git 的 OID compare-and-swap 适用于 ref。Draft 不能把 inode 复核伪装成跨平台、原子化的
-  compare-and-swap；Python 标准库的 `unlink`、`replace` 和 `rmdir` 没有“仅当名字仍是
-  某 inode”这一条件。
-- Git 对绕过 lock 的同权限进程没有绝对保护。Draft 也应明确：它保证协议参与者之间的
-  串行化，并在可观察的边界诊断外部修改；不承诺阻止外部进程在最后一个命名系统调用
-  间隙改写私有恢复垃圾。
-
-## 建议的 Draft 尽力诊断模型
-
-以下模型适用于选择“受协调 writer 通过 operation lock 串行化”的保障范围时；它是从 Git
-获得的设计参考，不是当前 Draft recovery 实现的行为声明。当前有效契约以
-`docs/superpowers/plans/2026-08-25-draft-recover-lifecycle-boundary-fix.md` 为准。
-
-在该模型中，“尽力诊断”只覆盖 Draft 实际观察到的事实，不能声称发现不可观察的最终瞬间
-竞态。
-
-| 观察到的事实 | 处理 |
-| --- | --- |
-| operation lock 不能原子取得 | 停止当前恢复，报告锁冲突或恢复待处理；不自动删除 lock。 |
-| 获锁后 journal 与锁前快照不同 | 丢弃锁前判断，以锁内 journal 重新分类；需要时返回 snapshot changed warning。 |
-| journal 缺失、格式损坏、非法 phase 或关联不闭合 | 返回 `operation.journal_corrupt` 或 `operation.inconsistent_state`，保留现场。 |
-| `.draft` 路径组件、operation 或叶节点是符号链接 | 返回 `path.symlink_escape`，不读取、不跟随、不清理链接目标。 |
-| operation 中存在未知名称，或期望普通文件的位置变成目录等异常节点 | 返回 `operation.inconsistent_state`，不递归删除。 |
-| 已确认可清理的普通恢复副本内容或 inode 改变 | 作为可观察 warning 记录后，按授权名称删除；该规则不适用于 journal 语义判断。 |
-| journal 写入、目录同步或 lock 释放失败 | 返回 `operation.durability_failed`，保留足以重试恢复的持久现场。 |
-
-若采纳该模型，无锁扫描不删除 journal、恢复副本或 operation 目录。任何会改变这些名字
-的动作都先取得对应 operation lock，并在 lock 内重读和验证当前 journal。这样可以防止
-正常 Draft writer 相互破坏；绕过 lock 的直接 `.draft/` 修改则按上述可观察边界处理。
+本参考保留 Git 源码观察，供比较本地锁与原子发布机制时查证。Draft 的当前行为由
+[运行时准入规格](../../plugins/draft/docs/spec/runtime/admission-and-effects.md) 和
+[运行时恢复规格](../../plugins/draft/docs/spec/runtime/recovery.md) 定义；架构取舍见
+[受协调 writer 的显式恢复边界](../../plugins/draft/docs/adr/0001-coordinated-recovery-writers.md)。
