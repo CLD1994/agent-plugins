@@ -8,6 +8,7 @@
 - 第一条消息只给出任务工作目录和任务说明路径。Codex 没有直接切换 subagent 工作目录的参数时，要求 subagent 在每次文件或命令操作中显式使用该目录。
 - 后续使用 `send_message` 或 `followup_task`。完整上下文写在文件中，工具消息只传递一个简短动作和文件路径，不重复生成相同正文。
 - 调度者没有其他可做工作且 subagent 仍在运行时，只调用 `wait_agent`，并把 `timeout_ms` 设为接口允许的最大值 `3600000`。
+- 不要把“避免长时间阻塞等待”当成了硬性 N 秒上限，这不准确。wait_agent 会被子任务消息或用户的新输入唤醒，所以响应式等待是最优解。
 
 ## 用户不可见对话时的消息留档
 
@@ -26,3 +27,10 @@
 任务说明必须要求 subagent 在回复或最终交付前采用同样做法。不同任务各自保持消息顺序，不共享编号，也不把普通进度消息合并到一个持续增长的文件。已经写入文件的大型材料只发送链接，不在消息中复制正文。
 
 Codex 消息留档只解决人类无法直接审阅 agent 间交流的问题，不改变任务权限、来源边界、失败计数或 checkpoint 规则。
+
+## Subagent 工具调用约束
+
+- 管理 subagent 时，`spawn_agent`、`send_message`、`followup_task`、`wait_agent`、`interrupt_agent`、`list_agents` 必须作为 direct collaboration tool call 使用。
+- 不得在 `functions.exec` 中调用 `tools.spawn_agent`、`tools.wait_agent`、`tools.list_agents` 等 collaboration tool，也不得通过 `ALL_TOOLS`、shell 或其他 namespace 间接查找、模拟或替代它们。
+- collaboration tool 不存在于 `functions.exec` 的 `tools.*` namespace，不代表该 tool 不可用；应直接使用当前暴露的 collaboration tool 定义。
+- 如果 direct collaboration tool 本身调用失败，只根据其 tool schema 修正参数或 recipient，不得退回 `functions.exec`。

@@ -6,7 +6,7 @@
 
 优先使用用户或项目已经规定的位置；没有约定时，把 linked worktree 建在 Git 主工作区的 `.worktrees/<任务名>/`。当前目录本身是 linked worktree 时，用 `git worktree list --porcelain` 找到主工作区，不根据路径外观猜测。所有 worktree 都是主工作区 `.worktrees/` 的直接子目录，不在 linked worktree 内继续嵌套。
 
-每个 worktree 在自己的 `tmp/agents/` 中保存任务说明、可选消息、checkpoint 和报告。这样，任务文件中的相对链接可以在隔离工作区内解析。
+每个 worktree 在自己的 `tmp/agents/` 中保存任务说明、可选消息、checkpoint 和报告，使任务记录与实际输入及产物归属同一工作区。文件引用遵循[调度记录与恢复](dispatch-records.md)中的路径规则。
 
 创建前，用 `git check-ignore` 确认候选 `.worktrees/<任务名>/` 和主工作区 `tmp/agents/<会话名>/` 会被项目规则忽略；创建后，再确认目标 worktree 的 `tmp/agents/<会话名>/` 被忽略。没有等价规则时，向用户申请加入：
 

@@ -117,7 +117,7 @@ candidate 纳管仅适用于已认证的 Markdown source；目录 candidate 纳�
 | 目标路径被其他对象占用，或 promote 将吸收未选择页面 | 选择 `operation.path_conflict`；拒绝且零写。 |
 | promote 的页面不是叶，或 sibling 不属于共同 parent | 选择 `promote.candidate_not_leaf` 或 `promote.parent_mismatch`；拒绝且零写。 |
 | collapse 目标是根/非 hub，或 hub 仍有受管理子页面 | 选择 `collapse.target_not_collapsible` 或 `collapse.hub_not_empty`；root/not_hub 的事实分区按 [R-ERRORS 命令特有领域 code 登记](../runtime/errors-and-observability.md#错误登记)投影；拒绝且零写。 |
-| 已认证内容违反页面、parent、导航、关系或结论规则 | 复用已认证事实在 [Check 诊断 code 登记](query-check-and-output.md#诊断-code-登记) 中的 Check code；正式根完整 after-state 仍有 error 时选择 `operation.check_failed`；拒绝且零写。 |
+| 已认证内容违反页面、parent、导航、关系规则，或违反结论制品窄改写所需的固定形状与原文位置约束 | 复用已认证事实在 [Check 诊断 code 登记](query-check-and-output.md#诊断-code-登记) 中的 Check code；结论制品按[既有制品的检查与使用](conclusions.md#既有制品的检查与使用)认证，不重算快照语义；正式根完整 after-state 仍有 error 时选择 `operation.check_failed`；拒绝且零写。 |
 | 闭包、mapping、span、目录物理边界或 after-tree 无法完整稳定取得 | 选择 `runtime.closure_incomplete`；拒绝且零写，不得从 lower-bound 或缓存事实继续。 |
 | recovery pending、snapshot/authority 不可认证、耐久结果不确定或私有权威损坏 | 复用 `runtime.recovery_required`、`runtime.external_change`、`runtime.durability_failed` 或 `runtime.corrupt`；拒绝且零写，不产生结构成功提交。 |
 

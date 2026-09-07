@@ -188,6 +188,8 @@ Check 的诊断项必含 `code`、`severity`、`path`、`message`。`line` 仅�
 
 | code | severity | `details.reason` 或触发范围 | 已认证事实或唯一领域入口 |
 | --- | --- | --- | --- |
+| `page.title_invalid` | `error` | `raw_html` | 页面一级标题含 CommonMark 原始 HTML 内联结构；[标题与链接文字](pages-and-navigation.md#标题与链接文字)。`line` 指向该一级标题，`details` 只含 `reason`。 |
+| `page.title_invalid` | `error` | `inline_structure` | 页面一级标题不含原始 HTML，但含 CommonMark 链接、图片、软/硬换行或其他不允许的内联结构；[标题与链接文字](pages-and-navigation.md#标题与链接文字)。`line` 指向该一级标题，`details` 只含 `reason`。 |
 | `page.frontmatter_invalid` | `error` | `missing` | 受管理页面缺少必需 YAML frontmatter；[页面头部与正文边界](pages-and-navigation.md#页面头部与正文边界)。 |
 | `page.frontmatter_invalid` | `error` | `delimiter_invalid` | frontmatter 首行或结束行不是只含 `---`；[页面头部与正文边界](pages-and-navigation.md#页面头部与正文边界)。 |
 | `page.frontmatter_invalid` | `error` | `yaml_invalid` | frontmatter 不是可解析的 YAML 文档；[YAML 页面头部结构](status-and-relations.md#yaml-页面头部结构)。 |
@@ -251,6 +253,13 @@ Check 的诊断项必含 `code`、`severity`、`path`、`message`。`line` 仅�
 | `resource.link_invalid` | `error` | `target_unclassifiable` | 编码合法但 target 已稳定证明无法归入 `page`、`local` 或 `external`；[稳定内容错误与事实不完整](resources-and-links.md#稳定内容错误与事实不完整)。 |
 | `resource.protected_target` | `error` | 规范化后目标进入 `.draft`；不增加 `reason`。 | 规范化 target 的第一个组件是 `.draft`；[目标分类算法](resources-and-links.md#目标分类算法)。 |
 | `resource.target_missing` | `warning` | 根内页面或本地资源已确认不存在；不增加 `reason`。 | 根内 `page` 或 `local` target 的存在性已稳定证明为缺失；[target_scope 与 target_state](resources-and-links.md#target_scope-与-target_state)。 |
+
+结论制品诊断描述被检查内容，不授权 Check 修复文件或导航，也不直接决定显式生成能否
+重建其已拥有的输出。Check、显式生成和结构窄改写对既有制品的不同处理，统一消费
+[既有制品的检查与使用](conclusions.md#既有制品的检查与使用)；正式根写入仍检查完整计划的
+after-state，不能用待替换旧输出的诊断代替重建后的检查结果。
+同一扫描若发现[生成输入事实集合](conclusions.md#显式生成决策表)中的来源页面、必需导航
+或关系违规，仍保留直接事实 owner 的 code；不能归入旧输出诊断或降级为事实不可取得。
 
 同一个 YAML 节点只使用上表中最具体的一个触发分区，不再为同一根因增加通用诊断。解析或
 成员形状不成立时，只报告能够直接认证的结构问题，不推断依赖它的嵌套值问题；不同节点上

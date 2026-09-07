@@ -48,7 +48,9 @@ parent: index.md
   `## 受质疑结论`，不得出现其他标题、段落、占位文字或列表。
 - “已确认结论”中，每个当前 `confirmed` 页面恰有一个顶层列表项。列表项只含一个非图片、
   无 tooltip、无 fragment 的 Markdown 链接；标签解码后等于页面一级标题，目标解析后等于
-  该页面当前路径。`conclusions.md` 自身不进入列表。
+  该页面当前路径。标题与所有层级链接标签的可见文字均按
+  [标题与链接文字](pages-and-navigation.md#标题与链接文字)认证和比较。
+  `conclusions.md` 自身不进入列表。
 - “受质疑结论”中，每个同时具有一项或多项有效 `challenged_by` 的 confirmed 页面恰有一个
   同形顶层列表项；每个质疑来源恰有一个以两个空格缩进的同形子列表项。顶层页面仍完整
   保留在“已确认结论”中，子项链接指向提出质疑的页面。
@@ -74,13 +76,19 @@ parent: index.md
 
 ### 显式生成决策表
 
+生成输入事实集合 `F_gen` 包含确定成员资格、父子导航遍历顺序、质疑来源、涉及
+`conclusions.md` 的可变关系以及安全重建计划所必需的来源页面、导航和关系事实。待替换
+结论页的固定头部、正文形状、成员投影、原文目标 span 和根导航结论保留项属于旧输出，
+不作为 `F_gen` 中必须合规的来源事实；这不排除对涉及该页面的可变关系进行认证。
+
 下表从上到下判定；第一条命中的行决定整个请求结果。
 
 | 结论生成状态 | 文件与根导航 | 已确认页面 | 关系与其他事实 | 结果与副作用 |
 | --- | --- | --- | --- | --- |
 | 任意 | 任意 | 任意 | 任一可变正式关系以 `conclusions.md` 为 source 或 target | 拒绝，零写；生成器不删除关系，调用方先显式清理。 |
 | 不可认证 | 任意 | 任意 | 任意 | 拒绝，零写；不得把未知状态当作未生成或已生成。 |
-| 任意 | 任意 | 任意 | 成员状态、关系配对、端点、目标 confirmed 条件或重复事实不可认证 | 拒绝，零写；不得输出部分快照。 |
+| 任意 | 任意 | 任意 | `F_gen` 中页面、导航或关系事实已认证为违反其 owner 不变量 | 选择直接负责事实的既有领域 code，拒绝、零写；不得把已确认违规解释为事实不完整或无关 error。 |
+| 任意 | 任意 | 任意 | `F_gen` 无法完整、稳定取得，或无法证明安全重建计划 | `runtime.closure_incomplete`，拒绝、零写；不得输出部分快照。 |
 | 未生成 | `conclusions.md` 或保留根导航项任一已经存在 | 任意 | 其余事实可认证 | 拒绝冲突，零写；没有生成器所有权时不得覆盖、接管或删除同名内容。 |
 | 未生成 | 文件与保留根导航项都不存在 | 零个 | 其余事实可认证 | 幂等空操作；保持未生成，不创建文件或根导航项。 |
 | 未生成 | 文件与保留根导航项都不存在 | 一个或多个 | 其余事实可认证 | 按固定形状创建文件和根导航项，并在同一提交中变为已生成。 |
@@ -89,6 +97,28 @@ parent: index.md
 已生成状态授权显式生成覆盖其拥有的损坏制品或补回缺失制品；未生成状态不授权处理同名
 碰撞。对同一已认证输入连续生成时，如果文件、根导航和生成状态已经等于规范 after-state，
 第二次是零写成功。
+
+显式重建区分生成所需的输入事实与待替换的旧输出：生成状态、成员来源页面、关系事实及
+所需导航必须完整且满足各自不变量；旧 `conclusions.md` 的固定头部、正文形状、成员投影和目标 span
+是否合规，不是重建的前置门禁。已生成制品的缺失、格式损坏或快照过时，以及结论导航
+保留项的缺失或损坏，都按上表重建或修复。既有普通页面导航和其他来源事实不因此获得
+自动修复权限；涉及结论制品的非法可变关系仍须先显式清理，无法认证所需关系事实时仍拒绝。
+
+### 既有制品的检查与使用
+
+下表区分对同一份既有制品的三个消费入口。它们均保留 runtime 准入、恢复和各自领域门禁；
+诊断的 code、reason 和定位只消费[诊断 code 登记](query-check-and-output.md#诊断-code-登记)。
+
+| 入口 | 既有制品与所需事实 | 行为与副作用 |
+| --- | --- | --- |
+| Check | 存在可直接认证的制品、成员或结论导航问题 | 报告相应诊断，不创建、重建或修复结论页及根导航；所需事实不可取得时按查询不完整规则报告，不猜测问题。 |
+| 显式生成 | 生成状态为已生成，生成所需输入事实及其他门禁通过；旧制品或结论导航保留项可以存在、缺失或损坏 | 按[显式生成决策表](#显式生成决策表)形成完整重建计划；旧输出的诊断不单独阻断重建。 |
+| `move`、`promote`、`collapse` | 已生成制品的固定头部、正文结构、既有链接及原文目标 span 可认证，且 mapping 可证明 | 同一结构提交中只改已有目标 span；不重算成员，不刷新标签、顺序或质疑来源。 |
+| `move`、`promote`、`collapse` | 已生成制品缺失，或上述固定形状、原文位置、mapping 任一无法认证 | 整个结构操作写前拒绝、零写；不通过补页或重新生成取得可写条件。 |
+
+快照的成员、标签或顺序与当前页面事实不一致，可以由 Check 报告；这种语义过时本身不
+替代结构命令对既有形状和位置的认证，也不授权结构命令修复快照。正式根仍须通过完整
+after-state Check，不能以窄改写为由绕过其中的 error。
 
 ### 其他事件与提交
 
@@ -105,8 +135,10 @@ parent: index.md
 
 在 `registered` 根中，显式生成和结构窄改写都必须对完整计划 after-state 通过
 [Check 门禁与副作用](query-check-and-output.md#check-门禁与副作用)；生成器可以整体替换其拥有但
-已损坏的结论制品，只要替换后的完整根零 error。`candidate` 只需成员、关系、制品 parser
-和本次 mapping 的完整事实，不因无关 error 被阻止。
+已损坏的结论制品，只要替换后的完整根零 error。生成门禁检查完整重建计划的结果，不以
+替换前的制品诊断拒绝该计划。`candidate` 显式生成需要完整的生成状态、成员、关系和
+所需导航事实；结构窄改写需要既有制品解析结果与本次 mapping 的完整事实。两者均不因
+无关 error 被阻止，也不能跳过自身所需事实的认证。
 
 ### 页面头部键与输出边界
 
@@ -122,44 +154,60 @@ Check/修改错误登记中的既有机器码；其 message、line、details 和
 
 ### 生成领域错误投影
 
-结论生成只消费[公共结果、错误与可观测性](../runtime/errors-and-observability.md#公共结果错误与可观测性)
-与[诊断 code 登记](query-check-and-output.md#诊断-code-登记)已登记的错误；本页只保留生成
-事实、机器码选择和零写后果，不复制 code、reason 或 severity 值域：
+显式生成只消费[公共结果、错误与可观测性](../runtime/errors-and-observability.md#公共结果错误与可观测性)
+与[诊断 code 登记](query-check-and-output.md#诊断-code-登记)已登记的错误。下表针对生成所需
+输入事实和写入门禁；已拥有旧输出的格式、成员投影、缺失及原文位置问题按
+[既有制品的检查与使用](#既有制品的检查与使用)处理，不作为本表的生成拒绝条件。
+
+错误选择优先级只由[显式生成决策表](#显式生成决策表)自上而下确定；本节的分区和 code
+投影表不另定检查顺序。共同 runtime 准入通过后，非法结论端点、生成状态、`F_gen`
+违规或不完整、未生成碰撞依该表顺序处理。下表只说明输入认证与根状态的组合；“闭包外
+独立 error”不包括本次获准替换的旧结论输出及其保留导航项的诊断。
+
+| 输入事实分区 | candidate 显式生成 | registered 显式生成 |
+| --- | --- | --- |
+| `F_gen` 中存在可直接认证的页面、导航或关系违规 | 使用直接事实 owner 的既有 Check code，写前零写。 | 同左，不推迟到 after-state Check 才重新分类。 |
+| 没有已直接认证的违规，但 `F_gen` 无法完整、稳定取得，或重建计划无法证明 | `runtime.closure_incomplete`，零写。 | 同左。 |
+| `F_gen` 合法完整，且无闭包外独立 error | 按生成决策表形成完整计划；旧输出缺失、损坏或过时不单独阻断。 | 形成同一完整计划，再对 after-state 运行完整 Check；无 blocker、零 error 才能提交。 |
+| `F_gen` 合法完整，但存在闭包外独立 error | 闭包外 error 不阻断本次生成计划。 | 仍检查完整 after-state；残留 error 为 `operation.check_failed`，结果不完整为 `runtime.closure_incomplete`，均零写。 |
+
+来源页面的 parent、角色、导航及关系声明、端点、配对、图和状态约束，都按其事实 owner
+在[诊断 code 登记](query-check-and-output.md#诊断-code-登记)中的对应分区选择错误。本页
+不维护第二套完整 code 清单，也不把必需的根页或祖先导航违规当作 candidate 的无关问题。
 
 | 已认证事实 | 领域选择与副作用 |
 | --- | --- |
 | 尚未生成但 `conclusions.md` 已存在 | 使用 [`conclusions.conflict`](query-check-and-output.md#诊断-code-登记)；写前零写。 |
 | 尚未生成但根导航保留项已存在 | 使用 [`conclusions.conflict`](query-check-and-output.md#诊断-code-登记)；写前零写。 |
-| 已生成制品 frontmatter 不符合固定头部 | 使用 [`conclusions.invalid`](query-check-and-output.md#诊断-code-登记)；写前零写。 |
-| 已生成制品标题、section 或列表结构不符合固定形状 | 使用 [`conclusions.invalid`](query-check-and-output.md#诊断-code-登记)；写前零写。 |
-| 已生成制品缺少应有确认/质疑成员 | 使用 [`conclusions.invalid`](query-check-and-output.md#诊断-code-登记)；写前零写。 |
-| 已生成制品含没有对应已认证成员的额外条目 | 使用 [`conclusions.invalid`](query-check-and-output.md#诊断-code-登记)；写前零写。 |
-| 已生成制品含重复确认成员或质疑来源 | 使用 [`conclusions.invalid`](query-check-and-output.md#诊断-code-登记)；写前零写。 |
-| 已生成制品链接含错误目标、fragment、tooltip 或其他非固定形状 | 使用 [`conclusions.invalid`](query-check-and-output.md#诊断-code-登记)；写前零写。 |
-| 已生成制品成员顺序不符合固定领域顺序 | 使用 [`conclusions.invalid`](query-check-and-output.md#诊断-code-登记)；写前零写。 |
-| 已生成状态下结论制品缺失 | 使用 [`conclusions.invalid`](query-check-and-output.md#诊断-code-登记)；写前零写。 |
-| 已生成状态下根导航结论保留项缺失 | 使用 [`conclusions.invalid`](query-check-and-output.md#诊断-code-登记)；写前零写。 |
-| 已生成制品的条目目标 span 无法唯一取得或映射 | 使用 [`conclusions.invalid`](query-check-and-output.md#诊断-code-登记)；写前零写。 |
 | 任一可变正式关系以 `conclusions.md` 为 source 或 target | 使用 [`relation.endpoint_invalid`](query-check-and-output.md#诊断-code-登记)；生成器不代为删除关系。 |
-| 页面头部事实不合法 | 复用 [`page.frontmatter_invalid`](query-check-and-output.md#诊断-code-登记)；不另造生成专用同义码，写前零写。 |
-| 页面状态事实不合法 | 复用 [`page.status_invalid`](query-check-and-output.md#诊断-code-登记)；不另造生成专用同义码，写前零写。 |
-| 关系端点事实不合法 | 复用 [`relation.endpoint_invalid`](query-check-and-output.md#诊断-code-登记)；不另造生成专用同义码，写前零写。 |
-| 关系配对事实不合法 | 复用 [`relation.pair_invalid`](query-check-and-output.md#诊断-code-登记)；不另造生成专用同义码，写前零写。 |
-| 生成所需事实、根导航或 mapping 无法完整稳定取得 | 使用 [`runtime.closure_incomplete`](../runtime/errors-and-observability.md#公共结果错误与可观测性)；拒绝并零写，不把未知生成状态或快照 stale 解释为未生成、已生成或 no-change。 |
+| `F_gen` 中来源页面、必需导航或关系事实已认证违规 | 按上表选择直接事实 owner 的既有 Check code；写前零写，不另造生成专用同义码。 |
+| 生成所需输入事实或导航无法完整稳定取得，或无法证明重建计划可安全提交 | 使用 [`runtime.closure_incomplete`](../runtime/errors-and-observability.md#公共结果错误与可观测性)；拒绝并零写，不把未知生成状态解释为未生成、已生成或 no-change。 |
 | 生成状态的私有权威本身损坏 | 使用 [`runtime.corrupt`](../runtime/errors-and-observability.md#公共结果错误与可观测性)；本页拒绝并零写，不公开其存储编码。 |
 
-正式根还必须满足完整 after-state Check；既有 error 使用 `operation.check_failed`，而 Check
-  无法完整运行使用 `runtime.closure_incomplete`。一次失败只返回一个独立错误，建议仅在已
-  认证事实足以支持时提供。
+正式根还必须满足完整 after-state Check；重建后仍有 error 使用 `operation.check_failed`，
+Check 无法完整运行使用 `runtime.closure_incomplete`。一次失败只返回一个独立错误，建议
+仅在已认证事实足以支持时提供。
 
 ### 失败、零写、恢复与验证
 
-- 生成前任一关系、端点、状态、生成状态或重复事实不可认证时零写。快照 stale 本身不是
+- 生成所需输入中的关系、端点、页面状态、生成状态或重复事实不可认证时零写。快照 stale 本身不是
   结构阻塞，但对结构命令而言不可安全解析的已生成制品是阻塞。
 - 领域提交后耐久结果不确定时由 runtime 保留 recovery 现场；普通结构或生成重试不能
   自行覆盖制品。显式 recovery 收敛后必须重新认证成员事实和 mapping。
 - 验证显式生成表的全部组合：未知生成状态、未生成碰撞、首次零成员、首次有成员、已生成
   的存在/缺失/损坏制品、零成员重建、非法关系阻断和幂等零写。
+- 对同一份已生成制品，分别覆盖头部非固定、正文形状损坏、文件缺失、结论导航保留项缺失
+  和快照语义过时：Check 报告可认证问题且不修复；显式生成在输入事实与门禁通过后重建；
+  结构操作只在既有形状、位置和 mapping 可认证时窄改写。分别验证 candidate 与 registered
+  的 after-state 门禁；生成状态未知、源页面或关系事实不完整时不得借重建权限继续。
+- 在旧制品损坏的同一场景中，分别加入必需根页或祖先导航违规、关系声明/端点/配对/图/
+  状态约束违规，验证 candidate 与 registered 都使用直接事实的领域 code 并零写；对应
+  事实无法完整、稳定读取时才使用 `runtime.closure_incomplete`。再以合法完整 `F_gen`
+  配闭包外独立 error，验证 candidate 可继续、registered 仍受完整 after-state Check 阻断。
+- 覆盖未生成状态下同名文件或结论导航保留项碰撞与输入问题并存的组合：`F_gen` 已认证
+  违规时先选择直接事实 owner code；未命中直接违规但输入不完整时选择
+  `runtime.closure_incomplete`；只有前述分区均未命中时才选择 `conclusions.conflict`。
+  所有分区均零写，不因错误选择顺序获得覆盖未拥有内容的权限。
 - 验证固定头部、一级标题、两个 section、顶层/缩进列表原文形状、标题标签、链接目标、
   confirmed-only 成员资格、`confirmed + challenged_by` 双投影、零/一/多个质疑和全部排序；
   任何多余文本、tooltip、fragment、层级或 span 歧义都阻止结构窄改写。

@@ -115,7 +115,7 @@ R-INTERFACE 校验的 `note_change` 语义计算最终 `status` 与有效 `note`
 | 根与恢复 | 根路径/选择不可认证 | `runtime.root_invalid`；拒绝且零写，不建立领域计划。 |
 | 根与恢复 | recovery pending、运行环境或耐久状态不能安全完成，或私有 marker/authority 已损坏 | 分别复用 `runtime.recovery_required`、`runtime.platform_unsupported`、`runtime.busy`、`runtime.external_change`、`runtime.durability_failed` 或 `runtime.corrupt`；拒绝且零写，不产生领域成功。 |
 | 页面路径 | 必需页面不存在，或存在但不属于受管理页面 | 选择 `operation.path_not_found` 或 `operation.path_not_managed`；拒绝且零写。 |
-| 页面内容 | 已读取但违反 frontmatter、状态、说明、parent 或页面角色规则 | 复用 `page.frontmatter_invalid`、`page.status_invalid`、`page.note_invalid`、`page.parent_invalid` 或 `page.role_invalid`；拒绝且零写。 |
+| 页面内容 | 已读取但违反标题、frontmatter、状态、说明、parent 或页面角色规则 | 复用 `page.title_invalid`、`page.frontmatter_invalid`、`page.status_invalid`、`page.note_invalid`、`page.parent_invalid` 或 `page.role_invalid`；拒绝且零写。 |
 | 关系事实 | 关系声明、端点、反向配对、图或 supersedes 状态不成立 | 复用 `relation.declaration_invalid`、`relation.endpoint_invalid`、`relation.pair_invalid`、`relation.graph_invalid`、`relation.status_mismatch`；实际删除最后一条取代关系缺少 `target_status` 时使用 `relation.target_status_required`，拒绝且零写。 |
 | 计划事实 | 结构/页面闭包、span 或 after-state 无法完整稳定取得 | 选择 `runtime.closure_incomplete`；拒绝且零写，不得把未知或暂时不可取得解释成不存在或成功无变化。 |
 | 正式根门禁 | 完整 after-state Check 有 error 且不是操作自身已分类的错误 | 选择 `operation.check_failed`；Check 无法完整运行仍使用 `runtime.closure_incomplete`；拒绝且零写。 |

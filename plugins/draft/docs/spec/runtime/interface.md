@@ -49,7 +49,9 @@ request 成员。
 - `OperationId` 和 `trash_id` 都是 36 字符的小写 UUID v4。它们是不透明值，不含路径、
   时间或排序含义。
 - 标题与说明文字是非空单行纯文本，不得有首尾空白或控制字符；runtime 不自动裁剪。标题
-  写入 Markdown 时的必要转义由 runtime 完成，解析后的可见标题必须等于输入值。
+  写入 Markdown 时的必要转义由 runtime 完成，解析后的可见标题必须等于输入值；读取与
+  比较遵循[标题与链接文字](../draft/pages-and-navigation.md#标题与链接文字)。request 中
+  的尖括号、星号和反引号都是纯文本字符，不作为 HTML 或 Markdown 输入语法解释。
 - 一个 request 只允许所属联合成员列出的字段；缺少、未知、重复、`null`、错误类型、非法
   枚举、非规范路径和非法 UUID 都是 `runtime.request_invalid`。普通操作的无序选择集合先按
   调用方原始顺序检查，再对合法唯一集合按规范路径排序；`sources`、`siblings` 等普通列表的
