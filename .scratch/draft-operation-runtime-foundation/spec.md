@@ -3,7 +3,7 @@
 Status: ready-for-agent
 Status-Schema: triage
 Tracker-State: open
-Base-Spec: b297f331fe0a3bc19b5832d6521c34a6c25e1c76
+Base-Spec: 4cf3b96b7d30e4c3f9d2374b88852e160d35dfa2
 Affects:
   - plugins/draft/docs/spec/runtime/
 Parent: none
@@ -16,8 +16,8 @@ Current-Owner:
   - plugins/draft/docs/spec/runtime/lifecycle-and-handoff.md
   - plugins/draft/docs/spec/runtime/recovery.md
   - plugins/draft/docs/spec/runtime/errors-and-observability.md
-Dispatch: eligible
-Dispatch-Diagnostic: 七份 Current-Owner 已完整定义 runtime v1 行为；本条目只组织实现与验证，因此可派遣。
+Dispatch: blocked
+Dispatch-Diagnostic: 整票 runtime v1 不是当前派遣入口。已拆分的 child issues 各自判定；本条目只组织实现范围与停止条件。
 
 ## 1. 任务定位与边界
 
