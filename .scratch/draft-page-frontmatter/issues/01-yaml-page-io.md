@@ -12,6 +12,7 @@ Design-Refs:
   - plugins/draft/docs/spec/draft/trash-and-restore.md
   - plugins/draft/docs/spec/draft/query-check-and-output.md
   - plugins/draft/docs/spec/runtime/interface.md
+  - plugins/draft/docs/spec/runtime/admission-and-effects.md
   - plugins/draft/docs/spec/runtime/errors-and-observability.md
 
 ## 交付结果与范围
@@ -80,6 +81,16 @@ Blocked by:
 纯解析、读取和纯计划可独立继续；runtime 的完整持久状态机不是本任务的前置。这不免除真实写入、失败和恢复的回归验证。
 如果实际实现证明必须改变持久记录协议、补充未定义的状态或扩大到其他完整行为，停止相关工作并报告具体 owner、
 调用链与反例；不得用测试通过声明这些额外行为已获批准。
+
+### 格式整合与关闭
+
+本任务负责上表所有受管理页面读取器、模型、写入器和直接消费者的 YAML 格式整合。[05](../../draft-runtime-tracer-bullets/issues/05-yaml-page-read.md)、[06](../../draft-runtime-tracer-bullets/issues/06-yaml-navigation-and-conclusions.md)、[08](../../draft-runtime-tracer-bullets/issues/08-yaml-metadata-plan-dryrun.md) 分别验收完整页面读取能力、跨消费者内部集成和纯元数据计划；这些能力可以在尚未接入公开数据流时独立交付。
+
+公开路径开始消费 YAML 页面事实时，所有仍可达的受管理页面读取器、模型、写入器和直接消费者必须在同一候选中完成切换。每个写入器的产物均须能被唯一读取器重新读取，同一根不能按页面或命令采用不同页面协议。实际写入接入仍须满足根锁与恢复前置、各入口的领域合同及相应验收。
+
+私有读取能力的零写验收与完整公开读取分别负责不同边界。公开 `read`／Check 的请求、错误、自动效果和并发行为由请求校验、并发读取任务及运行时设计共同约束；公开组合由[第 12 票](../../draft-runtime-tracer-bullets/issues/12-final-integration.md)验证。
+
+本任务关闭须覆盖上表每个入口的格式迁移、写后重读、失败与恢复后重读及同类读写入口审计。初始化页面集合、页面状态、模板内容及其恢复责任沿初始化决策和第 10 票处理；第 09 票验收经用户确认的一条普通耐久操作，各项交付分别提供自己的完成证据。
 
 ## Comments
 
