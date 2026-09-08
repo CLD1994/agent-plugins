@@ -83,6 +83,8 @@ Blocked by:
 
 ## Comments
 
+本任务的读取、消费者与纯计划交付沿[第 05–08 票](../../draft-runtime-tracer-bullets/spec.md#与现有任务的关系)推进；实际写入与首条操作恢复沿[第 09 票](../../draft-runtime-tracer-bullets/issues/09-first-yaml-write.md)及其后继票推进。各票引用同一项实现的执行记录，按各自范围验收；本任务关闭还需覆盖上表中的全部生成、编辑、结构和 Trash/Restore 消费者。候选选择与测试复用遵循[复用安排](../../draft-runtime-tracer-bullets/spec.md#基线与历史归档)。
+
 2026-09-06：用户批准本任务粒度及与请求校验任务互不阻塞的安排。
 
 2026-09-06：独立评审发现结论链接标签的原始 HTML 解码分区未定义。CommonMark 的普通文本、转义、实体、强调和行内代码可按已认证可见值处理；原始 HTML 的接受/拒绝需要用户明确，实施者不从当前 parser 行为反推规则。已暂停受影响的结论解析与接口采用，已有候选及验证记录保留。

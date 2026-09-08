@@ -63,6 +63,10 @@ Parent: .scratch/draft-operation-runtime-foundation/spec.md
 
 ## Comments
 
+本项工作按[第 02 票：根锁准入](../../draft-runtime-tracer-bullets/issues/02-root-lock-admission.md)、[第 03 票：恢复与清理归属](../../draft-runtime-tracer-bullets/issues/03-recovery-cleanup-ownership.md)、[第 04 票：只读、预演与通知](../../draft-runtime-tracer-bullets/issues/04-read-dryrun-maintenance.md)分别交付和验收，继续使用同一根锁候选与执行记录。
+
+2026-09-09：专用工作目录为 `.worktrees/draft-root-lock-recovery`，分支 `task/draft-root-lock-recovery`，HEAD 为 `670dbf210431badbdf68aa6e99f844417c35a6d4`；候选另含 `diagnostic_codes.py`、`operations.py` 的未提交修改，以及未跟踪的 `root_lock.py` 和两份根锁测试，HEAD 本身不包含这些候选内容。[执行计划](../../../.worktrees/draft-root-lock-recovery/tmp/agents/2026-09-07-issue-04-root-lock/execution-plan/plan.md)已有[计划评审结果](../../../.worktrees/draft-root-lock-recovery/tmp/agents/2026-09-07-issue-04-root-lock/plan-review/result.md)。[实施检查点](../../../.worktrees/draft-root-lock-recovery/tmp/agents/2026-09-07-issue-04-root-lock/implementation/checkpoint.md)记录了部分原语和入口接入，并列出旧 JSON 锁测试、Restore 准备顺序以及 read/DryRun/维护/CLI 接入的未完成项。当前恢复工作先核对候选与现行设计；这些历史验证记录不表示本轮已经重跑测试或整票通过验收。
+
 2026-09-06：用户同意把正常写入与恢复共用的锁及其崩溃处理加入当前实施范围，作为实际写入的独立前置修复。
 
 2026-09-07：用户确认两项可观察规则。(1) live owner 就是此刻持有平台 live OS lock 的写入者；不做 PID、mtime、锁文件存在性等额外活性证明。try-lock 失败，或无 record 但 OS lock live，都只表示有活的锁持有者。(2) 任何公开入口一旦返回给调用方，无论成功还是错误，都不得继续持有 OS 根锁。函数内部执行期间必须持锁；进程崩溃由内核释放活锁。

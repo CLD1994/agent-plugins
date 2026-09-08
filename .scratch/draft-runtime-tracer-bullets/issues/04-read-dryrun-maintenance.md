@@ -13,6 +13,8 @@ Parent: .scratch/draft-runtime-tracer-bullets/spec.md
 Blocked by:
   - [02: 写入和恢复共享根目录排他锁](02-root-lock-admission.md)：提供根锁竞争与统一错误事实，供只读、预演和通知接入。
 
+已有候选及共用执行记录见[根锁任务](../../draft-operation-runtime-foundation/issues/04-root-lock-and-recovery.md#comments)，本票分别核对只读、预演与通知的完整交付证据。
+
 - [ ] 普通读取本身不创建操作记录、不清理现场；机会式索引维护取锁失败时跳过写入并继续投影稳定读取结果。
 - [ ] 预演在没有待恢复记录时不探测或取得运行期锁；发现待恢复记录后最多进行规范允许的一次探测，并且始终零写。
 - [ ] 文件变更通知在活动写入者存在时不进行维护写、不安排隐式恢复或重试，并返回通知契约允许的最小结果。

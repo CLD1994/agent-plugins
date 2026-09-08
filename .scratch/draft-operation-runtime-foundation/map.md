@@ -39,6 +39,14 @@ Labels: wayfinder:map
 
 尚无经本图关闭的决策任务。上面的固定安排是本图建立时的已批准输入。
 
+## 交付入口与整体验收
+
+实施切片、前置交付和跨领域接缝统一从[运行时与 YAML 垂直交付路线](../draft-runtime-tracer-bullets/spec.md)进入；该路线的[第 12 票](../draft-runtime-tracer-bullets/issues/12-final-integration.md)负责已覆盖切片的最终整合与故障验收。
+
+初始化的阶段与共用责任在[初始化边界决策](issues/02-initialization-recovery-slices.md)维护；首条普通操作及其验收在[普通操作决策](issues/03-status-operation-recovery-slices.md)维护。后续实施票通过各自依赖引用这些决策结果。
+
+本路线图、runtime 总任务、YAML 总任务和每张交付票分别按自己的完整范围验收。相同实现沿同一工作记录继续；总任务关闭前还须核对尚未覆盖的领域入口和 runtime 行为。
+
 ## 尚未明确
 
 在初始化及首条普通操作的共同责任确定后，需要继续核对其余请求接入时的具体差异。

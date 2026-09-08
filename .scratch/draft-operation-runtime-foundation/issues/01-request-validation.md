@@ -66,4 +66,6 @@ runtime 的集成安排见[实施路线图](../map.md)。本任务完成只证�
 
 ## Comments
 
+交付切片见[第 01 票：公共请求校验](../../draft-runtime-tracer-bullets/issues/01-request-validation.md)。两个入口引用同一执行记录，分别按各自完整范围验收。
+
 2026-09-06：用户批准本任务粒度及与页面 YAML 任务互不阻塞的安排。
