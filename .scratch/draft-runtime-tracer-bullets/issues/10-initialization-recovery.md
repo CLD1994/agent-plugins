@@ -1,27 +1,18 @@
 # 10: 初始化及初始化中断恢复闭环
 
-Status-Schema: triage
 Status: ready-for-human
 Tracker-State: open
-Base-Spec: 4cf3b96b7d30e4c3f9d2374b88852e160d35dfa2
-Affects:
+Design-Refs:
   - plugins/draft/docs/spec/runtime/initialization-and-platform.md
   - plugins/draft/docs/spec/runtime/recovery.md
   - plugins/draft/docs/spec/runtime/authority-and-projections.md
 Parent: .scratch/draft-runtime-tracer-bullets/spec.md
-Scope: child-issue-only
-Current-Owner:
-  - plugins/draft/docs/spec/runtime/initialization-and-platform.md
-  - plugins/draft/docs/spec/runtime/recovery.md
-  - plugins/draft/docs/spec/runtime/authority-and-projections.md
-Dispatch: blocked
-Dispatch-Diagnostic: 等待现有任务“确定初始化与初始化恢复的实施边界”由人类确认阶段划分、共用责任和验收范围；根锁前置仍需第 02 票完成。
 
-**What to build:** 在人类确认的初始化边界内，先证明平台能力，再通过初始化专用门禁建立根目录标记；如果过程中断，后续初始化能够依据已认证材料安全继续或明确阻断，不猜测初始页面集合，也不让普通操作偷偷接管初始化现场。
+**交付目标：** 在人类确认的初始化边界内，先证明平台能力，再通过初始化专用门禁建立根目录标记；如果过程中断，后续初始化能够依据已认证材料安全继续或明确阻断，不猜测初始页面集合，也不让普通操作偷偷接管初始化现场。
 
-**Blocked by:** 02: 写入和恢复共享根目录排他锁；以及现有任务“确定初始化与初始化恢复的实施边界”的人类决策。
-
-**Status:** ready-for-human
+Blocked by:
+  - [02: 写入和恢复共享根目录排他锁](02-root-lock-admission.md)：完成初始化后清理所需的运行期根锁前置。
+  - [初始化实施边界决策](../../draft-operation-runtime-foundation/issues/02-initialization-recovery-slices.md)：由用户确认阶段划分、共用责任和验收范围。
 
 - [ ] 缺少必要平台能力时在任何写入前返回平台不支持，且不留下半成品。
 - [ ] 标记发布前后的中断、已有现场、未知版本、损坏、认证后变化和保存不确定分别得到确定结果。

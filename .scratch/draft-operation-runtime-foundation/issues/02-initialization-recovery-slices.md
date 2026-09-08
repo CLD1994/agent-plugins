@@ -1,10 +1,8 @@
 # 确定初始化与初始化恢复的实施边界
 
-Status-Schema: triage
 Status: ready-for-human
 Tracker-State: open
-Base-Spec: 4cf3b96b7d30e4c3f9d2374b88852e160d35dfa2
-Affects:
+Design-Refs:
   - plugins/draft/docs/spec/runtime/interface.md
   - plugins/draft/docs/spec/runtime/initialization-and-platform.md
   - plugins/draft/docs/spec/runtime/admission-and-effects.md
@@ -12,19 +10,8 @@ Affects:
   - plugins/draft/docs/spec/runtime/recovery.md
   - plugins/draft/docs/spec/runtime/errors-and-observability.md
 Parent: .scratch/draft-operation-runtime-foundation/map.md
-Scope: child-issue-only
-Current-Owner:
-  - plugins/draft/docs/spec/runtime/interface.md
-  - plugins/draft/docs/spec/runtime/initialization-and-platform.md
-  - plugins/draft/docs/spec/runtime/admission-and-effects.md
-  - plugins/draft/docs/spec/runtime/authority-and-projections.md
-  - plugins/draft/docs/spec/runtime/recovery.md
-  - plugins/draft/docs/spec/runtime/errors-and-observability.md
-Dispatch: blocked
-Dispatch-Diagnostic: 问题与 authority 已定位；实施切片和阶段验收尚需用户确认，只可作为人类协同讨论入口。
 Type: grilling
 Labels: wayfinder:grilling
-Blocked by: none
 
 ## 问题
 
@@ -36,7 +23,7 @@ marker 提交和提交后恢复清理拆成可单独验证的阶段，并确定�
 
 ## 讨论依据与所需产物
 
-先读取父任务的七份 Current-Owner，重点沿
+先读取父任务 `Design-Refs` 指向的七份设计规格，重点沿
 [初始化状态表](../../../plugins/draft/docs/spec/runtime/initialization-and-platform.md#初始化状态表)、
 [marker 发布、cleanup 与恢复](../../../plugins/draft/docs/spec/runtime/initialization-and-platform.md#marker-发布cleanup-与恢复)和
 [证据优先恢复表](../../../plugins/draft/docs/spec/runtime/recovery.md#证据优先恢复表)追踪同一现场：

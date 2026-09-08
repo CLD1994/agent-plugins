@@ -1,25 +1,13 @@
 # 01: 公共请求在任何副作用前被拒绝
 
-Status-Schema: triage
 Status: ready-for-agent
 Tracker-State: open
-Base-Spec: 4cf3b96b7d30e4c3f9d2374b88852e160d35dfa2
-Affects:
+Design-Refs:
   - plugins/draft/docs/spec/runtime/interface.md
   - plugins/draft/docs/spec/runtime/errors-and-observability.md
 Parent: .scratch/draft-runtime-tracer-bullets/spec.md
-Scope: child-issue-only
-Current-Owner:
-  - plugins/draft/docs/spec/runtime/interface.md
-  - plugins/draft/docs/spec/runtime/errors-and-observability.md
-Dispatch: eligible
-Dispatch-Diagnostic: 请求校验的行为已由规格负责人页面定义，且不依赖页面 YAML 或根锁实现；可从当前干净基线独立验收。
 
-**What to build:** 所有公开命令和公共调用先检查请求的类型、字段、值和组合关系；请求不合法时，在选择或读取 Draft 根目录、创建计划、维护索引、调用外部协作者之前返回统一的请求错误。
-
-**Blocked by:** None (can start immediately).
-
-**Status:** ready-for-agent
+**交付目标：** 所有公开命令和公共调用先检查请求的类型、字段、值和组合关系；请求不合法时，在选择或读取 Draft 根目录、创建计划、维护索引、调用外部协作者之前返回统一的请求错误。
 
 - [ ] 普通操作、回收区操作（Trash）、恢复（Restore）、查询、通知、恢复和初始化的非法输入都在第一次持久副作用前被拒绝。
 - [ ] 命令行接口（CLI）与公共调用对同一无效语义给出相同的机器分类和逻辑字段定位；命令行专属语法仍遵守接口契约。

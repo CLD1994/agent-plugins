@@ -1,22 +1,12 @@
 # 无效请求在读取 Draft 根之前被拒绝
 
-Status-Schema: triage
 Status: ready-for-agent
 Tracker-State: open
-Base-Spec: 4cf3b96b7d30e4c3f9d2374b88852e160d35dfa2
-Affects:
+Design-Refs:
   - plugins/draft/docs/spec/runtime/interface.md
   - plugins/draft/docs/spec/runtime/admission-and-effects.md
   - plugins/draft/docs/spec/runtime/errors-and-observability.md
 Parent: .scratch/draft-operation-runtime-foundation/spec.md
-Scope: child-issue-only
-Current-Owner:
-  - plugins/draft/docs/spec/runtime/interface.md
-  - plugins/draft/docs/spec/runtime/admission-and-effects.md
-  - plugins/draft/docs/spec/runtime/errors-and-observability.md
-Dispatch: eligible
-Dispatch-Diagnostic: 范围收窄到父任务的公共请求校验与拒绝投影；owner 已定义行为，用户已批准粒度与无阻塞安排。
-Blocked by: none
 
 ## 交付结果与范围
 

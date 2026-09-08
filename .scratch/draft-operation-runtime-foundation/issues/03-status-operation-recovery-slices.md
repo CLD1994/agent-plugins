@@ -1,14 +1,8 @@
 # 确定首条普通操作的提交与恢复闭环
 
-Status-Schema: triage
 Status: ready-for-human
 Tracker-State: open
-Base-Spec: 4cf3b96b7d30e4c3f9d2374b88852e160d35dfa2
-Affects:
-  - plugins/draft/docs/spec/runtime/
-Parent: .scratch/draft-operation-runtime-foundation/map.md
-Scope: child-issue-only
-Current-Owner:
+Design-Refs:
   - plugins/draft/docs/spec/runtime/interface.md
   - plugins/draft/docs/spec/runtime/initialization-and-platform.md
   - plugins/draft/docs/spec/runtime/admission-and-effects.md
@@ -16,11 +10,9 @@ Current-Owner:
   - plugins/draft/docs/spec/runtime/lifecycle-and-handoff.md
   - plugins/draft/docs/spec/runtime/recovery.md
   - plugins/draft/docs/spec/runtime/errors-and-observability.md
-Dispatch: blocked
-Dispatch-Diagnostic: 需先明确初始化共用责任和验收安排，再与用户确认首条普通操作的切片；尚不可作为代码任务派遣。
+Parent: .scratch/draft-operation-runtime-foundation/map.md
 Type: grilling
 Labels: wayfinder:grilling
-Blocked by: 02
 
 ## 问题
 
@@ -33,12 +25,14 @@ Blocked by: 02
 
 ## 阻塞关系
 
-等待[确定初始化与初始化恢复的实施边界](02-initialization-recovery-slices.md)给出共用责任与阶段验收。
+Blocked by:
+  - [确定初始化与初始化恢复的实施边界](02-initialization-recovery-slices.md)：确认共用责任与阶段验收。
+
 这里依赖的是该决策的结果，不是要求初始化代码先全部写完；否则无法准确划分普通操作应复用还是补充的认证、记录与恢复责任。
 
 ## 讨论依据与所需产物
 
-读取父任务的七份 Current-Owner，并消费
+读取父任务 `Design-Refs` 指向的七份设计规格，并消费
 [页面编辑](../../../plugins/draft/docs/spec/draft/page-edits.md)、
 [状态与关系](../../../plugins/draft/docs/spec/draft/status-and-relations.md)以及
 [Check 门禁](../../../plugins/draft/docs/spec/draft/query-check-and-output.md#check-门禁与副作用)已定义的领域事实。

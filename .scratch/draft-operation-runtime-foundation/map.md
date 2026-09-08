@@ -1,14 +1,8 @@
 # Draft runtime 实施路线图
 
-Status-Schema: triage
 Status: ready-for-human
 Tracker-State: open
-Base-Spec: 4cf3b96b7d30e4c3f9d2374b88852e160d35dfa2
-Affects:
-  - plugins/draft/docs/spec/runtime/
-Parent: .scratch/draft-operation-runtime-foundation/spec.md
-Scope: wayfinder-map-only
-Current-Owner:
+Design-Refs:
   - plugins/draft/docs/spec/runtime/interface.md
   - plugins/draft/docs/spec/runtime/initialization-and-platform.md
   - plugins/draft/docs/spec/runtime/admission-and-effects.md
@@ -16,8 +10,7 @@ Current-Owner:
   - plugins/draft/docs/spec/runtime/lifecycle-and-handoff.md
   - plugins/draft/docs/spec/runtime/recovery.md
   - plugins/draft/docs/spec/runtime/errors-and-observability.md
-Dispatch: blocked
-Dispatch-Diagnostic: 本图组织尚需与用户讨论的实施边界，不是生产代码派遣入口；现有实施任务有各自独立状态。
+Parent: .scratch/draft-operation-runtime-foundation/spec.md
 Labels: wayfinder:map
 
 ## 目的地
@@ -38,9 +31,9 @@ Labels: wayfinder:map
   `to-tickets`。决策答案记在对应任务的评论中，关闭后本图只保留摘要链接。
 - [根锁与恢复](issues/04-root-lock-and-recovery.md)是已批准的独立实施任务，作为页面 YAML 实际写入接入的前置；
   不阻止其纯解析/读取/计划工作，也不代表初始化或首条普通操作的全部责任已经完成。
-- 本图的决策任务与生产实施任务分开。未决的人类协同任务标为 `ready-for-human`／`Dispatch: blocked`；
+- 本图的决策任务与生产实施任务分开。未决的人类协同任务标为 `ready-for-human`；
   不把讨论入口当作可自动派遣的代码任务。读取或更新状态遵循[本地 tracker 规则](../../docs/agents/issue-tracker.md)。
-- 本轮建立路线，不实施或关闭决策任务；后续任务必须先认领，讨论结果不能由 Agent 代替用户作答。
+- 本图只组织路线，各决策任务和实施任务独立维护结果；后续任务必须先认领，讨论结果由用户确认。
 
 ## 已完成的决策
 

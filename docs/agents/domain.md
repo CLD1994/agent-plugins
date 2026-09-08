@@ -6,7 +6,7 @@
 
 - 根目录 `CONTEXT-MAP.md`：上下文路由
 - 目标插件的 `CONTEXT.md`：领域词汇和对象边界
-- 目标插件的 `docs/spec/index.md`：当前行为规格唯一入口
+- 目标插件的 `docs/spec/index.md`：现行设计规格唯一入口
 - 目标插件的 `docs/adr/`：与当前工作范围有关的架构决策记录
 
 路由或目标文件不存在时停止当前 authority 读取，不把其他上下文或历史文件当 fallback。领域术语或决策实际形成后，由 `/domain-modeling` 按目标插件上下文按需创建或更新。

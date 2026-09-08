@@ -1,12 +1,12 @@
 # Draft 当前规格
 
-本页是 Draft 插件当前行为规格的唯一入口。正式规格页面只表达当前有效规范；历史 provenance 通过页面的 `来源` 区域按需读取。
+本页是 Draft 插件现行设计规格的唯一入口。正式规格页面只表达已确认且当前有效的行为；历史 provenance（来源记录）通过页面的 `来源` 区域按需读取。
 
 ## 治理
 
 - [权威与成员资格](governance/authority.md)
 - [迁移与原子切换](governance/migration.md)
-- [Feature spec 与 tracker](governance/feature-specs.md)
+- [变更规格与任务文档](governance/feature-specs.md)
 - [行为合同登记](governance/contract-register.md)
 
 ## Draft 领域

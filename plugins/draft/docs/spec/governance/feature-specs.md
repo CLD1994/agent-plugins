@@ -1,42 +1,74 @@
-# Feature spec 与 tracker
+# 变更规格与任务文档
 
 ## Feature spec 生命周期
 
-`.scratch/<feature>/spec.md` 是相对 current Wiki 的 feature delta 和 tracker，不是当前行为 authority。只有 `Status-Schema: triage` 才进入本判定。机器判定分别读取 `Status`、`Tracker-State`、`Resolution` 和 `Promoted-to`；不得把其中任意两个拼成复合状态。
+现行设计规格定义已确认且当前有效的行为；`.scratch/<主题>/spec.md` 是描述本次增量目标与验收的变更规格。实施任务、Agent Brief 和路线图组织工作。它们的批准、执行或关闭均不能替代[正式设计的权威流程](authority.md#来源资格与唯一权威)。设计已生效不代表实现已完成。
 
-**输入**：feature 目录、`Status-Schema: triage`、`Status`、`Tracker-State`、`Base-Spec`、`Affects`，以及关闭条目的 `Resolution`/`Promoted-to`。
+本节统一定义任务字段及阅读、执行、关闭的行为；文件布局和写作模板见[轻量任务文档](../../../../../docs/agents/issue-tracker.md)。
 
-**输出**：可派遣、不可派遣或已关闭的 tracker 判定；不会因此改变 current Wiki。
+### 任务字段
 
-**不变量**：
+| 字段 | 含义与维护时机 |
+| --- | --- |
+| `Status` | 必填分诊角色：`needs-triage` 等待评估，`needs-info` 等待补充信息，`ready-for-agent` 可作为 Agent 实施候选，`ready-for-human` 需要人类实施或决策，`wontfix` 当前不处理。每项任务只维护一处。 |
+| `Tracker-State` | 必填生命周期：`open` 表示仍有待处理工作，`closed` 表示已经按关闭原因处理。与分诊分别维护。 |
+| `Design-Refs` | 设计依据链接列表，使用仓库相对路径，可定位到具体标题。指向从根路由可达的现行设计规格页面；实施前应明确与所选行为有关的依据。待分诊或调查时可以暂缺，并在正文明确待定位事项。 |
+| `Parent` | 有实际父任务时记录其仓库相对路径；没有父任务时省略。表达任务归属，父子的状态、结果及执行资格各自核对。 |
+| `Blocked by` | 有前置依赖时列出任务链接和等待的具体结果，必要时说明只影响哪部分工作。尚未确定的依赖在待决问题中记录；已确认无依赖时省略。 |
+| `Resolution` | 只在关闭时填写：`applied` 表示本任务交付已完成，`rejected` 表示已决定拒绝，`superseded` 表示已由其他任务或设计完整接替。需有下文规定的关闭证据。 |
 
-- `Status` 只可为 `needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix` 五种 canonical triage role。`applied`、`closed`、`superseded` 不是 `Status` 值。
-- `Tracker-State` 只可为 `open` 或 `closed`；`Resolution` 只可为 `applied`、`rejected` 或 `superseded`，且只在关闭后出现。四个字段彼此独立存储，不能合并为一个状态字符串。
-- `Promoted-to` 不是状态值：`applied` 与 `superseded` 必须给出可解析的 current-spec Target；`rejected` 禁止声称已迁入；open 条目不得伪造 `Promoted-to`。
-- Agent Brief 是 child issue 的局部执行约束，只能缩小父 feature spec 范围。与父 spec 或 current Wiki 冲突时，不能自行选择语义。
+任务正文集中说明目标、行为边界、待决问题和验收。文件列表可作为调查入口或实现建议；并行工作需要固定写入边界时，在具体执行任务中明确。child 的目标应落在父任务已确认的行为范围内；文件路径的包含关系不能代替行为与授权核对。
 
-### 正交状态决策表
+`Design-Refs` 用于导航，设计正文定义行为。相关链接失效、引用不能确定为现行设计，或不同设计之间有冲突时，先定位并报告缺口。尚无现行设计依据的新行为可以进入研究与设计讨论，正式实施前应按权威流程确定行为。
 
-| `Status` | `Tracker-State` | `Resolution` | `Promoted-to` | 结果 |
-| --- | --- | --- | --- | --- |
-| `ready-for-agent` | `open` | 缺失 | 缺失 | 只有 `Base-Spec` 有效且 `Affects` 非空、可解析时可派遣。 |
-| `needs-triage` / `needs-info` / `ready-for-human` / `wontfix` | `open` | 缺失 | 缺失 | 合法但不可派遣；保留 open 诊断，不能把 triage role 当完成结果。 |
-| 任一合法 triage role（实施已同步） | `closed` | `applied` | 必填且解析到 current-spec Target | 已完成 delta；不成为 authority。 |
-| `wontfix` | `closed` | `rejected` | 缺失 | 已拒绝；不得迁入 current Wiki。 |
-| 任一合法 triage role | `closed` | `superseded` | 必填且解析到取代它的 current-spec Target | 已被完整取代；不成为 authority。 |
-| `ready-for-agent` 等任一合法 role | `open` | 非空或非法 | 任意非空 | 非法组合，`unresolved`，不可派遣。 |
-| 任一合法 role | `closed` | 缺失或非法 | 任意 | 非法组合，`unresolved`，不可派遣。 |
-| 任一合法 role | `closed` | `rejected` | 非空，或 `Status` 不是 `wontfix` | 非法组合，`unresolved`，不可派遣。 |
-| 任一合法 role | `closed` | `applied` / `superseded` | 缺失或目标无法解析 | 非法组合，`unresolved`，不可派遣。 |
-| `Status-Schema` 缺失/非法、任一字段缺失/未知、Base-Spec/Affects 无法解析，或父子范围冲突 | 任意 | 任意 | 任意 | `unresolved`：保留字段级诊断，等待人工归一化；不得默认改成 open、applied 或 `needs-triage`。 |
+### 阅读与执行
 
-**转换与副作用**：实施完成后才可按 applied 从 open 转 closed，并同时写入适用 Resolution 和 Promoted-to；拒绝和被取代分别使用 rejected 和 superseded。关闭条目默认保留，状态转换本身不触发删除。
+**输入**：本次工作目的、任务字段与正文、现行设计、用户授权、前置任务的交付证据，以及实际工作基线。
 
-用户明确要求清理历史材料时，可将已被当前 owner 覆盖的旧设计、计划和失效 tracker 从当前树移除；仍有效且未完成的实施入口继续保留。清理同时更新当前引用和消费者登记，保留完整 Git locator 供历史来源追溯。Tracker 的实际状态只在对应条目维护，不在正式规格中复制各 feature 的状态清单。
+**结果**：完成阅读或分诊，开始已明确的执行任务，或停止受影响工作并说明具体缺口。任务文档保存事实；能否开始由执行前检查判断，结果记录在本次工作记录中。
 
-**失败与恢复**：Base-Spec 过期、Affects 为空或解析失败、父子范围冲突、字段非法或 legacy 缺字段时均不可派遣。诊断只能说明缺口；不能用实现、测试、issue 标题或 Agent Brief 填补字段。
+先区分工作目的，再按实施前条件表从上至下核对；无法证实的条件按未明确处理：
 
-**验证**：解析 feature spec 和 Agent Brief 头部；覆盖 open/ready-for-agent、open/不可派遣、closed/applied、closed/rejected、closed/superseded 与 legacy 非法组合；验证 Base-Spec、Affects 与 Promoted-to 链接，且 child 范围不扩张。
+| 工作目的 | 核对与结果 |
+| --- | --- |
+| 阅读、分诊或调查 | 读取当前文档，说明信息缺失、未知或冲突；可继续补充事实，不因阅读而改写执行资格。 |
+| 修改任务 | 更新实际变化的事实与相关链接；保持目标、授权、依赖和验收一致。 |
+| 实施选定任务 | 按下表核对执行前条件，并记录实际依据和基线。 |
+| 关闭任务 | 按生命周期与关闭证据表核对。 |
+| 重放历史判断 | 明确使用当时的记录和版本定位；其结果只解释当时的判断。 |
+
+| 实施前条件分区 | 处理 |
+| --- | --- |
+| 必需状态缺失或未知、生命周期组合非法、正文相互冲突 | 停止相关实施，报告并明确事实；不从标题或 checklist 推定状态。 |
+| 合法 `closed` | 按关闭记录读取结果，不作为未完成任务执行。 |
+| `open`，且 `Status` 不是 `ready-for-agent` | 按分诊目的补充信息、讨论或请求决策；不自动进入实施。 |
+| `open` + `ready-for-agent`，但文档仅用于组织路线 | 选定有明确交付与验收的独立子任务，分别核对。 |
+| 已选定执行任务，但设计、授权、范围、验收或必要决策未明确，或任一前置交付尚未满足/无法核验 | 停止受影响部分，列出具体缺口；独立且已授权的部分按其自身条件核对。 |
+| 已选定执行任务，上述条件均明确且满足 | 在本次执行记录写明所选范围、设计依据与工作基线，开始工作。 |
+
+执行前沿相关 `Design-Refs` 阅读实际设计，核对 Parent 中约定的行为范围和每项依赖所需结果。前置任务被拒绝不能满足依赖；被接替时必须沿后继交付证明原先所需结果确实满足；证据未知时保留阻断原因。
+
+工作基线与设计依据的版本在本次执行记录固定，可引用已有可复核记录，避免重复维护。Git commit 可定位已提交内容；使用未提交候选时应明确候选位置及相关差异，不能把该 commit 当成候选内容本身。执行中关键设计、授权、依赖或候选发生变化时，重新核对受影响部分并更新本次记录。普通阅读不要求创建仓库快照。
+
+变更规格需要比较已批准的设计版本时，在正文记录具体基线与比较范围。认领和执行结果在任务评论或链接的工作记录维护；总任务、路线图和子任务各自保留自己的交付含义，多个入口指向同一工作时核对已有执行记录。
+
+### 关闭与结果证据
+
+以下组合还要求 `Status` 是任务字段表中的合法值；状态缺失或未知、结果无证据时保留缺口，不自动补全或关闭。
+
+| 生命周期 | 关闭原因 | 结果要求 |
+| --- | --- | --- |
+| `open` | 不填写 | 保留当前工作、依赖及待决事实。 |
+| `closed` | `applied` | 提供本任务实际交付和已满足的验收证据。 |
+| `closed` | `rejected` | `Status` 为 `wontfix`，记录拒绝决定与理由。 |
+| `closed` | `superseded` | 链接接替任务或设计，并说明其完整覆盖本任务的范围；部分接替时保留未完成范围，不能关闭整项任务。 |
+| `open` 带关闭原因，或 `closed` 缺少/使用未知原因，或未满足对应结果要求 | 非法组合 | 报告具体缺口，按真实事实修订；不能用缺省值解释为已完成。 |
+
+完成记录按实际工作提供证据：实施任务链接改动和验证结果，研究任务链接结论与调查证据，决策任务链接已确认的决定，路线任务链接其要求的组织与整体验收结果。变更规格实际进入正式设计时，另链接已生效设计及批准/合入记录；已有设计的代码实现完成不声称发生设计提升。
+
+关闭本身不删除材料，也不隐式关闭或重开相关任务。用户明确要求清理历史材料时，先确认当前设计或后继记录已覆盖必要信息，更新引用与消费者登记，并保留 Git 历史定位；仍有效且未完成的入口继续保留。历史条目按当时记录解释，重新进入实施前核对当前事实与授权。
+
+**验证**：核对待分诊资料不齐但可调查、非法状态停止实施、路线容器与独立任务、依赖未完成/被拒绝/被接替/证据未知、部分工作受阻和必要人类决策；分别验证研究、实施、决策、规格提升与任务接替的关闭证据。证明同文件内扩大行为需要授权，行为不变的合理实现文件调整按具体执行边界处理；阅读不写回派遣结果，关闭不改变设计权威。
 
 ## 相关规格
 

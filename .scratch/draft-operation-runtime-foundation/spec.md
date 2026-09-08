@@ -1,14 +1,8 @@
 # Draft operation runtime 基础实施任务
 
 Status: ready-for-agent
-Status-Schema: triage
 Tracker-State: open
-Base-Spec: 4cf3b96b7d30e4c3f9d2374b88852e160d35dfa2
-Affects:
-  - plugins/draft/docs/spec/runtime/
-Parent: none
-Scope: feature-delta
-Current-Owner:
+Design-Refs:
   - plugins/draft/docs/spec/runtime/interface.md
   - plugins/draft/docs/spec/runtime/initialization-and-platform.md
   - plugins/draft/docs/spec/runtime/admission-and-effects.md
@@ -16,14 +10,12 @@ Current-Owner:
   - plugins/draft/docs/spec/runtime/lifecycle-and-handoff.md
   - plugins/draft/docs/spec/runtime/recovery.md
   - plugins/draft/docs/spec/runtime/errors-and-observability.md
-Dispatch: blocked
-Dispatch-Diagnostic: 整票 runtime v1 不是当前派遣入口。已拆分的 child issues 各自判定；本条目只组织实现范围与停止条件。
 
 ## 1. 任务定位与边界
 
-本文是 runtime v1 的实施入口，不是第二份行为规格。当前行为只由下列七份
-Current-Owner 正文定义；本文只提供读取顺序、实现责任、建议的代码与测试位置、停止条件
-和完成条件。实现者不得从本文推导新的字段、错误、状态、时限、调用顺序或其他行为。
+本文组织 runtime v1 的实现范围与验收路线，实际工作通过独立 child issue 执行，不将整票作为单一实施任务。
+当前行为由 `Design-Refs` 指向的七份现行设计规格定义；本文提供读取顺序、实现责任、建议的代码与测试位置、
+停止条件和完成条件。实现者不得从本文推导新的字段、错误、状态、时限、调用顺序或其他行为。
 
 实现范围覆盖七份 owner 共同负责的 runtime 核心和 CLI/适配层接缝。领域词汇仅按
 [Draft 领域词汇](../../plugins/draft/CONTEXT.md)理解；tracker 的字段只用于派遣和导航，
@@ -45,7 +37,7 @@ Current-Owner 正文定义；本文只提供读取顺序、实现责任、建议
 
 ## 2. 开始前的共同步骤
 
-1. 先逐页读取七份 Current-Owner，确认要实现的行为、验证章节和引用的 Draft owner；再
+1. 先逐页读取 `Design-Refs` 指向的七份设计规格，确认要实现的行为、验证章节和引用的 Draft owner；再
    检查对应现有代码、测试及其真实调用关系。
 2. 为每项 owner 合同确定最窄的生产责任边界和相应测试边界。先建立能区分合同分支的
    测试，再实现；测试替身必须服从真实协作者接口，跨文件系统、进程、平台或分发边界的
@@ -59,7 +51,7 @@ Current-Owner 正文定义；本文只提供读取顺序、实现责任、建议
 
 ## 3. Owner 对应的实施路线
 
-| 顺序 | Current-Owner 与实现责任 | 建议代码与测试位置 | 停止条件 | 完成条件 |
+| 顺序 | 设计依据与实现责任 | 建议代码与测试位置 | 停止条件 | 完成条件 |
 | --- | --- | --- | --- | --- |
 | 1 | [运行时公共接口](../../plugins/draft/docs/spec/runtime/interface.md)：落实公开入口、root 绑定、CLI 路由、输入边界及核心与适配层的隔离；只按 owner 连接内部协作者，不新增公开 seam。 | 核心的入口/装配/CLI 模块位于 `plugins/draft/skills/draft/scripts/runtime/src/draft/`；适配层位于 `plugins/draft/scripts/adapter/` 和 `plugins/draft/scripts/draft.py`。从核心 `tests/unit/`、`tests/integration/` 以及适配层 `tests/unit/`、`tests/integration/` 覆盖入口和依赖边界。 | 入口需要 owner 未定义的输入或输出、root 选择出现第二种解释、或内部协作者必须泄漏到公开边界。 | 入口与适配层行为逐项对应 owner，公开边界测试和核心/适配层依赖限制测试通过，内部实现细节未进入公开结果。 |
 | 2 | [运行时初始化与平台](../../plugins/draft/docs/spec/runtime/initialization-and-platform.md)：落实显式初始化、初始化现场认证与续建、平台能力检查、持久布局建立及初始化后清理的实现协作；平台差异只留在平台适配实现内。 | 核心运行时目录中的初始化、路径、平台和持久化模块；适配层的 init 路由。核心单元测试隔离稳定协作者，文件系统、原子发布、锁、耐久性和跨平台行为放在核心/适配层集成测试。 | 无法证明写入前的某项平台能力，初始化现场出现 owner 未覆盖的组合，或实现必须猜测/删除未认证现场。 | owner 验证章节覆盖空现场、已有现场、旧版或未知现场、损坏及保存失败等分区；初始化、平台拒绝、清理和现场保留的测试证据齐全。 |
@@ -79,10 +71,9 @@ Current-Owner 正文定义；本文只提供读取顺序、实现责任、建议
 整合前后至少完成以下检查：
 
 - 核心与适配层按 [plugins/draft/AGENTS.md](../../plugins/draft/AGENTS.md) 分开运行 unit、integration 和适用的静态/格式检查。
-- 运行 `git diff --check`，检查本条目头部字段、Current-Owner 集合及正文中的所有相对链接。
+- 运行 `git diff --check`，检查本条目头部字段、Design-Refs 集合及正文中的所有相对链接。
 - 扫描确认本文只组织实施路线：不包含任何可脱离 owner 独立执行的协议细节。
 - 核对每项实现和测试都能回到对应 owner；owner 发生必要行为变化时，先停止并由正式规格流程处理。
-- 本次 tracker 改动只涉及本文件；提交为一个文档提交，提交后工作区保持干净。
 
 完成条件是七份 owner 的实现和验证均已通过、跨 owner 数据流和失败恢复路径闭合、没有
 未决语义被 tracker 或代码自行补全，并且上述阶段门禁和交付检查都有可复核证据。

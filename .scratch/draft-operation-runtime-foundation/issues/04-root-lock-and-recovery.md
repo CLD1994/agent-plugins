@@ -1,26 +1,14 @@
 # 正常写入与恢复共用根锁并安全处理准备现场
 
-Status-Schema: triage
 Status: ready-for-agent
 Tracker-State: open
-Base-Spec: 4cf3b96b7d30e4c3f9d2374b88852e160d35dfa2
-Affects:
+Design-Refs:
   - plugins/draft/docs/spec/runtime/admission-and-effects.md
   - plugins/draft/docs/spec/runtime/recovery.md
   - plugins/draft/docs/spec/runtime/initialization-and-platform.md
   - plugins/draft/docs/spec/runtime/authority-and-projections.md
   - plugins/draft/docs/spec/runtime/errors-and-observability.md
 Parent: .scratch/draft-operation-runtime-foundation/spec.md
-Scope: child-issue-only
-Current-Owner:
-  - plugins/draft/docs/spec/runtime/admission-and-effects.md
-  - plugins/draft/docs/spec/runtime/recovery.md
-  - plugins/draft/docs/spec/runtime/initialization-and-platform.md
-  - plugins/draft/docs/spec/runtime/authority-and-projections.md
-  - plugins/draft/docs/spec/runtime/errors-and-observability.md
-Dispatch: eligible
-Dispatch-Diagnostic: 用户已批准根锁与崩溃恢复作为 YAML 实际写入的独立前置修复；只收窄父任务的锁、准备现场、恢复协调与必要入口接入，不重写整个 runtime。
-Blocked by: none
 
 ## 交付结果与边界
 

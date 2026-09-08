@@ -5,8 +5,8 @@
 
 ## 规格入口
 
-当前行为从根目录 `CONTEXT-MAP.md`、本插件 `CONTEXT.md` 和
-[规格入口](docs/spec/index.md) 定位；`docs/adr/` 解释架构取舍。
+现行设计规格从根目录 `CONTEXT-MAP.md`、本插件 `CONTEXT.md` 和
+[设计规格入口](docs/spec/index.md) 定位；`docs/adr/` 解释架构取舍。
 
 ## 测试布局
 

@@ -1,29 +1,18 @@
 # 06: 导航、查询和结论读取使用同一页面事实
 
-Status-Schema: triage
 Status: ready-for-agent
 Tracker-State: open
-Base-Spec: 4cf3b96b7d30e4c3f9d2374b88852e160d35dfa2
-Affects:
+Design-Refs:
   - plugins/draft/docs/spec/draft/pages-and-navigation.md
   - plugins/draft/docs/spec/draft/conclusions.md
   - plugins/draft/docs/spec/draft/query-check-and-output.md
   - plugins/draft/docs/spec/draft/resources-and-links.md
 Parent: .scratch/draft-runtime-tracer-bullets/spec.md
-Scope: child-issue-only
-Current-Owner:
-  - plugins/draft/docs/spec/draft/pages-and-navigation.md
-  - plugins/draft/docs/spec/draft/conclusions.md
-  - plugins/draft/docs/spec/draft/query-check-and-output.md
-  - plugins/draft/docs/spec/draft/resources-and-links.md
-Dispatch: blocked
-Dispatch-Diagnostic: 等待第 05 票提供经过认证且明确区分头部与正文的页面事实。
 
-**What to build:** 页面图、查询、检查、链接索引和结论读取都消费同一份已认证页面事实，不各自重新解释头部或正文。生成的结论文件按“独立制品”处理，不被误认为普通页面或物理父页。
+**交付目标：** 页面图、查询、检查、链接索引和结论读取都消费同一份已认证页面事实，不各自重新解释头部或正文。生成的结论文件按“独立制品”处理，不被误认为普通页面或物理父页。
 
-**Blocked by:** 05: 页面读取正确区分 YAML 头部和正文。
-
-**Status:** ready-for-agent
+Blocked by:
+  - [05: 页面读取正确区分 YAML 头部和正文](05-yaml-page-read.md)：提供经过认证且明确区分头部与正文的页面事实。
 
 - [ ] 头部链接字符串不会进入正文资源、反向链接、导航或结论成员集合。
 - [ ] 即使页面头部本身无效，仍报告能够独立确认的跨页面导航问题；不能因为一个无效字段而吞掉其他可认证事实。

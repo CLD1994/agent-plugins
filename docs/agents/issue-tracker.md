@@ -1,55 +1,63 @@
-# Issue tracker：本地 Markdown
+# Issue tracker：轻量任务文档
 
-本仓库的 issue、feature spec、Agent Brief 和 wayfinding map 使用 `.scratch/` 下的本地 Markdown 文件管理。它们是当前 Wiki 的 delta、过程证据或派遣入口，不是行为 authority；当前行为只能从 `CONTEXT-MAP.md`、插件 `CONTEXT.md`、`plugins/draft/docs/spec/index.md` 和其 owner 页面读取。
+本仓库使用 `.scratch/` 下的本地 Markdown 管理变更规格、实施任务、Agent Brief（执行任务说明）和路线图。字段含义、生命周期及执行前检查统一遵循 [Feature spec 生命周期](../../plugins/draft/docs/spec/governance/feature-specs.md#feature-spec-生命周期)；本页提供文件布局、模板和操作步骤。
 
 ## 文件约定
 
-- 每个 feature 使用独立目录：`.scratch/<feature-slug>/`
-- feature spec 位于 `.scratch/<feature-slug>/spec.md`
-- 实施 issue/Agent Brief 分别写入 `.scratch/<feature-slug>/issues/<NN>-<slug>.md`
-- issue 从 `01` 开始编号；每个 issue 使用独立文件
-- map 位于 `.scratch/<effort>/map.md`，只表达路线和依赖，不成为行为 authority
-- 评论和讨论记录追加到文件末尾的 `## Comments` 章节
+- 每个主题使用 `.scratch/<feature-slug>/`。
+- 变更规格位于该目录的 `spec.md`，说明本次拟增加或调整的行为及验收。
+- 实施任务和 Agent Brief 位于 `issues/<NN>-<slug>.md`，从 `01` 开始编号。
+- 路线图位于 `map.md`，组织路线、依赖和待决问题。
+- 执行记录、结果和讨论追加到任务的 `## Comments`，或链接到本次工作的独立记录。
 
-## Tracker 头部与机器判定
+现行设计规格从 `CONTEXT-MAP.md` 定位。任务的 `Design-Refs` 指向其中相关设计页面；`Parent` 记录所属任务或变更规格。设计依据和任务归属分别维护。
 
-纳入 authority/consumer audit 的 `.scratch` feature/spec/issue/map/Agent Brief 必须在标题附近提供下列正交字段；字段名和值按行解析，列表字段使用后续缩进的 `-` 行：
+## 任务模板
+
+新任务先记录分诊和生命周期；已定位的设计依据、有实际父任务或前置依赖时再填写相应部分。字段内容使用仓库相对路径，正文 Markdown 链接相对当前文档。下面是需要设计、父任务和前置结果的任务示例结构：
 
 ```text
-Status-Schema: triage
-Status: <canonical triage role>
-Tracker-State: open | closed
-Base-Spec: <valid base commit or approved base locator>
-Affects:
-  - <repo-relative current owner path>
-Parent: <repo-relative parent path or none>
-Scope: <feature-delta | child-issue-only | wayfinder-map-only>
-Current-Owner: <repo-relative current Wiki owner path>
-Dispatch: eligible | blocked
-Dispatch-Diagnostic: <具体、可复核的阻断或资格说明>
+# <任务标题>
+
+Status: needs-triage
+Tracker-State: open
+Design-Refs:
+  - <现行设计规格页面的仓库相对路径>
+Parent: <父任务或变更规格的仓库相对路径>
+
+## 目标与范围
+
+<交付什么行为；明确的边界；调查入口或实现建议>
+
+## 依赖与待决问题
+
+Blocked by:
+  - [<前置任务>](<相对链接>)：<等待哪个交付结果，影响哪部分工作>
+
+<尚需补充的事实或用户决定；设计依据待定位时在此说明>
+
+## 验收条件
+
+<可核验的输入、结果、失败行为及交付证据>
+
+## Comments
 ```
 
-`Status` 只能取 `needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`。`Tracker-State` 只能取 `open` 或 `closed`；open 条目不得写 `Resolution` 或 `Promoted-to`，closed 条目必须写合法的 `Resolution`，其中 `applied`/`superseded` 必须有可解析的 `Promoted-to` current-spec Target，`rejected` 不得有 `Promoted-to`。`Base-Spec` 和 open 条目的 `Affects` 必须非空且可解析；closed 条目的历史基线若无法重放，必须在 `Dispatch-Diagnostic` 中说明，不得伪造 current owner。
+仅保留当前任务需要的部分。明确无父任务或无前置依赖时省略对应字段；尚不知道依赖是否存在时，在待决问题中写明，不能用省略表达“已经确认没有”。关闭时按生命周期规则填写 `Resolution`，并在完成记录中链接实际结果。
 
-只有同时满足 `Status-Schema: triage`、合法字段、`Tracker-State: open`、`Status: ready-for-agent`、有效 `Base-Spec`、非空可解析 `Affects`、无父子范围冲突，并且 `Dispatch: eligible` 时才能派遣。任何字段缺失、未知值、非法组合、无效链接、父子范围扩张或未决语义都输出 `unresolved` 并保持 `Dispatch: blocked`；不能默认成 `open`、`applied`、`ready-for-agent` 或从标题、`Type`、`Blocked by`、代码、测试和 checklist 推断完成。
+## 日常操作
 
-`Current-Owner`、`Promoted-to` 和 `Affects` 只提供 tracker 导航，不能定义或覆盖 owner 页面行为。Agent Brief 只能收窄 `Parent` 的范围；与父 spec 或 current Wiki 冲突时，child 逐项保持 `Status: needs-triage`、`Tracker-State: open`、`Dispatch: blocked`，并写出冲突入口、影响和 current owner。已完整取代的条目显式使用 `closed` + `Resolution: superseded`，不通过 parent 状态隐式关闭 child。
+1. **读取与分诊**：读取头部和正文，理解目标、设计依据、依赖及待决事项。记录发现的缺口，阅读本身不要求生成或写回执行资格。
+2. **创建与修改**：在对应主题目录维护任务。按 [分诊操作](triage-labels.md) 更新唯一的 `Status`；范围、依赖和验收各在本任务的一处维护。
+3. **开始工作**：选定可独立交付的任务或明确获授权的部分，按设计规格中的执行前检查核对；在本次记录中写明实际依据、工作基线和所选范围。需要人类决定时提供具体问题，其他独立且已授权的工作可继续。
+4. **完成与关闭**：核对任务实际交付及验收证据，按关闭原因更新生命周期；研究报告、代码实现、后继任务和正式设计分别链接各自真实结果。
 
-历史材料的保留与清理遵循 [Feature spec 生命周期](../../plugins/draft/docs/spec/governance/feature-specs.md#feature-spec-生命周期)。Tracker 状态在对应条目维护；正式规格登记实施入口时只提供导航。
+当 skill 要求“发布到 issue tracker”或“读取相关 ticket”时，使用上述本地文件。缺失、未知或冲突信息可以作为调查对象；进入实施前按现行设计逐项明确，保留具体诊断。
 
-## Skill 操作
+## 路线与执行记录
 
-当 skill 要求“发布到 issue tracker”时，在 `.scratch/<feature-slug>/` 下创建相应文件；目录不存在时一并创建，并先写完整 tracker 头部。
+路线图通过 child ticket 链接组织工作，说明每项依赖等待的具体交付。开始前直接读取子任务及前置结果，结合当前授权选择执行单元。路线图和总任务在正文说明组织职责，各子任务分别维护自己的状态和结果。
 
-当 skill 要求“读取相关 ticket”时，读取用户提供的文件路径或 issue 编号对应的文件；先解析 tracker 头部，再读取正文。缺字段或冲突条目只能作为不可派遣过程证据，不能作为当前行为输入。
+`Type`、`Labels` 可按需标注调查或执行用途。认领时在本次执行记录写明任务、执行者和工作位置；结束时记录结果。状态值和关闭条件由生命周期规格统一定义。
 
-## Wayfinding 操作
-
-`/wayfinder` 使用一个 map 文件和多个独立的 child ticket 文件：
-
-- Map：`.scratch/<effort>/map.md`，保存 Notes、Decisions-so-far 和 Fog；它的 tracker 状态独立于 child。
-- Child ticket：`.scratch/<effort>/issues/<NN>-<slug>.md`
-- `Type:` 可记录 `research`、`prototype`、`grilling` 或 `task`，但不是 tracker 状态，也不能替代 `Status-Schema`、`Status` 或 `Tracker-State`。
-- `Blocked by: NN, NN` 只记录过程依赖；依赖满足不能绕过 `Base-Spec`、父子范围和 current owner 判定。
-- Frontier 只从机器判定为 `Dispatch: eligible` 的条目中选择；legacy 缺字段、`claimed`/`resolved` 旧状态或未决冲突均不可派遣。
-- Claim/Resolve 只能追加过程说明或更新完整正交 tracker 字段；不得把 `Status` 改成 `claimed`/`resolved`，不得只在 map 或 parent 写 superseded 来关闭 child。
+历史材料的保留与清理遵循 [Feature spec 生命周期](../../plugins/draft/docs/spec/governance/feature-specs.md#feature-spec-生命周期)。需要重放某次判断时明确使用当时的记录及版本定位；当前执行核对当前适用的设计和授权。

@@ -1,27 +1,17 @@
 # 04: 只读、预演和通知在并发写入下保持安全
 
-Status-Schema: triage
 Status: ready-for-agent
 Tracker-State: open
-Base-Spec: 4cf3b96b7d30e4c3f9d2374b88852e160d35dfa2
-Affects:
+Design-Refs:
   - plugins/draft/docs/spec/runtime/admission-and-effects.md
   - plugins/draft/docs/spec/runtime/errors-and-observability.md
   - plugins/draft/docs/spec/runtime/authority-and-projections.md
 Parent: .scratch/draft-runtime-tracer-bullets/spec.md
-Scope: child-issue-only
-Current-Owner:
-  - plugins/draft/docs/spec/runtime/admission-and-effects.md
-  - plugins/draft/docs/spec/runtime/errors-and-observability.md
-  - plugins/draft/docs/spec/runtime/authority-and-projections.md
-Dispatch: blocked
-Dispatch-Diagnostic: 等待第 02 票提供可观察的根锁竞争和统一错误事实。
 
-**What to build:** 读取、预演和文件变更通知在另一个进程写入同一根目录时仍遵守各自的只读边界。读取不因为无法写入而伪造结果；预演不写持久状态；通知在忙碌时只返回允许的最小成功结果，并正确映射机器错误和命令行接口退出状态。
+**交付目标：** 读取、预演和文件变更通知在另一个进程写入同一根目录时仍遵守各自的只读边界。读取不因为无法写入而伪造结果；预演不写持久状态；通知在忙碌时只返回允许的最小成功结果，并正确映射机器错误和命令行接口退出状态。
 
-**Blocked by:** 02: 写入和恢复共享根目录排他锁。
-
-**Status:** ready-for-agent
+Blocked by:
+  - [02: 写入和恢复共享根目录排他锁](02-root-lock-admission.md)：提供根锁竞争与统一错误事实，供只读、预演和通知接入。
 
 - [ ] 普通读取本身不创建操作记录、不清理现场；机会式索引维护取锁失败时跳过写入并继续投影稳定读取结果。
 - [ ] 预演在没有待恢复记录时不探测或取得运行期锁；发现待恢复记录后最多进行规范允许的一次探测，并且始终零写。

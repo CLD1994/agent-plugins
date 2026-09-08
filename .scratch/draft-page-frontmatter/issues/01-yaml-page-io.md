@@ -1,10 +1,8 @@
 # 页面头部的读取、编辑和生成统一使用 YAML
 
-Status-Schema: triage
 Status: ready-for-agent
 Tracker-State: open
-Base-Spec: 4cf3b96b7d30e4c3f9d2374b88852e160d35dfa2
-Affects:
+Design-Refs:
   - plugins/draft/docs/spec/draft/pages-and-navigation.md
   - plugins/draft/docs/spec/draft/status-and-relations.md
   - plugins/draft/docs/spec/draft/page-edits.md
@@ -15,22 +13,6 @@ Affects:
   - plugins/draft/docs/spec/draft/query-check-and-output.md
   - plugins/draft/docs/spec/runtime/interface.md
   - plugins/draft/docs/spec/runtime/errors-and-observability.md
-Parent: none
-Scope: feature-delta
-Current-Owner:
-  - plugins/draft/docs/spec/draft/pages-and-navigation.md
-  - plugins/draft/docs/spec/draft/status-and-relations.md
-  - plugins/draft/docs/spec/draft/page-edits.md
-  - plugins/draft/docs/spec/draft/structure.md
-  - plugins/draft/docs/spec/draft/resources-and-links.md
-  - plugins/draft/docs/spec/draft/conclusions.md
-  - plugins/draft/docs/spec/draft/trash-and-restore.md
-  - plugins/draft/docs/spec/draft/query-check-and-output.md
-  - plugins/draft/docs/spec/runtime/interface.md
-  - plugins/draft/docs/spec/runtime/errors-and-observability.md
-Dispatch: blocked
-Dispatch-Diagnostic: 用户已批准独立根锁与恢复前置任务；整票 Execute 接入等待该依赖完成，已授权的纯解析、读取及纯计划工作可以继续，不表示整票完成。
-Blocked by: .scratch/draft-operation-runtime-foundation/issues/04-root-lock-and-recovery.md
 
 ## 交付结果与范围
 
@@ -92,7 +74,9 @@ Draft 能读取符合现行合同的 YAML 页面头部，所有生成或修改�
 本任务与[无效请求在读取 Draft 根之前被拒绝](../../draft-operation-runtime-foundation/issues/01-request-validation.md)没有阻塞边。
 两者可能接触共同的路径值或错误投影消费者；规则复用现有权威入口，不各自维护一套完整协议。
 
-实际写入接入依赖[根锁与恢复前置任务](../../draft-operation-runtime-foundation/issues/04-root-lock-and-recovery.md)。
+Blocked by:
+  - [根锁与恢复前置任务](../../draft-operation-runtime-foundation/issues/04-root-lock-and-recovery.md)：实际写入接入等待根锁与恢复前置完成。
+
 纯解析、读取和纯计划可独立继续；runtime 的完整持久状态机不是本任务的前置。这不免除真实写入、失败和恢复的回归验证。
 如果实际实现证明必须改变持久记录协议、补充未定义的状态或扩大到其他完整行为，停止相关工作并报告具体 owner、
 调用链与反例；不得用测试通过声明这些额外行为已获批准。
