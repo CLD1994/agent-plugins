@@ -22,3 +22,11 @@ Parent: .scratch/draft-runtime-tracer-bullets/spec.md
 - [ ] 跨进程竞争、进程终止后重新取得锁、符号链接/类型异常和平台能力不足都有独立集成证据。
 
 **停止条件:** 需要改变页面、关系、结论或回收区操作（Trash）的业务语义，或需要新增未登记的公开错误时停止并报告。
+
+## Comments
+
+- 当前直接持锁接缝的实施范围包括 `operations`、`link_index_maintenance`、`trash_lifecycle`
+  和 `trash` 的取得、释放及异常退出路径；业务恢复协议保持原合同。
+- 异常传播遵循[根锁清理与异常传播](../../../plugins/draft/docs/spec/runtime/admission-and-effects.md#根锁清理与异常传播)，
+  进程保障范围遵循[宿主进程边界](../../../plugins/draft/docs/spec/runtime/initialization-and-platform.md#宿主进程边界)。
+  本票仍为未完成状态，锁原语候选和直接调用者的接缝需通过实施与独立评审。

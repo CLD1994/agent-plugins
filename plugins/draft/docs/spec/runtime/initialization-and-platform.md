@@ -16,6 +16,12 @@
 任一证明时返回 `runtime.platform_unsupported`，零写。POSIX、
 Windows 和 macOS 可以用不同实现满足这些相同的可观察性质。
 
+### 宿主进程边界
+
+根锁保障覆盖独立进程之间的竞争。宿主在运行期间使用 `fork` 时，保障范围限于单线程
+宿主及会触发 Python `os.register_at_fork` 回调的路径；子进程不取得父进程的写入资格，
+父进程持有的锁仍保持有效。`exec` 后的程序不继承根锁描述符。
+
 ### 权威现场与私有实现边界
 
 `InitDescriptor` 是 runtime 内唯一完整的初始化 authority。它认证 marker 预期字节、初始
