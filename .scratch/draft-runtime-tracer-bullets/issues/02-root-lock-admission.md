@@ -26,7 +26,8 @@ Parent: .scratch/draft-runtime-tracer-bullets/spec.md
 ## Comments
 
 - 当前直接持锁接缝的实施范围包括 `operations`、`link_index_maintenance`、`trash_lifecycle`
-  和 `trash` 的取得、释放及异常退出路径；业务恢复协议保持原合同。
+  和 `trash` 的取得、释放及异常退出路径，以及 `cli` 对这些 runtime 错误的退出码映射和相关测试；
+  退出码遵循既有错误登记，业务恢复协议保持原合同。
 - 异常传播遵循[根锁清理与异常传播](../../../plugins/draft/docs/spec/runtime/admission-and-effects.md#根锁清理与异常传播)，
   进程保障范围遵循[宿主进程边界](../../../plugins/draft/docs/spec/runtime/initialization-and-platform.md#宿主进程边界)。
   本票仍为未完成状态，锁原语候选和直接调用者的接缝需通过实施与独立评审。
