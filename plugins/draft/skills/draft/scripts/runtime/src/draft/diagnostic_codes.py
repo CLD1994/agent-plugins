@@ -29,6 +29,11 @@ class CheckCode(StrEnum):
     PAGE_INVALID_RELATION = "page.invalid_relation"
     PAGE_PARSE_ERROR = "page.parse_error"
     PAGE_CAPACITY = "page.capacity"
+    PAGE_FRONTMATTER_INVALID = "page.frontmatter_invalid"
+    PAGE_STATUS_INVALID = "page.status_invalid"
+    PAGE_NOTE_INVALID = "page.note_invalid"
+    PAGE_PARENT_INVALID = "page.parent_invalid"
+    RELATION_DECLARATION_INVALID = "relation.declaration_invalid"
     LINK_MISSING = "link.missing"
     LINK_INVALID = "link.invalid"
     LINK_UNAVAILABLE = "link.unavailable"
@@ -110,3 +115,50 @@ class LinkEscapeKind(StrEnum):
 class ReplacementStatusReason(StrEnum):
     RELATION_REQUIRES_STATUS = "relation_requires_status"
     STATUS_REQUIRES_RELATION = "status_requires_relation"
+
+
+class FrontmatterReason(StrEnum):
+    MISSING = "missing"
+    DELIMITER_INVALID = "delimiter_invalid"
+    YAML_INVALID = "yaml_invalid"
+    NOT_MAPPING = "not_mapping"
+    DUPLICATE_KEY = "duplicate_key"
+    UNSUPPORTED_FEATURE = "unsupported_feature"
+    UNKNOWN_KEY = "unknown_key"
+    INVALID_VALUE_TYPE = "invalid_value_type"
+
+
+class PageStatusReason(StrEnum):
+    MISSING = "missing"
+    INVALID_TYPE = "invalid_type"
+    INVALID_VALUE = "invalid_value"
+
+
+class PageNoteReason(StrEnum):
+    EMPTY = "empty"
+    MULTILINE = "multiline"
+    CONTROL_CHARACTER = "control_character"
+
+
+class PageParentReason(StrEnum):
+    UNEXPECTED = "unexpected"
+    MISSING = "missing"
+    INVALID_PATH = "invalid_path"
+
+
+class RelationDeclarationReason(StrEnum):
+    CONTAINER_EMPTY = "container_empty"
+    MEMBER_SHAPE = "member_shape"
+    TYPE_UNKNOWN = "type_unknown"
+    TARGET_PATH_INVALID = "target_path_invalid"
+
+
+HEAD_DIAGNOSTIC_CODES: frozenset[CheckCode] = frozenset(
+    {
+        CheckCode.PAGE_FRONTMATTER_INVALID,
+        CheckCode.PAGE_STATUS_INVALID,
+        CheckCode.PAGE_NOTE_INVALID,
+        CheckCode.PAGE_PARENT_INVALID,
+        CheckCode.RELATION_DECLARATION_INVALID,
+    }
+)

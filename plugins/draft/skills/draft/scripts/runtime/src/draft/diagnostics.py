@@ -6,14 +6,21 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from draft.diagnostic_codes import (
+    HEAD_DIAGNOSTIC_CODES,
     CheckCode,
+    FrontmatterReason,
     InvalidRelationReason,
     InvalidStatusReason,
     LinkEscapeKind,
+    PageNoteReason,
+    PageParentReason,
+    PageStatusReason,
     ParseErrorReason,
+    RelationDeclarationReason,
     ReplacementStatusReason,
     RootMissingKind,
 )
+from draft.errors import DraftError
 from draft.models import CheckIssue, IssueSeverity
 from draft.vocabulary import RelationCode, relation_label
 
@@ -73,6 +80,19 @@ def _fixed(count: int) -> DetailValidator:
 
 def _variant(arities: Mapping[str, int]) -> DetailValidator:
     return lambda details: bool(details) and arities.get(details[0]) == len(details)
+
+
+def _reason_only(reason_type: type[StrEnum]) -> DetailValidator:
+    allowed = frozenset(member.value for member in reason_type)
+    return lambda details: len(details) == 1 and details[0] in allowed
+
+
+def _frontmatter_details(details: tuple[str, ...]) -> bool:
+    if not details or details[0] not in {member.value for member in FrontmatterReason}:
+        return False
+    if details[0] == FrontmatterReason.UNKNOWN_KEY.value:
+        return len(details) in (1, 2)
+    return len(details) == 1
 
 
 def _cycle(details: tuple[str, ...]) -> bool:
@@ -159,6 +179,67 @@ def _render_cycle(prefix: str) -> MessageRenderer:
     return render
 
 
+def _render_frontmatter(details: tuple[str, ...]) -> str:
+    reason = details[0]
+    if reason == FrontmatterReason.MISSING.value:
+        return "缺少 YAML frontmatter"
+    if reason == FrontmatterReason.DELIMITER_INVALID.value:
+        return "YAML frontmatter 分隔线无效"
+    if reason == FrontmatterReason.YAML_INVALID.value:
+        return "YAML frontmatter 语法无效"
+    if reason == FrontmatterReason.NOT_MAPPING.value:
+        return "YAML frontmatter 根值必须是映射"
+    if reason == FrontmatterReason.DUPLICATE_KEY.value:
+        return "YAML frontmatter 含重复键"
+    if reason == FrontmatterReason.UNSUPPORTED_FEATURE.value:
+        return "YAML frontmatter 使用了不支持的 YAML 特性"
+    if reason == FrontmatterReason.UNKNOWN_KEY.value:
+        if len(details) == 1:
+            return "YAML frontmatter 包含未知键"
+        return f"YAML frontmatter 包含未知键：{_safe(details[1])}"
+    return "YAML frontmatter 字段类型无效"
+
+
+def _render_page_status(details: tuple[str, ...]) -> str:
+    reason = details[0]
+    if reason == PageStatusReason.MISSING.value:
+        return "缺少 status 字段"
+    if reason == PageStatusReason.INVALID_TYPE.value:
+        return "status 字段类型无效"
+    return "status 字段值无效"
+
+
+def _render_page_note(details: tuple[str, ...]) -> str:
+    reason = details[0]
+    if reason == PageNoteReason.EMPTY.value:
+        return "note 不能为空"
+    if reason == PageNoteReason.MULTILINE.value:
+        return "note 不能包含换行"
+    return "note 不能包含控制字符"
+
+
+def _render_page_parent(details: tuple[str, ...]) -> str:
+    reason = details[0]
+    if reason == PageParentReason.UNEXPECTED.value:
+        return "parent 字段出现位置无效"
+    if reason == PageParentReason.MISSING.value:
+        return "缺少 parent 字段"
+    if reason == PageParentReason.INVALID_PATH.value:
+        return "parent 字段路径无效"
+    raise AssertionError(f"unregistered parent reason: {reason}")
+
+
+def _render_relation_declaration(details: tuple[str, ...]) -> str:
+    reason = details[0]
+    if reason == RelationDeclarationReason.CONTAINER_EMPTY.value:
+        return "relations 不能为空"
+    if reason == RelationDeclarationReason.MEMBER_SHAPE.value:
+        return "relations 成员形状无效"
+    if reason == RelationDeclarationReason.TYPE_UNKNOWN.value:
+        return "relations 成员的 type 无效"
+    return "relations 成员的 target 路径无效"
+
+
 _ROOT = frozenset({LocationKind.ROOT})
 _LINE = frozenset({LocationKind.LINE})
 _FILE = frozenset({LocationKind.FILE})
@@ -228,6 +309,21 @@ _SPECS: dict[CheckCode, DiagnosticSpec] = {
         lambda details: (
             f"页面容量为 {_safe(details[0])} 行 / {_safe(details[1])} 字节，建议审查是否拆分"
         ),
+    ),
+    CheckCode.PAGE_FRONTMATTER_INVALID: DiagnosticSpec(
+        _LINE_OR_FILE, _frontmatter_details, _render_frontmatter
+    ),
+    CheckCode.PAGE_STATUS_INVALID: DiagnosticSpec(
+        _LINE_OR_FILE, _reason_only(PageStatusReason), _render_page_status
+    ),
+    CheckCode.PAGE_NOTE_INVALID: DiagnosticSpec(
+        _LINE_OR_FILE, _reason_only(PageNoteReason), _render_page_note
+    ),
+    CheckCode.PAGE_PARENT_INVALID: DiagnosticSpec(
+        _LINE_OR_FILE, _reason_only(PageParentReason), _render_page_parent
+    ),
+    CheckCode.RELATION_DECLARATION_INVALID: DiagnosticSpec(
+        _LINE_OR_FILE, _reason_only(RelationDeclarationReason), _render_relation_declaration
     ),
     CheckCode.LINK_MISSING: DiagnosticSpec(_LINE, _fixed(2), _render_link_missing),
     CheckCode.LINK_INVALID: DiagnosticSpec(_LINE, _fixed(2), _render_link_invalid),
@@ -351,6 +447,12 @@ _SPECS: dict[CheckCode, DiagnosticSpec] = {
 }
 
 KNOWN_CHECK_CODES: frozenset[str] = frozenset(code.value for code in _SPECS)
+_HEAD_DIAGNOSTIC_VALUES: frozenset[str] = frozenset(code.value for code in HEAD_DIAGNOSTIC_CODES)
+
+
+def is_head_diagnostic(code: str) -> bool:
+    """Return whether ``code`` belongs to the YAML page-header diagnostic owner."""
+    return code in _HEAD_DIAGNOSTIC_VALUES
 
 
 def _fallback(details: tuple[str, ...]) -> str:
@@ -358,25 +460,46 @@ def _fallback(details: tuple[str, ...]) -> str:
     return f"未登记诊断参数：{encoded}"
 
 
-def render_issue(issue: CheckIssue) -> str:
-    location_kind, location = _location(issue)
+def _spec_for(issue: CheckIssue) -> DiagnosticSpec | None:
     try:
         registered_code = CheckCode(issue.code)
     except ValueError:
-        spec = None
-    else:
-        spec = _SPECS.get(registered_code)
-    valid = (
-        spec is not None
-        and location_kind in spec.locations
+        return None
+    return _SPECS.get(registered_code)
+
+
+def _is_valid(issue: CheckIssue, spec: DiagnosticSpec | None) -> bool:
+    if spec is None:
+        return False
+    try:
+        registered_code = CheckCode(issue.code)
+    except ValueError:
+        return False
+    if registered_code in HEAD_DIAGNOSTIC_CODES and issue.severity is not IssueSeverity.ERROR:
+        return False
+    location_kind, _location_text = _location(issue)
+    return (
+        location_kind in spec.locations
         and (issue.line is None or issue.line > 0)
         and spec.valid_details(issue.details)
     )
-    message = (
-        spec.render_message(issue.details)
-        if valid and spec is not None
-        else _fallback(issue.details)
-    )
+
+
+def _message_for(issue: CheckIssue, spec: DiagnosticSpec | None, valid: bool) -> str:
+    if valid and spec is not None:
+        return spec.render_message(issue.details)
+    # The five page-header codes are public protocol values.  Invalid internal details must not
+    # turn their untrusted tuple into a second public schema or leak a raw YAML value.
+    if is_head_diagnostic(issue.code):
+        return "页面头部诊断事实无效"
+    return _fallback(issue.details)
+
+
+def render_issue(issue: CheckIssue) -> str:
+    _location_kind, location = _location(issue)
+    spec = _spec_for(issue)
+    valid = _is_valid(issue, spec)
+    message = _message_for(issue, spec, valid)
     if valid:
         # 已登记错误码只展示人类可读事实，不重复错误码；未知/未登记码在兜底分支保留。
         return f"{location}: {_SEVERITY_NAMES[issue.severity]}：{message}"
@@ -385,10 +508,43 @@ def render_issue(issue: CheckIssue) -> str:
 
 
 def issue_payload(issue: CheckIssue) -> dict[str, object]:
-    return {
+    if not is_head_diagnostic(issue.code):
+        return {
+            "code": issue.code,
+            "severity": issue.severity.value,
+            "path": None if issue.path is None else issue.path.as_posix(),
+            "line": issue.line,
+            "details": list(issue.details),
+        }
+
+    spec = _spec_for(issue)
+    valid = _is_valid(issue, spec)
+    payload: dict[str, object] = {
         "code": issue.code,
-        "severity": issue.severity.value,
-        "path": None if issue.path is None else issue.path.as_posix(),
-        "line": issue.line,
-        "details": list(issue.details),
+        "severity": IssueSeverity.ERROR.value,
+        "message": _message_for(issue, spec, valid),
     }
+    if issue.path is not None:
+        payload["path"] = issue.path.as_posix()
+    if issue.line is not None and issue.line > 0:
+        payload["line"] = issue.line
+    if valid and issue.details:
+        payload["details"] = {"reason": issue.details[0]}
+    return payload
+
+
+def error_payload(error: DraftError) -> dict[str, object] | None:
+    """Project a page-header ``DraftError`` to the public error object, if applicable."""
+    if not is_head_diagnostic(error.code):
+        return None
+    path = error.paths[0] if len(error.paths) == 1 else None
+    issue = CheckIssue(
+        code=error.code,
+        severity=IssueSeverity.ERROR,
+        path=path,
+        line=error.line,
+        details=error.details,
+    )
+    projected = issue_payload(issue)
+    projected.pop("severity", None)
+    return projected

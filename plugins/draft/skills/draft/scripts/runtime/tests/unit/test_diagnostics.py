@@ -6,10 +6,15 @@ import pytest
 
 from draft.diagnostic_codes import (
     CheckCode,
+    FrontmatterReason,
     InvalidRelationReason,
     InvalidStatusReason,
     LinkEscapeKind,
+    PageNoteReason,
+    PageParentReason,
+    PageStatusReason,
     ParseErrorReason,
+    RelationDeclarationReason,
     ReplacementStatusReason,
     RootMissingKind,
 )
@@ -265,6 +270,51 @@ VALID_RENDER_CASES = [
             ("620", "70000"),
         ),
         (0, 1),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.PAGE_FRONTMATTER_INVALID.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            2,
+            ("unknown_key", "产出"),
+        ),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.PAGE_STATUS_INVALID.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            None,
+            (PageStatusReason.MISSING.value,),
+        ),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.PAGE_NOTE_INVALID.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            4,
+            (PageNoteReason.MULTILINE.value,),
+        ),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.PAGE_PARENT_INVALID.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            None,
+            (PageParentReason.MISSING.value,),
+        ),
+    ),
+    RenderCase(
+        CheckIssue(
+            CheckCode.RELATION_DECLARATION_INVALID.value,
+            IssueSeverity.ERROR,
+            Path("pages/a.md"),
+            7,
+            (RelationDeclarationReason.MEMBER_SHAPE.value,),
+        ),
     ),
     RenderCase(
         CheckIssue(
@@ -827,4 +877,131 @@ def test_issue_payload_preserves_none_path_and_line() -> None:
         "path": None,
         "line": None,
         "details": ["a", "b"],
+    }
+
+
+def test_frontmatter_diagnostic_projects_authenticated_reason_and_unknown_key_message() -> None:
+    issue = CheckIssue(
+        CheckCode.PAGE_FRONTMATTER_INVALID.value,
+        IssueSeverity.ERROR,
+        Path("pages/a.md"),
+        3,
+        (FrontmatterReason.UNKNOWN_KEY.value, "产出"),
+    )
+
+    payload = issue_payload(issue)
+
+    assert payload["code"] == CheckCode.PAGE_FRONTMATTER_INVALID.value
+    assert payload["severity"] == "error"
+    assert payload["path"] == "pages/a.md"
+    assert payload["line"] == 3
+    assert payload["details"] == {"reason": "unknown_key"}
+    assert "产出" in str(payload["message"])
+    assert payload["details"] == {"reason": FrontmatterReason.UNKNOWN_KEY.value}
+
+
+def test_frontmatter_unknown_key_without_authenticated_name_keeps_public_reason() -> None:
+    issue = CheckIssue(
+        CheckCode.PAGE_FRONTMATTER_INVALID.value,
+        IssueSeverity.ERROR,
+        Path("pages/a.md"),
+        3,
+        (FrontmatterReason.UNKNOWN_KEY.value,),
+    )
+
+    rendered = render_issue(issue)
+    payload = issue_payload(issue)
+
+    assert "未知键" in rendered
+    assert "诊断事实无效" not in rendered
+    assert payload["details"] == {"reason": FrontmatterReason.UNKNOWN_KEY.value}
+    assert "[extra]" not in str(payload["message"])
+
+
+@pytest.mark.parametrize("reason", [reason.value for reason in PageStatusReason])
+def test_page_status_diagnostic_projects_reason_without_unlocated_line(reason: str) -> None:
+    issue = CheckIssue(
+        CheckCode.PAGE_STATUS_INVALID.value,
+        IssueSeverity.ERROR,
+        Path("pages/a.md"),
+        None,
+        (reason,),
+    )
+
+    payload = issue_payload(issue)
+
+    assert payload["code"] == CheckCode.PAGE_STATUS_INVALID.value
+    assert payload["severity"] == IssueSeverity.ERROR.value
+    assert payload["path"] == "pages/a.md"
+    assert "line" not in payload
+    assert payload["details"] == {"reason": reason}
+    assert payload["message"]
+
+
+@pytest.mark.parametrize("reason", [reason.value for reason in PageNoteReason])
+def test_page_note_diagnostic_projects_reason_without_empty_suggestions(reason: str) -> None:
+    issue = CheckIssue(
+        CheckCode.PAGE_NOTE_INVALID.value,
+        IssueSeverity.ERROR,
+        Path("pages/a.md"),
+        5,
+        (reason,),
+    )
+
+    payload = issue_payload(issue)
+
+    assert payload["code"] == CheckCode.PAGE_NOTE_INVALID.value
+    assert payload["severity"] == IssueSeverity.ERROR.value
+    assert payload["path"] == "pages/a.md"
+    assert payload["line"] == 5
+    assert payload["details"] == {"reason": reason}
+    assert "suggestions" not in payload
+    assert payload["message"]
+
+
+@pytest.mark.parametrize("reason", [reason.value for reason in PageParentReason])
+def test_page_parent_diagnostic_projects_each_registered_reason(reason: str) -> None:
+    issue = CheckIssue(
+        CheckCode.PAGE_PARENT_INVALID.value,
+        IssueSeverity.ERROR,
+        Path("pages/a.md"),
+        None,
+        (reason,),
+    )
+
+    payload = issue_payload(issue)
+
+    assert payload["code"] == CheckCode.PAGE_PARENT_INVALID.value
+    assert payload["severity"] == IssueSeverity.ERROR.value
+    assert payload["path"] == "pages/a.md"
+    assert "line" not in payload
+    assert payload["details"] == {"reason": reason}
+    assert payload["message"]
+
+
+@pytest.mark.parametrize("reason", [reason.value for reason in RelationDeclarationReason])
+def test_relation_declaration_diagnostic_projects_each_registered_reason(reason: str) -> None:
+    issue = CheckIssue(
+        CheckCode.RELATION_DECLARATION_INVALID.value,
+        IssueSeverity.ERROR,
+        Path("pages/a.md"),
+        8,
+        (reason,),
+    )
+
+    payload = issue_payload(issue)
+
+    assert payload["code"] == CheckCode.RELATION_DECLARATION_INVALID.value
+    assert payload["severity"] == IssueSeverity.ERROR.value
+    assert payload["path"] == "pages/a.md"
+    assert payload["line"] == 8
+    assert payload["details"] == {"reason": reason}
+    assert payload["message"]
+
+
+def test_page_parent_reason_has_only_the_registered_frontmatter_values() -> None:
+    assert {reason.value for reason in PageParentReason} == {
+        "unexpected",
+        "missing",
+        "invalid_path",
     }
