@@ -63,6 +63,8 @@ Parent: .scratch/draft-operation-runtime-foundation/spec.md
 
 ## Comments
 
+2026-09-10：Main 按用户指令直接接续 `.worktrees/draft-lock-run-20260909` 候选，不派遣 subagent。起点临时提交 bccb5c5；当前阶段记录提交 b04afae。锁对象身份及 restore 包清理入口的 18 个规定场景和 2 个附加场景通过；生产代码未改。审计器新增反例暴露 8 个错误放行，算法尚未修复，验收方式调整建议待用户确认；公共 recover 聚合、历史 red 记录缺失及后续范围仍未关闭。见[阶段结果](../../../.worktrees/draft-lock-run-20260909/tmp/agents/2026-09-10-root-lock-main/result-001.md)和[验证证据](../../../.worktrees/draft-lock-run-20260909/tmp/agents/2026-09-10-root-lock-main/verification-001.md)。任务保持未完成。
+
 本项工作按[第 02 票：根锁准入](../../draft-runtime-tracer-bullets/issues/02-root-lock-admission.md)、[第 03 票：恢复与清理归属](../../draft-runtime-tracer-bullets/issues/03-recovery-cleanup-ownership.md)、[第 04 票：只读、预演与通知](../../draft-runtime-tracer-bullets/issues/04-read-dryrun-maintenance.md)分别交付和验收，继续使用同一根锁候选与执行记录。
 
 2026-09-09：专用工作目录为 `.worktrees/draft-root-lock-recovery`，分支 `task/draft-root-lock-recovery`，HEAD 为 `670dbf210431badbdf68aa6e99f844417c35a6d4`；候选另含 `diagnostic_codes.py`、`operations.py` 的未提交修改，以及未跟踪的 `root_lock.py` 和两份根锁测试，HEAD 本身不包含这些候选内容。[执行计划](../../../.worktrees/draft-root-lock-recovery/tmp/agents/2026-09-07-issue-04-root-lock/execution-plan/plan.md)已有[计划评审结果](../../../.worktrees/draft-root-lock-recovery/tmp/agents/2026-09-07-issue-04-root-lock/plan-review/result.md)。[实施检查点](../../../.worktrees/draft-root-lock-recovery/tmp/agents/2026-09-07-issue-04-root-lock/implementation/checkpoint.md)记录了部分原语和入口接入，并列出旧 JSON 锁测试、Restore 准备顺序以及 read/DryRun/维护/CLI 接入的未完成项。当前恢复工作先核对候选与现行设计；这些历史验证记录不表示本轮已经重跑测试或整票通过验收。
