@@ -51,6 +51,12 @@ operations.recover 与 CLI 使用的 trash_lifecycle.recover_interrupted_operati
 
 ## Comments
 
+目录同步关闭出口已在候选 d354a0a 修复，结果记录 63f6c15。首次同步中断原对象传播，
+描述符关闭一次，普通耐久错误映射及恢复材料保持。1156 单元、61 项相关集成及静态
+检查通过；未重跑全量集成。详见
+[目录同步交付](../../../.worktrees/draft-lock-run-20260909/tmp/agents/2026-09-10-root-lock-main/directory-sync-result-001.md)。
+下一步为 Trash/Restore 清理与外层恢复出口，整体候选仍未通过。
+
 索引维护的六处错误转换已在候选 bd0f6a3 修复，结果记录 f7d841a：根锁认证失败原对象
 传播，普通 I/O 降级保持。1143 单元、54 项根锁/flag/索引恢复专项和完整类型检查通过；
 较宽集成选择仍有四项已核对的旧失败，本轮未重跑全部集成。详见

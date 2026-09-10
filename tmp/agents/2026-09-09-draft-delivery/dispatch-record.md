@@ -16,7 +16,7 @@
 
 | 任务与材料 | 内容版本 | Agent | 角色 / 模型 | 状态与处理 |
 | --- | --- | --- | --- | --- |
-| 根锁后续执行 | lock v4；Main 接续 | `/root`，不派遣 subagent | Main 直接执行并向用户汇报 | 索引维护根锁错误传播已交付，候选 HEAD f7d841a；Main 接续其余根锁调用链核验。任务与交付见 .scratch/draft-root-lock-followup/issues/01-recovery-result-and-evidence.md。未采用、未 rebase；原执行级三次失败保留。 |
+| 根锁后续执行 | lock v4；Main 接续 | `/root`，不派遣 subagent | Main 直接执行并向用户汇报 | 目录同步关闭出口已交付，候选 HEAD 63f6c15；Main 接续 Trash/Restore 清理与恢复出口核验。任务与交付见 .scratch/draft-root-lock-followup/issues/01-recovery-result-and-evidence.md。未采用、未 rebase；原执行级三次失败保留。 |
 
 ## 已完成或停止的派遣
 
