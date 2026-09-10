@@ -51,6 +51,12 @@ operations.recover 与 CLI 使用的 trash_lifecycle.recover_interrupted_operati
 
 ## Comments
 
+索引维护的六处错误转换已在候选 bd0f6a3 修复，结果记录 f7d841a：根锁认证失败原对象
+传播，普通 I/O 降级保持。1143 单元、54 项根锁/flag/索引恢复专项和完整类型检查通过；
+较宽集成选择仍有四项已核对的旧失败，本轮未重跑全部集成。详见
+[索引错误传播交付](../../../.worktrees/draft-lock-run-20260909/tmp/agents/2026-09-10-root-lock-main/index-guard-result-001.md)。
+其余根锁调用链及恢复错误出口继续核验，整体候选尚未通过。
+
 本轮 Main 核验和中断修复已保存于候选 7accc0c；工具位置清单 2f08ae5，原语修复
 64cc551。1030 单元、39 根锁及目录替换专项通过，完整 runtime Pyright 通过。
 完整发现及边界见[第 6 轮核验](../../../.worktrees/draft-lock-run-20260909/tmp/agents/review-notes/draft-root-lock-primitive/2026-09-10-round-6.md)。
