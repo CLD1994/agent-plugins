@@ -16,7 +16,7 @@
 
 | 任务与材料 | 内容版本 | Agent | 角色 / 模型 | 状态与处理 |
 | --- | --- | --- | --- | --- |
-| 根锁后续执行 | lock v4；Main 接续 | `/root`，不派遣 subagent | Main 直接执行并向用户汇报 | Main 实施与自查已交付，候选 HEAD c9271d1；等待用户指定独立评审执行者与调度方式。任务与交付见 .scratch/draft-root-lock-followup/issues/01-recovery-result-and-evidence.md。未采用、未 rebase；原执行级三次失败保留。 |
+| 根锁后续执行 | lock v4 历史候选；Main 重组 | `/root`，不派遣 subagent | Main 直接执行并向用户汇报 | 用户授权候选先基于 main rebase，再保留内容 reset 并按 issue 重新提交。当前候选分支 task/draft-lock-run-20260909；交付见候选 tmp/agents/2026-09-10-root-lock-main/rebase-result-001.md。独立评审调度待用户指定，尚未采用或合并；原执行级三次失败作为旧固定基线历史保留。 |
 
 ## 已完成或停止的派遣
 
