@@ -1,6 +1,6 @@
 # 根锁后续：公共恢复结果与历史验证证据
 
-Status: ready-for-agent
+Status: ready-for-human
 Tracker-State: open
 Design-Refs:
   - plugins/draft/docs/spec/runtime/recovery.md
@@ -50,6 +50,16 @@ operations.recover 与 CLI 使用的 trash_lifecycle.recover_interrupted_operati
 4. 当前测试绿不能证明旧测试确实失败，也不能替代仍未完成的源码核验、公共结果契约或独立评审。
 
 ## Comments
+
+Main 本轮实施、自查与固定代码回归已交付至候选 c9271d1（生产 bb0d58d）。恢复扫描资源
+清理与 Restore 根锁失败的立即退出已修复；1194 单元通过，完整非网络集成 1023 passed /
+218 failed / 8 deselected，与既有基线相比没有新增失败节点，不代表所有失败都不影响采用。
+详见[最终交付](../../../.worktrees/draft-lock-run-20260909/tmp/agents/2026-09-10-root-lock-main/final-result-001.md)。
+
+当前等待用户指定独立评审执行者与调度方式：父任务和 tracer 02 要求独立验收，Main 自查
+不能替代；不自行派遣 subagent。已准备
+[独立评审说明](../../../.worktrees/draft-lock-run-20260909/tmp/agents/2026-09-10-root-lock-main/independent-review-brief-001.md)。
+独立评审通过后才能 rebase 并验证主线组合，当前尚不能合并，任务保持 open。
 
 目录同步关闭出口已在候选 d354a0a 修复，结果记录 63f6c15。首次同步中断原对象传播，
 描述符关闭一次，普通耐久错误映射及恢复材料保持。1156 单元、61 项相关集成及静态
