@@ -1,6 +1,6 @@
 # 根锁后续：公共恢复结果与历史验证证据
 
-Status: needs-info
+Status: ready-for-agent
 Tracker-State: open
 Design-Refs:
   - plugins/draft/docs/spec/runtime/recovery.md
@@ -54,9 +54,12 @@ operations.recover 与 CLI 使用的 trash_lifecycle.recover_interrupted_operati
 本轮 Main 核验和中断修复已保存于候选 7accc0c；工具位置清单 2f08ae5，原语修复
 64cc551。1030 单元、39 根锁及目录替换专项通过，完整 runtime Pyright 通过。
 完整发现及边界见[第 6 轮核验](../../../.worktrees/draft-lock-run-20260909/tmp/agents/review-notes/draft-root-lock-primitive/2026-09-10-round-6.md)。
-共享业务 I/O 中发现 pending 文件句柄漏关、目录链旧句柄重复关闭及新句柄漏关，尚未扩展
-实现。待确认是否将这两处共享 I/O 资源清理纳入本轮，并对其采用首个控制异常优先、
-继续剩余关闭、每个描述符只关闭一次的规则；不涉及删除恢复材料或改变业务恢复。
+用户已批准将两处共享业务 I/O 清理纳入本轮，采用首个控制异常优先、继续剩余关闭、
+每个描述符只关闭一次的规则。候选 ec79408、e95ff2e 已实现发布、目录链和同一调用链
+外层关闭的一致处理；不删除恢复材料、不改变业务恢复。1113 单元及类型检查通过；
+固定 e95ff2e 的全量非网络集成为 983 passed / 218 failed / 8 deselected，未新增失败节点，
+218 项同名基线失败仍未逐项核因。候选 HEAD bdd20a2，详细结果见
+[共享 I/O 清理交付](../../../.worktrees/draft-lock-run-20260909/tmp/agents/2026-09-10-root-lock-main/io-cleanup-result-001.md)。
 其余根锁调用链核验继续待办，整体候选未通过。
 
 已形成[公共结果合同候选](../../../.worktrees/draft-lock-run-20260909/.scratch/draft-root-lock-followup/spec.md)。用户已批准相关公开编号输入与输出一并使用正式的 36 字符小写 UUID v4，明确开发阶段没有用户、不要求兼容。新编号从生成到持久记录、公开输出与 Restore 输入保持同值，不自动迁移已有开发现场。Main 正在候选工作树实施并验证。

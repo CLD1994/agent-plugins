@@ -16,7 +16,7 @@
 
 | 任务与材料 | 内容版本 | Agent | 角色 / 模型 | 状态与处理 |
 | --- | --- | --- | --- | --- |
-| 根锁后续执行 | lock v4；Main 接续 | `/root`，不派遣 subagent | Main 直接执行并向用户汇报 | 调用清单与根锁原语中断修复已交付，候选 HEAD 7accc0c；整体核验中的共享 I/O 清理范围待用户确认。任务与交付见 .scratch/draft-root-lock-followup/issues/01-recovery-result-and-evidence.md。未采用、未 rebase；原执行级三次失败保留。 |
+| 根锁后续执行 | lock v4；Main 接续 | `/root`，不派遣 subagent | Main 直接执行并向用户汇报 | 共享 I/O 清理已按用户批准范围交付，候选 HEAD bdd20a2；Main 接续根锁整体源码核验。任务与交付见 .scratch/draft-root-lock-followup/issues/01-recovery-result-and-evidence.md。未采用、未 rebase；原执行级三次失败保留。 |
 
 ## 已完成或停止的派遣
 
