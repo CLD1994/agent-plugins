@@ -29,7 +29,7 @@ operations.recover 与 CLI 使用的 trash_lifecycle.recover_interrupted_operati
 | 前面已有耐久成功，后面执行失败 | 返回错误，不返回部分成功作为整体成功；保留已完成的耐久变化，不为凑全有或全无而回滚；重试重新认证剩余现场。 |
 | live owner 阻止取得锁 | 保持既有 busy 和零业务写规则。 |
 
-用户已批准按破坏性重构实施结果模型与 CLI，同步更新受影响测试；不以修复所有基线失败为前置条件。候选源码与回归核验继续进行，整体根锁任务尚未通过验收。
+用户已批准按破坏性重构实施结果模型与 CLI，同步更新受影响测试；不以修复所有基线失败为前置条件。候选已完成实现者的源码与回归核验，整体根锁任务仍待独立验收。
 
 ## CLI 信息成本原则
 
@@ -49,45 +49,34 @@ operations.recover 与 CLI 使用的 trash_lifecycle.recover_interrupted_operati
 3. 对已知缺陷逐项核对回归测试是否覆盖被违反的不变量。
 4. 当前测试绿不能证明旧测试确实失败，也不能替代仍未完成的源码核验、公共结果契约或独立评审。
 
+## 当前检查项
+
+- [x] 完成公共批量恢复结果、简洁 CLI 和正式编号实现。
+- [x] 完成实现者的源码核验及单元、集成回归。
+- [x] 将候选基于 main 组合并重新提交。
+- [ ] 指定并完成独立评审，判断剩余集成失败对采用的影响。
+- [ ] 完成采用及合并。
+
+## 验证结果
+
+被测生产与测试版本为 `95bd9a2`，位于候选分支 `task/draft-lock-run-20260909`。该版本已组合主线的 YAML 基础交付，尚未采用。以下为 2026-09-10 的执行结果，本任务后续文档整理不改变被测代码。
+
+核心命令在 `plugins/draft/skills/draft/scripts/runtime` 中执行：
+
+| 检查 | 命令或范围 | 结果 |
+| --- | --- | --- |
+| 核心单元 | `uv run --locked pytest -q tests/unit` | 1340 通过 |
+| 核心非网络集成 | `uv run --locked pytest -q tests/integration -m 'not network'` | 1026 通过、218 失败、8 未选中 |
+| 核心专项集成 | `tests/integration/` 下的 test_root_lock.py、test_io_cleanup.py、test_recovery_results.py、test_cli.py、test_frontmatter_diagnostics.py | 176 通过 |
+| 核心静态检查 | `uv run --locked ruff check .` 与 `uv run --locked pyright` | 通过 |
+| 核心格式 | `uv run --locked ruff format --check .` | 未改的 test_distribution_contract.py 有格式差异 |
+
+适配层在仓库根使用同一 runtime 项目分别运行：`uv run --project plugins/draft/skills/draft/scripts/runtime --locked pytest -q plugins/draft/scripts/tests/unit` 为 191 通过；将测试路径换为 `plugins/draft/scripts/tests/integration` 并加 `-m 'not network'` 为 318 通过、1 未选中。`bash plugins/draft/scripts/check-adapters.sh` 通过。
+
+与组合前 `bb0d58d` 的完整非网络集成比较，218 个失败节点相同，没有新增或消失。比较只证明失败节点集合一致，不证明失败原因相同或全部与本任务无关。已知待核对范围包括旧持久锁及返回后仍持锁的断言、缺少 `lock` 参数的测试替身，以及其他消费者的恢复协议测试。独立评审需要判断哪些属于本次必须完成的验收，不能仅凭“无新增失败”放行。
+
 ## Comments
 
-Main 本轮实施、自查与固定代码回归已交付至候选 c9271d1（生产 bb0d58d）。恢复扫描资源
-清理与 Restore 根锁失败的立即退出已修复；1194 单元通过，完整非网络集成 1023 passed /
-218 failed / 8 deselected，与既有基线相比没有新增失败节点，不代表所有失败都不影响采用。
-详见[最终交付](../../../.worktrees/draft-lock-run-20260909/tmp/agents/2026-09-10-root-lock-main/final-result-001.md)。
+2026-09-10：确认以当前已提交代码的源码核验与回归作为验收依据，历史缺失的失败测试输入不补造。确认公共结果表达本次实际动作，并按调用者的信息用途压缩 CLI 输出；公开编号输入与输出统一为正式 UUID v4。完整结果合同随候选提交 `510bdca` 保存。
 
-当前等待用户指定独立评审执行者与调度方式：父任务和 tracer 02 要求独立验收，Main 自查
-不能替代；不自行派遣 subagent。已准备
-[独立评审说明](../../../.worktrees/draft-lock-run-20260909/tmp/agents/2026-09-10-root-lock-main/independent-review-brief-001.md)。
-独立评审通过后才能 rebase 并验证主线组合，当前尚不能合并，任务保持 open。
-
-目录同步关闭出口已在候选 d354a0a 修复，结果记录 63f6c15。首次同步中断原对象传播，
-描述符关闭一次，普通耐久错误映射及恢复材料保持。1156 单元、61 项相关集成及静态
-检查通过；未重跑全量集成。详见
-[目录同步交付](../../../.worktrees/draft-lock-run-20260909/tmp/agents/2026-09-10-root-lock-main/directory-sync-result-001.md)。
-下一步为 Trash/Restore 清理与外层恢复出口，整体候选仍未通过。
-
-索引维护的六处错误转换已在候选 bd0f6a3 修复，结果记录 f7d841a：根锁认证失败原对象
-传播，普通 I/O 降级保持。1143 单元、54 项根锁/flag/索引恢复专项和完整类型检查通过；
-较宽集成选择仍有四项已核对的旧失败，本轮未重跑全部集成。详见
-[索引错误传播交付](../../../.worktrees/draft-lock-run-20260909/tmp/agents/2026-09-10-root-lock-main/index-guard-result-001.md)。
-其余根锁调用链及恢复错误出口继续核验，整体候选尚未通过。
-
-本轮 Main 核验和中断修复已保存于候选 7accc0c；工具位置清单 2f08ae5，原语修复
-64cc551。1030 单元、39 根锁及目录替换专项通过，完整 runtime Pyright 通过。
-完整发现及边界见[第 6 轮核验](../../../.worktrees/draft-lock-run-20260909/tmp/agents/review-notes/draft-root-lock-primitive/2026-09-10-round-6.md)。
-用户已批准将两处共享业务 I/O 清理纳入本轮，采用首个控制异常优先、继续剩余关闭、
-每个描述符只关闭一次的规则。候选 ec79408、e95ff2e 已实现发布、目录链和同一调用链
-外层关闭的一致处理；不删除恢复材料、不改变业务恢复。1113 单元及类型检查通过；
-固定 e95ff2e 的全量非网络集成为 983 passed / 218 failed / 8 deselected，未新增失败节点，
-218 项同名基线失败仍未逐项核因。候选 HEAD bdd20a2，详细结果见
-[共享 I/O 清理交付](../../../.worktrees/draft-lock-run-20260909/tmp/agents/2026-09-10-root-lock-main/io-cleanup-result-001.md)。
-其余根锁调用链核验继续待办，整体候选未通过。
-
-已形成[公共结果合同候选](../../../.worktrees/draft-lock-run-20260909/.scratch/draft-root-lock-followup/spec.md)。用户已批准相关公开编号输入与输出一并使用正式的 36 字符小写 UUID v4，明确开发阶段没有用户、不要求兼容。新编号从生成到持久记录、公开输出与 Restore 输入保持同值，不自动迁移已有开发现场。Main 正在候选工作树实施并验证。
-
-检查方式、历史验证依据、公共恢复结果方向、CLI 信息成本原则与编号实施范围均已批准。公共恢复结果已提交 63499d4、b631da1；本次结果数据流已核对，完整根锁源码核验及整体采用尚未完成。实现与验证见[公共结果记录](../../../.worktrees/draft-lock-run-20260909/tmp/agents/2026-09-10-root-lock-main/recovery-results-001.md)。
-
-公共结果阶段核验记录已保存于 9fe10f3。全量回归中的唯一新增失败为旧接口断言，已同步并定向通过；其余 218 项同名基线失败不扩大修复。下一步为固定提交的根锁整体手工源码核验与审计位置清单。
-
-编号统一已保存于候选提交 e0d2818、df2f695。998 单元、133 CLI/根锁集成及 24 根目录替换专项通过。全量集成与修改前 c988526 比较有 222 项同名失败；本轮新增 2 项测试辅助函数问题已修复并定向通过，修复后未重新执行全量。详细范围与验证见[编号实施记录](../../../.worktrees/draft-lock-run-20260909/tmp/agents/2026-09-10-root-lock-main/identifiers-001.md)。
+实现者已核对根锁取得、传递、检查、副作用与释放的调用链，但这不构成独立评审。当前需要用户指定独立评审执行者与调度方式。
