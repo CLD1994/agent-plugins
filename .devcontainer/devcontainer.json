@@ -1,6 +1,6 @@
 {
-  "name": "draft",
-  "image": "hexchip/devcontainer:ubuntu-noble-claude-code",
+  "name": "agent-plugins",
+  "image": "cld1994/devcontainer:ubuntu_noble-claude-codex",
   "customizations": {
     "vscode": {
       "extensions": [
@@ -19,23 +19,10 @@
       }
     }
   },
-  "features": {
-    "ghcr.io/devcontainers/features/common-utils:2": {
-      "configureZshAsDefaultShell": false,
-      "username": "${localEnv:USER}",
-      "userUid": "1000",
-      "userGid": "1000"
-    }
-  },
-  "containerUser": "${localEnv:USER}",
   "mounts": [
-    "source=/mnt/wslg,target=/mnt/wslg,type=bind",
-    "source=draft-command_history-${devcontainerId},target=/opt/devcontainer/commandhistory,type=volume",
-    "source=draft-claude_config-${devcontainerId},target=/opt/devcontainer/.claude,type=volume",
-    "source=draft-extensions,target=/opt/devcontainer/vscode-extensions,type=volume"
+    "source=/mnt/wslg,target=/mnt/wslg,type=bind"
   ],
   "containerEnv": {
     "PULSE_SERVER": "${localEnv:PULSE_SERVER}"
-  },
-  "postCreateCommand": "bash .devcontainer/post_create.sh"
+  }
 }
